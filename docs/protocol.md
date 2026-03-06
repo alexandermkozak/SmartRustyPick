@@ -24,13 +24,17 @@ a single line of JSON.
 
 ```json
 {
-  "command": "READ" | "WRITE" | "DELETE" | "QUERY",
+  "command": "READ" | "WRITE" | "DELETE" | "QUERY" | "READNEXT" | "GETLIST",
   "account": "ACCOUNT_NAME", (optional, switches context if provided)
   "table": "TABLE_NAME",
   "key": "RECORD_KEY",
   "data": "RECORD_DATA", (for WRITE, using display format: ^ for FM, ] for VM, \ for SVM)
   "is_dict": true | false, (optional, default: false)
-  "query": { (for QUERY)
+  "query_string": "WITH First.Name = \"Ted\" AND Last.Name = \"Smith\"", (optional, alternative to 'query' or 'query_node')
+  "query_node": { ... structured QueryNode object ... }, (optional, alternative to 'query' or 'query_string')
+  "list_name": "LIST_NAME", (optional, for QUERY, READNEXT, GETLIST)
+  "batch_size": 10, (optional, for READNEXT)
+  "query": { (optional, for backward compatibility)
     "field_name": "FIELD_NAME",
     "op": "=",
     "value": "VALUE"
@@ -42,10 +46,12 @@ a single line of JSON.
 
 ```json
 {
-  "status": "OK" | "ERROR" | "NOT_FOUND",
+  "status": "OK" | "ERROR" | "NOT_FOUND" | "EOF",
   "message": "Error message if any",
   "record": "Returned record data for READ",
-  "results": [["key1", "data1"], ["key2", "data2"]] (for QUERY)
+  "results": [["key1", "data1"], ["key2", "data2"]], (for QUERY without list_name)
+  "keys": ["key1", "key2", ...], (for READNEXT, GETLIST)
+  "count": 42 (for QUERY with list_name, READNEXT, GETLIST)
 }
 ```
 
@@ -76,8 +82,26 @@ Removes a record.
 
 Performs a search.
 
-- Required fields: `table`, `query`.
-- Optional fields: `is_dict`.
+- Required fields: `table`, `query` (or `query_string` or `query_node`).
+- Optional fields: `is_dict`, `list_name`.
+- If `list_name` is provided, the result keys are stored in a named select list on the server, and only the `count` is
+  returned.
+
+### READNEXT
+
+Retrieves the next batch of keys from a named select list.
+
+- Required fields: `list_name`.
+- Optional fields: `batch_size` (default: 1).
+- Returns `keys` and `count`.
+- Returns `status: "EOF"` when the end of the list is reached.
+
+### GETLIST
+
+Retrieves all keys from a named select list.
+
+- Required fields: `list_name`.
+- Returns `keys` and `count`.
 
 ## Starting the Server
 

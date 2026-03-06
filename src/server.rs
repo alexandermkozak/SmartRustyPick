@@ -1,4 +1,4 @@
-use crate::db::{Database, Record};
+use crate::db::{Database, QueryNode, Record};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,6 +21,10 @@ pub struct Request {
     pub data: Option<String>,
     pub is_dict: Option<bool>,
     pub query: Option<QueryArgs>,
+    pub query_node: Option<QueryNode>,
+    pub query_string: Option<String>,
+    pub list_name: Option<String>,
+    pub batch_size: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -36,6 +40,8 @@ pub struct Response {
     pub message: Option<String>,
     pub record: Option<String>,
     pub results: Option<Vec<(String, String)>>,
+    pub keys: Option<Vec<String>>,
+    pub count: Option<usize>,
 }
 
 pub async fn run_server(
@@ -125,7 +131,7 @@ pub async fn run_server(
                         let req: Request = match serde_json::from_str(&line) {
                             Ok(r) => r,
                             Err(e) => {
-                                let resp = Response { status: "ERROR".to_string(), message: Some(format!("Invalid JSON: {}", e)), record: None, results: None };
+                                let resp = Response { status: "ERROR".to_string(), message: Some(format!("Invalid JSON: {}", e)), record: None, results: None, keys: None, count: None };
                                 let _ = writer.write_all(format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes()).await;
                                 continue;
                             }
@@ -150,47 +156,47 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>) -> Response {
     // If account is specified, logto it
     if let Some(acc) = req.account {
         if let Err(e) = db.logto(&acc) {
-            return Response { status: "ERROR".to_string(), message: Some(format!("Failed to login to account: {}", e)), record: None, results: None };
+            return Response { status: "ERROR".to_string(), message: Some(format!("Failed to login to account: {}", e)), record: None, results: None, keys: None, count: None };
         }
     } else if db.current_account.is_empty() {
-        return Response { status: "ERROR".to_string(), message: Some("Not logged into any account".to_string()), record: None, results: None };
+        return Response { status: "ERROR".to_string(), message: Some("Not logged into any account".to_string()), record: None, results: None, keys: None, count: None };
     }
 
     match req.command.to_uppercase().as_str() {
         "READ" => {
             let table_name = match req.table {
                 Some(t) => t,
-                None => return Response { status: "ERROR".to_string(), message: Some("Table not specified".to_string()), record: None, results: None },
+                None => return Response { status: "ERROR".to_string(), message: Some("Table not specified".to_string()), record: None, results: None, keys: None, count: None },
             };
             let key = match req.key {
                 Some(k) => k,
-                None => return Response { status: "ERROR".to_string(), message: Some("Key not specified".to_string()), record: None, results: None },
+                None => return Response { status: "ERROR".to_string(), message: Some("Key not specified".to_string()), record: None, results: None, keys: None, count: None },
             };
             let is_dict = req.is_dict.unwrap_or(false);
 
             if let Some(table) = db.get_table(&table_name) {
                 let map = if is_dict { &table.dictionary } else { &table.records };
                 if let Some(record) = map.get(&key) {
-                    Response { status: "OK".to_string(), message: None, record: Some(record.to_display_string()), results: None }
+                    Response { status: "OK".to_string(), message: None, record: Some(record.to_display_string()), results: None, keys: None, count: None }
                 } else {
-                    Response { status: "NOT_FOUND".to_string(), message: None, record: None, results: None }
+                    Response { status: "NOT_FOUND".to_string(), message: None, record: None, results: None, keys: None, count: None }
                 }
             } else {
-                Response { status: "ERROR".to_string(), message: Some("Table not found".to_string()), record: None, results: None }
+                Response { status: "ERROR".to_string(), message: Some("Table not found".to_string()), record: None, results: None, keys: None, count: None }
             }
         }
         "WRITE" => {
             let table_name = match req.table {
                 Some(t) => t,
-                None => return Response { status: "ERROR".to_string(), message: Some("Table not specified".to_string()), record: None, results: None },
+                None => return Response { status: "ERROR".to_string(), message: Some("Table not specified".to_string()), record: None, results: None, keys: None, count: None },
             };
             let key = match req.key {
                 Some(k) => k,
-                None => return Response { status: "ERROR".to_string(), message: Some("Key not specified".to_string()), record: None, results: None },
+                None => return Response { status: "ERROR".to_string(), message: Some("Key not specified".to_string()), record: None, results: None, keys: None, count: None },
             };
             let data = match req.data {
                 Some(d) => d,
-                None => return Response { status: "ERROR".to_string(), message: Some("Data not specified".to_string()), record: None, results: None },
+                None => return Response { status: "ERROR".to_string(), message: Some("Data not specified".to_string()), record: None, results: None, keys: None, count: None },
             };
             let is_dict = req.is_dict.unwrap_or(false);
 
@@ -203,16 +209,16 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>) -> Response {
             }
             table.dirty = true;
             let _ = db.save();
-            Response { status: "OK".to_string(), message: None, record: None, results: None }
+            Response { status: "OK".to_string(), message: None, record: None, results: None, keys: None, count: None }
         }
         "DELETE" => {
             let table_name = match req.table {
                 Some(t) => t,
-                None => return Response { status: "ERROR".to_string(), message: Some("Table not specified".to_string()), record: None, results: None },
+                None => return Response { status: "ERROR".to_string(), message: Some("Table not specified".to_string()), record: None, results: None, keys: None, count: None },
             };
             let key = match req.key {
                 Some(k) => k,
-                None => return Response { status: "ERROR".to_string(), message: Some("Key not specified".to_string()), record: None, results: None },
+                None => return Response { status: "ERROR".to_string(), message: Some("Key not specified".to_string()), record: None, results: None, keys: None, count: None },
             };
             let is_dict = req.is_dict.unwrap_or(false);
 
@@ -221,27 +227,93 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>) -> Response {
             if map.remove(&key).is_some() {
                 table.dirty = true;
                 let _ = db.save();
-                Response { status: "OK".to_string(), message: None, record: None, results: None }
+                Response { status: "OK".to_string(), message: None, record: None, results: None, keys: None, count: None }
             } else {
-                Response { status: "NOT_FOUND".to_string(), message: None, record: None, results: None }
+                Response { status: "NOT_FOUND".to_string(), message: None, record: None, results: None, keys: None, count: None }
             }
         }
         "QUERY" => {
             let table_name = match req.table {
                 Some(t) => t,
-                None => return Response { status: "ERROR".to_string(), message: Some("Table not specified".to_string()), record: None, results: None },
-            };
-            let q = match req.query {
-                Some(q) => q,
-                None => return Response { status: "ERROR".to_string(), message: Some("Query not specified".to_string()), record: None, results: None },
+                None => return Response { status: "ERROR".to_string(), message: Some("Table not specified".to_string()), record: None, results: None, keys: None, count: None },
             };
             let is_dict = req.is_dict.unwrap_or(false);
 
-            let records = db.query(&table_name, is_dict, &q.field_name, &q.op, &q.value, None);
-            let results = records.into_iter().map(|(k, r)| (k, r.to_display_string())).collect();
-            Response { status: "OK".to_string(), message: None, record: None, results: Some(results) }
+            let records = if let Some(node) = req.query_node {
+                db.query_new(&table_name, is_dict, &node, None)
+            } else if let Some(qs) = req.query_string {
+                let parts: Vec<&str> = qs.split_whitespace().collect();
+                if let Some(node) = db.parse_query(&table_name, &parts) {
+                    db.query_new(&table_name, is_dict, &node, None)
+                } else {
+                    return Response { status: "ERROR".to_string(), message: Some("Invalid query string".to_string()), record: None, results: None, keys: None, count: None };
+                }
+            } else if let Some(q) = req.query {
+                // Backward compatibility
+                db.query(&table_name, is_dict, &q.field_name, &q.op, &q.value, None)
+            } else {
+                return Response { status: "ERROR".to_string(), message: Some("Query not specified".to_string()), record: None, results: None, keys: None, count: None };
+            };
+
+            if let Some(name) = req.list_name {
+                let keys: Vec<String> = records.iter().map(|(k, _)| k.clone()).collect();
+                let count = keys.len();
+                db.remote_select_lists.insert(name.clone(), crate::db::SelectList {
+                    table_name,
+                    is_dict,
+                    keys,
+                });
+                db.remote_select_cursors.insert(name, 0);
+                Response { status: "OK".to_string(), message: None, record: None, results: None, keys: None, count: Some(count) }
+            } else {
+                let results = records.into_iter().map(|(k, r)| (k, r.to_display_string())).collect();
+                Response { status: "OK".to_string(), message: None, record: None, results: Some(results), keys: None, count: None }
+            }
         }
-        _ => Response { status: "ERROR".to_string(), message: Some("Unknown command".to_string()), record: None, results: None },
+        "READNEXT" => {
+            let list_name = match req.list_name {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("List name not specified".to_string()), record: None, results: None, keys: None, count: None },
+            };
+            let batch_size = req.batch_size.unwrap_or(1);
+
+            let (keys, count) = if db.remote_select_lists.contains_key(&list_name) {
+                let list = db.remote_select_lists.get(&list_name).unwrap();
+                let list_len = list.keys.len();
+                let start = *db.remote_select_cursors.get(&list_name).unwrap();
+                let end = std::cmp::min(start + batch_size, list_len);
+
+                if start >= list_len {
+                    (vec![], 0)
+                } else {
+                    let k = list.keys[start..end].to_vec();
+                    let cursor = db.remote_select_cursors.get_mut(&list_name).unwrap();
+                    *cursor = end;
+                    (k, end - start)
+                }
+            } else {
+                return Response { status: "ERROR".to_string(), message: Some("Select list not found".to_string()), record: None, results: None, keys: None, count: None };
+            };
+
+            if count == 0 && batch_size > 0 {
+                Response { status: "EOF".to_string(), message: None, record: None, results: None, keys: Some(vec![]), count: Some(0) }
+            } else {
+                Response { status: "OK".to_string(), message: None, record: None, results: None, keys: Some(keys), count: Some(count) }
+            }
+        }
+        "GETLIST" => {
+            let list_name = match req.list_name {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("List name not specified".to_string()), record: None, results: None, keys: None, count: None },
+            };
+
+            if let Some(list) = db.remote_select_lists.get(&list_name) {
+                Response { status: "OK".to_string(), message: None, record: None, results: None, keys: Some(list.keys.clone()), count: Some(list.keys.len()) }
+            } else {
+                Response { status: "ERROR".to_string(), message: Some("Select list not found".to_string()), record: None, results: None, keys: None, count: None }
+            }
+        }
+        _ => Response { status: "ERROR".to_string(), message: Some("Unknown command".to_string()), record: None, results: None, keys: None, count: None },
     }
 }
 

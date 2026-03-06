@@ -87,9 +87,11 @@ List tables, keys, or records with formatted fields.
 
 #### SELECT
 Create or refine an active select list based on field criteria.
-- **Usage**: `SELECT [DICT] <table> [WITH <field> <op> <value>]`
+
+- **Usage**: `SELECT [DICT] <table> [WITH <field> <op> <value> [AND/OR <field> <op> <value> ...]]`
 - **Operators**: `=`, `#` (not equal), `<`, `>`, `<=`, `>=`, `[` (ends with), `]` (starts with), `[]` (contains)
-- **Example**: `SELECT USERS WITH First.Name = "Ted"`
+- **Logical Operators**: `AND`, `OR`
+- **Example**: `SELECT USERS WITH First.Name = "Ted" AND Last.Name = "Smith"`
 
 #### EDIT
 

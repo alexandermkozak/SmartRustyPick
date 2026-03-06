@@ -422,17 +422,13 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
         None
     };
 
-    let operators = ["=", "#", "<", ">", "<=", ">=", "[", "]", "[]"];
-    let results = if parts.len() >= offset + 5 && parts[offset + 1].to_uppercase() == "WITH" && operators.contains(&parts[offset + 3]) {
-        let field_name = parts[offset + 2];
-        let op = parts[offset + 3];
-        let mut value = parts[offset + 4].to_string();
-        
-        // Remove quotes if present
-        if value.starts_with('"') && value.ends_with('"') {
-            value = value[1..value.len()-1].to_string();
+    let results = if parts.len() >= offset + 2 && parts[offset + 1].to_uppercase() == "WITH" {
+        if let Some(query) = db.parse_query(table_name, &parts[offset + 1..]) {
+            db.query_new(table_name, is_dict, &query, keys_to_filter.as_deref())
+        } else {
+            println!("INVALID QUERY FORMAT");
+            return;
         }
-        db.query(table_name, is_dict, field_name, op, &value, keys_to_filter.as_deref())
     } else if parts.len() == offset + 1 {
         if let Some(table) = db.get_table(table_name) {
             let map = if is_dict { &table.dictionary } else { &table.records };
