@@ -34,9 +34,11 @@ fn main() -> io::Result<()> {
             if choice.trim().to_uppercase() == "Y" {
                 db.create_account(account_name, None)?;
                 db.logto(account_name)?;
+                let _ = check_dir_file(&mut db);
                 break;
             }
         } else {
+            let _ = check_dir_file(&mut db);
             break;
         }
     }
@@ -106,6 +108,10 @@ fn main() -> io::Result<()> {
             }
             "LOGTO" => {
                 handle_logto(&mut db, &parts);
+                let _ = check_dir_file(&mut db);
+            }
+            "LIST.FILES" => {
+                handle_list_files(&mut db);
             }
             "SAVE" => {
                 db.save()?;
@@ -618,6 +624,7 @@ fn print_help() {
     println!("  CREATE.ACCOUNT <name> [<dir>]         - Create a new account.");
     println!("  DELETE.ACCOUNT <name>                 - Delete an account and all its files.");
     println!("  LOGTO <name>                          - Switch to a different account.");
+    println!("  LIST.FILES                            - List all files in the current account.");
     println!("  EXIT or QUIT                          - Exit the shell.");
 }
 
@@ -749,5 +756,58 @@ fn handle_logto(db: &mut Database, parts: &[&str]) {
     match db.logto(account_name) {
         Ok(_) => println!("Logged into account '{}'", account_name),
         Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_list_files(db: &mut Database) {
+    if db.current_account.is_empty() {
+        println!("Error: Not logged into an account");
+        return;
+    }
+
+    match db.get_table("DIR") {
+        Some(table) => {
+            println!("{:<20} {:<10}", "File", "Type");
+            println!("{:-<20} {:-<10}", "", "");
+
+            let mut files: Vec<_> = table.records.iter().collect();
+            files.sort_by_key(|(k, _)| *k);
+
+            for (name, record) in files {
+                let file_type = record.fields.get(0)
+                    .and_then(|f| f.values.get(0))
+                    .and_then(|v| v.sub_values.get(0))
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+
+                if file_type == "F" {
+                    println!("{:<20} {:<10}", name, file_type);
+                }
+            }
+        }
+        None => {
+            println!("Error: DIR file not found. Use LOGTO or check account.");
+        }
+    }
+}
+
+fn check_dir_file(db: &mut Database) -> io::Result<()> {
+    match db.ensure_dir_file() {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            print!("DIR file missing. Create and populate? (Y/N): ");
+            io::stdout().flush()?;
+            let mut choice = String::new();
+            io::stdin().read_line(&mut choice)?;
+            if choice.trim().to_uppercase() == "Y" {
+                db.create_dir_file()?;
+                println!("DIR file created and populated.");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            println!("Error checking DIR file: {}", e);
+            Err(e)
+        }
     }
 }

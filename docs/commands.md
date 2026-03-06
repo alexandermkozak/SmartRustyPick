@@ -28,6 +28,14 @@ Switch the current context to a different account.
 
 - **Usage**: `LOGTO <account name>`
 - **Example**: `LOGTO SALES`
+- **Note**: When switching to an account that lacks a `DIR` file, you will be prompted to create and populate it.
+
+#### LIST.FILES
+
+List all files in the current account. This command reads from the `DIR` file.
+
+- **Usage**: `LIST.FILES`
+- **Example**: `LIST.FILES`
 
 #### SET
 Store a record in the database.

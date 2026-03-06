@@ -241,6 +241,41 @@ impl Database {
         Ok(())
     }
 
+    pub fn ensure_dir_file(&mut self) -> io::Result<bool> {
+        if self.current_account.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
+        }
+        if self.available_tables.contains("DIR") {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub fn create_dir_file(&mut self) -> io::Result<()> {
+        self.create_table("DIR")?;
+        self.sync_dir_file()?;
+        Ok(())
+    }
+
+    pub fn sync_dir_file(&mut self) -> io::Result<()> {
+        let tables = self.list_tables();
+        let dir_table = self.get_table_mut("DIR");
+
+        for table_name in tables {
+            if table_name == "DIR" { continue; }
+            if !dir_table.records.contains_key(&table_name) {
+                let mut record = Record::new();
+                record.fields.push(Field {
+                    values: vec![Value { sub_values: vec!["F".to_string()] }]
+                });
+                dir_table.records.insert(table_name, record);
+                dir_table.dirty = true;
+            }
+        }
+        self.save()?;
+        Ok(())
+    }
+
     fn get_account_dir(&self, account_name: &str) -> Option<String> {
         // Search in accounts_config (Record: fields correspond to accounts)
         // Let's say field 1 contains account names and field 2 contains their directories.
@@ -280,6 +315,22 @@ impl Database {
         self.accounts_config.fields[1].values.push(Value { sub_values: vec![dir] });
 
         self.save_registry()?;
+
+        // Initialize DIR file for the new account
+        let prev_account = self.current_account.clone();
+        if self.logto(name).is_ok() {
+            let _ = self.create_dir_file();
+            // Restore previous account context if any
+            if !prev_account.is_empty() {
+                let _ = self.logto(&prev_account);
+            } else {
+                self.current_account = String::new();
+                self.loaded_tables.clear();
+                self.available_tables.clear();
+                self.lru_order.clear();
+            }
+        }
+
         Ok(())
     }
 
@@ -629,6 +680,12 @@ impl Database {
         File::create(format!("{}/dict", table_dir))?;
 
         self.available_tables.insert(name.to_string());
+
+        // Update DIR file if it exists and this is not the DIR file itself
+        if name != "DIR" && self.available_tables.contains("DIR") {
+            let _ = self.sync_dir_file();
+        }
+
         Ok(())
     }
 
