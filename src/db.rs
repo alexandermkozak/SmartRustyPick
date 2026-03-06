@@ -340,6 +340,64 @@ impl Database {
         }
     }
 
+    pub fn get_conversion_code(&mut self, table_name: &str, dict_name: &str) -> Option<String> {
+        let table = self.get_table(table_name)?;
+        let dict_item = table.dictionary.get(dict_name)?;
+        dict_item.fields.get(6)
+            .and_then(|f| f.values.get(0))
+            .and_then(|v| v.sub_values.get(0))
+            .cloned()
+    }
+
+    pub fn apply_conversion(value: &str, code: &str) -> String {
+        if code.is_empty() {
+            return value.to_string();
+        }
+
+        if code.starts_with('D') {
+            // Dates are stored as ms since epoch
+            if let Ok(ms) = value.parse::<i64>() {
+                let seconds = ms / 1000;
+                let date = match time::OffsetDateTime::from_unix_timestamp(seconds) {
+                    Ok(d) => d,
+                    Err(_) => return value.to_string(),
+                };
+
+                let format = &code[1..];
+                let year = date.year();
+                let month = date.month() as u8;
+                let day = date.day();
+
+                if format.starts_with('4') {
+                    let sep = format.chars().nth(1).unwrap_or('-');
+                    return format!("{:02}{}{:02}{}{:04}", month, sep, day, sep, year);
+                } else if format.starts_with('2') {
+                    let sep = format.chars().nth(1).unwrap_or('/');
+                    return format!("{:02}{}{:02}{}{:02}", month, sep, day, sep, year % 100);
+                }
+            }
+        } else if code.starts_with('M') {
+            // Numbers are stored as integers
+            if let Ok(num) = value.parse::<i64>() {
+                let mut res = value.to_string();
+                if code.len() >= 3 && code.chars().nth(1) == Some('R') {
+                    if let Some(precision_char) = code.chars().nth(2) {
+                        if let Some(precision) = precision_char.to_digit(10) {
+                            if precision > 0 {
+                                let factor = 10f64.powi(precision as i32);
+                                let float_val = num as f64 / factor;
+                                res = format!("{:.*}", precision as usize, float_val);
+                            }
+                        }
+                    }
+                }
+                return res;
+            }
+        }
+
+        value.to_string()
+    }
+
     pub fn query(&mut self, table_name: &str, use_dict_section: bool, dict_name: &str, op: &str, value: &str, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
         let field_idx = match self.get_field_index(table_name, dict_name) {
             Some(idx) => idx,
@@ -454,6 +512,22 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_conversions() {
+        // Date conversions
+        // 2026-03-26 is 1774483200000 ms since epoch
+        let date_ms_str = "1774483200000";
+        
+        assert_eq!(Database::apply_conversion(date_ms_str, "D4-"), "03-26-2026");
+        assert_eq!(Database::apply_conversion(date_ms_str, "D2/"), "03/26/26");
+        
+        // Number conversions
+        assert_eq!(Database::apply_conversion("12345", "MR2"), "123.45");
+        assert_eq!(Database::apply_conversion("12345", "MR4"), "1.2345");
+        assert_eq!(Database::apply_conversion("12345", "MR0"), "12345"); // MR0 should not have decimals
+        assert_eq!(Database::apply_conversion("12345", "M"), "12345"); // No R precision
+    }
 
     #[test]
     fn test_record_serialization() {

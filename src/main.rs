@@ -45,6 +45,9 @@ fn main() -> io::Result<()> {
             "EDIT" => {
                 handle_edit(&mut db, &parts);
             }
+            "CT" => {
+                handle_ct(&mut db, &parts);
+            }
             "SAVE-LIST" => {
                 handle_save_list(&mut db, &parts);
             }
@@ -274,8 +277,10 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
     } else {
         // Resolve field names to indices
         let mut field_indices = Vec::new();
+        let mut conversion_codes = Vec::new();
         for name in field_names {
             field_indices.push(db.get_field_index(table_name, name));
+            conversion_codes.push(db.get_conversion_code(table_name, name));
         }
 
         if let Some(table) = db.get_table(table_name) {
@@ -290,10 +295,16 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
             for key in keys {
                 if let Some(record) = map.get(&key) {
                     let mut line = key.clone();
-                    for opt_idx in &field_indices {
+                    for (i, opt_idx) in field_indices.iter().enumerate() {
                         line.push(' ');
                         if let Some(idx) = *opt_idx {
-                            line.push_str(&record.get_field_display_string(idx));
+                            let raw_val = record.get_field_display_string(idx);
+                            let formatted_val = if let Some(code) = &conversion_codes[i] {
+                                Database::apply_conversion(&raw_val, code)
+                            } else {
+                                raw_val
+                            };
+                            line.push_str(&formatted_val);
                         }
                     }
                     println!("{}", line);
@@ -448,6 +459,86 @@ fn handle_edit(db: &mut Database, parts: &[&str]) {
     let _ = std::fs::remove_file(&temp_file_path);
 }
 
+fn handle_ct(db: &mut Database, parts: &[&str]) {
+    // CT [DICT] <table> [<key>]
+    let mut offset = 1;
+    let is_dict = if parts.len() > offset && parts[offset].to_uppercase() == "DICT" {
+        offset += 1;
+        true
+    } else {
+        false
+    };
+
+    if parts.len() < offset + 1 {
+        println!("Usage: CT [DICT] <table> [<key>]");
+        return;
+    }
+
+    let table_name = parts[offset];
+
+    if parts.len() < offset + 2 {
+        // Try to use active select list
+        let mut keys_from_list = None;
+        if let Some(list) = &db.active_select_list {
+            if list.table_name == table_name && list.is_dict == is_dict {
+                keys_from_list = Some(list.keys.clone());
+            }
+        }
+
+        if let Some(keys) = keys_from_list {
+            if let Some(table) = db.get_table(table_name) {
+                let map = if is_dict { &table.dictionary } else { &table.records };
+                for (idx, key) in keys.iter().enumerate() {
+                    if let Some(record) = map.get(key) {
+                        println!("{}:", key);
+                        print_record_fields(record);
+                        if idx < keys.len() - 1 {
+                            println!();
+                        }
+                    }
+                }
+            }
+            db.active_select_list = None;
+        } else {
+            println!("Usage: CT [DICT] <table> <key>");
+            println!("(Or use an active SELECT list)");
+        }
+        return;
+    }
+
+    let key = parts[offset + 1];
+
+    if let Some(table) = db.get_table(table_name) {
+        let map = if is_dict { &table.dictionary } else { &table.records };
+        if let Some(record) = map.get(key) {
+            print_record_fields(record);
+        } else {
+            println!("NOT FOUND");
+        }
+    } else {
+        println!("TABLE NOT FOUND");
+    }
+}
+
+fn print_record_fields(record: &Record) {
+    for (i, field) in record.fields.iter().enumerate() {
+        let mut res = Vec::new();
+        for (j, v) in field.values.iter().enumerate() {
+            if j > 0 { res.push(db::VM); }
+            for (k, sv) in v.sub_values.iter().enumerate() {
+                if k > 0 { res.push(db::SVM); }
+                res.extend_from_slice(sv.as_bytes());
+            }
+        }
+        let display_bytes: Vec<u8> = res.iter().map(|&b| match b {
+            db::VM => b']',
+            db::SVM => b'\\',
+            _ => b
+        }).collect();
+        println!("{:03} {}", i + 1, String::from_utf8_lossy(&display_bytes));
+    }
+}
+
 fn print_help() {
     println!("Commands:");
     println!("  SET [DICT] <table> <key> <data>       - Store a record.");
@@ -458,6 +549,7 @@ fn print_help() {
     println!("    Operators: =, #, <, >, <=, >=, [ (ends with), ] (starts with), [] (contains)");
     println!("    Wildcards in value with = or #: [ (ends with), ] (starts with), [ ] (contains)");
     println!("  EDIT [DICT] <table> <key>             - Edit a record using external editor.");
+    println!("  CT [DICT] <table> [<key>]             - Print record contents, field by field. Uses SELECT list if key omitted.");
     println!("  SAVE                                  - Save database to disk.");
     println!("  HELP                                  - Show this help.");
     println!("  SAVE-LIST <name>                      - Save active select list.");
