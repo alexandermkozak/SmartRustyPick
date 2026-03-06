@@ -2,6 +2,20 @@
 
 SmartRustyPick is a CLI tool for interacting with a MultiValue-inspired database. It supports hierarchical data records, dictionary definitions for field formatting, and complex select operations.
 
+The goal of this project is to provide a simple PICK-like multivalue database implementation useful for personal
+projects that is done entirely through vibe-coding.
+
+This is not only a personal project/tool, but a proof of concept and an exploration of the usefulness of AI agents as
+someone who sees value in the use of AI, but struggles to believe claims from companies and influencers that say they no
+longer write or read production level code.
+
+To that end, this is being developed in Rust, which is a language I'd like to learn, have spent 2 hours following
+introductory tutorials for, but otherwise have no experience or knowledge of. The goal is that I will be able to
+understand the code enough to know when refactoring or other changes to code may be appropriate, but that I do not know
+if the solutions implemented are necessarily correct or efficient down to the line.
+
+With its natural support for safety and embedded unit testing, Rust seemed like the perfect choice for the project.
+
 ## Documentation
 
 For more information, see the following documentation:
