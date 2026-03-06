@@ -30,6 +30,7 @@ field formatting, and complex select operations.
 - **Hierarchical Records**: Support for Field Mark (FM), Value Mark (VM), and Sub-Value Mark (SVM).
 - **Dictionary Support**: Define field indices and formatting/conversions (Dates, Numbers).
 - **Active Select Lists**: Perform queries and refine them through sequential `SELECT` commands.
+- **Remote Access**: TCP SSL server with certificate authentication and CRUD protocol.
 - **Persistent Configuration**: Customize your environment (e.g., preferred editor).
 
 ## Documentation
@@ -38,6 +39,7 @@ For more information, see the following documentation:
 
 - [Data Structures](docs/data_structures.md) - Learn how records and dictionaries are structured.
 - [Commands](docs/commands.md) - See a full list of available CLI commands.
+- [Remote Protocol](docs/protocol.md) - Details on the TCP/SSL remote protocol.
 
 ## Configuration
 

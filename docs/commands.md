@@ -37,6 +37,34 @@ List all files in the current account. This command reads from the `DIR` file.
 - **Usage**: `LIST.FILES`
 - **Example**: `LIST.FILES`
 
+#### AUTHORIZE.CONN
+
+Authorize a client certificate SHA-256 thumbprint.
+
+- **Usage**: `AUTHORIZE.CONN <thumbprint>`
+- **Example**: `AUTHORIZE.CONN ef9d7b4d5...`
+
+#### DEAUTHORIZE.CONN
+
+Deauthorize a client certificate thumbprint.
+
+- **Usage**: `DEAUTHORIZE.CONN <thumbprint>`
+
+#### LIST.CONNS
+
+List all authorized certificate thumbprints.
+
+- **Usage**: `LIST.CONNS`
+
+#### START.SERVER
+
+Start the SSL TCP server for remote access.
+
+- **Usage**: `START.SERVER <addr:port> <cert_path> <key_path> <ca_path>`
+- **Example**: `START.SERVER 0.0.0.0:8443 server.crt server.key ca.crt`
+- **Note**: This starts the server in a background thread. For more protocol details,
+  see [Remote Connection Protocol](protocol.md).
+
 #### SET
 Store a record in the database.
 - **Usage**: `SET [DICT] <table> <key> <data>`

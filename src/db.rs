@@ -177,6 +177,7 @@ pub struct Database {
     lru_order: VecDeque<String>,
     max_loaded: usize,
     pub active_select_list: Option<SelectList>,
+    pub authorized_certs: HashSet<String>, // Set of SHA-256 thumbprints
 }
 
 impl Database {
@@ -190,6 +191,7 @@ impl Database {
             lru_order: VecDeque::new(),
             max_loaded: 10,
             active_select_list: None,
+            authorized_certs: HashSet::new(),
         };
 
         if !Path::new(&db.storage_dir).exists() {
@@ -205,8 +207,39 @@ impl Database {
                 db.accounts_config = reg_rec;
             }
         }
+
+        // Load authorized certificates
+        let certs_path = format!("{}/certs.reg", db.storage_dir);
+        if Path::new(&certs_path).exists() {
+            let mut map = HashMap::new();
+            Self::load_section(&mut map, &certs_path)?;
+            if let Some(certs_rec) = map.remove("certs") {
+                if let Some(f) = certs_rec.fields.get(0) {
+                    for v in &f.values {
+                        for sv in &v.sub_values {
+                            db.authorized_certs.insert(sv.clone());
+                        }
+                    }
+                }
+            }
+        }
         
         Ok(db)
+    }
+
+    pub fn save_certs(&self) -> io::Result<()> {
+        let mut certs_rec = Record::new();
+        let mut field = Field::default();
+        for thumbprint in &self.authorized_certs {
+            field.values.push(Value { sub_values: vec![thumbprint.clone()] });
+        }
+        certs_rec.fields.push(field);
+
+        let mut map = HashMap::new();
+        map.insert("certs".to_string(), certs_rec);
+        let certs_path = format!("{}/certs.reg", self.storage_dir);
+        Self::save_section(&certs_path, &map)?;
+        Ok(())
     }
 
     pub fn save_registry(&self) -> io::Result<()> {
