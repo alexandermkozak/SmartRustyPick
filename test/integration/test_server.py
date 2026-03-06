@@ -19,7 +19,13 @@ def generate_certs():
     thumbprint = subprocess.check_output("openssl x509 -in client.crt -fingerprint -noout -sha256", shell=True).decode().split('=')[1].replace(':', '').strip().lower()
     return thumbprint
 
-def run_request(port, request, certfile, keyfile, cafile):
+def run_request(port, request, certfile, keyfile, cafile, existing_ssock=None):
+    if existing_ssock:
+        existing_ssock.sendall(json.dumps(request).encode() + b'\n')
+        response = existing_ssock.recv(4096).decode()
+        if not response: return None
+        return json.loads(response)
+
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=cafile)
     context.load_cert_chain(certfile=certfile, keyfile=keyfile)
     context.check_hostname = False
@@ -59,57 +65,68 @@ def test_integration():
     time.sleep(5) # Wait for server to start
 
     port = 9999
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="ca.crt")
+    context.load_cert_chain(certfile="client.crt", keyfile="client.key")
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_REQUIRED
+
     try:
-        # 1. WRITE
-        print("Testing WRITE...")
-        resp = run_request(port, {"command": "WRITE", "table": "USERS", "key": "USER1", "data": "John^Doe^30"}, "client.crt", "client.key", "ca.crt")
-        assert resp["status"] == "OK"
+        with socket.create_connection(('127.0.0.1', port)) as sock:
+            with context.wrap_socket(sock, server_hostname='localhost') as ssock:
+                # 1. WRITE
+                print("Testing WRITE...")
+                resp = run_request(port, {"command": "WRITE", "table": "USERS", "key": "USER1", "data": "John^Doe^30"}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                assert resp["status"] == "OK"
 
-        # 2. READ
-        print("Testing READ...")
-        resp = run_request(port, {"command": "READ", "table": "USERS", "key": "USER1"}, "client.crt", "client.key", "ca.crt")
-        assert resp["status"] == "OK"
-        assert resp["record"] == "John^Doe^30"
+                # 2. READ
+                print("Testing READ...")
+                resp = run_request(port, {"command": "READ", "table": "USERS", "key": "USER1"}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                assert resp["status"] == "OK"
+                assert resp["record"] == "John^Doe^30"
 
-        print("Testing QUERY...")
-        # Use field 1 which corresponds to "John"
-        # Since table USERS might not have a dictionary yet, it relies on numeric index
-        resp = run_request(port, {"command": "QUERY", "table": "USERS", "query_string": "WITH 1 = John"}, "client.crt", "client.key", "ca.crt")
-        print(f"QUERY response: {resp}")
-        assert resp["status"] == "OK"
-        # Results is a list of [key, record_string]
-        # Let's check what we got
-        if not resp["results"]:
-            # Maybe it needs quotes?
-            resp = run_request(port, {"command": "QUERY", "table": "USERS", "query_string": "WITH 1 = \"John\""}, "client.crt", "client.key", "ca.crt")
-            print(f"QUERY response with quotes: {resp}")
-        
-        keys = [item[0] for item in resp["results"]]
-        assert "USER1" in keys
+                print("Testing QUERY...")
+                # Use field 1 which corresponds to "John"
+                # Since table USERS might not have a dictionary yet, it relies on numeric index
+                resp = run_request(port, {"command": "QUERY", "table": "USERS", "query_string": "WITH 1 = John"}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                print(f"QUERY response: {resp}")
+                assert resp["status"] == "OK"
+                # Results is a list of [key, record_string]
+                # Let's check what we got
+                if not resp["results"]:
+                    # Maybe it needs quotes?
+                    resp = run_request(port, {"command": "QUERY", "table": "USERS", "query_string": "WITH 1 = \"John\""}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                    print(f"QUERY response with quotes: {resp}")
+                
+                keys = [item[0] for item in resp["results"]]
+                assert "USER1" in keys
 
-        # 4. SELECT LIST (QUERY with list_name)
-        print("Testing SELECT LIST...")
-        resp = run_request(port, {"command": "QUERY", "table": "USERS", "query_string": "WITH 1 = John", "list_name": "MYLIST"}, "client.crt", "client.key", "ca.crt")
-        assert resp["status"] == "OK"
-        assert resp["count"] == 1
+                # 4. SELECT LIST (QUERY with list_name)
+                print("Testing SELECT LIST...")
+                resp = run_request(port, {"command": "QUERY", "table": "USERS", "query_string": "WITH 1 = John", "list_name": "MYLIST"}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                assert resp["status"] == "OK"
+                assert resp["count"] == 1
 
-        # 5. READNEXT
-        print("Testing READNEXT...")
-        resp = run_request(port, {"command": "READNEXT", "list_name": "MYLIST", "batch_size": 1}, "client.crt", "client.key", "ca.crt")
-        assert resp["status"] == "OK"
-        assert resp["keys"] == ["USER1"]
+                # 5. READNEXT
+                print("Testing READNEXT...")
+                resp = run_request(port, {"command": "READNEXT", "list_name": "MYLIST", "batch_size": 1}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                assert resp["status"] == "OK"
+                assert resp["keys"] == ["USER1"]
 
-        # 6. DELETE
-        print("Testing DELETE...")
-        resp = run_request(port, {"command": "DELETE", "table": "USERS", "key": "USER1"}, "client.crt", "client.key", "ca.crt")
-        assert resp["status"] == "OK"
+                # 6. DELETE
+                print("Testing DELETE...")
+                resp = run_request(port, {"command": "DELETE", "table": "USERS", "key": "USER1"}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                assert resp["status"] == "OK"
 
-        # 7. READ (should fail)
-        print("Testing READ (after DELETE)...")
-        resp = run_request(port, {"command": "READ", "table": "USERS", "key": "USER1"}, "client.crt", "client.key", "ca.crt")
-        assert resp["status"] == "NOT_FOUND"
+                # 7. READ (should fail)
+                print("Testing READ (after DELETE)...")
+                resp = run_request(port, {"command": "READ", "table": "USERS", "key": "USER1"}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                assert resp["status"] == "NOT_FOUND"
 
-        print("Integration tests PASSED")
+                print("Integration tests PASSED")
+                try:
+                    ssock.unwrap()
+                except (ssl.SSLError, socket.error):
+                    pass
     finally:
         proc.terminate()
         proc.wait()

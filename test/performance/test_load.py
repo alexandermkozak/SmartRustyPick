@@ -84,6 +84,11 @@ def test_performance():
                 end_time = time.time()
                 print(f"Complex query time: {(end_time - start_time)*1000:.2f}ms. Keys found: {len(resp.get('results', []))}")
 
+                try:
+                    ssock.unwrap()
+                except (ssl.SSLError, socket.error):
+                    pass
+
     finally:
         proc.terminate()
         proc.wait()
