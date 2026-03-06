@@ -1,0 +1,562 @@
+mod db;
+
+use std::io::{self, Write};
+use db::{Database, Record};
+
+fn main() -> io::Result<()> {
+    // We use a directory "db_storage" to hold our tables
+    let mut db = Database::new("db_storage")?;
+    println!("SmartRustyPick CLI. Type 'HELP' for commands.");
+
+    loop {
+        print!("PICK> ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            break;
+        }
+        let input = input.trim();
+
+        if input.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        if parts.is_empty() { continue; }
+        let command = parts[0].to_uppercase();
+
+        match command.as_str() {
+            "SET" => {
+                handle_set(&mut db, &parts);
+            }
+            "GET" => {
+                handle_get(&mut db, &parts);
+            }
+            "DELETE" => {
+                handle_delete(&mut db, &parts);
+            }
+            "LIST" => {
+                handle_list(&mut db, &parts);
+            }
+            "SELECT" => {
+                handle_select(&mut db, &parts);
+            }
+            "EDIT" => {
+                handle_edit(&mut db, &parts);
+            }
+            "SAVE-LIST" => {
+                handle_save_list(&mut db, &parts);
+            }
+            "GET-LIST" => {
+                handle_get_list(&mut db, &parts);
+            }
+            "CREATE.FILE" => {
+                handle_create_file(&mut db, &parts);
+            }
+            "DELETE.FILE" => {
+                handle_delete_file(&mut db, &parts);
+            }
+            "SAVE" => {
+                db.save()?;
+                println!("OK");
+            }
+            "HELP" => {
+                print_help();
+            }
+            "EXIT" | "QUIT" => break,
+            _ => println!("Unknown command: {}", command),
+        }
+    }
+
+    // Auto-save on exit
+    db.save()?;
+    Ok(())
+}
+
+fn handle_set(db: &mut Database, parts: &[&str]) {
+    // SET [DICT] <table> <key> <data>
+    let mut offset = 1;
+    let is_dict = if parts.len() > offset && parts[offset].to_uppercase() == "DICT" {
+        offset += 1;
+        true
+    } else {
+        false
+    };
+
+    if parts.len() < offset + 3 {
+        println!("Usage: SET [DICT] <table> <key> <data>");
+        return;
+    }
+
+    let table_name = parts[offset];
+    let key = parts[offset + 1].to_string();
+    let data = parts[offset + 2..].join(" ");
+    
+    let table = db.get_table_mut(table_name);
+    let record = Record::from_display_string(&data);
+    if is_dict {
+        table.dictionary.insert(key, record);
+    } else {
+        table.records.insert(key, record);
+    }
+    table.dirty = true;
+    println!("OK");
+}
+
+fn handle_get(db: &mut Database, parts: &[&str]) {
+    // GET [DICT] <table> [<key>]
+    let mut offset = 1;
+    let is_dict = if parts.len() > offset && parts[offset].to_uppercase() == "DICT" {
+        offset += 1;
+        true
+    } else {
+        false
+    };
+
+    if parts.len() < offset + 1 {
+        println!("Usage: GET [DICT] <table> [<key>]");
+        return;
+    }
+
+    let table_name = parts[offset];
+    
+    if parts.len() < offset + 2 {
+        // Try to use active select list
+        let mut keys_from_list = None;
+        if let Some(list) = &db.active_select_list {
+            if list.table_name == table_name && list.is_dict == is_dict {
+                keys_from_list = Some(list.keys.clone());
+            }
+        }
+
+        if let Some(keys) = keys_from_list {
+            if let Some(table) = db.get_table(table_name) {
+                let map = if is_dict { &table.dictionary } else { &table.records };
+                for key in &keys {
+                    if let Some(record) = map.get(key) {
+                        println!("{}: {}", key, record.to_display_string());
+                    }
+                }
+            }
+            db.active_select_list = None;
+        } else {
+            println!("Usage: GET [DICT] <table> <key>");
+            println!("(Or use an active SELECT list)");
+        }
+        return;
+    }
+
+    let key = parts[offset + 1];
+
+    if let Some(table) = db.get_table(table_name) {
+        let map = if is_dict { &table.dictionary } else { &table.records };
+        if let Some(record) = map.get(key) {
+            println!("{}", record.to_display_string());
+        } else {
+            println!("NOT FOUND");
+        }
+    } else {
+        println!("TABLE NOT FOUND");
+    }
+}
+
+fn handle_delete(db: &mut Database, parts: &[&str]) {
+    // DELETE [DICT] <table> [<key>]
+    let mut offset = 1;
+    let is_dict = if parts.len() > offset && parts[offset].to_uppercase() == "DICT" {
+        offset += 1;
+        true
+    } else {
+        false
+    };
+
+    if parts.len() < offset + 1 {
+        println!("Usage: DELETE [DICT] <table> [<key>]");
+        return;
+    }
+
+    let table_name = parts[offset];
+
+    if parts.len() < offset + 2 {
+        // Try to use active select list
+        let mut keys_to_delete = Vec::new();
+        let mut used_list = false;
+        if let Some(list) = &db.active_select_list {
+            if list.table_name == table_name && list.is_dict == is_dict {
+                keys_to_delete = list.keys.clone();
+                used_list = true;
+            }
+        }
+
+        if used_list {
+            let table = db.get_table_mut(table_name);
+            let map = if is_dict { &mut table.dictionary } else { &mut table.records };
+            let mut count = 0;
+            for key in keys_to_delete {
+                if map.remove(&key).is_some() {
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                table.dirty = true;
+                println!("[{}] records deleted", count);
+            } else {
+                println!("NO RECORDS DELETED");
+            }
+            db.active_select_list = None;
+        } else {
+            println!("Usage: DELETE [DICT] <table> <key>");
+            println!("(Or use an active SELECT list)");
+        }
+        return;
+    }
+
+    let key = parts[offset + 1];
+
+    let table = db.get_table_mut(table_name);
+    let map = if is_dict { &mut table.dictionary } else { &mut table.records };
+    if map.remove(key).is_some() {
+        table.dirty = true;
+        println!("OK");
+    } else {
+        println!("NOT FOUND");
+    }
+}
+
+fn handle_list(db: &mut Database, parts: &[&str]) {
+    // LIST [DICT] <table> [<fields>...]
+    let mut offset = 1;
+    let is_dict = if parts.len() > offset && parts[offset].to_uppercase() == "DICT" {
+        offset += 1;
+        true
+    } else {
+        false
+    };
+
+    if parts.len() < offset + 1 {
+        // List all tables
+        let tables = db.list_tables();
+        for t in tables {
+            println!("{}", t);
+        }
+        return;
+    }
+
+    let table_name = parts[offset];
+    let field_names = &parts[offset + 1..];
+
+    let mut use_select_list = false;
+    let mut selected_keys = Vec::new();
+    if let Some(list) = &db.active_select_list {
+        if list.table_name == table_name && list.is_dict == is_dict {
+            use_select_list = true;
+            selected_keys = list.keys.clone();
+        }
+    }
+
+    if field_names.is_empty() {
+        if let Some(table) = db.get_table(table_name) {
+            let map = if is_dict { &table.dictionary } else { &table.records };
+            let keys = if use_select_list {
+                selected_keys
+            } else {
+                let mut k: Vec<_> = map.keys().cloned().collect();
+                k.sort();
+                k
+            };
+            for key in keys {
+                println!("{}", key);
+            }
+        } else {
+            println!("TABLE NOT FOUND");
+        }
+    } else {
+        // Resolve field names to indices
+        let mut field_indices = Vec::new();
+        for name in field_names {
+            field_indices.push(db.get_field_index(table_name, name));
+        }
+
+        if let Some(table) = db.get_table(table_name) {
+            let map = if is_dict { &table.dictionary } else { &table.records };
+            let keys = if use_select_list {
+                selected_keys
+            } else {
+                let mut k: Vec<_> = map.keys().cloned().collect();
+                k.sort();
+                k
+            };
+            for key in keys {
+                if let Some(record) = map.get(&key) {
+                    let mut line = key.clone();
+                    for opt_idx in &field_indices {
+                        line.push(' ');
+                        if let Some(idx) = *opt_idx {
+                            line.push_str(&record.get_field_display_string(idx));
+                        }
+                    }
+                    println!("{}", line);
+                }
+            }
+        } else {
+            println!("TABLE NOT FOUND");
+        }
+    }
+
+    if use_select_list {
+        db.active_select_list = None;
+    }
+}
+
+fn handle_select(db: &mut Database, parts: &[&str]) {
+    // SELECT [DICT] <table> [WITH <field> <op> <value>]
+    // e.g. SELECT USERS WITH First.Name = "Ted"
+    let mut offset = 1;
+    let is_dict = if parts.len() > offset && parts[offset].to_uppercase() == "DICT" {
+        offset += 1;
+        true
+    } else {
+        false
+    };
+
+    if parts.len() < offset + 1 {
+        println!("Usage: SELECT [DICT] <table> [WITH <field> <op> <value>]");
+        return;
+    }
+
+    let table_name = parts[offset];
+
+    // Check if we should refine the active select list
+    let keys_to_filter = if let Some(list) = &db.active_select_list {
+        if list.table_name == table_name && list.is_dict == is_dict {
+            Some(list.keys.clone())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let operators = ["=", "#", "<", ">", "<=", ">=", "[", "]", "[]"];
+    let results = if parts.len() >= offset + 5 && parts[offset + 1].to_uppercase() == "WITH" && operators.contains(&parts[offset + 3]) {
+        let field_name = parts[offset + 2];
+        let op = parts[offset + 3];
+        let mut value = parts[offset + 4].to_string();
+        
+        // Remove quotes if present
+        if value.starts_with('"') && value.ends_with('"') {
+            value = value[1..value.len()-1].to_string();
+        }
+        db.query(table_name, is_dict, field_name, op, &value, keys_to_filter.as_deref())
+    } else if parts.len() == offset + 1 {
+        if let Some(table) = db.get_table(table_name) {
+            let map = if is_dict { &table.dictionary } else { &table.records };
+            let mut res: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            res.sort_by(|a, b| a.0.cmp(&b.0));
+            res
+        } else {
+            println!("TABLE NOT FOUND");
+            return;
+        }
+    } else {
+        println!("Usage: SELECT [DICT] <table> [WITH <field> <op> <value>]");
+        return;
+    };
+
+    if results.is_empty() {
+        println!("NO RECORDS FOUND");
+        db.active_select_list = None;
+    } else {
+        let keys: Vec<String> = results.iter().map(|(k, _)| k.clone()).collect();
+        println!("[{}] records selected", keys.len());
+        db.active_select_list = Some(db::SelectList {
+            table_name: table_name.to_string(),
+            is_dict,
+            keys,
+        });
+    }
+}
+
+fn handle_edit(db: &mut Database, parts: &[&str]) {
+    // EDIT [DICT] <table> <key>
+    let mut offset = 1;
+    let is_dict = if parts.len() > offset && parts[offset].to_uppercase() == "DICT" {
+        offset += 1;
+        true
+    } else {
+        false
+    };
+
+    if parts.len() < offset + 2 {
+        println!("Usage: EDIT [DICT] <table> <key>");
+        return;
+    }
+
+    let table_name = parts[offset];
+    let key = parts[offset + 1];
+
+    // Get current record content or empty string
+    let current_content = if let Some(table) = db.get_table(table_name) {
+        let map = if is_dict { &table.dictionary } else { &table.records };
+        if let Some(record) = map.get(key) {
+            record.to_edit_string()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    // Create temporary file
+    let temp_file_path = format!(".edit_{}_{}.tmp", table_name, key);
+    if let Err(e) = std::fs::write(&temp_file_path, current_content) {
+        println!("Error creating temporary file: {}", e);
+        return;
+    }
+
+    // Launch editor
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
+    let status = std::process::Command::new(editor)
+        .arg(&temp_file_path)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            // Read back the content
+            match std::fs::read_to_string(&temp_file_path) {
+                Ok(new_content) => {
+                    let table = db.get_table_mut(table_name);
+                    let record = Record::from_edit_string(&new_content);
+                    let key_str = key.to_string();
+                    if is_dict {
+                        table.dictionary.insert(key_str, record);
+                    } else {
+                        table.records.insert(key_str, record);
+                    }
+                    table.dirty = true;
+                    println!("OK");
+                }
+                Err(e) => println!("Error reading back content: {}", e),
+            }
+        }
+        Ok(s) => println!("Editor exited with error: {}", s),
+        Err(e) => println!("Failed to launch editor: {}", e),
+    }
+
+    // Cleanup
+    let _ = std::fs::remove_file(&temp_file_path);
+}
+
+fn print_help() {
+    println!("Commands:");
+    println!("  SET [DICT] <table> <key> <data>       - Store a record.");
+    println!("  GET [DICT] <table> [<key>]             - Retrieve record(s). Uses SELECT list if key omitted.");
+    println!("  DELETE [DICT] <table> [<key>]          - Remove record(s). Uses SELECT list if key omitted.");
+    println!("  LIST [DICT] [<table> [<fields>...]]   - List tables, keys, or records. Uses SELECT list if applicable.");
+    println!("  SELECT [DICT] <table> [WITH <field> <op> <value>] - Create/refine active select list.");
+    println!("    Operators: =, #, <, >, <=, >=, [ (ends with), ] (starts with), [] (contains)");
+    println!("    Wildcards in value with = or #: [ (ends with), ] (starts with), [ ] (contains)");
+    println!("  EDIT [DICT] <table> <key>             - Edit a record using external editor.");
+    println!("  SAVE                                  - Save database to disk.");
+    println!("  HELP                                  - Show this help.");
+    println!("  SAVE-LIST <name>                      - Save active select list.");
+    println!("  GET-LIST <name>                       - Restore a saved select list.");
+    println!("  CREATE.FILE <name>                    - Create a new file (data and dict).");
+    println!("  DELETE.FILE <name>                    - Delete a file (data and dict).");
+    println!("  EXIT or QUIT                          - Exit the shell.");
+}
+
+fn handle_save_list(db: &mut Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: SAVE-LIST <list_name>");
+        return;
+    }
+
+    let list_name = parts[1];
+
+    let list = match &db.active_select_list {
+        Some(l) => l.clone(),
+        None => {
+            println!("NO ACTIVE SELECT LIST");
+            return;
+        }
+    };
+
+    let mut data = Vec::new();
+    data.extend_from_slice(list.table_name.as_bytes());
+    data.push(db::FM);
+    data.extend_from_slice(if list.is_dict { b"1" } else { b"0" });
+    for key in &list.keys {
+        data.push(db::FM);
+        data.extend_from_slice(key.as_bytes());
+    }
+    
+    let record = Record::from_bytes(&data);
+    let table = db.get_table_mut("$SAVEDLISTS");
+    table.records.insert(list_name.to_string(), record);
+    table.dirty = true;
+    
+    db.active_select_list = None;
+    println!("List '{}' saved", list_name);
+}
+
+fn handle_get_list(db: &mut Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: GET-LIST <list_name>");
+        return;
+    }
+
+    let list_name = parts[1];
+    
+    let table = db.get_table_mut("$SAVEDLISTS");
+    if let Some(record) = table.records.get(list_name) {
+        let data = record.to_bytes();
+        let fields: Vec<&[u8]> = data.split(|&b| b == db::FM).collect();
+        
+        if fields.len() < 2 {
+            println!("INVALID SAVED LIST FORMAT");
+            return;
+        }
+        
+        let table_name = String::from_utf8_lossy(fields[0]).to_string();
+        let is_dict = fields[1] == b"1";
+        let mut keys = Vec::new();
+        for f in &fields[2..] {
+            keys.push(String::from_utf8_lossy(f).to_string());
+        }
+        
+        db.active_select_list = Some(db::SelectList {
+            table_name,
+            is_dict,
+            keys,
+        });
+        println!("[{}] records retrieved", db.active_select_list.as_ref().unwrap().keys.len());
+    } else {
+        println!("LIST '{}' NOT FOUND", list_name);
+    }
+}
+
+fn handle_create_file(db: &mut Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: CREATE.FILE <file_name>");
+        return;
+    }
+    let file_name = parts[1];
+    match db.create_table(file_name) {
+        Ok(_) => println!("[{}] created (data and dict)", file_name),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_delete_file(db: &mut Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: DELETE.FILE <file_name>");
+        return;
+    }
+    let file_name = parts[1];
+    match db.delete_table(file_name) {
+        Ok(_) => println!("[{}] deleted (data and dict)", file_name),
+        Err(e) => println!("Error: {}", e),
+    }
+}
