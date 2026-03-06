@@ -30,15 +30,26 @@ a single line of JSON.
   "key": "RECORD_KEY",
   "data": "RECORD_DATA", (for WRITE, using display format: ^ for FM, ] for VM, \ for SVM)
   "is_dict": true | false, (optional, default: false)
-  "query_string": "WITH First.Name = \"Ted\" AND Last.Name = \"Smith\"", (optional, alternative to 'query' or 'query_node')
-  "query_node": { ... structured QueryNode object ... }, (optional, alternative to 'query' or 'query_string')
+  "query_string": "WITH First.Name = \"Ted\" AND Last.Name = \"Smith\"",
+  (optional,
+  alternative
+  to
+  'query_node'
+  )
+  "query_node": {
+    ...
+    structured
+    QueryNode
+    object
+    ...
+  },
+  (optional,
+  alternative
+  to
+  'query_string'
+  )
   "list_name": "LIST_NAME", (optional, for QUERY, READNEXT, GETLIST)
   "batch_size": 10, (optional, for READNEXT)
-  "query": { (optional, for backward compatibility)
-    "field_name": "FIELD_NAME",
-    "op": "=",
-    "value": "VALUE"
-  }
 }
 ```
 
@@ -82,7 +93,7 @@ Removes a record.
 
 Performs a search.
 
-- Required fields: `table`, `query` (or `query_string` or `query_node`).
+- Required fields: `table`, `query_string` (or `query_node`).
 - Optional fields: `is_dict`, `list_name`.
 - If `list_name` is provided, the result keys are stored in a named select list on the server, and only the `count` is
   returned.

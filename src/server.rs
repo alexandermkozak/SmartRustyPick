@@ -20,18 +20,10 @@ pub struct Request {
     pub key: Option<String>,
     pub data: Option<String>,
     pub is_dict: Option<bool>,
-    pub query: Option<QueryArgs>,
     pub query_node: Option<QueryNode>,
     pub query_string: Option<String>,
     pub list_name: Option<String>,
     pub batch_size: Option<usize>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct QueryArgs {
-    pub field_name: String,
-    pub op: String,
-    pub value: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -248,9 +240,6 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>) -> Response {
                 } else {
                     return Response { status: "ERROR".to_string(), message: Some("Invalid query string".to_string()), record: None, results: None, keys: None, count: None };
                 }
-            } else if let Some(q) = req.query {
-                // Backward compatibility
-                db.query(&table_name, is_dict, &q.field_name, &q.op, &q.value, None)
             } else {
                 return Response { status: "ERROR".to_string(), message: Some("Query not specified".to_string()), record: None, results: None, keys: None, count: None };
             };
