@@ -53,7 +53,7 @@ def test_integration():
     proc.stdin.write("TEST_ACC\nY\nY\n") # Account, Create, DIR Create
     proc.stdin.write("CREATE.FILE USERS\n")
     proc.stdin.write(f"AUTHORIZE.CONN {thumbprint}\n")
-    proc.stdin.write("START.SERVER server.crt server.key ca.crt\n")
+    proc.stdin.write("START.SERVER 127.0.0.1:9999 server.crt server.key ca.crt\n")
     proc.stdin.flush()
 
     time.sleep(5) # Wait for server to start
