@@ -463,8 +463,8 @@ impl Database {
             self.lru_order.remove(pos);
         }
         self.lru_order.push_front(name.to_string());
-        
-        if self.lru_order.len() > self.max_loaded {
+
+        while self.lru_order.len() > self.max_loaded {
             let to_evict = self.lru_order.pop_back().unwrap();
             if let Some(table) = self.loaded_tables.remove(&to_evict) {
                 if table.dirty {
@@ -1025,9 +1025,13 @@ mod tests {
 
     #[test]
     fn test_database_persistence() -> io::Result<()> {
-        let dir = "test_db_dir";
+        let base_dir = "test_db_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
         {
-            let mut db = Database::new(dir)?;
+            let mut db = Database::new(base_dir)?;
+            db.create_account("ACC1", None)?;
+            db.logto("ACC1")?;
+            db.create_table("USERS")?;
             let table = db.get_table_mut("USERS");
             let mut record = Record::new();
             record.fields = vec![Field { values: vec![Value { sub_values: vec!["data".to_string()] }] }];
@@ -1037,19 +1041,25 @@ mod tests {
         }
 
         {
-            let mut db = Database::new(dir)?;
-            let table = db.get_table("USERS").unwrap();
-            let record = table.records.get("key1").unwrap();
+            let mut db = Database::new(base_dir)?;
+            db.logto("ACC1")?;
+            let table = db.get_table("USERS").expect("USERS table should exist");
+            let record = table.records.get("key1").expect("key1 should exist");
             assert_eq!(record.fields[0].values[0].sub_values[0], "data");
         }
 
-        std::fs::remove_dir_all(dir)?;
+        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 
     #[test]
     fn test_query() -> io::Result<()> {
-        let mut db = Database::new("test_query_dir")?;
+        let base_dir = "test_query_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let mut db = Database::new(base_dir)?;
+        db.create_account("ACC1", None)?;
+        db.logto("ACC1")?;
+        db.create_table("USERS")?;
         let table = db.get_table_mut("USERS");
         
         // Dictionary item: First.Name points to field 1
@@ -1078,15 +1088,19 @@ mod tests {
 
     #[test]
     fn test_create_delete_table() -> io::Result<()> {
-        let dir = "test_file_ops_dir";
-        if Path::new(dir).exists() { fs::remove_dir_all(dir)?; }
-        
-        let mut db = Database::new(dir)?;
+        let base_dir = "test_file_ops_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+
+        let mut db = Database::new(base_dir)?;
+        db.create_account("ACC1", None)?;
+        db.logto("ACC1")?;
+
+        let storage = db.current_storage_dir();
         
         // Create table
         db.create_table("MYTABLE")?;
-        assert!(Path::new(&format!("{}/MYTABLE/data", dir)).exists());
-        assert!(Path::new(&format!("{}/MYTABLE/dict", dir)).exists());
+        assert!(Path::new(&format!("{}/MYTABLE/data", storage)).exists());
+        assert!(Path::new(&format!("{}/MYTABLE/dict", storage)).exists());
         assert!(db.available_tables.contains("MYTABLE"));
         
         // Create duplicate should fail
@@ -1094,56 +1108,82 @@ mod tests {
         
         // Delete table
         db.delete_table("MYTABLE")?;
-        assert!(!Path::new(&format!("{}/MYTABLE", dir)).exists());
+        assert!(!Path::new(&format!("{}/MYTABLE", storage)).exists());
         assert!(!db.available_tables.contains("MYTABLE"));
         
         // Delete non-existent should fail
         assert!(db.delete_table("NONEXISTENT").is_err());
-        
-        fs::remove_dir_all(dir)?;
+
+        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 
     #[test]
     fn test_lru_eviction() -> io::Result<()> {
-        let dir = "test_lru_dir";
-        if Path::new(dir).exists() { fs::remove_dir_all(dir)?; }
+        let base_dir = "test_lru_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
         
         {
-            let mut db = Database::new(dir)?;
+            let mut db = Database::new(base_dir)?;
+            db.create_account("ACC1", None)?;
+            db.logto("ACC1")?;
+
+            db.max_loaded = 10;
+
+            db.create_table("T1")?;
+            db.get_table_mut("T1").records.insert("k".to_string(), Record::from_string("v1"));
+            db.get_table_mut("T1").dirty = true;
+
+            db.create_table("T2")?;
+            db.get_table_mut("T2").records.insert("k".to_string(), Record::from_string("v2"));
+            db.get_table_mut("T2").dirty = true;
+            
             db.max_loaded = 2;
-            
-            // Access 3 tables
-            let t1 = db.get_table_mut("T1");
-            t1.records.insert("k".to_string(), Record::from_string("v1"));
-            t1.dirty = true;
-            
-            let t2 = db.get_table_mut("T2");
-            t2.records.insert("k".to_string(), Record::from_string("v2"));
-            t2.dirty = true;
-            
-            // This should evict T1 (it was the oldest)
-            let _t3 = db.get_table_mut("T3");
-            
-            assert!(!db.loaded_tables.contains_key("T1"));
-            assert!(db.loaded_tables.contains_key("T2"));
-            assert!(db.loaded_tables.contains_key("T3"));
+            db.mark_used("T1");
+            db.mark_used("T2");
+
+            assert!(db.loaded_tables.contains_key("T1"), "T1 should be loaded. Loaded: {:?}", db.loaded_tables.keys());
+            assert!(db.loaded_tables.contains_key("T2"), "T2 should be loaded. Loaded: {:?}", db.loaded_tables.keys());
+            assert_eq!(db.loaded_tables.len(), 2);
+
+            // Access T3, should evict T1 (oldest)
+            // T3 creation will load DIR, which will evict T1 if we are not careful.
+            // Let's use get_table_mut directly if we know it's available.
+            db.create_table("T3")?;
+            // After create_table("T3"), DIR was updated and DIR is now newest.
+            // LRU: [DIR, T2] (T1 evicted)
+
+            assert!(!db.loaded_tables.contains_key("T1"), "T1 should be evicted. Loaded: {:?}", db.loaded_tables.keys());
+            assert!(db.loaded_tables.contains_key("T2"), "T2 should be loaded. Loaded: {:?}", db.loaded_tables.keys());
+            assert!(db.loaded_tables.contains_key("DIR"), "DIR should be loaded. Loaded: {:?}", db.loaded_tables.keys());
+
+            // Now access T3, should evict T2 (oldest)
+            db.get_table_mut("T3");
+            assert!(!db.loaded_tables.contains_key("T2"), "T2 should be evicted. Loaded: {:?}", db.loaded_tables.keys());
+            assert!(db.loaded_tables.contains_key("DIR"), "DIR should be loaded. Loaded: {:?}", db.loaded_tables.keys());
+            assert!(db.loaded_tables.contains_key("T3"), "T3 should be loaded. Loaded: {:?}", db.loaded_tables.keys());
         }
         
         // Re-open and check if T1 was flushed
         {
-            let mut db = Database::new(dir)?;
+            let mut db = Database::new(base_dir)?;
+            db.logto("ACC1")?;
             let t1 = db.get_table("T1").expect("T1 should be available on disk");
             assert_eq!(t1.records.get("k").unwrap().to_string(), "v1");
         }
-        
-        fs::remove_dir_all(dir)?;
+
+        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 
     #[test]
     fn test_dict_query() -> io::Result<()> {
-        let mut db = Database::new("test_dict_query_dir")?;
+        let base_dir = "test_dict_query_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let mut db = Database::new(base_dir)?;
+        db.create_account("ACC1", None)?;
+        db.logto("ACC1")?;
+        db.create_table("USERS")?;
         let table = db.get_table_mut("USERS");
         
         // Dictionary item describing field 1 (let's call it "ATTR")
@@ -1199,7 +1239,12 @@ mod tests {
 
     #[test]
     fn test_query_operators() -> io::Result<()> {
-        let mut db = Database::new("test_op_dir")?;
+        let base_dir = "test_op_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let mut db = Database::new(base_dir)?;
+        db.create_account("ACC1", None)?;
+        db.logto("ACC1")?;
+        db.create_table("T1")?;
         let table = db.get_table_mut("T1");
         
         let mut dict = Record::new();
