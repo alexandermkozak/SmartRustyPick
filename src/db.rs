@@ -582,7 +582,10 @@ impl Database {
                 return Some(idx - 1);
             }
         }
-        let table = self.get_table(table_name)?;
+        let table = match self.get_table(table_name) {
+            Some(t) => t,
+            None => return None,
+        };
         let dict_item = table.dictionary.get(dict_name)?;
         let field_no_str = dict_item.fields.get(0)
             .and_then(|f| f.values.get(0))

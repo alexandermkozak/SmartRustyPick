@@ -1,0 +1,26 @@
+name: Build and Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build
+
+      - name: Run Unit Tests
+        run: cargo test
+
+      - name: Run Integration Tests
+        run: python3 test/integration/test_server.py
+
+      - name: Run Performance Tests
+        run: python3 test/performance/test_load.py
