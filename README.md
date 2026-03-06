@@ -26,6 +26,13 @@ For more information, see the following documentation:
 - [Data Structures](docs/data_structures.md) - Learn how records and dictionaries are structured.
 - [Commands](docs/commands.md) - See a full list of available CLI commands.
 
+## Configuration
+
+The application can be configured via a `config.toml` file in the root directory.
+Currently supported settings:
+
+- `editor`: The command to launch for the `EDIT` command (default: `nano`).
+
 ## Quick Start
 
 1. Compile the project with `cargo build --release`.

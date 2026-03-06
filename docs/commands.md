@@ -29,9 +29,12 @@ Create or refine an active select list based on field criteria.
 - **Example**: `SELECT USERS WITH First.Name = "Ted"`
 
 #### EDIT
-Edit a record using an external editor defined by the `$EDITOR` environment variable.
+
+Edit a record using an external editor.
 - **Usage**: `EDIT [DICT] <table> <key>`
 - **Example**: `EDIT USERS 1`
+- **Configuration**: The editor can be configured in `config.toml` in the application root (e.g., `editor = "nano"`). If
+  not set, it defaults to the `$EDITOR` environment variable, then to `nano`.
 
 #### CT (Copy-To-Terminal)
 Print record contents with numbered fields.

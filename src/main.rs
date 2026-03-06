@@ -1,9 +1,14 @@
 mod db;
+mod config;
 
-use std::io::{self, Write};
+use config::Config;
 use db::{Database, Record};
+use std::io::{self, Write};
 
 fn main() -> io::Result<()> {
+    // Load config
+    let config = Config::load();
+    
     // We use a directory "db_storage" to hold our tables
     let mut db = Database::new("db_storage")?;
     println!("SmartRustyPick CLI. Type 'HELP' for commands.");
@@ -43,7 +48,7 @@ fn main() -> io::Result<()> {
                 handle_select(&mut db, &parts);
             }
             "EDIT" => {
-                handle_edit(&mut db, &parts);
+                handle_edit(&mut db, &parts, &config);
             }
             "CT" => {
                 handle_ct(&mut db, &parts);
@@ -389,7 +394,7 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
     }
 }
 
-fn handle_edit(db: &mut Database, parts: &[&str]) {
+fn handle_edit(db: &mut Database, parts: &[&str], config: &Config) {
     // EDIT [DICT] <table> <key>
     let mut offset = 1;
     let is_dict = if parts.len() > offset && parts[offset].to_uppercase() == "DICT" {
@@ -427,8 +432,20 @@ fn handle_edit(db: &mut Database, parts: &[&str]) {
     }
 
     // Launch editor
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
-    let status = std::process::Command::new(editor)
+    // Priority: config.toml > EDITOR env var > nano
+    let editor = config.editor.clone()
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| "nano".to_string());
+
+    // Split editor command to handle arguments (e.g., "python3 fake_editor.py")
+    let editor_parts: Vec<&str> = editor.split_whitespace().collect();
+    if editor_parts.is_empty() {
+        println!("Invalid editor configuration");
+        return;
+    }
+
+    let status = std::process::Command::new(editor_parts[0])
+        .args(&editor_parts[1..])
         .arg(&temp_file_path)
         .status();
 
