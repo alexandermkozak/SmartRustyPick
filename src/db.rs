@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -177,6 +178,32 @@ pub struct Database {
     lru_order: VecDeque<String>,
     max_loaded: usize,
     pub active_select_list: Option<SelectList>,
+    pub remote_select_lists: HashMap<String, SelectList>,
+    pub remote_select_cursors: HashMap<String, usize>,
+    pub authorized_certs: HashSet<String>, // Set of SHA-256 thumbprints
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct QueryCondition {
+    pub field_name: String,
+    pub op: String,
+    pub value: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum LogicalOp {
+    And,
+    Or,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum QueryNode {
+    Condition(QueryCondition),
+    Logical {
+        op: LogicalOp,
+        left: Box<QueryNode>,
+        right: Box<QueryNode>,
+    },
 }
 
 impl Database {
@@ -190,6 +217,9 @@ impl Database {
             lru_order: VecDeque::new(),
             max_loaded: 10,
             active_select_list: None,
+            remote_select_lists: HashMap::new(),
+            remote_select_cursors: HashMap::new(),
+            authorized_certs: HashSet::new(),
         };
 
         if !Path::new(&db.storage_dir).exists() {
@@ -205,8 +235,39 @@ impl Database {
                 db.accounts_config = reg_rec;
             }
         }
+
+        // Load authorized certificates
+        let certs_path = format!("{}/certs.reg", db.storage_dir);
+        if Path::new(&certs_path).exists() {
+            let mut map = HashMap::new();
+            Self::load_section(&mut map, &certs_path)?;
+            if let Some(certs_rec) = map.remove("certs") {
+                if let Some(f) = certs_rec.fields.get(0) {
+                    for v in &f.values {
+                        for sv in &v.sub_values {
+                            db.authorized_certs.insert(sv.clone());
+                        }
+                    }
+                }
+            }
+        }
         
         Ok(db)
+    }
+
+    pub fn save_certs(&self) -> io::Result<()> {
+        let mut certs_rec = Record::new();
+        let mut field = Field::default();
+        for thumbprint in &self.authorized_certs {
+            field.values.push(Value { sub_values: vec![thumbprint.clone()] });
+        }
+        certs_rec.fields.push(field);
+
+        let mut map = HashMap::new();
+        map.insert("certs".to_string(), certs_rec);
+        let certs_path = format!("{}/certs.reg", self.storage_dir);
+        Self::save_section(&certs_path, &map)?;
+        Ok(())
     }
 
     pub fn save_registry(&self) -> io::Result<()> {
@@ -516,6 +577,11 @@ impl Database {
     }
 
     pub fn get_field_index(&mut self, table_name: &str, dict_name: &str) -> Option<usize> {
+        if let Ok(idx) = dict_name.parse::<usize>() {
+            if idx > 0 {
+                return Some(idx - 1);
+            }
+        }
         let table = self.get_table(table_name)?;
         let dict_item = table.dictionary.get(dict_name)?;
         let field_no_str = dict_item.fields.get(0)
@@ -656,6 +722,158 @@ impl Database {
             "]" => record_val.starts_with(search_val),
             "[]" => record_val.contains(search_val),
             _ => false,
+        }
+    }
+
+    pub fn parse_query(&mut self, _table_name: &str, parts: &[&str]) -> Option<QueryNode> {
+        // Simple parser for WITH <field> <op> <value> [AND/OR <field> <op> <value> ...]
+        if parts.is_empty() { return None; }
+        if parts[0].to_uppercase() != "WITH" { return None; }
+
+        let mut i = 1;
+        let mut current_node: Option<QueryNode> = None;
+
+        while i < parts.len() {
+            if i + 2 >= parts.len() { break; }
+
+            let field_name = parts[i];
+            let op = parts[i + 1];
+            let mut value = parts[i + 2].to_string();
+            if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+                value = value[1..value.len() - 1].to_string();
+            }
+
+            let condition = QueryNode::Condition(QueryCondition {
+                field_name: field_name.to_string(),
+                op: op.to_string(),
+                value,
+            });
+
+            match current_node {
+                None => {
+                    current_node = Some(condition);
+                    i += 3;
+                }
+                Some(_) => {
+                    // This shouldn't happen without a logical op
+                    return None;
+                }
+            }
+
+            // Check for logical operator
+            if i < parts.len() {
+                let logical_op_str = parts[i].to_uppercase();
+                let logical_op = match logical_op_str.as_str() {
+                    "AND" => LogicalOp::And,
+                    "OR" => LogicalOp::Or,
+                    _ => break, // End of query or unknown
+                };
+                i += 1;
+
+                // Parse next condition
+                if i + 2 >= parts.len() { break; }
+                let field_name = parts[i];
+                let op = parts[i + 1];
+                let mut value = parts[i + 2].to_string();
+                if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+                    value = value[1..value.len() - 1].to_string();
+                }
+                let next_condition = QueryNode::Condition(QueryCondition {
+                    field_name: field_name.to_string(),
+                    op: op.to_string(),
+                    value,
+                });
+
+                current_node = Some(QueryNode::Logical {
+                    op: logical_op,
+                    left: Box::new(current_node.unwrap()),
+                    right: Box::new(next_condition),
+                });
+                i += 3;
+            }
+        }
+
+        current_node
+    }
+
+    pub fn query_new(&mut self, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
+        let (source_map, field_map) = {
+            let table = match self.get_table(table_name) {
+                Some(t) => t,
+                None => return vec![],
+            };
+
+            let source_map = if use_dict_section {
+                table.dictionary.clone()
+            } else {
+                table.records.clone()
+            };
+
+            // Pre-calculate field indices to avoid repeated mutable borrows of self
+            let mut field_map = HashMap::new();
+            self.collect_field_indices(table_name, query, &mut field_map);
+
+            (source_map, field_map)
+        };
+
+        let mut results = Vec::new();
+
+        let keys: Vec<String> = if let Some(filter_keys) = keys_to_filter {
+            filter_keys.to_vec()
+        } else {
+            source_map.keys().cloned().collect()
+        };
+
+        for key in keys {
+            if let Some(record) = source_map.get(&key) {
+                if self.evaluate_node_static(record, query, &field_map) {
+                    results.push((key.clone(), record.clone()));
+                }
+            }
+        }
+
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        results
+    }
+
+    fn collect_field_indices(&mut self, table_name: &str, node: &QueryNode, map: &mut HashMap<String, usize>) {
+        match node {
+            QueryNode::Condition(cond) => {
+                if !map.contains_key(&cond.field_name) {
+                    if let Some(idx) = self.get_field_index(table_name, &cond.field_name) {
+                        map.insert(cond.field_name.clone(), idx);
+                    }
+                }
+            }
+            QueryNode::Logical { left, right, .. } => {
+                self.collect_field_indices(table_name, left, map);
+                self.collect_field_indices(table_name, right, map);
+            }
+        }
+    }
+
+    fn evaluate_node_static(&self, record: &Record, node: &QueryNode, field_map: &HashMap<String, usize>) -> bool {
+        match node {
+            QueryNode::Condition(cond) => {
+                let field_idx = match field_map.get(&cond.field_name) {
+                    Some(idx) => *idx,
+                    None => return false,
+                };
+                if let Some(field) = record.fields.get(field_idx) {
+                    for v in &field.values {
+                        if v.sub_values.iter().any(|sv| Self::compare_values(sv, &cond.op, &cond.value)) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            QueryNode::Logical { op, left, right } => {
+                match op {
+                    LogicalOp::And => self.evaluate_node_static(record, left, field_map) && self.evaluate_node_static(record, right, field_map),
+                    LogicalOp::Or => self.evaluate_node_static(record, left, field_map) || self.evaluate_node_static(record, right, field_map),
+                }
+            }
         }
     }
 

@@ -5,6 +5,7 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub editor: Option<String>,
+    pub server_port: Option<u16>,
 }
 
 impl Config {
@@ -20,6 +21,7 @@ impl Config {
         // Return default if file doesn't exist or is invalid
         Config {
             editor: Some("nano".to_string()),
+            server_port: Some(8443),
         }
     }
 }

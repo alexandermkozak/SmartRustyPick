@@ -1,16 +1,17 @@
 mod db;
 mod config;
+mod server;
 
 use config::Config;
 use db::{Database, Record};
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 
 fn main() -> io::Result<()> {
-    // Load config
     let config = Config::load();
     
     // We use a directory "db_storage" to hold our tables
-    let mut db = Database::new("db_storage")?;
+    let db = Arc::new(Mutex::new(Database::new("db_storage")?));
     println!("SmartRustyPick CLI. Type 'HELP' for commands.");
 
     // Account login prompt
@@ -26,28 +27,35 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        if let Err(_) = db.logto(account_name) {
+        let mut db_lock = db.lock().unwrap();
+        if let Err(_) = db_lock.logto(account_name) {
             println!("Account '{}' not found. Create it? (Y/N)", account_name);
             io::stdout().flush()?;
             let mut choice = String::new();
             io::stdin().read_line(&mut choice)?;
             if choice.trim().to_uppercase() == "Y" {
-                db.create_account(account_name, None)?;
-                db.logto(account_name)?;
-                let _ = check_dir_file(&mut db);
+                db_lock.create_account(account_name, None)?;
+                db_lock.logto(account_name)?;
+                let _ = check_dir_file(&mut db_lock);
                 break;
+            } else {
+                continue;
             }
         } else {
-            let _ = check_dir_file(&mut db);
+            let _ = check_dir_file(&mut db_lock);
             break;
         }
     }
 
     loop {
-        let prompt = if db.current_account.is_empty() {
-            "PICK> ".to_string()
-        } else {
-            format!("{} PICK> ", db.current_account)
+        let prompt = {
+            let db_lock = db.lock().unwrap();
+            let acc = db_lock.current_account.clone();
+            if acc.is_empty() {
+                "PICK> ".to_string()
+            } else {
+                format!("{} PICK> ", acc)
+            }
         };
         print!("{}", prompt);
         io::stdout().flush()?;
@@ -68,53 +76,66 @@ fn main() -> io::Result<()> {
 
         match command.as_str() {
             "SET" => {
-                handle_set(&mut db, &parts);
+                handle_set(&mut db.lock().unwrap(), &parts);
             }
             "GET" => {
-                handle_get(&mut db, &parts);
+                handle_get(&mut db.lock().unwrap(), &parts);
             }
             "DELETE" => {
-                handle_delete(&mut db, &parts);
+                handle_delete(&mut db.lock().unwrap(), &parts);
             }
             "LIST" => {
-                handle_list(&mut db, &parts);
+                handle_list(&mut db.lock().unwrap(), &parts);
             }
             "SELECT" => {
-                handle_select(&mut db, &parts);
+                handle_select(&mut db.lock().unwrap(), &parts);
             }
             "EDIT" => {
-                handle_edit(&mut db, &parts, &config);
+                handle_edit(&mut db.lock().unwrap(), &parts, &config);
             }
             "CT" => {
-                handle_ct(&mut db, &parts);
+                handle_ct(&mut db.lock().unwrap(), &parts);
             }
             "SAVE-LIST" => {
-                handle_save_list(&mut db, &parts);
+                handle_save_list(&mut db.lock().unwrap(), &parts);
             }
             "GET-LIST" => {
-                handle_get_list(&mut db, &parts);
+                handle_get_list(&mut db.lock().unwrap(), &parts);
             }
             "CREATE.FILE" => {
-                handle_create_file(&mut db, &parts);
+                handle_create_file(&mut db.lock().unwrap(), &parts);
             }
             "DELETE.FILE" => {
-                handle_delete_file(&mut db, &parts);
+                handle_delete_file(&mut db.lock().unwrap(), &parts);
             }
             "CREATE.ACCOUNT" => {
-                handle_create_account(&mut db, &parts);
+                handle_create_account(&mut db.lock().unwrap(), &parts);
             }
             "DELETE.ACCOUNT" => {
-                handle_delete_account(&mut db, &parts);
+                handle_delete_account(&mut db.lock().unwrap(), &parts);
             }
             "LOGTO" => {
-                handle_logto(&mut db, &parts);
-                let _ = check_dir_file(&mut db);
+                let mut db_lock = db.lock().unwrap();
+                handle_logto(&mut db_lock, &parts);
+                let _ = check_dir_file(&mut db_lock);
             }
             "LIST.FILES" => {
-                handle_list_files(&mut db);
+                handle_list_files(&mut db.lock().unwrap());
+            }
+            "AUTHORIZE.CONN" => {
+                handle_authorize_conn(&mut db.lock().unwrap(), &parts);
+            }
+            "DEAUTHORIZE.CONN" => {
+                handle_deauthorize_conn(&mut db.lock().unwrap(), &parts);
+            }
+            "LIST.CONNS" => {
+                handle_list_conns(&db.lock().unwrap());
+            }
+            "START.SERVER" => {
+                handle_start_server(db.clone(), &parts, &config);
             }
             "SAVE" => {
-                db.save()?;
+                db.lock().unwrap().save()?;
                 println!("OK");
             }
             "HELP" => {
@@ -126,7 +147,7 @@ fn main() -> io::Result<()> {
     }
 
     // Auto-save on exit
-    db.save()?;
+    db.lock().unwrap().save()?;
     Ok(())
 }
 
@@ -402,17 +423,13 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
         None
     };
 
-    let operators = ["=", "#", "<", ">", "<=", ">=", "[", "]", "[]"];
-    let results = if parts.len() >= offset + 5 && parts[offset + 1].to_uppercase() == "WITH" && operators.contains(&parts[offset + 3]) {
-        let field_name = parts[offset + 2];
-        let op = parts[offset + 3];
-        let mut value = parts[offset + 4].to_string();
-        
-        // Remove quotes if present
-        if value.starts_with('"') && value.ends_with('"') {
-            value = value[1..value.len()-1].to_string();
+    let results = if parts.len() >= offset + 2 && parts[offset + 1].to_uppercase() == "WITH" {
+        if let Some(query) = db.parse_query(table_name, &parts[offset + 1..]) {
+            db.query_new(table_name, is_dict, &query, keys_to_filter.as_deref())
+        } else {
+            println!("INVALID QUERY FORMAT");
+            return;
         }
-        db.query(table_name, is_dict, field_name, op, &value, keys_to_filter.as_deref())
     } else if parts.len() == offset + 1 {
         if let Some(table) = db.get_table(table_name) {
             let map = if is_dict { &table.dictionary } else { &table.records };
@@ -625,6 +642,11 @@ fn print_help() {
     println!("  DELETE.ACCOUNT <name>                 - Delete an account and all its files.");
     println!("  LOGTO <name>                          - Switch to a different account.");
     println!("  LIST.FILES                            - List all files in the current account.");
+    println!("  AUTHORIZE.CONN <thumbprint>           - Authorize an SSL cert thumbprint.");
+    println!("  DEAUTHORIZE.CONN <thumbprint>         - Deauthorize an SSL cert thumbprint.");
+    println!("  LIST.CONNS                            - List authorized thumbprints.");
+    println!("  START.SERVER [<addr:port>] <cert_path> <key_path> <ca_path> - Start TCP SSL server.");
+    println!("  SAVE                                  - Save all changes to disk.");
     println!("  EXIT or QUIT                          - Exit the shell.");
 }
 
@@ -789,6 +811,80 @@ fn handle_list_files(db: &mut Database) {
             println!("Error: DIR file not found. Use LOGTO or check account.");
         }
     }
+}
+
+fn handle_authorize_conn(db: &mut Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: AUTHORIZE.CONN <thumbprint>");
+        return;
+    }
+    let thumbprint = parts[1].to_lowercase();
+    db.authorized_certs.insert(thumbprint.clone());
+    let _ = db.save_certs();
+    println!("Authorized: {}", thumbprint);
+}
+
+fn handle_deauthorize_conn(db: &mut Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: DEAUTHORIZE.CONN <thumbprint>");
+        return;
+    }
+    let thumbprint = parts[1].to_lowercase();
+    if db.authorized_certs.remove(&thumbprint) {
+        let _ = db.save_certs();
+        println!("Deauthorized: {}", thumbprint);
+    } else {
+        println!("Not found: {}", thumbprint);
+    }
+}
+
+fn handle_list_conns(db: &Database) {
+    println!("Authorized Connection Thumbprints:");
+    for thumbprint in &db.authorized_certs {
+        println!("  {}", thumbprint);
+    }
+}
+
+fn handle_start_server(db: Arc<Mutex<Database>>, parts: &[&str], config: &Config) {
+    let mut offset = 1;
+    let mut addr = "127.0.0.1".to_string();
+
+    // Check if the first part looks like an address/port (contains : or .)
+    // but exclude cert/key filenames by checking for common extensions
+    if parts.len() > offset {
+        let first_arg = parts[offset];
+        if first_arg.contains(':') || (first_arg.contains('.') && !first_arg.ends_with(".crt") && !first_arg.ends_with(".key") && !first_arg.ends_with(".pem")) {
+            addr = first_arg.to_string();
+            offset += 1;
+        }
+    }
+
+    // Append default port if not specified
+    if !addr.contains(':') {
+        let port = config.server_port.unwrap_or(8443);
+        addr = format!("{}:{}", addr, port);
+    }
+
+    if parts.len() < offset + 3 {
+        println!("Usage: START.SERVER [<addr:port>] <cert_path> <key_path> <ca_path>");
+        println!("Default port: {}", config.server_port.unwrap_or(8443));
+        return;
+    }
+
+    let cert_path = parts[offset].to_string();
+    let key_path = parts[offset + 1].to_string();
+    let ca_path = parts[offset + 2].to_string();
+
+    let addr_clone = addr.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            if let Err(e) = server::run_server(&addr_clone, db, &cert_path, &key_path, &ca_path).await {
+                eprintln!("Server error: {}", e);
+            }
+        });
+    });
+    println!("Server start initiated on {}.", addr);
 }
 
 fn check_dir_file(db: &mut Database) -> io::Result<()> {

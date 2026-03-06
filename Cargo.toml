@@ -7,3 +7,10 @@ edition = "2024"
 time = { version = "0.3.47", features = ["local-offset"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
+tokio = { version = "1.0", features = ["full"] }
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = { version = "0.26", features = ["ring"] }
+rustls-pemfile = "2.0"
+serde_json = "1.0"
+sha2 = "0.10"
+hex = "0.4"
