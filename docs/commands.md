@@ -58,10 +58,11 @@ List all authorized certificate thumbprints.
 
 #### START.SERVER
 
-Start the SSL TCP server for remote access.
+Start the SSL TCP server for remote access. If the address/port is omitted, it defaults to `127.0.0.1` and the
+`server_port` specified in `config.toml` (default 8443).
 
-- **Usage**: `START.SERVER <addr:port> <cert_path> <key_path> <ca_path>`
-- **Example**: `START.SERVER 0.0.0.0:8443 server.crt server.key ca.crt`
+- **Usage**: `START.SERVER [<addr:port>] <cert_path> <key_path> <ca_path>`
+- **Example**: `START.SERVER 0.0.0.0:8443 server.crt server.key ca.crt` or `START.SERVER server.crt server.key ca.crt`
 - **Note**: This starts the server in a background thread. For more protocol details,
   see [Remote Connection Protocol](protocol.md).
 

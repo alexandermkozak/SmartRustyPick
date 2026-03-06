@@ -8,7 +8,6 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 fn main() -> io::Result<()> {
-    // Load config
     let config = Config::load();
     
     // We use a directory "db_storage" to hold our tables
@@ -39,6 +38,8 @@ fn main() -> io::Result<()> {
                 db_lock.logto(account_name)?;
                 let _ = check_dir_file(&mut db_lock);
                 break;
+            } else {
+                continue;
             }
         } else {
             let _ = check_dir_file(&mut db_lock);
@@ -131,7 +132,7 @@ fn main() -> io::Result<()> {
                 handle_list_conns(&db.lock().unwrap());
             }
             "START.SERVER" => {
-                handle_start_server(db.clone(), &parts);
+                handle_start_server(db.clone(), &parts, &config);
             }
             "SAVE" => {
                 db.lock().unwrap().save()?;
@@ -644,7 +645,7 @@ fn print_help() {
     println!("  AUTHORIZE.CONN <thumbprint>           - Authorize an SSL cert thumbprint.");
     println!("  DEAUTHORIZE.CONN <thumbprint>         - Deauthorize an SSL cert thumbprint.");
     println!("  LIST.CONNS                            - List authorized thumbprints.");
-    println!("  START.SERVER <addr> <cert> <key> <ca> - Start TCP SSL server.");
+    println!("  START.SERVER [<addr:port>] <cert_path> <key_path> <ca_path> - Start TCP SSL server.");
     println!("  SAVE                                  - Save all changes to disk.");
     println!("  EXIT or QUIT                          - Exit the shell.");
 }
@@ -844,25 +845,46 @@ fn handle_list_conns(db: &Database) {
     }
 }
 
-fn handle_start_server(db: Arc<Mutex<Database>>, parts: &[&str]) {
-    if parts.len() < 5 {
-        println!("Usage: START.SERVER <addr:port> <cert_path> <key_path> <ca_path>");
+fn handle_start_server(db: Arc<Mutex<Database>>, parts: &[&str], config: &Config) {
+    let mut offset = 1;
+    let mut addr = "127.0.0.1".to_string();
+
+    // Check if the first part looks like an address/port (contains : or .)
+    // but exclude cert/key filenames by checking for common extensions
+    if parts.len() > offset {
+        let first_arg = parts[offset];
+        if first_arg.contains(':') || (first_arg.contains('.') && !first_arg.ends_with(".crt") && !first_arg.ends_with(".key") && !first_arg.ends_with(".pem")) {
+            addr = first_arg.to_string();
+            offset += 1;
+        }
+    }
+
+    // Append default port if not specified
+    if !addr.contains(':') {
+        let port = config.server_port.unwrap_or(8443);
+        addr = format!("{}:{}", addr, port);
+    }
+
+    if parts.len() < offset + 3 {
+        println!("Usage: START.SERVER [<addr:port>] <cert_path> <key_path> <ca_path>");
+        println!("Default port: {}", config.server_port.unwrap_or(8443));
         return;
     }
-    let addr = parts[1].to_string();
-    let cert_path = parts[2].to_string();
-    let key_path = parts[3].to_string();
-    let ca_path = parts[4].to_string();
 
+    let cert_path = parts[offset].to_string();
+    let key_path = parts[offset + 1].to_string();
+    let ca_path = parts[offset + 2].to_string();
+
+    let addr_clone = addr.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            if let Err(e) = server::run_server(&addr, db, &cert_path, &key_path, &ca_path).await {
+            if let Err(e) = server::run_server(&addr_clone, db, &cert_path, &key_path, &ca_path).await {
                 eprintln!("Server error: {}", e);
             }
         });
     });
-    println!("Server start initiated.");
+    println!("Server start initiated on {}.", addr);
 }
 
 fn check_dir_file(db: &mut Database) -> io::Result<()> {

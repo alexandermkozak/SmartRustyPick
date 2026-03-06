@@ -43,6 +43,8 @@ pub async fn run_server(
     key_path: &str,
     ca_path: &str,
 ) -> io::Result<()> {
+    rustls::crypto::ring::default_provider().install_default().ok();
+    
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
     let ca_certs = load_certs(ca_path)?;
@@ -69,6 +71,8 @@ pub async fn run_server(
     };
 
     println!("TCP Server listening on {}", addr);
+    use std::io::Write;
+    std::io::stdout().flush()?;
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;

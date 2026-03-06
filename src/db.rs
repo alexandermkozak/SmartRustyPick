@@ -577,6 +577,11 @@ impl Database {
     }
 
     pub fn get_field_index(&mut self, table_name: &str, dict_name: &str) -> Option<usize> {
+        if let Ok(idx) = dict_name.parse::<usize>() {
+            if idx > 0 {
+                return Some(idx - 1);
+            }
+        }
         let table = self.get_table(table_name)?;
         let dict_item = table.dictionary.get(dict_name)?;
         let field_no_str = dict_item.fields.get(0)

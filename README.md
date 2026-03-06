@@ -47,6 +47,7 @@ The application can be configured via a `config.toml` file in the root directory
 Currently supported settings:
 
 - `editor`: The command to launch for the `EDIT` command (default: `nano`).
+- `server_port`: The default port for the `START.SERVER` command (default: 8443).
 
 ## Quick Start
 
