@@ -16,6 +16,9 @@ if the solutions implemented are necessarily correct or efficient down to the li
 
 With its natural support for safety and embedded unit testing, Rust seemed like the perfect choice for the project.
 
+For development I am using Jetbrains RustRover with their Junie agent. So far, the primary model used has been the
+default in Junie, Gemini 3 Flash.
+
 ## Documentation
 
 For more information, see the following documentation:
