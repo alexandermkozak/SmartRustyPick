@@ -1,6 +1,33 @@
+### Data Organization
+
+SmartRustyPick organizes data into **Accounts**. Each account is a collection of files (tables).
+When you start the application, you will be prompted to log into an account.
+
 ### Commands
 
 SmartRustyPick CLI supports the following commands:
+
+#### CREATE.ACCOUNT
+
+Create a new account.
+
+- **Usage**: `CREATE.ACCOUNT <account name> [<directory>]`
+- **Example**: `CREATE.ACCOUNT MYAPP /path/to/myapp`
+- **Default**: If no directory is provided, it defaults to a folder named `<account name>` in the root directory.
+
+#### DELETE.ACCOUNT
+
+Delete an account and all its contained data files.
+
+- **Usage**: `DELETE.ACCOUNT <account name>`
+- **Example**: `DELETE.ACCOUNT OLDAPP`
+
+#### LOGTO
+
+Switch the current context to a different account.
+
+- **Usage**: `LOGTO <account name>`
+- **Example**: `LOGTO SALES`
 
 #### SET
 Store a record in the database.

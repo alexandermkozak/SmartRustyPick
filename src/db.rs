@@ -1,6 +1,6 @@
-use std::collections::{HashMap, VecDeque, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{self, Read, Write, BufReader, BufWriter};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 pub const FM: u8 = 254; // Field Mark
@@ -170,6 +170,8 @@ impl Table {
 
 pub struct Database {
     pub storage_dir: String,
+    pub current_account: String,
+    pub accounts_config: Record, // Map account name to its directory path
     loaded_tables: HashMap<String, Table>,
     available_tables: HashSet<String>,
     lru_order: VecDeque<String>,
@@ -178,28 +180,157 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn new(storage_dir: &str) -> io::Result<Self> {
+    pub fn new(base_storage_dir: &str) -> io::Result<Self> {
         let mut db = Database {
-            storage_dir: storage_dir.to_string(),
+            storage_dir: base_storage_dir.to_string(),
+            current_account: String::new(),
+            accounts_config: Record::new(),
             loaded_tables: HashMap::new(),
             available_tables: HashSet::new(),
             lru_order: VecDeque::new(),
-            max_loaded: 10, // Default limit
+            max_loaded: 10,
             active_select_list: None,
         };
-        db.init_available()?;
-        if !db.available_tables.contains("$SAVEDLISTS") {
-            db.available_tables.insert("$SAVEDLISTS".to_string());
+
+        if !Path::new(&db.storage_dir).exists() {
+            fs::create_dir_all(&db.storage_dir)?;
         }
+
+        // Load or create account registry
+        let registry_path = format!("{}/accounts.reg", db.storage_dir);
+        if Path::new(&registry_path).exists() {
+            let mut map = HashMap::new();
+            Self::load_section(&mut map, &registry_path)?;
+            if let Some(reg_rec) = map.remove("registry") {
+                db.accounts_config = reg_rec;
+            }
+        }
+        
         Ok(db)
     }
 
-    fn init_available(&mut self) -> io::Result<()> {
-        if !Path::new(&self.storage_dir).exists() {
-            fs::create_dir_all(&self.storage_dir)?;
+    pub fn save_registry(&self) -> io::Result<()> {
+        let mut map = HashMap::new();
+        map.insert("registry".to_string(), self.accounts_config.clone());
+        let registry_path = format!("{}/accounts.reg", self.storage_dir);
+        Self::save_section(&registry_path, &map)?;
+        Ok(())
+    }
+
+    pub fn logto(&mut self, account_name: &str) -> io::Result<()> {
+        // If switching accounts, flush current loaded tables
+        self.save()?;
+        self.loaded_tables.clear();
+        self.available_tables.clear();
+        self.lru_order.clear();
+        self.active_select_list = None;
+
+        let account_dir = if let Some(dir) = self.get_account_dir(account_name) {
+            dir
+        } else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", account_name)));
+        };
+
+        self.current_account = account_name.to_string();
+        self.init_available_in_dir(&account_dir)?;
+
+        if !self.available_tables.contains("$SAVEDLISTS") {
+            self.available_tables.insert("$SAVEDLISTS".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn get_account_dir(&self, account_name: &str) -> Option<String> {
+        // Search in accounts_config (Record: fields correspond to accounts)
+        // Let's say field 1 contains account names and field 2 contains their directories.
+        // Actually, easier: field 1 is names, field 2 is directories.
+        let names_field = self.accounts_config.fields.get(0)?;
+        let dirs_field = self.accounts_config.fields.get(1)?;
+
+        for (i, v) in names_field.values.iter().enumerate() {
+            if let Some(name) = v.sub_values.get(0) {
+                if name == account_name {
+                    return dirs_field.values.get(i)?.sub_values.get(0).cloned();
+                }
+            }
+        }
+        None
+    }
+
+    pub fn create_account(&mut self, name: &str, directory: Option<&str>) -> io::Result<()> {
+        if self.get_account_dir(name).is_some() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("Account '{}' already exists", name)));
+        }
+
+        let dir = directory.map(|d| d.to_string())
+            .unwrap_or_else(|| format!("{}/{}", self.storage_dir, name));
+
+        if !Path::new(&dir).exists() {
+            fs::create_dir_all(&dir)?;
+        }
+
+        // Add to registry
+        if self.accounts_config.fields.is_empty() {
+            self.accounts_config.fields.push(Field::default()); // Names
+            self.accounts_config.fields.push(Field::default()); // Dirs
+        }
+
+        self.accounts_config.fields[0].values.push(Value { sub_values: vec![name.to_string()] });
+        self.accounts_config.fields[1].values.push(Value { sub_values: vec![dir] });
+
+        self.save_registry()?;
+        Ok(())
+    }
+
+    pub fn delete_account(&mut self, name: &str) -> io::Result<()> {
+        let dir = if let Some(d) = self.get_account_dir(name) {
+            d
+        } else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", name)));
+        };
+
+        // If current account is the one being deleted, log out
+        if self.current_account == name {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
+        }
+
+        // Remove from registry
+        let mut idx_to_remove = None;
+        {
+            let names_field = &self.accounts_config.fields[0];
+            for (i, v) in names_field.values.iter().enumerate() {
+                if let Some(acc_name) = v.sub_values.get(0) {
+                    if acc_name == name {
+                        idx_to_remove = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(i) = idx_to_remove {
+            self.accounts_config.fields[0].values.remove(i);
+            self.accounts_config.fields[1].values.remove(i);
+        }
+
+        // Delete files
+        let _ = fs::remove_dir_all(dir);
+
+        self.save_registry()?;
+        Ok(())
+    }
+
+
+    fn init_available_in_dir(&mut self, dir: &str) -> io::Result<()> {
+        if !Path::new(dir).exists() {
+            fs::create_dir_all(dir)?;
             return Ok(());
         }
-        for entry in fs::read_dir(&self.storage_dir)? {
+        for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
@@ -209,6 +340,10 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    fn current_storage_dir(&self) -> String {
+        self.get_account_dir(&self.current_account).unwrap_or_else(|| self.storage_dir.clone())
     }
 
     fn mark_used(&mut self, name: &str) {
@@ -221,15 +356,16 @@ impl Database {
             let to_evict = self.lru_order.pop_back().unwrap();
             if let Some(table) = self.loaded_tables.remove(&to_evict) {
                 if table.dirty {
-                    let _ = Self::flush_table_internal(&self.storage_dir, &to_evict, &table);
+                    let _ = Self::flush_table_internal(&self.current_storage_dir(), &to_evict, &table);
                 }
             }
         }
     }
 
     fn load_table_into(&self, name: &str, table: &mut Table) -> io::Result<()> {
-        Self::load_section(&mut table.records, &format!("{}/{}/data", self.storage_dir, name))?;
-        Self::load_section(&mut table.dictionary, &format!("{}/{}/dict", self.storage_dir, name))?;
+        let storage = self.current_storage_dir();
+        Self::load_section(&mut table.records, &format!("{}/{}/data", storage, name))?;
+        Self::load_section(&mut table.dictionary, &format!("{}/{}/dict", storage, name))?;
         table.dirty = false;
         Ok(())
     }
@@ -271,8 +407,9 @@ impl Database {
     }
 
     pub fn save(&mut self) -> io::Result<()> {
-        if !Path::new(&self.storage_dir).exists() {
-            fs::create_dir_all(&self.storage_dir)?;
+        let storage = self.current_storage_dir();
+        if !Path::new(&storage).exists() {
+            fs::create_dir_all(&storage)?;
         }
         
         let mut dirty_names = Vec::new();
@@ -284,7 +421,7 @@ impl Database {
 
         for name in dirty_names {
             if let Some(table) = self.loaded_tables.get_mut(&name) {
-                Self::flush_table_internal(&self.storage_dir, &name, table)?;
+                Self::flush_table_internal(&storage, &name, table)?;
                 table.dirty = false;
             }
         }
@@ -478,11 +615,15 @@ impl Database {
     }
 
     pub fn create_table(&mut self, name: &str) -> io::Result<()> {
+        if self.current_account.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
+        }
         if self.available_tables.contains(name) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("Table '{}' already exists", name)));
         }
 
-        let table_dir = format!("{}/{}", self.storage_dir, name);
+        let storage = self.current_storage_dir();
+        let table_dir = format!("{}/{}", storage, name);
         fs::create_dir_all(&table_dir)?;
         File::create(format!("{}/data", table_dir))?;
         File::create(format!("{}/dict", table_dir))?;
@@ -492,6 +633,9 @@ impl Database {
     }
 
     pub fn delete_table(&mut self, name: &str) -> io::Result<()> {
+        if self.current_account.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
+        }
         if !self.available_tables.contains(name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' not found", name)));
         }
@@ -502,7 +646,8 @@ impl Database {
             self.lru_order.remove(pos);
         }
 
-        let table_dir = format!("{}/{}", self.storage_dir, name);
+        let storage = self.current_storage_dir();
+        let table_dir = format!("{}/{}", storage, name);
         let _ = fs::remove_dir_all(table_dir);
 
         Ok(())
@@ -512,6 +657,56 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_accounts() -> io::Result<()> {
+        let base_dir = "test_accounts_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+
+        {
+            let mut db = Database::new(base_dir)?;
+            db.create_account("ACC1", None)?;
+            db.create_account("ACC2", None)?;
+
+            // Log to ACC1 and create a table
+            db.logto("ACC1")?;
+            db.create_table("T1")?;
+            let t1 = db.get_table_mut("T1");
+            t1.records.insert("K1".to_string(), Record::from_string("VAL1"));
+            t1.dirty = true;
+            db.save()?;
+
+            // Log to ACC2 and create a table with same name but different content
+            db.logto("ACC2")?;
+            db.create_table("T1")?;
+            let t1_acc2 = db.get_table_mut("T1");
+            t1_acc2.records.insert("K1".to_string(), Record::from_string("VAL2"));
+            t1_acc2.dirty = true;
+            db.save()?;
+        }
+
+        // Re-open and verify isolation
+        {
+            let mut db = Database::new(base_dir)?;
+            db.logto("ACC1")?;
+            let t1 = db.get_table("T1").unwrap();
+            assert_eq!(t1.records.get("K1").unwrap().to_string(), "VAL1");
+
+            db.logto("ACC2")?;
+            let t1 = db.get_table("T1").unwrap();
+            assert_eq!(t1.records.get("K1").unwrap().to_string(), "VAL2");
+
+            // Test delete account
+            db.delete_account("ACC1")?;
+        }
+
+        let mut db = Database::new(base_dir)?;
+        assert!(db.logto("ACC1").is_err());
+        assert!(db.logto("ACC2").is_ok());
+
+        fs::remove_dir_all(base_dir)?;
+        Ok(())
+    }
 
     #[test]
     fn test_conversions() {

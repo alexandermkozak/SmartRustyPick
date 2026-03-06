@@ -13,8 +13,41 @@ fn main() -> io::Result<()> {
     let mut db = Database::new("db_storage")?;
     println!("SmartRustyPick CLI. Type 'HELP' for commands.");
 
+    // Account login prompt
     loop {
-        print!("PICK> ");
+        print!("Account: ");
+        io::stdout().flush()?;
+        let mut account_input = String::new();
+        if io::stdin().read_line(&mut account_input)? == 0 {
+            return Ok(());
+        }
+        let account_name = account_input.trim();
+        if account_name.is_empty() {
+            continue;
+        }
+
+        if let Err(_) = db.logto(account_name) {
+            println!("Account '{}' not found. Create it? (Y/N)", account_name);
+            io::stdout().flush()?;
+            let mut choice = String::new();
+            io::stdin().read_line(&mut choice)?;
+            if choice.trim().to_uppercase() == "Y" {
+                db.create_account(account_name, None)?;
+                db.logto(account_name)?;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    loop {
+        let prompt = if db.current_account.is_empty() {
+            "PICK> ".to_string()
+        } else {
+            format!("{} PICK> ", db.current_account)
+        };
+        print!("{}", prompt);
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -64,6 +97,15 @@ fn main() -> io::Result<()> {
             }
             "DELETE.FILE" => {
                 handle_delete_file(&mut db, &parts);
+            }
+            "CREATE.ACCOUNT" => {
+                handle_create_account(&mut db, &parts);
+            }
+            "DELETE.ACCOUNT" => {
+                handle_delete_account(&mut db, &parts);
+            }
+            "LOGTO" => {
+                handle_logto(&mut db, &parts);
             }
             "SAVE" => {
                 db.save()?;
@@ -573,6 +615,9 @@ fn print_help() {
     println!("  GET-LIST <name>                       - Restore a saved select list.");
     println!("  CREATE.FILE <name>                    - Create a new file (data and dict).");
     println!("  DELETE.FILE <name>                    - Delete a file (data and dict).");
+    println!("  CREATE.ACCOUNT <name> [<dir>]         - Create a new account.");
+    println!("  DELETE.ACCOUNT <name>                 - Delete an account and all its files.");
+    println!("  LOGTO <name>                          - Switch to a different account.");
     println!("  EXIT or QUIT                          - Exit the shell.");
 }
 
@@ -666,6 +711,43 @@ fn handle_delete_file(db: &mut Database, parts: &[&str]) {
     let file_name = parts[1];
     match db.delete_table(file_name) {
         Ok(_) => println!("[{}] deleted (data and dict)", file_name),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_create_account(db: &mut Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: CREATE.ACCOUNT <account_name> [<directory>]");
+        return;
+    }
+    let account_name = parts[1];
+    let directory = if parts.len() > 2 { Some(parts[2]) } else { None };
+    match db.create_account(account_name, directory) {
+        Ok(_) => println!("Account '{}' created", account_name),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_delete_account(db: &mut Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: DELETE.ACCOUNT <account_name>");
+        return;
+    }
+    let account_name = parts[1];
+    match db.delete_account(account_name) {
+        Ok(_) => println!("Account '{}' deleted", account_name),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_logto(db: &mut Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: LOGTO <account_name>");
+        return;
+    }
+    let account_name = parts[1];
+    match db.logto(account_name) {
+        Ok(_) => println!("Logged into account '{}'", account_name),
         Err(e) => println!("Error: {}", e),
     }
 }

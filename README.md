@@ -1,6 +1,16 @@
 # SmartRustyPick
 
-SmartRustyPick is a CLI tool for interacting with a MultiValue-inspired database. It supports hierarchical data records, dictionary definitions for field formatting, and complex select operations.
+SmartRustyPick is a CLI tool for interacting with a MultiValue-inspired database. It supports hierarchical data
+organization through **Accounts**, data records with multiple fields, values and sub-values, dictionary definitions for
+field formatting, and complex select operations.
+
+## Features
+
+- **Account-level Organization**: Multiple accounts can exist within a single system, providing data isolation.
+- **Hierarchical Records**: Support for Field Mark (FM), Value Mark (VM), and Sub-Value Mark (SVM).
+- **Dictionary Support**: Define field indices and formatting/conversions (Dates, Numbers).
+- **Active Select Lists**: Perform queries and refine them through sequential `SELECT` commands.
+- **Persistent Configuration**: Customize your environment (e.g., preferred editor).
 
 The goal of this project is to provide a simple PICK-like multivalue database implementation useful for personal
 projects that is done entirely through vibe-coding.
