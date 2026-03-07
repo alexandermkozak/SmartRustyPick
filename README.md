@@ -40,6 +40,7 @@ For more information, see the following documentation:
 - [Data Structures](docs/data_structures.md) - Learn how records and dictionaries are structured.
 - [Commands](docs/commands.md) - See a full list of available CLI commands.
 - [Remote Protocol](docs/protocol.md) - Details on the TCP/SSL remote protocol.
+- [AI Agents](agents.md) - Documentation on the role and contributions of AI agents in this project.
 
 ## Configuration
 
