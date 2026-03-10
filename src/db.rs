@@ -385,9 +385,8 @@ impl Database {
         }
 
         // Add to registry
-        if self.accounts_config.fields.is_empty() {
-            self.accounts_config.fields.push(Field::default()); // Names
-            self.accounts_config.fields.push(Field::default()); // Dirs
+        while self.accounts_config.fields.len() < 2 {
+            self.accounts_config.fields.push(Field::default()); // Names and Dirs
         }
 
         self.accounts_config.fields[0].values.push(Value { sub_values: vec![name.to_string()] });

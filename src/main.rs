@@ -72,7 +72,8 @@ fn main() -> io::Result<()> {
         }
 
         let mut db_lock = db.lock().unwrap();
-        if let Err(_) = db_lock.logto(account_name) {
+        if let Err(e) = db_lock.logto(account_name) {
+            println!("Error: {}", e);
             println!("Account '{}' not found. Create it? (Y/N)", account_name);
             io::stdout().flush()?;
             let mut choice = String::new();
