@@ -16,3 +16,9 @@ test-performance: build
 	python3 test/performance/test_load.py
 
 test-all: test-unit test-integration test-performance
+
+mcp-setup:
+	pip install -r mcp/requirements.txt
+
+mcp-run:
+	python3 mcp/server.py

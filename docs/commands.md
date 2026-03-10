@@ -18,6 +18,13 @@ When run with the `--headless` flag, the application starts the database service
 - **Usage**: `./SmartRustyPick --headless`
 - **Requirement**: Requires `cert_path`, `key_path`, and `ca_path` to be configured in `config.toml`.
 
+#### MCP Mode
+
+SmartRustyPick also includes a Model Context Protocol (MCP) server for integration with AI agents.
+
+- **Usage**: `make mcp-run` (after `make mcp-setup`)
+- **Documentation**: See [MCP Server README](../mcp/README.md) for detailed tool descriptions and configuration.
+
 ### Data Organization
 
 SmartRustyPick organizes data into **Accounts**. Each account is a collection of files (tables).

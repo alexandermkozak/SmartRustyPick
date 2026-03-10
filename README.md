@@ -34,6 +34,7 @@ field formatting, and complex select operations.
 - **Persistent Configuration**: Customize your environment (e.g., preferred editor, SSL certificates, server address).
 - **Headless Mode**: Run the database as a background service without a CLI.
 - **Smart Login**: Automatic CLI account login based on the current working directory.
+- **MCP Server Support**: Integrated Model Context Protocol (MCP) server for database interaction by other AI agents.
 
 ## Documentation
 
@@ -42,6 +43,7 @@ For more information, see the following documentation:
 - [Data Structures](docs/data_structures.md) - Learn how records and dictionaries are structured.
 - [Commands](docs/commands.md) - See a full list of available CLI commands and modes.
 - [Remote Protocol](docs/protocol.md) - Details on the TCP/SSL remote protocol.
+- [MCP Server](mcp/README.md) - Usage instructions for the Model Context Protocol server.
 - [AI Agents](agents.md) - Documentation on the role and contributions of AI agents in this project.
 
 ## Configuration
@@ -67,3 +69,15 @@ when the CLI is launched.
 3. Run as a headless service: `./target/release/SmartRustyPick --headless`.
    - Requires SSL settings in `config.toml`.
 4. Type `HELP` in the CLI to see all commands.
+
+## MCP Server
+
+This project includes a Model Context Protocol (MCP) server located in the `mcp/` directory. This allows other AI agents
+to interact with the database using standardized tools.
+
+### Running the MCP Server
+
+1. Setup the environment: `make mcp-setup`
+2. Run the server: `make mcp-run`
+
+For detailed configuration and tool descriptions, see [mcp/README.md](mcp/README.md).

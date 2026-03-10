@@ -136,3 +136,10 @@ Manually start the server from within the CLI:
 
 Example:
 `START.SERVER 0.0.0.0:8443 server.crt server.key ca.crt`
+
+## MCP Server Integration
+
+For high-level interaction via AI agents, a Model Context Protocol (MCP) server is available in the `mcp/` directory. It
+wraps this low-level JSON protocol into standardized tools like `read_record`, `write_record`, and `query_records`.
+
+See [mcp/README.md](../mcp/README.md) for more information.
