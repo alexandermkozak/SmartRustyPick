@@ -337,6 +337,24 @@ impl Database {
         Ok(())
     }
 
+    pub fn get_account_for_dir(&self, target_dir: &str) -> Option<String> {
+        let names_field = self.accounts_config.fields.get(0)?;
+        let dirs_field = self.accounts_config.fields.get(1)?;
+
+        let target_path = fs::canonicalize(target_dir).ok()?;
+
+        for (i, _v) in names_field.values.iter().enumerate() {
+            if let Some(dir_str) = dirs_field.values.get(i).and_then(|v| v.sub_values.get(0)) {
+                if let Ok(acc_path) = fs::canonicalize(dir_str) {
+                    if acc_path == target_path {
+                        return names_field.values.get(i).and_then(|v| v.sub_values.get(0)).cloned();
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn get_account_dir(&self, account_name: &str) -> Option<String> {
         // Search in accounts_config (Record: fields correspond to accounts)
         // Let's say field 1 contains account names and field 2 contains their directories.

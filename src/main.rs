@@ -9,13 +9,57 @@ use std::sync::{Arc, Mutex};
 
 fn main() -> io::Result<()> {
     let config = Config::load();
-    
+
+    let args: Vec<String> = std::env::args().collect();
+    let headless = args.iter().any(|arg| arg == "--headless");
+
     // We use a directory "db_storage" to hold our tables
     let db = Arc::new(Mutex::new(Database::new("db_storage")?));
+
+    if headless {
+        let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = config.server_port.unwrap_or(8443);
+        let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
+
+        let cert_path = config.cert_path.clone().expect("headless mode requires cert_path in config.toml");
+        let key_path = config.key_path.clone().expect("headless mode requires key_path in config.toml");
+        let ca_path = config.ca_path.clone().expect("headless mode requires ca_path in config.toml");
+
+        println!("Starting headless database service on {}...", full_addr);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            if let Err(e) = server::run_server(&full_addr, db, &cert_path, &key_path, &ca_path).await {
+                eprintln!("Server error: {}", e);
+            }
+        });
+        return Ok(());
+    }
+
     println!("SmartRustyPick CLI. Type 'HELP' for commands.");
 
-    // Account login prompt
+    // Auto-login based on current directory
+    let auto_account = {
+        let db_lock = db.lock().unwrap();
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        db_lock.get_account_for_dir(current_dir.to_str().unwrap_or("."))
+    };
+
+    if let Some(account_name) = auto_account {
+        let mut db_lock = db.lock().unwrap();
+        if db_lock.logto(&account_name).is_ok() {
+            println!("Auto-logged into account '{}' based on current directory.", account_name);
+            let _ = check_dir_file(&mut db_lock);
+        }
+    }
+
+    // Account login prompt if not logged in
     loop {
+        {
+            let db_lock = db.lock().unwrap();
+            if !db_lock.current_account.is_empty() {
+                break;
+            }
+        }
         print!("Account: ");
         io::stdout().flush()?;
         let mut account_input = String::new();
@@ -45,6 +89,26 @@ fn main() -> io::Result<()> {
             let _ = check_dir_file(&mut db_lock);
             break;
         }
+    }
+
+    // Check if server should be auto-started in background for CLI
+    if config.cert_path.is_some() && config.key_path.is_some() && config.ca_path.is_some() {
+        let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = config.server_port.unwrap_or(8443);
+        let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
+
+        let db_clone = db.clone();
+        let cert_path = config.cert_path.clone().unwrap();
+        let key_path = config.key_path.clone().unwrap();
+        let ca_path = config.ca_path.clone().unwrap();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let _ = server::run_server(&full_addr, db_clone, &cert_path, &key_path, &ca_path).await;
+            });
+        });
+        println!("Database service attached and running in background.");
     }
 
     loop {

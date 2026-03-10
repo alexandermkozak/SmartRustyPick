@@ -6,6 +6,10 @@ use std::path::Path;
 pub struct Config {
     pub editor: Option<String>,
     pub server_port: Option<u16>,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+    pub ca_path: Option<String>,
+    pub server_addr: Option<String>,
 }
 
 impl Config {
@@ -22,6 +26,10 @@ impl Config {
         Config {
             editor: Some("nano".to_string()),
             server_port: Some(8443),
+            cert_path: None,
+            key_path: None,
+            ca_path: None,
+            server_addr: Some("127.0.0.1".to_string()),
         }
     }
 }

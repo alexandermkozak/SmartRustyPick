@@ -116,8 +116,23 @@ Retrieves all keys from a named select list.
 
 ## Starting the Server
 
-The server is started from the CLI:
-`START.SERVER <addr:port> <cert_path> <key_path> <ca_path>`
+The server can be started in several ways:
+
+### Headless Mode
+
+Start the database service directly from the command line:
+`./SmartRustyPick --headless`
+This requires `cert_path`, `key_path`, and `ca_path` to be configured in `config.toml`.
+
+### Automatic Background Service
+
+If `cert_path`, `key_path`, and `ca_path` are provided in `config.toml`, the server starts automatically in the
+background when the CLI is launched.
+
+### CLI Command
+
+Manually start the server from within the CLI:
+`START.SERVER [<addr:port>] <cert_path> <key_path> <ca_path>`
 
 Example:
 `START.SERVER 0.0.0.0:8443 server.crt server.key ca.crt`

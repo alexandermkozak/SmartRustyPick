@@ -1,7 +1,27 @@
+### Application Modes
+
+SmartRustyPick can be run in two modes:
+
+#### CLI Mode (Default)
+
+When run without any flags, SmartRustyPick opens an interactive CLI.
+
+- **Auto-login**: If you launch the application from a directory associated with an account (as defined in
+  `CREATE.ACCOUNT`), it will automatically log into that account.
+- **Background Service**: If SSL certificates are provided in `config.toml`, the database service starts automatically
+  in the background, allowing remote clients to connect to the session.
+
+#### Headless Mode
+
+When run with the `--headless` flag, the application starts the database service without the CLI.
+
+- **Usage**: `./SmartRustyPick --headless`
+- **Requirement**: Requires `cert_path`, `key_path`, and `ca_path` to be configured in `config.toml`.
+
 ### Data Organization
 
 SmartRustyPick organizes data into **Accounts**. Each account is a collection of files (tables).
-When you start the application, you will be prompted to log into an account.
+When you start the application, if not auto-logged, you will be prompted to log into an account.
 
 ### Commands
 
