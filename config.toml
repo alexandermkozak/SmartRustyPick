@@ -1,0 +1,6 @@
+server_addr = "127.0.0.1"
+server_port = 8443
+cert_path = "server.crt"
+key_path = "server.key"
+ca_path = "ca.crt"
+editor = "nano"
