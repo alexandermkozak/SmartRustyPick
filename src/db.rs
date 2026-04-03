@@ -23,7 +23,6 @@ pub struct Value {
     pub sub_values: Vec<String>,
 }
 
-#[allow(dead_code)]
 impl Record {
     pub fn new() -> Self {
         Self::default()
@@ -64,17 +63,7 @@ impl Record {
         res
     }
 
-    // Keep to_string/from_string for compatibility with existing tests/code if needed
-    // but they will use the byte-based implementation under the hood
-    #[allow(dead_code)]
-    pub fn from_string(data: &str) -> Self {
-        Self::from_bytes(data.as_bytes())
-    }
-
-    #[allow(dead_code)]
-    pub fn to_string(&self) -> String {
-        String::from_utf8_lossy(&self.to_bytes()).to_string()
-    }
+    // Removed from_string/to_string as they were dead code
 
     pub fn to_display_string(&self) -> String {
         let display_bytes: Vec<u8> = self.to_bytes().iter().map(|&b| match b {
@@ -867,54 +856,6 @@ impl Database {
         value.to_string()
     }
 
-    #[allow(dead_code)]
-    pub fn query(&mut self, table_name: &str, use_dict_section: bool, dict_name: &str, op: &str, value: &str, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
-        let field_idx = match self.get_field_index(table_name, dict_name) {
-            Some(idx) => idx,
-            None => return vec![],
-        };
-
-        let table = self.get_table(table_name).unwrap(); // safe because get_field_index succeeded
-
-        let mut results = Vec::new();
-        let source_map = if use_dict_section { &table.dictionary } else { &table.records };
-        
-        if let Some(filter_keys) = keys_to_filter {
-            for key in filter_keys {
-                if let Some(record) = source_map.get(key) {
-                    if let Some(field) = record.fields.get(field_idx) {
-                        let mut match_found = false;
-                        for v in &field.values {
-                            if v.sub_values.iter().any(|sv| Self::compare_values(sv, op, value)) {
-                                match_found = true;
-                                break;
-                            }
-                        }
-                        if match_found {
-                            results.push((key.clone(), record.clone()));
-                        }
-                    }
-                }
-            }
-        } else {
-            for (key, record) in source_map {
-                if let Some(field) = record.fields.get(field_idx) {
-                    let mut match_found = false;
-                    for v in &field.values {
-                        if v.sub_values.iter().any(|sv| Self::compare_values(sv, op, value)) {
-                            match_found = true;
-                            break;
-                        }
-                    }
-                    if match_found {
-                        results.push((key.clone(), record.clone()));
-                    }
-                }
-            }
-        }
-        results.sort_by(|a, b| a.0.cmp(&b.0));
-        results
-    }
 
     fn compare_values(record_val: &str, op: &str, search_val: &str) -> bool {
         match op {
@@ -1012,7 +953,7 @@ impl Database {
         current_node
     }
 
-    pub fn query_new(&mut self, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
+    pub fn query(&mut self, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
         let (source_map, field_map) = {
             let table = match self.get_table(table_name) {
                 Some(t) => t,
@@ -1272,7 +1213,7 @@ mod tests {
             db.logto("ACC1")?;
             db.create_table("T1")?;
             let t1 = db.get_table_mut("T1");
-            t1.records.insert("K1".to_string(), Record::from_string("VAL1"));
+            t1.records.insert("K1".to_string(), Record::from_bytes(b"VAL1"));
             t1.dirty = true;
             db.save()?;
 
@@ -1280,7 +1221,7 @@ mod tests {
             db.logto("ACC2")?;
             db.create_table("T1")?;
             let t1_acc2 = db.get_table_mut("T1");
-            t1_acc2.records.insert("K1".to_string(), Record::from_string("VAL2"));
+            t1_acc2.records.insert("K1".to_string(), Record::from_bytes(b"VAL2"));
             t1_acc2.dirty = true;
             db.save()?;
         }
@@ -1290,11 +1231,11 @@ mod tests {
             let mut db = Database::new(base_dir)?;
             db.logto("ACC1")?;
             let t1 = db.get_table("T1").unwrap();
-            assert_eq!(t1.records.get("K1").unwrap().to_string(), "VAL1");
+            assert_eq!(String::from_utf8_lossy(&t1.records.get("K1").unwrap().to_bytes()), "VAL1");
 
             db.logto("ACC2")?;
             let t1 = db.get_table("T1").unwrap();
-            assert_eq!(t1.records.get("K1").unwrap().to_string(), "VAL2");
+            assert_eq!(String::from_utf8_lossy(&t1.records.get("K1").unwrap().to_bytes()), "VAL2");
 
             // Test delete account
             db.delete_account("ACC1")?;
@@ -1341,8 +1282,8 @@ mod tests {
 
     #[test]
     fn test_empty_record() {
-        let record = Record::from_string("");
-        assert_eq!(record.to_string(), "");
+        let record = Record::from_bytes(b"");
+        assert_eq!(record.to_bytes(), Vec::<u8>::new());
     }
 
     #[test]
@@ -1398,7 +1339,12 @@ mod tests {
         r2.fields = vec![Field { values: vec![Value { sub_values: vec!["John".to_string()] }] }];
         table.records.insert("K2".to_string(), r2);
 
-        let results = db.query("USERS", false, "First.Name", "=", "Ted", None);
+        let query = QueryNode::Condition(QueryCondition {
+            field_name: "First.Name".to_string(),
+            op: "=".to_string(),
+            value: "Ted".to_string(),
+        });
+        let results = db.query("USERS", false, &query, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "K1");
 
@@ -1453,11 +1399,11 @@ mod tests {
             db.max_loaded = 10;
 
             db.create_table("T1")?;
-            db.get_table_mut("T1").records.insert("k".to_string(), Record::from_string("v1"));
+            db.get_table_mut("T1").records.insert("k".to_string(), Record::from_bytes(b"v1"));
             db.get_table_mut("T1").dirty = true;
 
             db.create_table("T2")?;
-            db.get_table_mut("T2").records.insert("k".to_string(), Record::from_string("v2"));
+            db.get_table_mut("T2").records.insert("k".to_string(), Record::from_bytes(b"v2"));
             db.get_table_mut("T2").dirty = true;
             
             db.max_loaded = 2;
@@ -1491,7 +1437,7 @@ mod tests {
             let mut db = Database::new(base_dir)?;
             db.logto("ACC1")?;
             let t1 = db.get_table("T1").expect("T1 should be available on disk");
-            assert_eq!(t1.records.get("k").unwrap().to_string(), "v1");
+            assert_eq!(String::from_utf8_lossy(&t1.records.get("k").unwrap().to_bytes()), "v1");
         }
 
         fs::remove_dir_all(base_dir)?;
@@ -1519,7 +1465,12 @@ mod tests {
         table.dictionary.insert("First.Name".to_string(), name_dict);
 
         // Querying the dictionary section: Find all dictionary items where ATTR is "1"
-        let results = db.query("USERS", true, "ATTR", "=", "1", None);
+        let query = QueryNode::Condition(QueryCondition {
+            field_name: "ATTR".to_string(),
+            op: "=".to_string(),
+            value: "1".to_string(),
+        });
+        let results = db.query("USERS", true, &query, None);
         
         // Should find both "ATTR" and "First.Name"
         assert_eq!(results.len(), 2);
@@ -1585,33 +1536,33 @@ mod tests {
         r3.fields = vec![Field { values: vec![Value { sub_values: vec!["Cherry".to_string()] }] }];
         table.records.insert("K3".to_string(), r3);
 
-        // Test =
-        assert_eq!(db.query("T1", false, "F1", "=", "Apple", None).len(), 1);
+        let q = |op: &str, val: &str| QueryNode::Condition(QueryCondition { field_name: "F1".to_string(), op: op.to_string(), value: val.to_string() });
+        assert_eq!(db.query("T1", false, &q("=", "Apple"), None).len(), 1);
         
         // Test #
-        assert_eq!(db.query("T1", false, "F1", "#", "Apple", None).len(), 2);
+        assert_eq!(db.query("T1", false, &q("#", "Apple"), None).len(), 2);
 
         // Test <
-        assert_eq!(db.query("T1", false, "F1", "<", "Banana", None).len(), 1); // Apple
+        assert_eq!(db.query("T1", false, &q("<", "Banana"), None).len(), 1); // Apple
 
         // Test >
-        assert_eq!(db.query("T1", false, "F1", ">", "Banana", None).len(), 1); // Cherry
+        assert_eq!(db.query("T1", false, &q(">", "Banana"), None).len(), 1); // Cherry
 
         // Test <=
-        assert_eq!(db.query("T1", false, "F1", "<=", "Banana", None).len(), 2); // Apple, Banana
+        assert_eq!(db.query("T1", false, &q("<=", "Banana"), None).len(), 2); // Apple, Banana
 
         // Test >=
-        assert_eq!(db.query("T1", false, "F1", ">=", "Banana", None).len(), 2); // Banana, Cherry
+        assert_eq!(db.query("T1", false, &q(">=", "Banana"), None).len(), 2); // Banana, Cherry
 
         // Test wildcards with =
-        assert_eq!(db.query("T1", false, "F1", "=", "App]", None).len(), 1);
-        assert_eq!(db.query("T1", false, "F1", "=", "[ana]", None).len(), 1); // Banana contains ana
-        assert_eq!(db.query("T1", false, "F1", "=", "[ple", None).len(), 1); // Apple ends with ple
+        assert_eq!(db.query("T1", false, &q("=", "App]"), None).len(), 1);
+        assert_eq!(db.query("T1", false, &q("=", "[ana]"), None).len(), 1); // Banana contains ana
+        assert_eq!(db.query("T1", false, &q("=", "[ple"), None).len(), 1); // Apple ends with ple
 
         // Test operators [ and ]
-        assert_eq!(db.query("T1", false, "F1", "]", "App", None).len(), 1); // Starts with App
-        assert_eq!(db.query("T1", false, "F1", "[", "ple", None).len(), 1); // Ends with ple
-        assert_eq!(db.query("T1", false, "F1", "[]", "ana", None).len(), 1); // Contains ana
+        assert_eq!(db.query("T1", false, &q("]", "App"), None).len(), 1); // Starts with App
+        assert_eq!(db.query("T1", false, &q("[", "ple"), None).len(), 1); // Ends with ple
+        assert_eq!(db.query("T1", false, &q("[]", "ana"), None).len(), 1); // Contains ana
 
         fs::remove_dir_all("test_op_dir")?;
         Ok(())

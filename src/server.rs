@@ -238,11 +238,11 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>) -> Response {
             let is_dict = req.is_dict.unwrap_or(false);
 
             let records = if let Some(node) = req.query_node {
-                db.query_new(&table_name, is_dict, &node, None)
+                db.query(&table_name, is_dict, &node, None)
             } else if let Some(qs) = req.query_string {
                 let parts: Vec<&str> = qs.split_whitespace().collect();
                 if let Some(node) = db.parse_query(&table_name, &parts) {
-                    db.query_new(&table_name, is_dict, &node, None)
+                    db.query(&table_name, is_dict, &node, None)
                 } else {
                     return Response { status: "ERROR".to_string(), message: Some("Invalid query string".to_string()), record: None, results: None, keys: None, count: None };
                 }

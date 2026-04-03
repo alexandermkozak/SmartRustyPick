@@ -492,7 +492,7 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
 
     let results = if parts.len() >= offset + 2 && parts[offset + 1].to_uppercase() == "WITH" {
         if let Some(query) = db.parse_query(table_name, &parts[offset + 1..]) {
-            db.query_new(table_name, is_dict, &query, keys_to_filter.as_deref())
+            db.query(table_name, is_dict, &query, keys_to_filter.as_deref())
         } else {
             println!("INVALID QUERY FORMAT");
             return;
