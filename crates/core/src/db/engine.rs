@@ -45,220 +45,239 @@ impl Database {
             fs::create_dir_all(&db.storage_dir)?;
         }
 
-        // Load or create account registry
-        let registry_path = format!("{}/accounts.reg", db.storage_dir);
-        if Path::new(&registry_path).exists() {
-            let mut map = HashMap::new();
-            Self::load_section(&mut map, &registry_path)?;
-            if let Some(reg_rec) = map.remove("registry") {
-                db.accounts_config = reg_rec;
-            }
-        }
-
-        // Ensure SYSTEM account exists
-        if db.get_account_dir("SYSTEM").is_none() {
-            db.create_account("SYSTEM", None)?;
-        }
+        db.load_account_registry()?;
+        db.ensure_system_account()?;
 
         // Explicitly log to SYSTEM to populate available_tables
         db.logto("SYSTEM")?;
 
         // Perform all system setup within a single account switch
         db.run_in_system_account(|db| {
-            // Ensure DIR file exists for SYSTEM account
-            if !db.available_tables.contains("DIR") {
-                let _ = db.create_table("DIR");
-                let _ = db.sync_dir_file();
-            }
-
-            // Ensure $LOGS file exists
-            if !db.available_tables.contains("$LOGS") {
-                let _ = db.create_table("$LOGS");
-            }
-
-            // Ensure $ACCOUNTS file exists
-            if !db.available_tables.contains("$ACCOUNTS") {
-                let _ = db.create_table("$ACCOUNTS");
-            }
-            // Populate $ACCOUNTS with all non-SYSTEM accounts
-            let mut accounts_to_list = Vec::new();
-            if let Some(names_field) = db.accounts_config.fields.get(0) {
-                if let Some(dirs_field) = db.accounts_config.fields.get(1) {
-                    for (i, v) in names_field.values.iter().enumerate() {
-                        if let Some(name) = v.sub_values.get(0) {
-                            if name != "SYSTEM" {
-                                if let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.get(0)) {
-                                    accounts_to_list.push((name.clone(), dir.clone()));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            {
-                let accounts_table = db.get_table_mut("$ACCOUNTS");
-                for (name, dir) in accounts_to_list {
-                    let mut record = Record::new();
-                    record.fields.push(Field {
-                        values: vec![Value { sub_values: vec![dir] }]
-                    });
-                    accounts_table.records.insert(name, record);
-                }
-                accounts_table.dirty = true;
-            }
-
-            // Ensure $CLIENTS file exists
-            if !db.available_tables.contains("$CLIENTS") {
-                let _ = db.create_table("$CLIENTS");
-            }
-
-            // Ensure $SAVEDLISTS file exists
-            if !db.available_tables.contains("$SAVEDLISTS") {
-                let _ = db.create_table("$SAVEDLISTS");
-            }
-
-            // One-time migration from certs.reg to $CLIENTS
-            let certs_path = format!("{}/certs.reg", db.storage_dir);
-            if Path::new(&certs_path).exists() {
-                let mut map = HashMap::new();
-                if Self::load_section(&mut map, &certs_path).is_ok() {
-                    if let Some(certs_rec) = map.remove("certs") {
-                        if let Some(f) = certs_rec.fields.get(0) {
-                            let table = db.get_table_mut("$CLIENTS");
-                            for v in &f.values {
-                                for sv in &v.sub_values {
-                                    if !sv.is_empty() {
-                                        let tp_lower = sv.to_lowercase();
-                                        // Migrate if not already present
-                                        let already_exists = table.records.values().any(|r| {
-                                            r.fields.get(0).and_then(|f| f.values.get(0)).and_then(|v| v.sub_values.get(0)) == Some(&tp_lower)
-                                        });
-                                        if !already_exists {
-                                            let mut rec = Record::new();
-                                            rec.fields.push(Field { values: vec![Value { sub_values: vec![tp_lower] }] }); // Thumbprint
-                                            rec.fields.push(Field { values: vec![] }); // No specific accounts
-                                            rec.fields.push(Field { values: vec![Value { sub_values: vec!["Y".to_string()] }] }); // Admin by default for legacy certs
-                                            table.records.insert(format!("migrated_{}", &sv[..8]), rec);
-                                            table.dirty = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let _ = fs::rename(&certs_path, format!("{}.migrated", certs_path));
-            }
-
-            // Self-heal default dictionaries for all $ files and DIR
-            let table_names: Vec<String> = db.available_tables.iter()
-                .filter(|n| n.starts_with('$') || *n == "DIR")
-                .cloned()
-                .collect();
-
-            let mut any_updated = false;
-            for table_name in table_names {
-                let mut updated = false;
-                let table = db.get_table_mut(&table_name);
-                match table_name.as_str() {
-                    "$LOGS" => {
-                        if !table.dictionary.contains_key("MESSAGE") {
-                            table.dictionary.insert("MESSAGE".to_string(), Record::from_display_string("1^MESSAGE^L^60"));
-                            updated = true;
-                        }
-                        if !table.dictionary.contains_key("DETAIL") {
-                            table.dictionary.insert("DETAIL".to_string(), Record::from_display_string("2^DETAIL^L^40"));
-                            updated = true;
-                        }
-                    }
-                    "$ACCOUNTS" => {
-                        if !table.dictionary.contains_key("PATH") {
-                            table.dictionary.insert("PATH".to_string(), Record::from_display_string("1^PATH^L^50"));
-                            updated = true;
-                        }
-                    }
-                    "$CLIENTS" => {
-                        if !table.dictionary.contains_key("THUMBPRINT") {
-                            table.dictionary.insert("THUMBPRINT".to_string(), Record::from_display_string("1^THUMBPRINT^L^64"));
-                            updated = true;
-                        }
-                        if !table.dictionary.contains_key("ACCOUNTS") {
-                            table.dictionary.insert("ACCOUNTS".to_string(), Record::from_display_string("2^ACCOUNTS^L^30"));
-                            updated = true;
-                        }
-                        if !table.dictionary.contains_key("ADMIN") {
-                            table.dictionary.insert("ADMIN".to_string(), Record::from_display_string("3^ADMIN^L^5"));
-                            updated = true;
-                        }
-                    }
-                    "$SAVEDLISTS" => {
-                        if !table.dictionary.contains_key("TABLE") {
-                            table.dictionary.insert("TABLE".to_string(), Record::from_display_string("1^TABLE^L^20"));
-                            updated = true;
-                        }
-                        if !table.dictionary.contains_key("IS_DICT") {
-                            table.dictionary.insert("IS_DICT".to_string(), Record::from_display_string("2^IS_DICT^L^1"));
-                            updated = true;
-                        }
-                    }
-                    "DIR" => {
-                        if !table.dictionary.contains_key("TYPE") {
-                            table.dictionary.insert("TYPE".to_string(), Record::from_display_string("1^TYPE^L^1"));
-                            updated = true;
-                        }
-                    }
-                    _ => {}
-                }
-                if updated {
-                    table.dirty = true;
-                    any_updated = true;
-                }
-            }
-
-            // Populate in-memory structures from $CLIENTS
-            {
-                let table = db.get_table_mut("$CLIENTS");
-                let mut clients = Vec::new();
-                for record in table.records.values() {
-                    if let Some(tp) = record.fields.get(0).and_then(|f| f.values.get(0)).and_then(|v| v.sub_values.get(0)) {
-                        let tp_lower = tp.to_lowercase();
-                        let mut allowed_accounts = Vec::new();
-                        if let Some(acc_field) = record.fields.get(1) {
-                            for v in &acc_field.values {
-                                if let Some(acc) = v.sub_values.get(0) {
-                                    if !acc.is_empty() {
-                                        allowed_accounts.push(acc.clone());
-                                    }
-                                }
-                            }
-                        }
-                        let is_admin = record.fields.get(2)
-                            .and_then(|f| f.values.get(0))
-                            .and_then(|v| v.sub_values.get(0))
-                            .map(|s| s == "Y")
-                            .unwrap_or(false);
-                        clients.push(ClientInfo {
-                            thumbprint: tp_lower,
-                            allowed_accounts,
-                            is_admin,
-                        });
-                    }
-                }
-                db.authorized_clients.clear();
-                db.authorized_certs.clear();
-                for info in clients {
-                    let tp = info.thumbprint.clone();
-                    db.authorized_clients.insert(tp.clone(), info);
-                    db.authorized_certs.insert(tp);
-                }
-            }
-            if any_updated {
-                db.save()?;
-            }
+            db.ensure_system_files()?;
+            db.migrate_legacy_certs()?;
+            db.self_heal_system_dictionaries()?;
+            db.load_clients_from_table()?;
             Ok(())
         })?;
 
         Ok(db)
+    }
+
+    fn load_account_registry(&mut self) -> io::Result<()> {
+        let registry_path = format!("{}/accounts.reg", self.storage_dir);
+        if Path::new(&registry_path).exists() {
+            let mut map = HashMap::new();
+            Self::load_section(&mut map, &registry_path)?;
+            if let Some(reg_rec) = map.remove("registry") {
+                self.accounts_config = reg_rec;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_system_account(&mut self) -> io::Result<()> {
+        if self.get_account_dir("SYSTEM").is_none() {
+            self.create_account("SYSTEM", None)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_system_files(&mut self) -> io::Result<()> {
+        // Ensure DIR file exists for SYSTEM account
+        if !self.available_tables.contains("DIR") {
+            let _ = self.create_table("DIR");
+            let _ = self.sync_dir_file();
+        }
+
+        // Ensure mandatory system files exist
+        let system_files = vec!["$LOGS", "$ACCOUNTS", "$CLIENTS", "$SAVEDLISTS"];
+        for file in system_files {
+            if !self.available_tables.contains(file) {
+                let _ = self.create_table(file);
+            }
+        }
+
+        // Populate $ACCOUNTS with all non-SYSTEM accounts
+        let mut accounts_to_list = Vec::new();
+        if let Some(names_field) = self.accounts_config.fields.get(0) {
+            if let Some(dirs_field) = self.accounts_config.fields.get(1) {
+                for (i, v) in names_field.values.iter().enumerate() {
+                    if let Some(name) = v.sub_values.get(0) {
+                        if name != "SYSTEM" {
+                            if let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.get(0)) {
+                                accounts_to_list.push((name.clone(), dir.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let accounts_table = self.get_table_mut("$ACCOUNTS");
+        for (name, dir) in accounts_to_list {
+            let mut record = Record::new();
+            while record.fields.len() <= SYS_ACCOUNTS_PATH_IDX {
+                record.fields.push(Field::default());
+            }
+            record.fields[SYS_ACCOUNTS_PATH_IDX].values.push(Value { sub_values: vec![dir] });
+            accounts_table.records.insert(name, record);
+        }
+        accounts_table.dirty = true;
+        Ok(())
+    }
+
+    fn migrate_legacy_certs(&mut self) -> io::Result<()> {
+        let certs_path = format!("{}/certs.reg", self.storage_dir);
+        if !Path::new(&certs_path).exists() {
+            return Ok(());
+        }
+
+        let mut map = HashMap::new();
+        if Self::load_section(&mut map, &certs_path).is_ok() {
+            if let Some(certs_rec) = map.remove("certs") {
+                if let Some(f) = certs_rec.fields.get(0) {
+                    let table = self.get_table_mut("$CLIENTS");
+                    for v in &f.values {
+                        for sv in &v.sub_values {
+                            if !sv.is_empty() {
+                                let tp_lower = sv.to_lowercase();
+                                // Migrate if not already present
+                                let already_exists = table.records.values().any(|r| {
+                                    r.fields.get(0).and_then(|f| f.values.get(0)).and_then(|v| v.sub_values.get(0)) == Some(&tp_lower)
+                                });
+                                if !already_exists {
+                                    let mut rec = Record::new();
+                                    while rec.fields.len() <= SYS_CLIENTS_ADMIN_IDX {
+                                        rec.fields.push(Field::default());
+                                    }
+                                    rec.fields[SYS_CLIENTS_THUMBPRINT_IDX].values.push(Value { sub_values: vec![tp_lower] });
+                                    rec.fields[SYS_CLIENTS_ADMIN_IDX].values.push(Value { sub_values: vec!["Y".to_string()] });
+                                    table.records.insert(format!("migrated_{}", &sv[..8]), rec);
+                                    table.dirty = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = fs::rename(&certs_path, format!("{}.migrated", certs_path));
+        Ok(())
+    }
+
+    fn self_heal_system_dictionaries(&mut self) -> io::Result<()> {
+        let table_names: Vec<String> = self.available_tables.iter()
+            .filter(|n| n.starts_with('$') || *n == "DIR")
+            .cloned()
+            .collect();
+
+        let mut any_updated = false;
+        for table_name in table_names {
+            if self.ensure_default_dictionaries(&table_name)? {
+                any_updated = true;
+            }
+        }
+
+        if any_updated {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_default_dictionaries(&mut self, table_name: &str) -> io::Result<bool> {
+        let mut updated = false;
+        let table = self.get_table_mut(table_name);
+        match table_name {
+            "$LOGS" => {
+                if !table.dictionary.contains_key("MESSAGE") {
+                    table.dictionary.insert("MESSAGE".to_string(), Record::from_display_string("1^MESSAGE^L^60"));
+                    updated = true;
+                }
+                if !table.dictionary.contains_key("DETAIL") {
+                    table.dictionary.insert("DETAIL".to_string(), Record::from_display_string("2^DETAIL^L^40"));
+                    updated = true;
+                }
+            }
+            "$ACCOUNTS" => {
+                if !table.dictionary.contains_key("PATH") {
+                    table.dictionary.insert("PATH".to_string(), Record::from_display_string("1^PATH^L^50"));
+                    updated = true;
+                }
+            }
+            "$CLIENTS" => {
+                if !table.dictionary.contains_key("THUMBPRINT") {
+                    table.dictionary.insert("THUMBPRINT".to_string(), Record::from_display_string("1^THUMBPRINT^L^64"));
+                    updated = true;
+                }
+                if !table.dictionary.contains_key("ACCOUNTS") {
+                    table.dictionary.insert("ACCOUNTS".to_string(), Record::from_display_string("2^ACCOUNTS^L^30"));
+                    updated = true;
+                }
+                if !table.dictionary.contains_key("ADMIN") {
+                    table.dictionary.insert("ADMIN".to_string(), Record::from_display_string("3^ADMIN^L^5"));
+                    updated = true;
+                }
+            }
+            "$SAVEDLISTS" => {
+                if !table.dictionary.contains_key("TABLE") {
+                    table.dictionary.insert("TABLE".to_string(), Record::from_display_string("1^TABLE^L^20"));
+                    updated = true;
+                }
+                if !table.dictionary.contains_key("IS_DICT") {
+                    table.dictionary.insert("IS_DICT".to_string(), Record::from_display_string("2^IS_DICT^L^1"));
+                    updated = true;
+                }
+            }
+            "DIR" => {
+                if !table.dictionary.contains_key("TYPE") {
+                    table.dictionary.insert("TYPE".to_string(), Record::from_display_string("1^TYPE^L^1"));
+                    updated = true;
+                }
+            }
+            _ => {}
+        }
+        if updated {
+            table.dirty = true;
+        }
+        Ok(updated)
+    }
+
+    fn load_clients_from_table(&mut self) -> io::Result<()> {
+        let table = self.get_table_mut("$CLIENTS");
+        let mut clients = Vec::new();
+        for record in table.records.values() {
+            if let Some(tp) = record.fields.get(SYS_CLIENTS_THUMBPRINT_IDX).and_then(|f| f.values.get(0)).and_then(|v| v.sub_values.get(0)) {
+                let tp_lower = tp.to_lowercase();
+                let mut allowed_accounts = Vec::new();
+                if let Some(acc_field) = record.fields.get(SYS_CLIENTS_ACCOUNTS_IDX) {
+                    for v in &acc_field.values {
+                        if let Some(acc) = v.sub_values.get(0) {
+                            if !acc.is_empty() {
+                                allowed_accounts.push(acc.clone());
+                            }
+                        }
+                    }
+                }
+                let is_admin = record.fields.get(SYS_CLIENTS_ADMIN_IDX)
+                    .and_then(|f| f.values.get(0))
+                    .and_then(|v| v.sub_values.get(0))
+                    .map(|s| s == "Y")
+                    .unwrap_or(false);
+                clients.push(ClientInfo {
+                    thumbprint: tp_lower,
+                    allowed_accounts,
+                    is_admin,
+                });
+            }
+        }
+        self.authorized_clients.clear();
+        self.authorized_certs.clear();
+        for info in clients {
+            let tp = info.thumbprint.clone();
+            self.authorized_clients.insert(tp.clone(), info);
+            self.authorized_certs.insert(tp);
+        }
+        Ok(())
     }
 
     pub fn run_in_system_account<F, R>(&mut self, f: F) -> io::Result<R>
@@ -328,19 +347,17 @@ impl Database {
         self.accounts_config.fields[0].values.push(Value { sub_values: vec![name.to_string()] });
         self.accounts_config.fields[1].values.push(Value { sub_values: vec![dir.clone()] });
 
-        // Persist registry
-        let mut map = HashMap::new();
-        map.insert("registry".to_string(), self.accounts_config.clone());
-        Self::save_section(&map, &format!("{}/accounts.reg", self.storage_dir))?;
+        self.persist_account_registry()?;
 
         // Update $ACCOUNTS table if it exists
         self.run_in_system_account(|db| {
             if db.available_tables.contains("$ACCOUNTS") {
                 let accounts_table = db.get_table_mut("$ACCOUNTS");
                 let mut record = Record::new();
-                record.fields.push(Field {
-                    values: vec![Value { sub_values: vec![dir] }]
-                });
+                while record.fields.len() <= SYS_ACCOUNTS_PATH_IDX {
+                    record.fields.push(Field::default());
+                }
+                record.fields[SYS_ACCOUNTS_PATH_IDX].values.push(Value { sub_values: vec![dir] });
                 accounts_table.records.insert(name.to_string(), record);
                 accounts_table.dirty = true;
                 db.save()?;
@@ -357,6 +374,12 @@ impl Database {
             self.lru_order.clear();
         }
         Ok(())
+    }
+
+    fn persist_account_registry(&self) -> io::Result<()> {
+        let mut map = HashMap::new();
+        map.insert("registry".to_string(), self.accounts_config.clone());
+        Self::save_section(&map, &format!("{}/accounts.reg", self.storage_dir))
     }
 
     pub fn delete_account(&mut self, name: &str) -> io::Result<()> {
@@ -378,9 +401,7 @@ impl Database {
         }
 
         // Persist registry
-        let mut map = HashMap::new();
-        map.insert("registry".to_string(), self.accounts_config.clone());
-        Self::save_section(&map, &format!("{}/accounts.reg", self.storage_dir))?;
+        self.persist_account_registry()?;
 
         // Remove from $ACCOUNTS table
         self.run_in_system_account(|db| {
@@ -601,39 +622,8 @@ impl Database {
         }
 
         // Set default dictionary for SYSTEM files
-        if self.current_account == "SYSTEM" && name.starts_with('$') {
-            let mut updated = false;
-            let table = self.get_table_mut(name);
-            match name {
-                "$LOGS" => {
-                    table.dictionary.insert("MESSAGE".to_string(), Record::from_display_string("1^MESSAGE^L^60"));
-                    table.dictionary.insert("DETAIL".to_string(), Record::from_display_string("2^DETAIL^L^40"));
-                    updated = true;
-                }
-                "$ACCOUNTS" => {
-                    table.dictionary.insert("PATH".to_string(), Record::from_display_string("1^PATH^L^50"));
-                    updated = true;
-                }
-                "$CLIENTS" => {
-                    table.dictionary.insert("THUMBPRINT".to_string(), Record::from_display_string("1^THUMBPRINT^L^64"));
-                    table.dictionary.insert("ACCOUNTS".to_string(), Record::from_display_string("2^ACCOUNTS^L^30"));
-                    table.dictionary.insert("ADMIN".to_string(), Record::from_display_string("3^ADMIN^L^5"));
-                    updated = true;
-                }
-                "$SAVEDLISTS" => {
-                    table.dictionary.insert("TABLE".to_string(), Record::from_display_string("1^TABLE^L^20"));
-                    table.dictionary.insert("IS_DICT".to_string(), Record::from_display_string("2^IS_DICT^L^1"));
-                    updated = true;
-                }
-                _ => {}
-            }
-            if updated {
-                table.dirty = true;
-            }
-        } else if name == "DIR" {
-            let table = self.get_table_mut(name);
-            table.dictionary.insert("TYPE".to_string(), Record::from_display_string("1^TYPE^L^1"));
-            table.dirty = true;
+        if self.current_account == "SYSTEM" && (name.starts_with('$') || name == "DIR") {
+            let _ = self.ensure_default_dictionaries(name);
         }
 
         Ok(())
@@ -707,7 +697,7 @@ impl Database {
         let table = self.get_table_read_only(table_name)?;
         if let Some(rec) = table.dictionary.get(field_name) {
             // Pick MDn conversion is in Field 8
-            if let Some(f8) = rec.fields.get(7) {
+            if let Some(f8) = rec.fields.get(DICT_CONV_IDX) {
                 if let Some(v) = f8.values.get(0) {
                     let code: &String = v.sub_values.get(0)?;
                     if !code.is_empty() {
@@ -759,7 +749,7 @@ impl Database {
         if field_name == "ID" { return Some(0); }
         let table = self.get_table_read_only(table_name)?;
         if let Some(rec) = table.dictionary.get(field_name) {
-            if let Some(f1) = rec.fields.get(0) {
+            if let Some(f1) = rec.fields.get(DICT_FIELD_IDX) {
                 if let Some(v1) = f1.values.get(0) {
                     let idx_str: &String = v1.sub_values.get(0)?;
                     if let Ok(idx) = idx_str.parse::<usize>() {
@@ -787,16 +777,16 @@ impl Database {
             let key = format!("{}*{}*{}*{}", date_str, time_str, now.microsecond(), account);
 
             let mut record = Record::new();
+            while record.fields.len() <= SYS_LOGS_DETAIL_IDX {
+                record.fields.push(Field::default());
+            }
+
             // Field 1: Message
-            record.fields.push(Field {
-                values: vec![Value { sub_values: vec![message.to_string()] }]
-            });
+            record.fields[SYS_LOGS_MESSAGE_IDX].values.push(Value { sub_values: vec![message.to_string()] });
 
             // Field 2: Detail
             if db.log_detail == "detailed" {
-                record.fields.push(Field {
-                    values: vec![Value { sub_values: vec![format!("UTC: {}", now)] }]
-                });
+                record.fields[SYS_LOGS_DETAIL_IDX].values.push(Value { sub_values: vec![format!("UTC: {}", now)] });
             }
 
             let max_records = db.max_log_records;
@@ -826,20 +816,17 @@ impl Database {
             {
                 let table = db.get_table_mut("$CLIENTS");
                 let mut record = Record::new();
-                // Field 0: Thumbprint
-                record.fields.push(Field {
-                    values: vec![Value { sub_values: vec![thumbprint_lower.clone()] }]
-                });
-                // Field 1: Allowed Accounts
-                let mut accounts_field = Field::default();
-                for acc in &allowed_accounts {
-                    accounts_field.values.push(Value { sub_values: vec![acc.clone()] });
+                while record.fields.len() <= SYS_CLIENTS_ADMIN_IDX {
+                    record.fields.push(Field::default());
                 }
-                record.fields.push(accounts_field);
+                // Field 0: Thumbprint
+                record.fields[SYS_CLIENTS_THUMBPRINT_IDX].values.push(Value { sub_values: vec![thumbprint_lower] });
+                // Field 1: Allowed Accounts
+                for acc in &allowed_accounts {
+                    record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.push(Value { sub_values: vec![acc.clone()] });
+                }
                 // Field 2: Admin flag
-                record.fields.push(Field {
-                    values: vec![Value { sub_values: vec![if is_admin { "Y".to_string() } else { "".to_string() }] }]
-                });
+                record.fields[SYS_CLIENTS_ADMIN_IDX].values.push(Value { sub_values: vec![if is_admin { "Y".to_string() } else { "".to_string() }] });
 
                 table.records.insert(name.to_string(), record);
                 table.dirty = true;
@@ -847,12 +834,7 @@ impl Database {
             db.save()?;
 
             // Update in-memory structures
-            db.authorized_clients.insert(thumbprint_lower.clone(), ClientInfo {
-                thumbprint: thumbprint_lower.clone(),
-                allowed_accounts,
-                is_admin,
-            });
-            db.authorized_certs.insert(thumbprint_lower);
+            db.load_clients_from_table()?;
 
             // Sync with certs.reg for backward compatibility (optional but safe)
             db.save_certs()
@@ -861,58 +843,29 @@ impl Database {
 
     pub fn add_client_account(&mut self, name: &str, account: &str) -> io::Result<bool> {
         self.run_in_system_account(|db| {
-            let mut thumbprint = None;
             let mut success = false;
-            let mut existing_accounts = Vec::new();
-            let mut is_admin = false;
             {
                 let table = db.get_table_mut("$CLIENTS");
                 if let Some(record) = table.records.get_mut(name) {
-                    // Get thumbprint for updating in-memory map later
-                    thumbprint = record.fields.get(0)
-                        .and_then(|f| f.values.get(0))
-                        .and_then(|v| v.sub_values.get(0))
-                        .cloned();
-
-                    // Ensure Field 1 exists
-                    while record.fields.len() <= 1 {
+                    // Ensure mandatory fields exist
+                    while record.fields.len() <= SYS_CLIENTS_ACCOUNTS_IDX {
                         record.fields.push(Field::default());
                     }
 
                     // Check if account already exists in Field 1
-                    let already_exists = record.fields[1].values.iter().any(|v| v.sub_values.get(0) == Some(&account.to_string()));
+                    let already_exists = record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.iter().any(|v| v.sub_values.get(0) == Some(&account.to_string()));
 
                     if !already_exists {
-                        record.fields[1].values.push(Value { sub_values: vec![account.to_string()] });
+                        record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.push(Value { sub_values: vec![account.to_string()] });
                         table.dirty = true;
                         success = true;
                     }
-
-                    // Collect all accounts for in-memory update
-                    for v in &record.fields[1].values {
-                        if let Some(acc) = v.sub_values.get(0) {
-                            existing_accounts.push(acc.clone());
-                        }
-                    }
-
-                    is_admin = record.fields.get(2)
-                        .and_then(|f| f.values.get(0))
-                        .and_then(|v| v.sub_values.get(0))
-                        .map(|s| s == "Y")
-                        .unwrap_or(false);
                 }
             }
 
             if success {
                 db.save()?;
-                if let Some(tp) = thumbprint {
-                    let tp_lower = tp.to_lowercase();
-                    db.authorized_clients.insert(tp_lower.clone(), ClientInfo {
-                        thumbprint: tp_lower,
-                        allowed_accounts: existing_accounts,
-                        is_admin,
-                    });
-                }
+                db.load_clients_from_table()?;
             }
 
             Ok(success)
@@ -921,52 +874,25 @@ impl Database {
 
     pub fn remove_client_account(&mut self, name: &str, account: &str) -> io::Result<bool> {
         self.run_in_system_account(|db| {
-            let mut thumbprint = None;
             let mut success = false;
-            let mut existing_accounts = Vec::new();
-            let mut is_admin = false;
             {
                 let table = db.get_table_mut("$CLIENTS");
                 if let Some(record) = table.records.get_mut(name) {
-                    thumbprint = record.fields.get(0)
-                        .and_then(|f| f.values.get(0))
-                        .and_then(|v| v.sub_values.get(0))
-                        .cloned();
+                    if record.fields.len() > SYS_CLIENTS_ACCOUNTS_IDX {
+                        let original_len = record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len();
+                        record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.retain(|v| v.sub_values.get(0).map(|s| s != account).unwrap_or(true));
 
-                    if record.fields.len() > 1 {
-                        let original_len = record.fields[1].values.len();
-                        record.fields[1].values.retain(|v| v.sub_values.get(0).map(|s| s != account).unwrap_or(true));
-
-                        if record.fields[1].values.len() < original_len {
+                        if record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len() < original_len {
                             table.dirty = true;
                             success = true;
                         }
-
-                        for v in &record.fields[1].values {
-                            if let Some(acc) = v.sub_values.get(0) {
-                                existing_accounts.push(acc.clone());
-                            }
-                        }
                     }
-
-                    is_admin = record.fields.get(2)
-                        .and_then(|f| f.values.get(0))
-                        .and_then(|v| v.sub_values.get(0))
-                        .map(|s| s == "Y")
-                        .unwrap_or(false);
                 }
             }
 
             if success {
                 db.save()?;
-                if let Some(tp) = thumbprint {
-                    let tp_lower = tp.to_lowercase();
-                    db.authorized_clients.insert(tp_lower.clone(), ClientInfo {
-                        thumbprint: tp_lower,
-                        allowed_accounts: existing_accounts,
-                        is_admin,
-                    });
-                }
+                db.load_clients_from_table()?;
             }
             Ok(success)
         })
@@ -974,17 +900,9 @@ impl Database {
 
     pub fn remove_authorized_client(&mut self, name: &str) -> io::Result<bool> {
         self.run_in_system_account(|db| {
-            let mut removed_thumbprint = None;
             let found = {
                 let table = db.get_table_mut("$CLIENTS");
-                if let Some(record) = table.records.remove(name) {
-                    if let Some(f) = record.fields.get(0) {
-                        if let Some(v) = f.values.get(0) {
-                            if let Some(tp) = v.sub_values.get(0) {
-                                removed_thumbprint = Some(tp.clone());
-                            }
-                        }
-                    }
+                if table.records.remove(name).is_some() {
                     table.dirty = true;
                     true
                 } else {
@@ -994,12 +912,8 @@ impl Database {
 
             if found {
                 db.save()?;
-                if let Some(tp) = removed_thumbprint {
-                    let tp_lower = tp.to_lowercase();
-                    db.authorized_certs.remove(&tp_lower);
-                    db.authorized_clients.remove(&tp_lower);
-                    let _ = db.save_certs();
-                }
+                db.load_clients_from_table()?;
+                let _ = db.save_certs();
             }
             Ok(found)
         })

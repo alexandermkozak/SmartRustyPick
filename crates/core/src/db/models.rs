@@ -5,6 +5,21 @@ pub const FM: u8 = 254; // Field Mark
 pub const VM: u8 = 253; // Value Mark
 pub const SVM: u8 = 252; // Sub-Value Mark
 
+// System file field indices
+pub const SYS_ACCOUNTS_PATH_IDX: usize = 0;
+pub const SYS_CLIENTS_THUMBPRINT_IDX: usize = 0;
+pub const SYS_CLIENTS_ACCOUNTS_IDX: usize = 1;
+pub const SYS_CLIENTS_ADMIN_IDX: usize = 2;
+pub const SYS_LOGS_MESSAGE_IDX: usize = 0;
+pub const SYS_LOGS_DETAIL_IDX: usize = 1;
+
+// Dictionary record field indices
+pub const DICT_FIELD_IDX: usize = 0;
+pub const DICT_NAME_IDX: usize = 1;
+pub const DICT_JUSTIFY_IDX: usize = 2;
+pub const DICT_WIDTH_IDX: usize = 3;
+pub const DICT_CONV_IDX: usize = 7;
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Record {
     pub fields: Vec<Field>,
