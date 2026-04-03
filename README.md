@@ -41,7 +41,9 @@ field formatting, and complex select operations.
 For more information, see the following documentation:
 
 - [Data Structures](docs/data_structures.md) - Learn how records and dictionaries are structured.
-- [Commands](docs/commands.md) - See a full list of available CLI commands and modes.
+- [Commands](docs/commands.md) - Learn about application modes and command categories.
+- [Administration Commands](docs/admin_commands.md) - System management and security.
+- [General Use Commands](docs/general_commands.md) - Data operations and queries.
 - [Remote Protocol](docs/protocol.md) - Details on the TCP/SSL remote protocol.
 - [MCP Server](mcp/README.md) - Usage instructions for the Model Context Protocol server.
 - [AI Agents](agents.md) - Documentation on the role and contributions of AI agents in this project.
