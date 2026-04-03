@@ -178,6 +178,9 @@ fn main() -> io::Result<()> {
             "CREATE.ACCOUNT" => {
                 handle_create_account(&mut db.lock().unwrap(), &parts);
             }
+            "CREATE.TEST.ACCOUNT" => {
+                handle_create_test_account(&mut db.lock().unwrap(), &parts);
+            }
             "DELETE.ACCOUNT" => {
                 handle_delete_account(&mut db.lock().unwrap(), &parts);
             }
@@ -706,6 +709,7 @@ fn print_help() {
     println!("  CREATE.FILE <name>                    - Create a new file (data and dict).");
     println!("  DELETE.FILE <name>                    - Delete a file (data and dict).");
     println!("  CREATE.ACCOUNT <name> [<dir>]         - Create a new account.");
+    println!("  CREATE.TEST.ACCOUNT <name>            - Create and populate a test account (SYSTEM only).");
     println!("  DELETE.ACCOUNT <name>                 - Delete an account and all its files.");
     println!("  LOGTO <name>                          - Switch to a different account.");
     println!("  LIST.FILES                            - List all files in the current account.");
@@ -820,6 +824,22 @@ fn handle_create_account(db: &mut Database, parts: &[&str]) {
     let directory = if parts.len() > 2 { Some(parts[2]) } else { None };
     match db.create_account(account_name, directory) {
         Ok(_) => println!("Account '{}' created", account_name),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_create_test_account(db: &mut Database, parts: &[&str]) {
+    if db.current_account != "SYSTEM" {
+        println!("Error: CREATE.TEST.ACCOUNT can only be executed from the SYSTEM account");
+        return;
+    }
+    if parts.len() < 2 {
+        println!("Usage: CREATE.TEST.ACCOUNT <account_name>");
+        return;
+    }
+    let account_name = parts[1];
+    match db.create_test_account(account_name) {
+        Ok(_) => println!("Test account '{}' created and populated", account_name),
         Err(e) => println!("Error: {}", e),
     }
 }

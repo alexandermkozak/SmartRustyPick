@@ -44,6 +44,9 @@ AI agents have been responsible for several critical improvements and fixes in t
 - **MultiValue Logic:** Implementation of hierarchical data structures (FM, VM, SVM).
 - **Dictionary Support:** Logic for field formatting and conversions (Dates, Numbers).
 - **Query Engine:** Implementation of `SELECT` and `QUERY` commands for data retrieval.
+- **Test Infrastructure:** Added `CREATE.TEST.ACCOUNT` command in the `SYSTEM` account to quickly spin up pre-populated
+  accounts for feature verification and regression testing. This command must be maintained and updated as new data
+  structures or features are added to the system.
 
 ## Lessons Learned
 

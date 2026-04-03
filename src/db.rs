@@ -1084,6 +1084,56 @@ impl Database {
 
         Ok(())
     }
+
+    pub fn create_test_account(&mut self, name: &str) -> io::Result<()> {
+        let original_account = self.current_account.clone();
+
+        // 1. Create the new account
+        self.create_account(name, None)?;
+
+        // 2. Log into the new account to populate it
+        self.logto(name)?;
+
+        // 3. Create tables
+        self.create_table("USERS")?;
+        self.create_table("PRODUCTS")?;
+
+        // 4. Populate USERS dictionary and data
+        {
+            let table = self.get_table_mut("USERS");
+            // Dictionary: ID, NAME, EMAIL
+            table.dictionary.insert("NAME".to_string(), Record::from_display_string("1^NAME^L^15"));
+            table.dictionary.insert("EMAIL".to_string(), Record::from_display_string("2^EMAIL^L^20"));
+
+            // Data
+            table.records.insert("1".to_string(), Record::from_display_string("John Doe^john@example.com"));
+            table.records.insert("2".to_string(), Record::from_display_string("Jane Smith^jane@example.com"));
+            table.dirty = true;
+        }
+
+        // 5. Populate PRODUCTS dictionary and data
+        {
+            let table = self.get_table_mut("PRODUCTS");
+            // Dictionary: ID, DESC, PRICE
+            table.dictionary.insert("DESC".to_string(), Record::from_display_string("1^DESCRIPTION^L^20"));
+            table.dictionary.insert("PRICE".to_string(), Record::from_display_string("2^PRICE^R^10^MD2"));
+
+            // Data
+            table.records.insert("P100".to_string(), Record::from_display_string("Widget^1995"));
+            table.records.insert("P200".to_string(), Record::from_display_string("Gadget^4999"));
+            table.dirty = true;
+        }
+
+        // 6. Save changes in the test account
+        self.save()?;
+
+        // 7. Log back to original account (usually SYSTEM)
+        if !original_account.is_empty() {
+            self.logto(&original_account)?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1565,6 +1615,48 @@ mod tests {
         assert_eq!(db.query("T1", false, &q("[]", "ana"), None).len(), 1); // Contains ana
 
         fs::remove_dir_all("test_op_dir")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_test_account() -> io::Result<()> {
+        let base_dir = "test_create_test_account_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+
+        {
+            let mut db = Database::new(base_dir)?;
+            // 1. Must be in SYSTEM or at least valid state
+            db.logto("SYSTEM")?;
+
+            // 2. Create test account
+            db.create_test_account("TEST_ACC")?;
+
+            // 3. Verify we are back in SYSTEM
+            assert_eq!(db.current_account, "SYSTEM");
+
+            // 4. Log into test account and verify content
+            db.logto("TEST_ACC")?;
+            assert!(db.available_tables.contains("USERS"));
+            assert!(db.available_tables.contains("PRODUCTS"));
+
+            // 5. Check USERS dictionary
+            let users = db.get_table("USERS").unwrap();
+            assert!(users.dictionary.contains_key("NAME"));
+            assert!(users.dictionary.contains_key("EMAIL"));
+
+            // 6. Check USERS data
+            assert_eq!(users.records.get("1").unwrap().fields[0].values[0].sub_values[0], "John Doe");
+
+            // 7. Check PRODUCTS dictionary
+            let products = db.get_table("PRODUCTS").unwrap();
+            assert!(products.dictionary.contains_key("DESC"));
+            assert!(products.dictionary.contains_key("PRICE"));
+
+            // 8. Check PRODUCTS data
+            assert_eq!(products.records.get("P100").unwrap().fields[0].values[0].sub_values[0], "Widget");
+        }
+
+        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 }
