@@ -145,13 +145,17 @@ pub async fn run_server(
                             Ok(r) => r,
                             Err(e) => {
                                 let resp = Response { status: "ERROR".to_string(), message: Some(format!("Invalid JSON: {}", e)), record: None, results: None, keys: None, count: None };
-                                let _ = writer.write_all(format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes()).await;
+                                if let Ok(resp_json) = serde_json::to_string(&resp) {
+                                    let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
+                                }
                                 continue;
                             }
                         };
 
                         let resp = handle_request(req, &db, &client_info);
-                        let _ = writer.write_all(format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes()).await;
+                        if let Ok(resp_json) = serde_json::to_string(&resp) {
+                            let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
+                        }
                     }
                     Err(e) => {
                         eprintln!("Read error from {}: {}", peer_addr, e);
@@ -180,22 +184,17 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &crate::
         if client_info.allowed_accounts.len() == 1 {
             // Default to the only allowed account
             client_info.allowed_accounts[0].clone()
-        } else if client_info.is_admin {
-            // Admin defaults to SYSTEM if not specified? 
-            // The requirement says "If no account is provided, allow admin." 
-            // In the context of request, maybe it means they must still specify which admin account to use?
-            // "If only one account is accessed, default usage to that account"
-            // If admin has no specific list, they must specify.
-            return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), record: None, results: None, keys: None, count: None };
         } else {
             return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), record: None, results: None, keys: None, count: None };
         }
     };
 
-    if let Err(e) = db.logto(&target_account) {
-        let msg = format!("Remote login error for account {}: {}", target_account, e);
-        let _ = db.log_error("REMOTE", &msg);
-        return Response { status: "ERROR".to_string(), message: Some(format!("Failed to login to account: {}", e)), record: None, results: None, keys: None, count: None };
+    if db.current_account != target_account {
+        if let Err(e) = db.logto(&target_account) {
+            let msg = format!("Remote login error for account {}: {}", target_account, e);
+            let _ = db.log_error("REMOTE", &msg);
+            return Response { status: "ERROR".to_string(), message: Some(format!("Failed to login to account: {}", e)), record: None, results: None, keys: None, count: None };
+        }
     }
 
     match req.command.to_uppercase().as_str() {

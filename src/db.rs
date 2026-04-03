@@ -332,6 +332,11 @@ impl Database {
 
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
+        } else if prev_acc.is_empty() {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
         }
         Ok(())
     }
@@ -392,6 +397,11 @@ impl Database {
 
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
+        } else if prev_acc.is_empty() {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
         }
         Ok(())
     }
@@ -435,6 +445,11 @@ impl Database {
 
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
+        } else if prev_acc.is_empty() {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
         }
         Ok(())
     }
@@ -467,6 +482,11 @@ impl Database {
 
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
+        } else if prev_acc.is_empty() {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
         }
         Ok(())
     }
@@ -480,6 +500,11 @@ impl Database {
 
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
+        } else if prev_acc.is_empty() {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
         }
         Ok(())
     }
@@ -526,6 +551,11 @@ impl Database {
 
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
+        } else if prev_acc.is_empty() {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
         }
         Ok(())
     }
@@ -573,6 +603,11 @@ impl Database {
 
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
+        } else if prev_acc.is_empty() {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
         }
         Ok(())
     }
