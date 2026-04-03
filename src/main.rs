@@ -205,6 +205,22 @@ fn main() -> io::Result<()> {
                     println!("Unknown command: {}", command);
                 }
             }
+            "ADD.CLIENT.ACCOUNT" => {
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_add_client_account(&mut db_lock, &parts);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
+            }
+            "REMOVE.CLIENT.ACCOUNT" => {
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_remove_client_account(&mut db_lock, &parts);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
+            }
             "DEAUTHORIZE.CONN" => {
                 let mut db_lock = db.lock().unwrap();
                 if db_lock.current_account == "SYSTEM" {
@@ -745,7 +761,9 @@ fn print_help(current_account: &str) {
     println!("  LOGTO <name>                          - Switch to a different account.");
     println!("  LIST.FILES                            - List all files in the current account.");
     if current_account == "SYSTEM" {
-        println!("  AUTHORIZE.CONN <thumbprint> <name>    - Authorize an SSL cert thumbprint with a name.");
+        println!("  AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts> - Authorize a client.");
+        println!("  ADD.CLIENT.ACCOUNT <name> <accounts>  - Add allowed accounts to a client.");
+        println!("  REMOVE.CLIENT.ACCOUNT <name> <accounts> - Remove allowed accounts from a client.");
         println!("  DEAUTHORIZE.CONN <name>               - Deauthorize an SSL cert by name.");
         println!("  LIST.CONNS                            - List authorized connections.");
         println!("  GENERATE.CERT <common_name>           - Generate and sign a new client certificate (SYSTEM only).");
@@ -939,16 +957,88 @@ fn handle_authorize_conn(db: &mut Database, parts: &[&str]) {
         println!("Error: AUTHORIZE.CONN can only be executed from the SYSTEM account");
         return;
     }
-    if parts.len() < 3 {
-        println!("Usage: AUTHORIZE.CONN <thumbprint> <name>");
+    if parts.len() < 4 {
+        println!("Usage: AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts>");
+        println!("  'accounts' is a comma separated list of allowed accounts.");
         return;
     }
     let thumbprint = parts[1];
     let name = parts[2];
-    match db.add_authorized_client(name, thumbprint) {
-        Ok(_) => println!("Authorized: {} as {}", thumbprint, name),
+    let arg3 = parts[3].to_uppercase();
+
+    let (is_admin, accounts) = if arg3 == "ADMIN" {
+        (true, Vec::new())
+    } else {
+        (false, arg3.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+    };
+
+    if !is_admin && accounts.is_empty() {
+        println!("Error: Must provide ADMIN or at least one account.");
+        return;
+    }
+
+    match db.add_authorized_client(name, thumbprint, accounts, is_admin) {
+        Ok(_) => {
+            if is_admin {
+                println!("Authorized: {} as {} (ADMIN)", thumbprint, name);
+            } else {
+                println!("Authorized: {} as {}", thumbprint, name);
+            }
+        },
         Err(e) => println!("Error authorizing: {}", e),
     }
+}
+
+fn handle_add_client_account(db: &mut Database, parts: &[&str]) {
+    if db.current_account != "SYSTEM" {
+        println!("Error: ADD.CLIENT.ACCOUNT can only be executed from the SYSTEM account");
+        return;
+    }
+    if parts.len() < 3 {
+        println!("Usage: ADD.CLIENT.ACCOUNT <name> <accounts>");
+        return;
+    }
+    let name = parts[1];
+    let accounts: Vec<&str> = parts[2].split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+
+    let mut count = 0;
+    for acc in accounts {
+        match db.add_client_account(name, acc) {
+            Ok(true) => count += 1,
+            Ok(false) => {},
+            Err(e) => {
+                println!("Error adding account {}: {}", acc, e);
+                return;
+            }
+        }
+    }
+    println!("Added {} accounts to client {}", count, name);
+}
+
+fn handle_remove_client_account(db: &mut Database, parts: &[&str]) {
+    if db.current_account != "SYSTEM" {
+        println!("Error: REMOVE.CLIENT.ACCOUNT can only be executed from the SYSTEM account");
+        return;
+    }
+    if parts.len() < 3 {
+        println!("Usage: REMOVE.CLIENT.ACCOUNT <name> <accounts>");
+        return;
+    }
+    let name = parts[1];
+    let accounts: Vec<&str> = parts[2].split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+
+    let mut count = 0;
+    for acc in accounts {
+        match db.remove_client_account(name, acc) {
+            Ok(true) => count += 1,
+            Ok(false) => {},
+            Err(e) => {
+                println!("Error removing account {}: {}", acc, e);
+                return;
+            }
+        }
+    }
+    println!("Removed {} accounts from client {}", count, name);
 }
 
 fn handle_deauthorize_conn(db: &mut Database, parts: &[&str]) {
@@ -1018,6 +1108,7 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
     let key_file = format!("{}.key", cn);
     let csr_file = format!("{}.csr", cn);
     let crt_file = format!("{}.crt", cn);
+    let pfx_file = format!("{}.pfx", cn);
 
     // 1. Generate RSA key
     let status = std::process::Command::new("openssl")
@@ -1060,7 +1151,22 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
         return;
     }
 
-    // 4. Calculate thumbprint for convenience
+    // 4. Create PFX file
+    let status = std::process::Command::new("openssl")
+        .args(&[
+            "pkcs12", "-export",
+            "-out", &pfx_file,
+            "-inkey", &key_file,
+            "-in", &crt_file,
+            "-passout", "pass:"
+        ])
+        .status();
+
+    if status.is_err() || !status.unwrap().success() {
+        println!("Error generating PFX file.");
+    }
+
+    // 5. Calculate thumbprint for convenience
     let output = std::process::Command::new("openssl")
         .args(&["x509", "-in", &crt_file, "-fingerprint", "-noout", "-sha256"])
         .output();
@@ -1071,12 +1177,56 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
             let thumbprint = thumbprint.replace(':', "").trim().to_lowercase();
             println!("Certificate generated: {}", crt_file);
             println!("Private key: {}", key_file);
+            println!("PFX file: {}", pfx_file);
             println!("SHA-256 Thumbprint: {}", thumbprint);
-            println!("To authorize this certificate, use: AUTHORIZE.CONN {} <name>", thumbprint);
+
+            // Interactive authorization
+            println!("\n--- Connection Authorization ---");
+            print!("Enter authorization name [{}]: ", cn);
+            io::stdout().flush().unwrap();
+            let mut auth_name = String::new();
+            io::stdin().read_line(&mut auth_name).unwrap();
+            let auth_name = if auth_name.trim().is_empty() { cn.to_string() } else { auth_name.trim().to_string() };
+
+            print!("Is this an ADMIN connection? (Y/N) [N]: ");
+            io::stdout().flush().unwrap();
+            let mut is_admin_input = String::new();
+            io::stdin().read_line(&mut is_admin_input).unwrap();
+            let is_admin = is_admin_input.trim().to_uppercase() == "Y";
+
+            let accounts = if is_admin {
+                Vec::new()
+            } else {
+                print!("Enter comma-separated list of allowed accounts: ");
+                io::stdout().flush().unwrap();
+                let mut accs_input = String::new();
+                io::stdin().read_line(&mut accs_input).unwrap();
+                accs_input.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+
+            if !is_admin && accounts.is_empty() {
+                println!("Error: Non-admin connections must have at least one allowed account.");
+                println!("Authorization skipped. Use AUTHORIZE.CONN to authorize manually.");
+            } else {
+                match db.add_authorized_client(&auth_name, &thumbprint, accounts, is_admin) {
+                    Ok(_) => {
+                        if is_admin {
+                            println!("Successfully authorized: {} as {} (ADMIN)", thumbprint, auth_name);
+                        } else {
+                            println!("Successfully authorized: {} as {}", thumbprint, auth_name);
+                        }
+                    },
+                    Err(e) => println!("Error authorizing: {}", e),
+                }
+            }
         }
     } else {
         println!("Certificate generated: {}", crt_file);
         println!("Private key: {}", key_file);
+        println!("PFX file: {}", pfx_file);
     }
 }
 

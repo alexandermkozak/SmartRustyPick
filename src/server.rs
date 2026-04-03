@@ -118,15 +118,19 @@ pub async fn run_server(
             };
 
             // Check authorization
-            {
+            let client_info = {
+                let db_lock = db.lock().unwrap();
+                db_lock.authorized_clients.get(&thumbprint).cloned()
+            };
+
+            if client_info.is_none() {
+                let msg = format!("Unauthorized certificate {} from {}", thumbprint, peer_addr);
+                eprintln!("{}", msg);
                 let mut db_lock = db.lock().unwrap();
-                if !db_lock.authorized_certs.contains(&thumbprint) {
-                    let msg = format!("Unauthorized certificate {} from {}", thumbprint, peer_addr);
-                    eprintln!("{}", msg);
-                    let _ = db_lock.log_error("SYSTEM", &msg);
-                    return;
-                }
+                let _ = db_lock.log_error("SYSTEM", &msg);
+                return;
             }
+            let client_info = client_info.unwrap();
 
             let (reader, mut writer) = tokio::io::split(tls_stream);
             let mut reader = BufReader::new(reader);
@@ -146,7 +150,7 @@ pub async fn run_server(
                             }
                         };
 
-                        let resp = handle_request(req, &db);
+                        let resp = handle_request(req, &db, &client_info);
                         let _ = writer.write_all(format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes()).await;
                     }
                     Err(e) => {
@@ -159,18 +163,39 @@ pub async fn run_server(
     }
 }
 
-fn handle_request(req: Request, db: &Arc<Mutex<Database>>) -> Response {
+fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &crate::db::ClientInfo) -> Response {
     let mut db = db.lock().unwrap();
 
-    // If account is specified, logto it
-    if let Some(acc) = req.account {
-        if let Err(e) = db.logto(&acc) {
-            let msg = format!("Remote login error for account {}: {}", acc, e);
+    // Account restriction and defaulting logic
+    let target_account = if let Some(acc) = req.account {
+        // Client specified an account
+        if !client_info.is_admin && !client_info.allowed_accounts.contains(&acc) {
+            let msg = format!("Access denied for account {}: Not in allowed list", acc);
             let _ = db.log_error("REMOTE", &msg);
-            return Response { status: "ERROR".to_string(), message: Some(format!("Failed to login to account: {}", e)), record: None, results: None, keys: None, count: None };
+            return Response { status: "ERROR".to_string(), message: Some(msg), record: None, results: None, keys: None, count: None };
         }
-    } else if db.current_account.is_empty() {
-        return Response { status: "ERROR".to_string(), message: Some("Not logged into any account".to_string()), record: None, results: None, keys: None, count: None };
+        acc
+    } else {
+        // Client did not specify an account
+        if client_info.allowed_accounts.len() == 1 {
+            // Default to the only allowed account
+            client_info.allowed_accounts[0].clone()
+        } else if client_info.is_admin {
+            // Admin defaults to SYSTEM if not specified? 
+            // The requirement says "If no account is provided, allow admin." 
+            // In the context of request, maybe it means they must still specify which admin account to use?
+            // "If only one account is accessed, default usage to that account"
+            // If admin has no specific list, they must specify.
+            return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), record: None, results: None, keys: None, count: None };
+        } else {
+            return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), record: None, results: None, keys: None, count: None };
+        }
+    };
+
+    if let Err(e) = db.logto(&target_account) {
+        let msg = format!("Remote login error for account {}: {}", target_account, e);
+        let _ = db.log_error("REMOTE", &msg);
+        return Response { status: "ERROR".to_string(), message: Some(format!("Failed to login to account: {}", e)), record: None, results: None, keys: None, count: None };
     }
 
     match req.command.to_uppercase().as_str() {

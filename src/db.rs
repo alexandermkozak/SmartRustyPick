@@ -158,6 +158,13 @@ impl Table {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ClientInfo {
+    pub thumbprint: String,
+    pub allowed_accounts: Vec<String>,
+    pub is_admin: bool,
+}
+
 pub struct Database {
     pub storage_dir: String,
     pub current_account: String,
@@ -169,7 +176,8 @@ pub struct Database {
     pub active_select_list: Option<SelectList>,
     pub remote_select_lists: HashMap<String, SelectList>,
     pub remote_select_cursors: HashMap<String, usize>,
-    pub authorized_certs: HashSet<String>, // Set of SHA-256 thumbprints
+    pub authorized_certs: HashSet<String>, // Set of SHA-256 thumbprints (legacy)
+    pub authorized_clients: HashMap<String, ClientInfo>, // key is thumbprint (lowercase)
     pub log_detail: String,
     pub max_log_records: usize,
 }
@@ -212,6 +220,7 @@ impl Database {
             remote_select_lists: HashMap::new(),
             remote_select_cursors: HashMap::new(),
             authorized_certs: HashSet::new(),
+            authorized_clients: HashMap::new(),
             log_detail: config.log_detail.unwrap_or_else(|| "normal".to_string()),
             max_log_records: config.max_log_records.unwrap_or(100),
         };
@@ -259,8 +268,72 @@ impl Database {
 
         // Ensure $CLIENTS file exists in SYSTEM account
         db.ensure_system_clients_file()?;
+
+        // Self-heal default dictionaries for all $ files
+        db.ensure_all_system_dictionaries()?;
         
         Ok(db)
+    }
+
+    fn ensure_all_system_dictionaries(&mut self) -> io::Result<()> {
+        let prev_acc = self.current_account.clone();
+        self.logto("SYSTEM")?;
+
+        let table_names: Vec<String> = self.available_tables.iter()
+            .filter(|n| n.starts_with('$'))
+            .cloned()
+            .collect();
+
+        for table_name in table_names {
+            let mut updated = false;
+            {
+                let table = self.get_table_mut(&table_name);
+                match table_name.as_str() {
+                    "$LOGS" => {
+                        if !table.dictionary.contains_key("MESSAGE") {
+                            table.dictionary.insert("MESSAGE".to_string(), Record::from_display_string("1^MESSAGE^L^60"));
+                            updated = true;
+                        }
+                        if !table.dictionary.contains_key("DETAIL") {
+                            table.dictionary.insert("DETAIL".to_string(), Record::from_display_string("2^DETAIL^L^40"));
+                            updated = true;
+                        }
+                    }
+                    "$ACCOUNTS" => {
+                        if !table.dictionary.contains_key("PATH") {
+                            table.dictionary.insert("PATH".to_string(), Record::from_display_string("1^PATH^L^50"));
+                            updated = true;
+                        }
+                    }
+                    "$CLIENTS" => {
+                        if !table.dictionary.contains_key("THUMBPRINT") {
+                            table.dictionary.insert("THUMBPRINT".to_string(), Record::from_display_string("1^THUMBPRINT^L^64"));
+                            updated = true;
+                        }
+                        if !table.dictionary.contains_key("ACCOUNTS") {
+                            table.dictionary.insert("ACCOUNTS".to_string(), Record::from_display_string("2^ACCOUNTS^L^30"));
+                            updated = true;
+                        }
+                        if !table.dictionary.contains_key("ADMIN") {
+                            table.dictionary.insert("ADMIN".to_string(), Record::from_display_string("3^ADMIN^L^5"));
+                            updated = true;
+                        }
+                    }
+                    _ => {}
+                }
+                if updated {
+                    table.dirty = true;
+                }
+            }
+            if updated {
+                self.save()?;
+            }
+        }
+
+        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
+            self.logto(&prev_acc)?;
+        }
+        Ok(())
     }
 
     fn ensure_system_clients_file(&mut self) -> io::Result<()> {
@@ -271,31 +344,54 @@ impl Database {
             self.create_table("$CLIENTS")?;
         }
 
-        // Load authorized clients from $CLIENTS into in-memory set
-        let mut loaded_certs = Vec::new();
+        // Load authorized clients from $CLIENTS into in-memory structures
+        let mut loaded_clients = Vec::new();
         {
             let clients_table = self.get_table_mut("$CLIENTS");
             for (_name, record) in &clients_table.records {
-                if let Some(f) = record.fields.get(0) {
-                    if let Some(v) = f.values.get(0) {
-                        if let Some(thumbprint) = v.sub_values.get(0) {
-                            loaded_certs.push(thumbprint.to_lowercase());
+                let thumbprint = record.fields.get(0)
+                    .and_then(|f| f.values.get(0))
+                    .and_then(|v| v.sub_values.get(0))
+                    .cloned();
+
+                if let Some(tp) = thumbprint {
+                    let tp_lower = tp.to_lowercase();
+
+                    let mut allowed_accounts = Vec::new();
+                    if let Some(f) = record.fields.get(1) {
+                        for v in &f.values {
+                            if let Some(acc) = v.sub_values.get(0) {
+                                if !acc.is_empty() {
+                                    allowed_accounts.push(acc.clone());
+                                }
+                            }
                         }
                     }
+
+                    let is_admin = record.fields.get(2)
+                        .and_then(|f| f.values.get(0))
+                        .and_then(|v| v.sub_values.get(0))
+                        .map(|s| s == "Y")
+                        .unwrap_or(false);
+
+                    loaded_clients.push(ClientInfo {
+                        thumbprint: tp_lower,
+                        allowed_accounts,
+                        is_admin,
+                    });
                 }
             }
         }
-        for thumbprint in loaded_certs {
-            self.authorized_certs.insert(thumbprint);
+        self.authorized_clients.clear();
+        self.authorized_certs.clear();
+        for info in loaded_clients {
+            let tp = info.thumbprint.clone();
+            self.authorized_clients.insert(tp.clone(), info);
+            self.authorized_certs.insert(tp);
         }
 
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
         }
         Ok(())
     }
@@ -339,11 +435,6 @@ impl Database {
 
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
         }
         Ok(())
     }
@@ -376,11 +467,6 @@ impl Database {
 
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
         }
         Ok(())
     }
@@ -391,13 +477,9 @@ impl Database {
         if !self.available_tables.contains("$LOGS") {
             self.create_table("$LOGS")?;
         }
+
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
         }
         Ok(())
     }
@@ -444,16 +526,11 @@ impl Database {
 
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
         }
         Ok(())
     }
 
-    pub fn add_authorized_client(&mut self, name: &str, thumbprint: &str) -> io::Result<()> {
+    pub fn add_authorized_client(&mut self, name: &str, thumbprint: &str, allowed_accounts: Vec<String>, is_admin: bool) -> io::Result<()> {
         let prev_acc = self.current_account.clone();
         self.logto("SYSTEM")?;
 
@@ -463,18 +540,86 @@ impl Database {
         {
             let table = self.get_table_mut("$CLIENTS");
             let mut record = Record::new();
+            // Field 0: Thumbprint
             record.fields.push(Field {
                 values: vec![Value { sub_values: vec![thumbprint_lower.clone()] }]
             });
+            // Field 1: Allowed Accounts
+            let mut accounts_field = Field::default();
+            for acc in &allowed_accounts {
+                accounts_field.values.push(Value { sub_values: vec![acc.clone()] });
+            }
+            record.fields.push(accounts_field);
+            // Field 2: Admin flag
+            record.fields.push(Field {
+                values: vec![Value { sub_values: vec![if is_admin { "Y".to_string() } else { "".to_string() }] }]
+            });
+
             table.records.insert(name.to_string(), record);
             table.dirty = true;
         }
         self.save()?;
 
-        // Update in-memory set
+        // Update in-memory structures
+        self.authorized_clients.insert(thumbprint_lower.clone(), ClientInfo {
+            thumbprint: thumbprint_lower.clone(),
+            allowed_accounts,
+            is_admin,
+        });
         self.authorized_certs.insert(thumbprint_lower);
+
         // Sync with certs.reg for backward compatibility (optional but safe)
         self.save_certs()?;
+
+        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
+            self.logto(&prev_acc)?;
+        }
+        Ok(())
+    }
+
+    pub fn add_client_account(&mut self, name: &str, account: &str) -> io::Result<bool> {
+        let prev_acc = self.current_account.clone();
+        self.logto("SYSTEM")?;
+
+        let mut thumbprint = None;
+        let mut success = false;
+        {
+            let table = self.get_table_mut("$CLIENTS");
+            if let Some(record) = table.records.get_mut(name) {
+                // Get thumbprint for updating in-memory map later
+                thumbprint = record.fields.get(0)
+                    .and_then(|f| f.values.get(0))
+                    .and_then(|v| v.sub_values.get(0))
+                    .cloned();
+
+                // Ensure Field 1 exists
+                while record.fields.len() <= 1 {
+                    record.fields.push(Field::default());
+                }
+
+                // Check if account already exists in Field 1
+                let accounts_field = &mut record.fields[1];
+                let exists = accounts_field.values.iter().any(|v| v.sub_values.get(0).map(|s| s == account).unwrap_or(false));
+
+                if !exists {
+                    accounts_field.values.push(Value { sub_values: vec![account.to_string()] });
+                    table.dirty = true;
+                    success = true;
+                }
+            }
+        }
+
+        if success {
+            self.save()?;
+            if let Some(tp) = thumbprint {
+                let tp_lower = tp.to_lowercase();
+                if let Some(info) = self.authorized_clients.get_mut(&tp_lower) {
+                    if !info.allowed_accounts.contains(&account.to_string()) {
+                        info.allowed_accounts.push(account.to_string());
+                    }
+                }
+            }
+        }
 
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             self.logto(&prev_acc)?;
@@ -484,7 +629,55 @@ impl Database {
             self.available_tables.clear();
             self.lru_order.clear();
         }
-        Ok(())
+        Ok(success)
+    }
+
+    pub fn remove_client_account(&mut self, name: &str, account: &str) -> io::Result<bool> {
+        let prev_acc = self.current_account.clone();
+        self.logto("SYSTEM")?;
+
+        let mut thumbprint = None;
+        let mut success = false;
+        {
+            let table = self.get_table_mut("$CLIENTS");
+            if let Some(record) = table.records.get_mut(name) {
+                thumbprint = record.fields.get(0)
+                    .and_then(|f| f.values.get(0))
+                    .and_then(|v| v.sub_values.get(0))
+                    .cloned();
+
+                if record.fields.len() > 1 {
+                    let accounts_field = &mut record.fields[1];
+                    let original_len = accounts_field.values.len();
+                    accounts_field.values.retain(|v| v.sub_values.get(0).map(|s| s != account).unwrap_or(true));
+
+                    if accounts_field.values.len() < original_len {
+                        table.dirty = true;
+                        success = true;
+                    }
+                }
+            }
+        }
+
+        if success {
+            self.save()?;
+            if let Some(tp) = thumbprint {
+                let tp_lower = tp.to_lowercase();
+                if let Some(info) = self.authorized_clients.get_mut(&tp_lower) {
+                    info.allowed_accounts.retain(|a| a != account);
+                }
+            }
+        }
+
+        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
+            self.logto(&prev_acc)?;
+        } else if prev_acc.is_empty() {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
+        }
+        Ok(success)
     }
 
     pub fn remove_authorized_client(&mut self, name: &str) -> io::Result<bool> {
@@ -512,7 +705,9 @@ impl Database {
         if found {
             self.save()?;
             if let Some(tp) = removed_thumbprint {
-                self.authorized_certs.remove(&tp);
+                let tp_lower = tp.to_lowercase();
+                self.authorized_certs.remove(&tp_lower);
+                self.authorized_clients.remove(&tp_lower);
                 self.save_certs()?;
             }
         }
@@ -1256,6 +1451,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_system_dictionary_auto_creation() -> io::Result<()> {
+        let base_dir = "test_system_dict_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+
+        {
+            let mut db = Database::new(base_dir)?;
+            db.logto("SYSTEM")?;
+
+            // Verify $LOGS dictionary
+            let logs = db.get_table("$LOGS").unwrap();
+            assert!(logs.dictionary.contains_key("MESSAGE"));
+            assert!(logs.dictionary.contains_key("DETAIL"));
+
+            // Verify $ACCOUNTS dictionary
+            let accounts = db.get_table("$ACCOUNTS").unwrap();
+            assert!(accounts.dictionary.contains_key("PATH"));
+
+            // Verify $CLIENTS dictionary
+            let clients = db.get_table("$CLIENTS").unwrap();
+            assert!(clients.dictionary.contains_key("THUMBPRINT"));
+            assert!(clients.dictionary.contains_key("ACCOUNTS"));
+            assert!(clients.dictionary.contains_key("ADMIN"));
+
+            // Manually corrupt dictionary for $LOGS
+            {
+                let logs_mut = db.get_table_mut("$LOGS");
+                logs_mut.dictionary.remove("MESSAGE");
+                // Add an override
+                logs_mut.dictionary.insert("DETAIL".to_string(), Record::from_display_string("2^OVERRIDE_DETAIL^L^10"));
+                logs_mut.dirty = true;
+            }
+            db.save()?;
+        }
+
+        // Restart and check for self-healing
+        {
+            let mut db = Database::new(base_dir)?;
+            db.logto("SYSTEM")?;
+
+            let logs = db.get_table("$LOGS").unwrap();
+            // Should be restored
+            assert!(logs.dictionary.contains_key("MESSAGE"), "MESSAGE dictionary should be restored");
+            // Should NOT be overwritten
+            let detail_dict = logs.dictionary.get("DETAIL").unwrap();
+            let detail_val = detail_dict.get_field_display_string(1);
+            println!("DEBUG: Detail dictionary field 1 (NAME): '{}'", detail_val);
+            assert!(detail_val.contains("OVERRIDE_DETAIL"), "Existing dictionary entry should NOT be overwritten (got '{}')", detail_val);
+        }
+
+        fs::remove_dir_all(base_dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn test_system_account_auto_creation() -> io::Result<()> {
         let base_dir = "test_system_account_dir";
         if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
@@ -1327,8 +1576,8 @@ mod tests {
 
         {
             let mut db = Database::new(base_dir)?;
-            db.add_authorized_client("CLIENT1", "aabbccdd")?;
-            db.add_authorized_client("CLIENT2", "11223344")?;
+            db.add_authorized_client("CLIENT1", "aabbccdd", vec!["ACC1".to_string()], false)?;
+            db.add_authorized_client("CLIENT2", "11223344", vec![], true)?; // ADMIN
 
             // Verify $CLIENTS exists and contains CLIENT1 and CLIENT2
             db.logto("SYSTEM")?;
@@ -1340,23 +1589,52 @@ mod tests {
 
             let rec1 = clients_table.records.get("CLIENT1").unwrap();
             assert_eq!(rec1.fields[0].values[0].sub_values[0], "aabbccdd");
+            assert_eq!(rec1.fields[1].values[0].sub_values[0], "ACC1");
+            assert_eq!(rec1.fields[2].values[0].sub_values[0], "");
 
-            // Verify in-memory set
-            assert!(db.authorized_certs.contains("aabbccdd"));
-            assert!(db.authorized_certs.contains("11223344"));
+            let rec2 = clients_table.records.get("CLIENT2").unwrap();
+            assert_eq!(rec2.fields[0].values[0].sub_values[0], "11223344");
+            assert_eq!(rec2.fields[2].values[0].sub_values[0], "Y");
 
-            // Test removal
+            // Verify in-memory map
+            assert!(db.authorized_clients.contains_key("aabbccdd"));
+            assert_eq!(db.authorized_clients.get("aabbccdd").unwrap().allowed_accounts, vec!["ACC1"]);
+            assert!(!db.authorized_clients.get("aabbccdd").unwrap().is_admin);
+
+            assert!(db.authorized_clients.contains_key("11223344"));
+            assert!(db.authorized_clients.get("11223344").unwrap().is_admin);
+
+            // Test add_client_account
+            db.add_client_account("CLIENT1", "ACC2")?;
+            db.logto("SYSTEM")?;
+            let clients_table = db.get_table("$CLIENTS").unwrap();
+            let rec1_v2 = clients_table.records.get("CLIENT1").unwrap();
+            assert_eq!(rec1_v2.fields[1].values.len(), 2);
+            assert_eq!(rec1_v2.fields[1].values[1].sub_values[0], "ACC2");
+            assert!(db.authorized_clients.get("aabbccdd").unwrap().allowed_accounts.contains(&"ACC2".to_string()));
+
+            // Test remove_client_account
+            db.remove_client_account("CLIENT1", "ACC1")?;
+            db.logto("SYSTEM")?;
+            let clients_table = db.get_table("$CLIENTS").unwrap();
+            let rec1_v3 = clients_table.records.get("CLIENT1").unwrap();
+            assert_eq!(rec1_v3.fields[1].values.len(), 1);
+            assert_eq!(rec1_v3.fields[1].values[0].sub_values[0], "ACC2");
+            assert!(!db.authorized_clients.get("aabbccdd").unwrap().allowed_accounts.contains(&"ACC1".to_string()));
+
+            // Test removal of client
             db.remove_authorized_client("CLIENT1")?;
             db.logto("SYSTEM")?;
             let clients_table = db.get_table("$CLIENTS").unwrap();
             assert!(!clients_table.records.contains_key("CLIENT1"), "$CLIENTS should not contain CLIENT1 after removal");
-            assert!(!db.authorized_certs.contains("aabbccdd"), "In-memory set should be updated");
+            assert!(!db.authorized_clients.contains_key("aabbccdd"), "In-memory map should be updated");
         }
 
         // Test auto-population on restart
         {
             let db = Database::new(base_dir)?;
-            assert!(db.authorized_certs.contains("11223344"), "Should load CLIENT2 from $CLIENTS on restart");
+            assert!(db.authorized_clients.contains_key("11223344"), "Should load CLIENT2 from $CLIENTS on restart");
+            assert!(db.authorized_clients.get("11223344").unwrap().is_admin);
         }
 
         fs::remove_dir_all(base_dir)?;

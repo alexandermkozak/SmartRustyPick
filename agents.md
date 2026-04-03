@@ -48,7 +48,7 @@ AI agents have been responsible for several critical improvements and fixes in t
   accounts for feature verification and regression testing. This command must be maintained and updated as new data
   structures or features are added to the system.
 - **Certificate Management:** Implemented `GENERATE.CERT` in the `SYSTEM` account, allowing users to create signed
-  client certificates directly from the database CLI for simplified secure remote access setup.
+  client certificates and PKCS#12 (.pfx) files directly from the database CLI for simplified secure remote access setup.
 
 ### TLS Troubleshooting
 
@@ -59,7 +59,9 @@ AI agents have been responsible for several critical improvements and fixes in t
 - **No client certificate provided**: The server requires client authentication. Ensure the client is sending its
   certificate and key.
 - **Unauthorized certificate**: The certificate thumbprint is not in the authorized list. Use
-  `AUTHORIZE.CONN <thumbprint>` in the CLI to grant access.
+  `AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts>` in the CLI to grant access.
+- **Access denied for account**: The client is authorized but trying to access an account not in its allowed list.
+  Use `ADD.CLIENT.ACCOUNT <name> <accounts>` to grant access to additional accounts.
 
 ## Lessons Learned
 
