@@ -83,7 +83,15 @@ pub async fn run_server(
             let tls_stream = match acceptor.accept(stream).await {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("TLS accept error from {}: {}", peer_addr, e);
+                    let mut msg = format!("TLS accept error from {}: {}", peer_addr, e);
+                    if msg.contains("UnknownIssuer") {
+                        msg.push_str(" (Check if client cert is signed by the server's CA)");
+                    } else if msg.contains("UnknownCA") {
+                        msg.push_str(" (Check if the client trusts the server's CA)");
+                    }
+                    eprintln!("{}", msg);
+                    let mut db_lock = db.lock().unwrap();
+                    let _ = db_lock.log_error("SYSTEM", &msg);
                     return;
                 }
             };
@@ -101,16 +109,21 @@ pub async fn run_server(
             let thumbprint = match client_cert_thumbprint {
                 Some(t) => t,
                 None => {
-                    eprintln!("No client certificate provided from {}", peer_addr);
+                    let msg = format!("No client certificate provided from {}", peer_addr);
+                    eprintln!("{}", msg);
+                    let mut db_lock = db.lock().unwrap();
+                    let _ = db_lock.log_error("SYSTEM", &msg);
                     return;
                 }
             };
 
             // Check authorization
             {
-                let db_lock = db.lock().unwrap();
+                let mut db_lock = db.lock().unwrap();
                 if !db_lock.authorized_certs.contains(&thumbprint) {
-                    eprintln!("Unauthorized certificate {} from {}", thumbprint, peer_addr);
+                    let msg = format!("Unauthorized certificate {} from {}", thumbprint, peer_addr);
+                    eprintln!("{}", msg);
+                    let _ = db_lock.log_error("SYSTEM", &msg);
                     return;
                 }
             }

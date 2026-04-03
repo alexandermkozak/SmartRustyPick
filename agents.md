@@ -47,6 +47,19 @@ AI agents have been responsible for several critical improvements and fixes in t
 - **Test Infrastructure:** Added `CREATE.TEST.ACCOUNT` command in the `SYSTEM` account to quickly spin up pre-populated
   accounts for feature verification and regression testing. This command must be maintained and updated as new data
   structures or features are added to the system.
+- **Certificate Management:** Implemented `GENERATE.CERT` in the `SYSTEM` account, allowing users to create signed
+  client certificates directly from the database CLI for simplified secure remote access setup.
+
+### TLS Troubleshooting
+
+- **UnknownIssuer error (on server logs)**: The client certificate is not signed by a CA the server trusts. Correct by
+  ensuring the client certificate is signed by `ca.crt` or by updating the server's CA store.
+- **UnknownCA fatal alert (on server logs)**: The client does not trust the server's certificate. Correct by providing
+  `ca.crt` to the client's trust store.
+- **No client certificate provided**: The server requires client authentication. Ensure the client is sending its
+  certificate and key.
+- **Unauthorized certificate**: The certificate thumbprint is not in the authorized list. Use
+  `AUTHORIZE.CONN <thumbprint>` in the CLI to grant access.
 
 ## Lessons Learned
 

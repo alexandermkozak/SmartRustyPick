@@ -179,7 +179,12 @@ fn main() -> io::Result<()> {
                 handle_create_account(&mut db.lock().unwrap(), &parts);
             }
             "CREATE.TEST.ACCOUNT" => {
-                handle_create_test_account(&mut db.lock().unwrap(), &parts);
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_create_test_account(&mut db_lock, &parts);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
             }
             "DELETE.ACCOUNT" => {
                 handle_delete_account(&mut db.lock().unwrap(), &parts);
@@ -193,13 +198,36 @@ fn main() -> io::Result<()> {
                 handle_list_files(&mut db.lock().unwrap());
             }
             "AUTHORIZE.CONN" => {
-                handle_authorize_conn(&mut db.lock().unwrap(), &parts);
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_authorize_conn(&mut db_lock, &parts);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
             }
             "DEAUTHORIZE.CONN" => {
-                handle_deauthorize_conn(&mut db.lock().unwrap(), &parts);
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_deauthorize_conn(&mut db_lock, &parts);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
             }
             "LIST.CONNS" => {
-                handle_list_conns(&db.lock().unwrap());
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_list_conns(&mut db_lock);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
+            }
+            "GENERATE.CERT" => {
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_generate_cert(&mut db_lock, &parts);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
             }
             "START.SERVER" => {
                 handle_start_server(db.clone(), &parts, &config);
@@ -209,7 +237,8 @@ fn main() -> io::Result<()> {
                 println!("OK");
             }
             "HELP" => {
-                print_help();
+                let db_lock = db.lock().unwrap();
+                print_help(&db_lock.current_account);
             }
             "EXIT" | "QUIT" => break,
             _ => println!("Unknown command: {}", command),
@@ -691,7 +720,7 @@ fn print_record_fields(record: &Record) {
     }
 }
 
-fn print_help() {
+fn print_help(current_account: &str) {
     println!("Commands:");
     println!("  SET [DICT] <table> <key> <data>       - Store a record.");
     println!("  GET [DICT] <table> [<key>]             - Retrieve record(s). Uses SELECT list if key omitted.");
@@ -709,13 +738,18 @@ fn print_help() {
     println!("  CREATE.FILE <name>                    - Create a new file (data and dict).");
     println!("  DELETE.FILE <name>                    - Delete a file (data and dict).");
     println!("  CREATE.ACCOUNT <name> [<dir>]         - Create a new account.");
-    println!("  CREATE.TEST.ACCOUNT <name>            - Create and populate a test account (SYSTEM only).");
+    if current_account == "SYSTEM" {
+        println!("  CREATE.TEST.ACCOUNT <name>            - Create and populate a test account (SYSTEM only).");
+    }
     println!("  DELETE.ACCOUNT <name>                 - Delete an account and all its files.");
     println!("  LOGTO <name>                          - Switch to a different account.");
     println!("  LIST.FILES                            - List all files in the current account.");
-    println!("  AUTHORIZE.CONN <thumbprint>           - Authorize an SSL cert thumbprint.");
-    println!("  DEAUTHORIZE.CONN <thumbprint>         - Deauthorize an SSL cert thumbprint.");
-    println!("  LIST.CONNS                            - List authorized thumbprints.");
+    if current_account == "SYSTEM" {
+        println!("  AUTHORIZE.CONN <thumbprint> <name>    - Authorize an SSL cert thumbprint with a name.");
+        println!("  DEAUTHORIZE.CONN <name>               - Deauthorize an SSL cert by name.");
+        println!("  LIST.CONNS                            - List authorized connections.");
+        println!("  GENERATE.CERT <common_name>           - Generate and sign a new client certificate (SYSTEM only).");
+    }
     println!("  START.SERVER [<addr:port>] <cert_path> <key_path> <ca_path> - Start TCP SSL server.");
     println!("  SAVE                                  - Save all changes to disk.");
     println!("  EXIT or QUIT                          - Exit the shell.");
@@ -901,34 +935,148 @@ fn handle_list_files(db: &mut Database) {
 }
 
 fn handle_authorize_conn(db: &mut Database, parts: &[&str]) {
-    if parts.len() < 2 {
-        println!("Usage: AUTHORIZE.CONN <thumbprint>");
+    if db.current_account != "SYSTEM" {
+        println!("Error: AUTHORIZE.CONN can only be executed from the SYSTEM account");
         return;
     }
-    let thumbprint = parts[1].to_lowercase();
-    db.authorized_certs.insert(thumbprint.clone());
-    let _ = db.save_certs();
-    println!("Authorized: {}", thumbprint);
+    if parts.len() < 3 {
+        println!("Usage: AUTHORIZE.CONN <thumbprint> <name>");
+        return;
+    }
+    let thumbprint = parts[1];
+    let name = parts[2];
+    match db.add_authorized_client(name, thumbprint) {
+        Ok(_) => println!("Authorized: {} as {}", thumbprint, name),
+        Err(e) => println!("Error authorizing: {}", e),
+    }
 }
 
 fn handle_deauthorize_conn(db: &mut Database, parts: &[&str]) {
-    if parts.len() < 2 {
-        println!("Usage: DEAUTHORIZE.CONN <thumbprint>");
+    if db.current_account != "SYSTEM" {
+        println!("Error: DEAUTHORIZE.CONN can only be executed from the SYSTEM account");
         return;
     }
-    let thumbprint = parts[1].to_lowercase();
-    if db.authorized_certs.remove(&thumbprint) {
-        let _ = db.save_certs();
-        println!("Deauthorized: {}", thumbprint);
-    } else {
-        println!("Not found: {}", thumbprint);
+    if parts.len() < 2 {
+        println!("Usage: DEAUTHORIZE.CONN <name>");
+        return;
+    }
+    let name = parts[1];
+    match db.remove_authorized_client(name) {
+        Ok(true) => println!("Deauthorized client: {}", name),
+        Ok(false) => println!("Client not found: {}", name),
+        Err(e) => println!("Error deauthorizing: {}", e),
     }
 }
 
-fn handle_list_conns(db: &Database) {
-    println!("Authorized Connection Thumbprints:");
-    for thumbprint in &db.authorized_certs {
-        println!("  {}", thumbprint);
+fn handle_list_conns(db: &mut Database) {
+    if db.current_account != "SYSTEM" {
+        println!("Error: LIST.CONNS can only be executed from the SYSTEM account");
+        return;
+    }
+
+    let prev_acc = db.current_account.clone();
+    if let Err(e) = db.logto("SYSTEM") {
+        println!("Error accessing SYSTEM account: {}", e);
+        return;
+    }
+
+    println!("{:<20} {:<64}", "Name", "Thumbprint");
+    println!("{:-<20} {:-<64}", "", "");
+
+    let table = db.get_table_mut("$CLIENTS");
+    let mut names: Vec<_> = table.records.keys().cloned().collect();
+    names.sort();
+
+    for name in names {
+        if let Some(record) = table.records.get(&name) {
+            let thumbprint = record.fields.get(0)
+                .and_then(|f| f.values.get(0))
+                .and_then(|v| v.sub_values.get(0))
+                .cloned()
+                .unwrap_or_else(|| "N/A".to_string());
+            println!("{:<20} {:<64}", name, thumbprint);
+        }
+    }
+
+    if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
+        let _ = db.logto(&prev_acc);
+    }
+}
+
+fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
+    if db.current_account != "SYSTEM" {
+        println!("Error: GENERATE.CERT can only be executed from the SYSTEM account");
+        return;
+    }
+
+    if parts.len() < 2 {
+        println!("Usage: GENERATE.CERT <common_name>");
+        return;
+    }
+
+    let cn = parts[1];
+    let key_file = format!("{}.key", cn);
+    let csr_file = format!("{}.csr", cn);
+    let crt_file = format!("{}.crt", cn);
+
+    // 1. Generate RSA key
+    let status = std::process::Command::new("openssl")
+        .args(&["genrsa", "-out", &key_file, "2048"])
+        .status();
+
+    if status.is_err() || !status.unwrap().success() {
+        println!("Error generating RSA key");
+        return;
+    }
+
+    // 2. Generate CSR
+    let subj = format!("/CN={}", cn);
+    let status = std::process::Command::new("openssl")
+        .args(&["req", "-new", "-key", &key_file, "-out", &csr_file, "-subj", &subj])
+        .status();
+
+    if status.is_err() || !status.unwrap().success() {
+        println!("Error generating CSR");
+        return;
+    }
+
+    // 3. Sign CSR with system CA
+    // Assuming ca.crt and ca.key are in the root directory (as seen in the project root)
+    let status = std::process::Command::new("openssl")
+        .args(&[
+            "x509", "-req",
+            "-in", &csr_file,
+            "-CA", "ca.crt",
+            "-CAkey", "ca.key",
+            "-CAcreateserial",
+            "-out", &crt_file,
+            "-days", "365",
+            "-sha256"
+        ])
+        .status();
+
+    if status.is_err() || !status.unwrap().success() {
+        println!("Error signing certificate. Ensure ca.crt and ca.key are in the project root.");
+        return;
+    }
+
+    // 4. Calculate thumbprint for convenience
+    let output = std::process::Command::new("openssl")
+        .args(&["x509", "-in", &crt_file, "-fingerprint", "-noout", "-sha256"])
+        .output();
+
+    if let Ok(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(thumbprint) = text.split('=').nth(1) {
+            let thumbprint = thumbprint.replace(':', "").trim().to_lowercase();
+            println!("Certificate generated: {}", crt_file);
+            println!("Private key: {}", key_file);
+            println!("SHA-256 Thumbprint: {}", thumbprint);
+            println!("To authorize this certificate, use: AUTHORIZE.CONN {} <name>", thumbprint);
+        }
+    } else {
+        println!("Certificate generated: {}", crt_file);
+        println!("Private key: {}", key_file);
     }
 }
 

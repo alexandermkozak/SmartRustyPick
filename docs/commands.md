@@ -66,22 +66,36 @@ List all files in the current account. This command reads from the `DIR` file.
 
 #### AUTHORIZE.CONN
 
-Authorize a client certificate SHA-256 thumbprint.
+Authorize a client certificate SHA-256 thumbprint with a name for easy management. This command is restricted to the
+`SYSTEM` account.
 
-- **Usage**: `AUTHORIZE.CONN <thumbprint>`
-- **Example**: `AUTHORIZE.CONN ef9d7b4d5...`
+- **Usage**: `AUTHORIZE.CONN <thumbprint> <name>`
+- **Example**: `AUTHORIZE.CONN ef9d7b4d5... my-laptop`
+- **Note**: The authorization is stored in the `$CLIENTS` file within the `SYSTEM` account for durability.
 
 #### DEAUTHORIZE.CONN
 
-Deauthorize a client certificate thumbprint.
+Deauthorize a client certificate by its assigned name. This command is restricted to the `SYSTEM` account.
 
-- **Usage**: `DEAUTHORIZE.CONN <thumbprint>`
+- **Usage**: `DEAUTHORIZE.CONN <name>`
+- **Example**: `DEAUTHORIZE.CONN my-laptop`
 
 #### LIST.CONNS
 
-List all authorized certificate thumbprints.
+List all authorized certificate names and their thumbprints. This command is restricted to the `SYSTEM` account.
 
 - **Usage**: `LIST.CONNS`
+
+#### GENERATE.CERT
+
+Generate and sign a new client certificate and private key using the system's CA. This command is restricted to the
+`SYSTEM` account.
+
+- **Usage**: `GENERATE.CERT <common_name>`
+- **Example**: `GENERATE.CERT myclient`
+- **Output**: Creates `myclient.crt`, `myclient.csr`, and `myclient.key` in the current directory.
+- **Note**: After generation, you must use `AUTHORIZE.CONN <thumbprint> <name>` to allow the certificate to connect to
+  the server.
 
 #### START.SERVER
 

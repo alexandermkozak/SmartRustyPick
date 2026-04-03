@@ -2,3 +2,16 @@
 /db_storage/
 /.junie/
 /.idea/
+/.env
+/ca.crt
+/ca.key
+/check_logs.txt
+/client.crt
+/client.csr
+/client.key
+/custom_path/user2/DIR/data
+/custom_path/user2/DIR/dict
+/last_key.txt
+/server.crt
+/server.csr
+/server.key
