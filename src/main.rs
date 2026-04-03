@@ -1114,7 +1114,8 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
     }
 
     // 3. Create extension file for SAN if needed
-    let mut san = format!("subjectAltName = DNS:{}", cn);
+    let mut san = "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nsubjectAltName = DNS:".to_string();
+    san.push_str(cn);
     if cn == "localhost" {
         san.push_str(", IP:127.0.0.1");
     }
@@ -1344,7 +1345,7 @@ fn ensure_certificates(config: &Config) -> io::Result<()> {
 
         // 3. Sign server certificate with CA
         let ext_path = "server.ext";
-        std::fs::write(&ext_path, "subjectAltName = DNS:localhost, IP:127.0.0.1")?;
+        std::fs::write(&ext_path, "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nsubjectAltName = DNS:localhost, IP:127.0.0.1")?;
 
         let status = std::process::Command::new("openssl")
             .args(&[

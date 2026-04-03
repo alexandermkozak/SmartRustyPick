@@ -39,7 +39,7 @@ def run_request(port, request, certfile, keyfile, cafile):
             return json.loads(response)
 
 def cleanup():
-    for f in ["config.toml", "ca.key", "ca.crt", "ca.srl", "server.key", "server.csr", "server.crt", "client.key", "client.csr", "client.crt"]:
+    for f in ["ca.key", "ca.crt", "ca.srl", "server.key", "server.csr", "server.crt", "client.key", "client.csr", "client.crt"]:
         if os.path.exists(f): os.remove(f)
     if os.path.exists("db_storage_test"):
         shutil.rmtree("db_storage_test")
@@ -95,7 +95,12 @@ def test_headless_and_cli_attachment():
         f.write(len(client_rec_data).to_bytes(4, 'little'))
         f.write(client_rec_data)
 
-    # Create config.toml
+    # Create config.toml (if it already exists, back it up)
+    config_backup = None
+    if os.path.exists("config.toml"):
+        with open("config.toml", "r") as f:
+            config_backup = f.read()
+
     config_content = f"""
 server_port = 9998
 server_addr = "127.0.0.1"
@@ -168,6 +173,14 @@ ca_path = "ca.crt"
         if os.path.exists("db_storage_backup"):
             shutil.rmtree("db_storage")
             shutil.move("db_storage_backup", "db_storage")
+        
+        # Restore config.toml if we backed it up, otherwise remove our test one
+        if config_backup is not None:
+            with open("config.toml", "w") as f:
+                f.write(config_backup)
+        elif os.path.exists("config.toml"):
+            os.remove("config.toml")
+
         cleanup()
 
 if __name__ == "__main__":
