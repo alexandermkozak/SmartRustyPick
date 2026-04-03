@@ -65,12 +65,22 @@ when the CLI is launched.
 
 ## Quick Start
 
-1. Compile the project with `cargo build --release`.
-2. Run as a CLI: `./target/release/SmartRustyPick`.
+1. Compile the workspace with `cargo build --release`.
+2. Run the interactive "full stack" experience (CLI + background server): `make run` or
+   `cargo run -p smart-rusty-pick-cli`.
    - The CLI will automatically log into an account if the current directory is associated with one.
-3. Run as a headless service: `./target/release/SmartRustyPick --headless`.
+   - The database server will start in the background if SSL certificates are configured in `config.toml`.
+3. Run specifically as a headless database service: `make run-server`.
    - Requires SSL settings in `config.toml`.
 4. Type `HELP` in the CLI to see all commands.
+
+## Workspace Structure
+
+The project is organized into a Rust workspace with the following crates:
+
+- `crates/core`: The core database engine and library.
+- `crates/cli`: The interactive command-line interface.
+- `crates/server`: The dedicated headless server entry point.
 
 ## MCP Server
 

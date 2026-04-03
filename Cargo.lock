@@ -3,22 +3,6 @@
 version = 4
 
 [[package]]
-name = "SmartRustyPick"
-version = "0.1.0"
-dependencies = [
- "hex",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2",
- "time",
- "tokio",
- "tokio-rustls",
- "toml",
-]
-
-[[package]]
 name = "aws-lc-rs"
 version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -508,6 +492,38 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "smart-rusty-pick-cli"
+version = "0.1.0"
+dependencies = [
+ "smart-rusty-pick-core",
+ "tokio",
+]
+
+[[package]]
+name = "smart-rusty-pick-core"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+]
+
+[[package]]
+name = "smart-rusty-pick-server"
+version = "0.1.0"
+dependencies = [
+ "smart-rusty-pick-core",
+ "tokio",
+]
 
 [[package]]
 name = "socket2"

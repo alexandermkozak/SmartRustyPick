@@ -118,7 +118,7 @@ ca_path = "ca.crt"
         shutil.move("db_storage", "db_storage_backup")
     shutil.move("db_storage_test", "db_storage")
 
-    headless_proc = subprocess.Popen(["./target/debug/SmartRustyPick", "--headless"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    headless_proc = subprocess.Popen(["./target/debug/smart-rusty-pick-server"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     
     try:
         time.sleep(2) # Wait for server to start
@@ -146,7 +146,7 @@ ca_path = "ca.crt"
         os.chdir("TEST_ACC_DIR")
         # Run CLI in a way that we can talk to it.
         # We need to go back up to run the binary.
-        cli_proc = subprocess.Popen(["../target/debug/SmartRustyPick"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        cli_proc = subprocess.Popen(["../target/debug/smart-rusty-pick-cli"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
         # The CLI should auto-login and show "Database service attached and running in background."
         # We can send a command to it.

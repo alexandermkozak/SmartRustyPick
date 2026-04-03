@@ -61,7 +61,7 @@ def test_integration():
         shutil.rmtree("db_storage/TEST_ACC")
 
     # Start the application
-    proc = subprocess.Popen(["./target/debug/SmartRustyPick"], stdin=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(["./target/debug/smart-rusty-pick-cli"], stdin=subprocess.PIPE, text=True)
     
     # Initialize SYSTEM and authorize client
     proc.stdin.write("SYSTEM\n") # Log into SYSTEM

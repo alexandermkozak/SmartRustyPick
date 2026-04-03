@@ -933,7 +933,7 @@ impl Database {
 
         // Update $ACCOUNTS in SYSTEM account
         self.update_system_accounts(name, None, true)?;
-        
+
         Ok(())
     }
 
@@ -1024,7 +1024,7 @@ impl Database {
         if !Path::new(&storage).exists() {
             fs::create_dir_all(&storage)?;
         }
-        
+
         let mut dirty_names = Vec::new();
         for (name, table) in &self.loaded_tables {
             if table.dirty {
@@ -1091,7 +1091,7 @@ impl Database {
         let field_no_str = dict_item.fields.get(0)
             .and_then(|f| f.values.get(0))
             .and_then(|v| v.sub_values.get(0))?;
-        
+
         match field_no_str.parse::<usize>() {
             Ok(idx) if idx > 0 => Some(idx - 1),
             _ => None,
@@ -1736,10 +1736,10 @@ mod tests {
         // Date conversions
         // 2026-03-26 is 1774483200000 ms since epoch
         let date_ms_str = "1774483200000";
-        
+
         assert_eq!(Database::apply_conversion(date_ms_str, "D4-"), "03-26-2026");
         assert_eq!(Database::apply_conversion(date_ms_str, "D2/"), "03/26/26");
-        
+
         // Number conversions
         assert_eq!(Database::apply_conversion("12345", "MR2"), "123.45");
         assert_eq!(Database::apply_conversion("12345", "MR4"), "1.2345");
@@ -1806,7 +1806,7 @@ mod tests {
         db.logto("ACC1")?;
         db.create_table("USERS")?;
         let table = db.get_table_mut("USERS");
-        
+
         // Dictionary item: First.Name points to field 1
         let mut dict_item = Record::new();
         dict_item.fields = vec![Field { values: vec![Value { sub_values: vec!["1".to_string()] }] }];
@@ -1846,21 +1846,21 @@ mod tests {
         db.logto("ACC1")?;
 
         let storage = db.current_storage_dir();
-        
+
         // Create table
         db.create_table("MYTABLE")?;
         assert!(Path::new(&format!("{}/MYTABLE/data", storage)).exists());
         assert!(Path::new(&format!("{}/MYTABLE/dict", storage)).exists());
         assert!(db.available_tables.contains("MYTABLE"));
-        
+
         // Create duplicate should fail
         assert!(db.create_table("MYTABLE").is_err());
-        
+
         // Delete table
         db.delete_table("MYTABLE")?;
         assert!(!Path::new(&format!("{}/MYTABLE", storage)).exists());
         assert!(!db.available_tables.contains("MYTABLE"));
-        
+
         // Delete non-existent should fail
         assert!(db.delete_table("NONEXISTENT").is_err());
 
@@ -1872,7 +1872,7 @@ mod tests {
     fn test_lru_eviction() -> io::Result<()> {
         let base_dir = "test_lru_dir";
         if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
-        
+
         {
             let mut db = Database::new(base_dir)?;
             db.create_account("ACC1", None)?;
@@ -1887,7 +1887,7 @@ mod tests {
             db.create_table("T2")?;
             db.get_table_mut("T2").records.insert("k".to_string(), Record::from_bytes(b"v2"));
             db.get_table_mut("T2").dirty = true;
-            
+
             db.max_loaded = 2;
             db.mark_used("T1");
             db.mark_used("T2");
@@ -1913,7 +1913,7 @@ mod tests {
             assert!(db.loaded_tables.contains_key("DIR"), "DIR should be loaded. Loaded: {:?}", db.loaded_tables.keys());
             assert!(db.loaded_tables.contains_key("T3"), "T3 should be loaded. Loaded: {:?}", db.loaded_tables.keys());
         }
-        
+
         // Re-open and check if T1 was flushed
         {
             let mut db = Database::new(base_dir)?;
@@ -1935,7 +1935,7 @@ mod tests {
         db.logto("ACC1")?;
         db.create_table("USERS")?;
         let table = db.get_table_mut("USERS");
-        
+
         // Dictionary item describing field 1 (let's call it "ATTR")
         let mut attr_dict = Record::new();
         attr_dict.fields = vec![Field { values: vec![Value { sub_values: vec!["1".to_string()] }] }];
@@ -1953,7 +1953,7 @@ mod tests {
             value: "1".to_string(),
         });
         let results = db.query("USERS", true, &query, None);
-        
+
         // Should find both "ATTR" and "First.Name"
         assert_eq!(results.len(), 2);
         let keys: std::collections::HashSet<_> = results.iter().map(|(k, _)| k.clone()).collect();
@@ -1972,10 +1972,12 @@ mod tests {
         // A^B]C\D^E
         record.fields = vec![
             Field { values: vec![Value { sub_values: vec!["A".to_string()] }] },
-            Field { values: vec![
-                Value { sub_values: vec!["B".to_string()] },
-                Value { sub_values: vec!["C".to_string(), "D".to_string()] }
-            ] },
+            Field {
+                values: vec![
+                    Value { sub_values: vec!["B".to_string()] },
+                    Value { sub_values: vec!["C".to_string(), "D".to_string()] }
+                ]
+            },
             Field { values: vec![Value { sub_values: vec!["E".to_string()] }] },
         ];
 
@@ -1985,7 +1987,7 @@ mod tests {
 
         let deserialized = Record::from_edit_string(&edit_string);
         assert_eq!(record, deserialized);
-        
+
         // Test with trailing newline (common from editors)
         let edit_string_with_nl = edit_string.clone() + "\n";
         let deserialized_with_nl = Record::from_edit_string(&edit_string_with_nl);
@@ -2001,7 +2003,7 @@ mod tests {
         db.logto("ACC1")?;
         db.create_table("T1")?;
         let table = db.get_table_mut("T1");
-        
+
         let mut dict = Record::new();
         dict.fields = vec![Field { values: vec![Value { sub_values: vec!["1".to_string()] }] }];
         table.dictionary.insert("F1".to_string(), dict);
@@ -2020,7 +2022,7 @@ mod tests {
 
         let q = |op: &str, val: &str| QueryNode::Condition(QueryCondition { field_name: "F1".to_string(), op: op.to_string(), value: val.to_string() });
         assert_eq!(db.query("T1", false, &q("=", "Apple"), None).len(), 1);
-        
+
         // Test #
         assert_eq!(db.query("T1", false, &q("#", "Apple"), None).len(), 2);
 

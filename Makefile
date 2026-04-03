@@ -1,10 +1,18 @@
-.PHONY: test-unit test-integration test-performance test-all build
+.PHONY: test-unit test-integration test-performance test-all build run run-cli run-server
 
 build:
 	cargo build
 
+run: run-cli
+
+run-cli: build
+	./target/debug/smart-rusty-pick-cli
+
+run-server: build
+	./target/debug/smart-rusty-pick-server
+
 test-unit:
-	cargo test
+	cargo test --workspace
 
 test-integration: build
 	@echo "Running integration tests..."

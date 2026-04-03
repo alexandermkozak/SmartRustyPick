@@ -1,48 +1,18 @@
-mod db;
-mod config;
-mod server;
-
-use config::Config;
-use db::{Database, Record};
+use smart_rusty_pick_core::config::Config;
+use smart_rusty_pick_core::db::{Database, Record};
+use smart_rusty_pick_core::server;
 use std::io::{self, Write};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 fn main() -> io::Result<()> {
     let config = Config::load();
 
-    let args: Vec<String> = std::env::args().collect();
-    let headless = args.iter().any(|arg| arg == "--headless");
-
     // We use a directory "db_storage" to hold our tables
     let db = Arc::new(Mutex::new(Database::new("db_storage")?));
 
-    if headless {
-        let cert_path = config.cert_path.clone().expect("headless mode requires cert_path in config.toml");
-        let key_path = config.key_path.clone().expect("headless mode requires key_path in config.toml");
-        let ca_path = config.ca_path.clone().expect("headless mode requires ca_path in config.toml");
-
-        if let Err(e) = ensure_certificates(&config) {
-            eprintln!("Failed to ensure certificates: {}", e);
-        }
-
-        let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = config.server_port.unwrap_or(8443);
-        let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
-
-        println!("Starting headless database service on {}...", full_addr);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            if let Err(e) = server::run_server(&full_addr, db, &cert_path, &key_path, &ca_path).await {
-                eprintln!("Server error: {}", e);
-            }
-        });
-        return Ok(());
-    }
-
     // Check if server should be auto-started in background for CLI
     if config.cert_path.is_some() && config.key_path.is_some() && config.ca_path.is_some() {
-        if let Err(e) = ensure_certificates(&config) {
+        if let Err(e) = server::ensure_certificates(&config) {
             eprintln!("Failed to ensure certificates: {}", e);
         }
 
@@ -293,7 +263,7 @@ fn handle_set(db: &mut Database, parts: &[&str]) {
     let table_name = parts[offset];
     let key = parts[offset + 1].to_string();
     let data = parts[offset + 2..].join(" ");
-    
+
     let table = db.get_table_mut(table_name);
     let record = Record::from_display_string(&data);
     if is_dict {
@@ -321,7 +291,7 @@ fn handle_get(db: &mut Database, parts: &[&str]) {
     }
 
     let table_name = parts[offset];
-    
+
     if parts.len() < offset + 2 {
         // Try to use active select list
         let mut keys_from_list = None;
@@ -575,7 +545,7 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
     } else {
         let keys: Vec<String> = results.iter().map(|(k, _)| k.clone()).collect();
         println!("[{}] records selected", keys.len());
-        db.active_select_list = Some(db::SelectList {
+        db.active_select_list = Some(smart_rusty_pick_core::db::SelectList {
             table_name: table_name.to_string(),
             is_dict,
             keys,
@@ -730,15 +700,15 @@ fn print_record_fields(record: &Record) {
     for (i, field) in record.fields.iter().enumerate() {
         let mut res = Vec::new();
         for (j, v) in field.values.iter().enumerate() {
-            if j > 0 { res.push(db::VM); }
+            if j > 0 { res.push(smart_rusty_pick_core::db::VM); }
             for (k, sv) in v.sub_values.iter().enumerate() {
-                if k > 0 { res.push(db::SVM); }
+                if k > 0 { res.push(smart_rusty_pick_core::db::SVM); }
                 res.extend_from_slice(sv.as_bytes());
             }
         }
         let display_bytes: Vec<u8> = res.iter().map(|&b| match b {
-            db::VM => b']',
-            db::SVM => b'\\',
+            smart_rusty_pick_core::db::VM => b']',
+            smart_rusty_pick_core::db::SVM => b'\\',
             _ => b
         }).collect();
         println!("{:03} {}", i + 1, String::from_utf8_lossy(&display_bytes));
@@ -800,18 +770,18 @@ fn handle_save_list(db: &mut Database, parts: &[&str]) {
 
     let mut data = Vec::new();
     data.extend_from_slice(list.table_name.as_bytes());
-    data.push(db::FM);
+    data.push(smart_rusty_pick_core::db::FM);
     data.extend_from_slice(if list.is_dict { b"1" } else { b"0" });
     for key in &list.keys {
-        data.push(db::FM);
+        data.push(smart_rusty_pick_core::db::FM);
         data.extend_from_slice(key.as_bytes());
     }
-    
+
     let record = Record::from_bytes(&data);
     let table = db.get_table_mut("$SAVEDLISTS");
     table.records.insert(list_name.to_string(), record);
     table.dirty = true;
-    
+
     db.active_select_list = None;
     println!("List '{}' saved", list_name);
 }
@@ -823,25 +793,25 @@ fn handle_get_list(db: &mut Database, parts: &[&str]) {
     }
 
     let list_name = parts[1];
-    
+
     let table = db.get_table_mut("$SAVEDLISTS");
     if let Some(record) = table.records.get(list_name) {
         let data = record.to_bytes();
-        let fields: Vec<&[u8]> = data.split(|&b| b == db::FM).collect();
-        
+        let fields: Vec<&[u8]> = data.split(|&b| b == smart_rusty_pick_core::db::FM).collect();
+
         if fields.len() < 2 {
             println!("INVALID SAVED LIST FORMAT");
             return;
         }
-        
+
         let table_name = String::from_utf8_lossy(fields[0]).to_string();
         let is_dict = fields[1] == b"1";
         let mut keys = Vec::new();
         for f in &fields[2..] {
             keys.push(String::from_utf8_lossy(f).to_string());
         }
-        
-        db.active_select_list = Some(db::SelectList {
+
+        db.active_select_list = Some(smart_rusty_pick_core::db::SelectList {
             table_name,
             is_dict,
             keys,
@@ -989,7 +959,7 @@ fn handle_authorize_conn(db: &mut Database, parts: &[&str]) {
             } else {
                 println!("Authorized: {} as {}", thumbprint, name);
             }
-        },
+        }
         Err(e) => println!("Error authorizing: {}", e),
     }
 }
@@ -1006,7 +976,7 @@ fn handle_add_client_account(db: &mut Database, parts: &[&str]) {
     for acc in accounts {
         match db.add_client_account(name, acc) {
             Ok(true) => count += 1,
-            Ok(false) => {},
+            Ok(false) => {}
             Err(e) => {
                 println!("Error adding account {}: {}", acc, e);
                 return;
@@ -1028,7 +998,7 @@ fn handle_remove_client_account(db: &mut Database, parts: &[&str]) {
     for acc in accounts {
         match db.remove_client_account(name, acc) {
             Ok(true) => count += 1,
-            Ok(false) => {},
+            Ok(false) => {}
             Err(e) => {
                 println!("Error removing account {}: {}", acc, e);
                 return;
@@ -1214,7 +1184,7 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
                         } else {
                             println!("Successfully authorized: {} as {}", thumbprint, auth_name);
                         }
-                    },
+                    }
                     Err(e) => println!("Error authorizing: {}", e),
                 }
             }
@@ -1260,9 +1230,7 @@ fn handle_start_server(db: Arc<Mutex<Database>>, parts: &[&str], config: &Config
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            if let Err(e) = server::run_server(&addr_clone, db, &cert_path, &key_path, &ca_path).await {
-                eprintln!("Server error: {}", e);
-            }
+            let _ = server::run_server(&addr_clone, db, &cert_path, &key_path, &ca_path).await;
         });
     });
     println!("Server start initiated on {}.", addr);
@@ -1287,87 +1255,4 @@ fn check_dir_file(db: &mut Database) -> io::Result<()> {
             Err(e)
         }
     }
-}
-
-fn ensure_certificates(config: &Config) -> io::Result<()> {
-    let cert_path = config.cert_path.as_ref().expect("cert_path missing");
-    let key_path = config.key_path.as_ref().expect("key_path missing");
-    let ca_path = config.ca_path.as_ref().expect("ca_path missing");
-    let ca_key_path = "ca.key"; // Private key for CA
-
-    let cert_exists = Path::new(cert_path).exists();
-    let key_exists = Path::new(key_path).exists();
-    let ca_exists = Path::new(ca_path).exists();
-
-    if cert_exists && key_exists && ca_exists {
-        return Ok(());
-    }
-
-    println!("Generating certificates for first-time startup...");
-
-    // 1. Generate CA key and certificate if needed
-    if !Path::new(ca_key_path).exists() || !ca_exists {
-        println!("Generating CA certificate...");
-        let status = std::process::Command::new("openssl")
-            .args(&[
-                "req", "-new", "-x509", "-days", "3650",
-                "-nodes",
-                "-newkey", "rsa:2048",
-                "-keyout", ca_key_path,
-                "-out", ca_path,
-                "-subj", "/CN=SmartRustyPick Root CA",
-                "-addext", "basicConstraints=critical,CA:TRUE",
-                "-addext", "keyUsage=critical,keyCertSign,cRLSign"
-            ])
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Failed to generate CA certificate"));
-        }
-    }
-
-    // 2. Generate server key and CSR
-    if !key_exists {
-        println!("Generating server certificate...");
-        let csr_path = "server.csr";
-        let status = std::process::Command::new("openssl")
-            .args(&[
-                "req", "-new",
-                "-nodes",
-                "-newkey", "rsa:2048",
-                "-keyout", key_path,
-                "-out", csr_path,
-                "-subj", "/CN=localhost"
-            ])
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Failed to generate server CSR"));
-        }
-
-        // 3. Sign server certificate with CA
-        let ext_path = "server.ext";
-        std::fs::write(&ext_path, "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nsubjectAltName = DNS:localhost, IP:127.0.0.1")?;
-
-        let status = std::process::Command::new("openssl")
-            .args(&[
-                "x509", "-req",
-                "-in", csr_path,
-                "-CA", ca_path,
-                "-CAkey", ca_key_path,
-                "-CAcreateserial",
-                "-out", cert_path,
-                "-days", "365",
-                "-sha256",
-                "-extfile", ext_path
-            ])
-            .status()?;
-
-        let _ = std::fs::remove_file(csr_path);
-        let _ = std::fs::remove_file(ext_path);
-
-        if !status.success() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Failed to sign server certificate"));
-        }
-    }
-
-    Ok(())
 }
