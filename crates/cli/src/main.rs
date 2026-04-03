@@ -149,13 +149,28 @@ fn main() -> io::Result<()> {
                 handle_get_list(&mut db.lock().unwrap(), &parts);
             }
             "CREATE.FILE" => {
-                handle_create_file(&mut db.lock().unwrap(), &parts);
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_create_file(&mut db_lock, &parts);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
             }
             "DELETE.FILE" => {
-                handle_delete_file(&mut db.lock().unwrap(), &parts);
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_delete_file(&mut db_lock, &parts);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
             }
             "CREATE.ACCOUNT" => {
-                handle_create_account(&mut db.lock().unwrap(), &parts);
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_create_account(&mut db_lock, &parts);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
             }
             "CREATE.TEST.ACCOUNT" => {
                 let mut db_lock = db.lock().unwrap();
@@ -166,7 +181,12 @@ fn main() -> io::Result<()> {
                 }
             }
             "DELETE.ACCOUNT" => {
-                handle_delete_account(&mut db.lock().unwrap(), &parts);
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_delete_account(&mut db_lock, &parts);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
             }
             "LOGTO" => {
                 let mut db_lock = db.lock().unwrap();
@@ -730,13 +750,13 @@ fn print_help(current_account: &str) {
     println!("  HELP                                  - Show this help.");
     println!("  SAVE-LIST <name>                      - Save active select list.");
     println!("  GET-LIST <name>                       - Restore a saved select list.");
-    println!("  CREATE.FILE <name>                    - Create a new file (data and dict).");
-    println!("  DELETE.FILE <name>                    - Delete a file (data and dict).");
-    println!("  CREATE.ACCOUNT <name> [<dir>]         - Create a new account.");
+    println!("  CREATE.FILE <name>                    - Create a new file (data and dict) (SYSTEM only).");
+    println!("  DELETE.FILE <name>                    - Delete a file (data and dict) (SYSTEM only).");
+    println!("  CREATE.ACCOUNT <name> [<dir>]         - Create a new account (SYSTEM only).");
     if current_account == "SYSTEM" {
         println!("  CREATE.TEST.ACCOUNT <name>            - Create and populate a test account (SYSTEM only).");
     }
-    println!("  DELETE.ACCOUNT <name>                 - Delete an account and all its files.");
+    println!("  DELETE.ACCOUNT <name>                 - Delete an account and all its files (SYSTEM only).");
     println!("  LOGTO <name>                          - Switch to a different account.");
     println!("  LIST.FILES                            - List all files in the current account.");
     if current_account == "SYSTEM" {

@@ -16,6 +16,7 @@ use tokio_rustls::TlsAcceptor;
 pub struct Request {
     pub command: String,
     pub account: Option<String>,
+    pub target_account: Option<String>,
     pub table: Option<String>,
     pub key: Option<String>,
     pub data: Option<String>,
@@ -24,6 +25,10 @@ pub struct Request {
     pub query_string: Option<String>,
     pub list_name: Option<String>,
     pub batch_size: Option<usize>,
+    pub thumbprint: Option<String>,
+    pub name: Option<String>,
+    pub accounts_list: Option<Vec<String>>,
+    pub is_admin: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -256,7 +261,6 @@ pub async fn run_server(
 fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &crate::db::ClientInfo) -> Response {
     let mut db = db.lock().unwrap();
 
-    // Account restriction and defaulting logic
     let target_account = if let Some(acc) = req.account {
         // Client specified an account
         if !client_info.is_admin && !client_info.allowed_accounts.contains(&acc) {
@@ -264,27 +268,36 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &crate::
             let _ = db.log_error("REMOTE", &msg);
             return Response { status: "ERROR".to_string(), message: Some(msg), record: None, results: None, keys: None, count: None };
         }
-        acc
+        Some(acc)
     } else {
         // Client did not specify an account
         if client_info.allowed_accounts.len() == 1 {
             // Default to the only allowed account
-            client_info.allowed_accounts[0].clone()
+            Some(client_info.allowed_accounts[0].clone())
+        } else if client_info.is_admin {
+            // Admin can access SYSTEM or other accounts, but must specify one if multiple are possible.
+            // However, for administrative commands, they might not need a target account context in terms of 'logto'.
+            None
         } else {
             return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), record: None, results: None, keys: None, count: None };
         }
     };
 
-    if db.current_account != target_account {
-        if let Err(e) = db.logto(&target_account) {
-            let msg = format!("Remote login error for account {}: {}", target_account, e);
-            let _ = db.log_error("REMOTE", &msg);
-            return Response { status: "ERROR".to_string(), message: Some(format!("Failed to login to account: {}", e)), record: None, results: None, keys: None, count: None };
+    if let Some(ref acc) = target_account {
+        if db.current_account != *acc {
+            if let Err(e) = db.logto(acc) {
+                let msg = format!("Remote login error for account {}: {}", acc, e);
+                let _ = db.log_error("REMOTE", &msg);
+                return Response { status: "ERROR".to_string(), message: Some(format!("Failed to login to account: {}", e)), record: None, results: None, keys: None, count: None };
+            }
         }
     }
 
     match req.command.to_uppercase().as_str() {
         "READ" => {
+            if target_account.is_none() {
+                return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), record: None, results: None, keys: None, count: None };
+            }
             let table_name = match req.table {
                 Some(t) => t,
                 None => return Response { status: "ERROR".to_string(), message: Some("Table not specified".to_string()), record: None, results: None, keys: None, count: None },
@@ -307,6 +320,9 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &crate::
             }
         }
         "WRITE" => {
+            if target_account.is_none() {
+                return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), record: None, results: None, keys: None, count: None };
+            }
             let table_name = match req.table {
                 Some(t) => t,
                 None => return Response { status: "ERROR".to_string(), message: Some("Table not specified".to_string()), record: None, results: None, keys: None, count: None },
@@ -333,6 +349,9 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &crate::
             Response { status: "OK".to_string(), message: None, record: None, results: None, keys: None, count: None }
         }
         "DELETE" => {
+            if target_account.is_none() {
+                return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), record: None, results: None, keys: None, count: None };
+            }
             let table_name = match req.table {
                 Some(t) => t,
                 None => return Response { status: "ERROR".to_string(), message: Some("Table not specified".to_string()), record: None, results: None, keys: None, count: None },
@@ -354,6 +373,9 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &crate::
             }
         }
         "QUERY" => {
+            if target_account.is_none() {
+                return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), record: None, results: None, keys: None, count: None };
+            }
             let table_name = match req.table {
                 Some(t) => t,
                 None => return Response { status: "ERROR".to_string(), message: Some("Table not specified".to_string()), record: None, results: None, keys: None, count: None },
@@ -389,6 +411,9 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &crate::
             }
         }
         "READNEXT" => {
+            if target_account.is_none() {
+                return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), record: None, results: None, keys: None, count: None };
+            }
             let list_name = match req.list_name {
                 Some(n) => n,
                 None => return Response { status: "ERROR".to_string(), message: Some("List name not specified".to_string()), record: None, results: None, keys: None, count: None },
@@ -430,6 +455,123 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &crate::
             } else {
                 Response { status: "ERROR".to_string(), message: Some("Select list not found".to_string()), record: None, results: None, keys: None, count: None }
             }
+        }
+        "CREATE.ACCOUNT" => {
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), record: None, results: None, keys: None, count: None };
+            }
+            let name = match req.target_account {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("Account name not specified".to_string()), record: None, results: None, keys: None, count: None },
+            };
+            match db.create_account(&name, None) {
+                Ok(_) => Response { status: "OK".to_string(), message: None, record: None, results: None, keys: None, count: None },
+                Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), record: None, results: None, keys: None, count: None },
+            }
+        }
+        "DELETE.ACCOUNT" => {
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), record: None, results: None, keys: None, count: None };
+            }
+            let name = match req.target_account {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("Account name not specified".to_string()), record: None, results: None, keys: None, count: None },
+            };
+            match db.delete_account(&name) {
+                Ok(_) => Response { status: "OK".to_string(), message: None, record: None, results: None, keys: None, count: None },
+                Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), record: None, results: None, keys: None, count: None },
+            }
+        }
+        "CREATE.FILE" => {
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), record: None, results: None, keys: None, count: None };
+            }
+            let name = match req.table {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("File name not specified".to_string()), record: None, results: None, keys: None, count: None },
+            };
+            match db.create_table(&name) {
+                Ok(_) => Response { status: "OK".to_string(), message: None, record: None, results: None, keys: None, count: None },
+                Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), record: None, results: None, keys: None, count: None },
+            }
+        }
+        "DELETE.FILE" => {
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), record: None, results: None, keys: None, count: None };
+            }
+            let name = match req.table {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("File name not specified".to_string()), record: None, results: None, keys: None, count: None },
+            };
+            match db.delete_table(&name) {
+                Ok(_) => Response { status: "OK".to_string(), message: None, record: None, results: None, keys: None, count: None },
+                Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), record: None, results: None, keys: None, count: None },
+            }
+        }
+        "AUTHORIZE.CONN" => {
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), record: None, results: None, keys: None, count: None };
+            }
+            let thumbprint = match req.thumbprint {
+                Some(t) => t,
+                None => return Response { status: "ERROR".to_string(), message: Some("Thumbprint not specified".to_string()), record: None, results: None, keys: None, count: None }
+            };
+            let name = match req.name {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("Name not specified".to_string()), record: None, results: None, keys: None, count: None }
+            };
+            let accounts = req.accounts_list.unwrap_or_default();
+            let is_admin = req.is_admin.unwrap_or(false);
+            match db.add_authorized_client(&name, &thumbprint, accounts, is_admin) {
+                Ok(_) => Response { status: "OK".to_string(), message: None, record: None, results: None, keys: None, count: None },
+                Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), record: None, results: None, keys: None, count: None },
+            }
+        }
+        "DEAUTHORIZE.CONN" => {
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), record: None, results: None, keys: None, count: None };
+            }
+            let name = match req.name {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("Name not specified".to_string()), record: None, results: None, keys: None, count: None }
+            };
+            match db.remove_authorized_client(&name) {
+                Ok(true) => Response { status: "OK".to_string(), message: None, record: None, results: None, keys: None, count: None },
+                Ok(false) => Response { status: "ERROR".to_string(), message: Some("Client not found".to_string()), record: None, results: None, keys: None, count: None },
+                Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), record: None, results: None, keys: None, count: None },
+            }
+        }
+        "ADD.CLIENT.ACCOUNT" => {
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), record: None, results: None, keys: None, count: None };
+            }
+            let name = match req.name {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("Name not specified".to_string()), record: None, results: None, keys: None, count: None }
+            };
+            let accounts = req.accounts_list.unwrap_or_default();
+            for acc in accounts {
+                if let Err(e) = db.add_client_account(&name, &acc) {
+                    return Response { status: "ERROR".to_string(), message: Some(format!("Error adding account {}: {}", acc, e)), record: None, results: None, keys: None, count: None };
+                }
+            }
+            Response { status: "OK".to_string(), message: None, record: None, results: None, keys: None, count: None }
+        }
+        "REMOVE.CLIENT.ACCOUNT" => {
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), record: None, results: None, keys: None, count: None };
+            }
+            let name = match req.name {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("Name not specified".to_string()), record: None, results: None, keys: None, count: None }
+            };
+            let accounts = req.accounts_list.unwrap_or_default();
+            for acc in accounts {
+                if let Err(e) = db.remove_client_account(&name, &acc) {
+                    return Response { status: "ERROR".to_string(), message: Some(format!("Error removing account {}: {}", acc, e)), record: None, results: None, keys: None, count: None };
+                }
+            }
+            Response { status: "OK".to_string(), message: None, record: None, results: None, keys: None, count: None }
         }
         _ => Response { status: "ERROR".to_string(), message: Some("Unknown command".to_string()), record: None, results: None, keys: None, count: None },
     }
