@@ -5,6 +5,7 @@ mod server;
 use config::Config;
 use db::{Database, Record};
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 fn main() -> io::Result<()> {
@@ -17,13 +18,17 @@ fn main() -> io::Result<()> {
     let db = Arc::new(Mutex::new(Database::new("db_storage")?));
 
     if headless {
-        let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = config.server_port.unwrap_or(8443);
-        let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
-
         let cert_path = config.cert_path.clone().expect("headless mode requires cert_path in config.toml");
         let key_path = config.key_path.clone().expect("headless mode requires key_path in config.toml");
         let ca_path = config.ca_path.clone().expect("headless mode requires ca_path in config.toml");
+
+        if let Err(e) = ensure_certificates(&config) {
+            eprintln!("Failed to ensure certificates: {}", e);
+        }
+
+        let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = config.server_port.unwrap_or(8443);
+        let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
 
         println!("Starting headless database service on {}...", full_addr);
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -33,6 +38,30 @@ fn main() -> io::Result<()> {
             }
         });
         return Ok(());
+    }
+
+    // Check if server should be auto-started in background for CLI
+    if config.cert_path.is_some() && config.key_path.is_some() && config.ca_path.is_some() {
+        if let Err(e) = ensure_certificates(&config) {
+            eprintln!("Failed to ensure certificates: {}", e);
+        }
+
+        let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = config.server_port.unwrap_or(8443);
+        let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
+
+        let db_clone = db.clone();
+        let cert_path = config.cert_path.clone().unwrap();
+        let key_path = config.key_path.clone().unwrap();
+        let ca_path = config.ca_path.clone().unwrap();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let _ = server::run_server(&full_addr, db_clone, &cert_path, &key_path, &ca_path).await;
+            });
+        });
+        println!("Database service attached and running in background.");
     }
 
     println!("SmartRustyPick CLI. Type 'HELP' for commands.");
@@ -92,26 +121,6 @@ fn main() -> io::Result<()> {
             let _ = check_dir_file(&mut db_lock);
             break;
         }
-    }
-
-    // Check if server should be auto-started in background for CLI
-    if config.cert_path.is_some() && config.key_path.is_some() && config.ca_path.is_some() {
-        let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = config.server_port.unwrap_or(8443);
-        let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
-
-        let db_clone = db.clone();
-        let cert_path = config.cert_path.clone().unwrap();
-        let key_path = config.key_path.clone().unwrap();
-        let ca_path = config.ca_path.clone().unwrap();
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let _ = server::run_server(&full_addr, db_clone, &cert_path, &key_path, &ca_path).await;
-            });
-        });
-        println!("Database service attached and running in background.");
     }
 
     loop {
@@ -1263,4 +1272,80 @@ fn check_dir_file(db: &mut Database) -> io::Result<()> {
             Err(e)
         }
     }
+}
+
+fn ensure_certificates(config: &Config) -> io::Result<()> {
+    let cert_path = config.cert_path.as_ref().expect("cert_path missing");
+    let key_path = config.key_path.as_ref().expect("key_path missing");
+    let ca_path = config.ca_path.as_ref().expect("ca_path missing");
+    let ca_key_path = "ca.key"; // Private key for CA
+
+    let cert_exists = Path::new(cert_path).exists();
+    let key_exists = Path::new(key_path).exists();
+    let ca_exists = Path::new(ca_path).exists();
+
+    if cert_exists && key_exists && ca_exists {
+        return Ok(());
+    }
+
+    println!("Generating certificates for first-time startup...");
+
+    // 1. Generate CA key and certificate if needed
+    if !Path::new(ca_key_path).exists() || !ca_exists {
+        println!("Generating CA certificate...");
+        let status = std::process::Command::new("openssl")
+            .args(&[
+                "req", "-new", "-x509", "-days", "3650",
+                "-nodes",
+                "-newkey", "rsa:2048",
+                "-keyout", ca_key_path,
+                "-out", ca_path,
+                "-subj", "/CN=SmartRustyPick Root CA"
+            ])
+            .status()?;
+        if !status.success() {
+            return Err(io::Error::new(io::ErrorKind::Other, "Failed to generate CA certificate"));
+        }
+    }
+
+    // 2. Generate server key and CSR
+    if !key_exists {
+        println!("Generating server certificate...");
+        let csr_path = "server.csr";
+        let status = std::process::Command::new("openssl")
+            .args(&[
+                "req", "-new",
+                "-nodes",
+                "-newkey", "rsa:2048",
+                "-keyout", key_path,
+                "-out", csr_path,
+                "-subj", "/CN=localhost"
+            ])
+            .status()?;
+        if !status.success() {
+            return Err(io::Error::new(io::ErrorKind::Other, "Failed to generate server CSR"));
+        }
+
+        // 3. Sign server certificate with CA
+        let status = std::process::Command::new("openssl")
+            .args(&[
+                "x509", "-req",
+                "-in", csr_path,
+                "-CA", ca_path,
+                "-CAkey", ca_key_path,
+                "-CAcreateserial",
+                "-out", cert_path,
+                "-days", "365",
+                "-sha256"
+            ])
+            .status()?;
+
+        let _ = std::fs::remove_file(csr_path);
+
+        if !status.success() {
+            return Err(io::Error::new(io::ErrorKind::Other, "Failed to sign server certificate"));
+        }
+    }
+
+    Ok(())
 }
