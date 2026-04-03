@@ -25,6 +25,12 @@ test-performance: build
 
 test-all: test-unit test-integration test-performance
 
+test-coverage:
+	cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+test-coverage-html:
+	cargo llvm-cov --workspace --html
+
 mcp-setup:
 	pip install -r mcp/requirements.txt
 
