@@ -73,6 +73,8 @@ fn main() -> io::Result<()> {
 
         let mut db_lock = db.lock().unwrap();
         if let Err(e) = db_lock.logto(account_name) {
+            let msg = format!("Login error: {}", e);
+            let _ = db_lock.log_error("CLI", &msg);
             println!("Error: {}", e);
             println!("Account '{}' not found. Create it? (Y/N)", account_name);
             io::stdout().flush()?;

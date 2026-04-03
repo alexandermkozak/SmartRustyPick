@@ -181,6 +181,8 @@ pub struct Database {
     pub remote_select_lists: HashMap<String, SelectList>,
     pub remote_select_cursors: HashMap<String, usize>,
     pub authorized_certs: HashSet<String>, // Set of SHA-256 thumbprints
+    pub log_detail: String,
+    pub max_log_records: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -208,6 +210,7 @@ pub enum QueryNode {
 
 impl Database {
     pub fn new(base_storage_dir: &str) -> io::Result<Self> {
+        let config = crate::config::Config::load();
         let mut db = Database {
             storage_dir: base_storage_dir.to_string(),
             current_account: String::new(),
@@ -220,6 +223,8 @@ impl Database {
             remote_select_lists: HashMap::new(),
             remote_select_cursors: HashMap::new(),
             authorized_certs: HashSet::new(),
+            log_detail: config.log_detail.unwrap_or_else(|| "normal".to_string()),
+            max_log_records: config.max_log_records.unwrap_or(100),
         };
 
         if !Path::new(&db.storage_dir).exists() {
@@ -251,8 +256,172 @@ impl Database {
                 }
             }
         }
+
+        // Ensure SYSTEM account exists
+        if db.get_account_dir("SYSTEM").is_none() {
+            db.create_account("SYSTEM", None)?;
+        }
+
+        // Ensure $LOGS file exists in SYSTEM account
+        db.ensure_system_logs()?;
+
+        // Ensure $ACCOUNTS file exists in SYSTEM account
+        db.ensure_system_accounts_file()?;
         
         Ok(db)
+    }
+
+    fn ensure_system_accounts_file(&mut self) -> io::Result<()> {
+        let prev_acc = self.current_account.clone();
+        self.logto("SYSTEM")?;
+
+        if !self.available_tables.contains("$ACCOUNTS") {
+            self.create_table("$ACCOUNTS")?;
+        }
+
+        // Populate $ACCOUNTS with all non-SYSTEM accounts
+        let mut accounts_to_list = Vec::new();
+        if let Some(names_field) = self.accounts_config.fields.get(0) {
+            if let Some(dirs_field) = self.accounts_config.fields.get(1) {
+                for (i, v) in names_field.values.iter().enumerate() {
+                    if let Some(name) = v.sub_values.get(0) {
+                        if name != "SYSTEM" {
+                            if let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.get(0)) {
+                                accounts_to_list.push((name.clone(), dir.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let accounts_table = self.get_table_mut("$ACCOUNTS");
+        // Clear or update? Requirement says "contain all non-SYSTEM accounts". 
+        // I'll ensure they are all present.
+        for (name, dir) in accounts_to_list {
+            let mut record = Record::new();
+            record.fields.push(Field {
+                values: vec![Value { sub_values: vec![dir] }]
+            });
+            accounts_table.records.insert(name, record);
+        }
+        accounts_table.dirty = true;
+        self.save()?;
+
+        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
+            self.logto(&prev_acc)?;
+        } else if prev_acc.is_empty() {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
+        }
+        Ok(())
+    }
+
+    fn update_system_accounts(&mut self, name: &str, dir: Option<&str>, remove: bool) -> io::Result<()> {
+        if name == "SYSTEM" {
+            return Ok(());
+        }
+
+        let prev_acc = self.current_account.clone();
+        self.logto("SYSTEM")?;
+
+        if !self.available_tables.contains("$ACCOUNTS") {
+            self.create_table("$ACCOUNTS")?;
+        }
+
+        let accounts_table = self.get_table_mut("$ACCOUNTS");
+        if remove {
+            accounts_table.records.remove(name);
+        } else if let Some(d) = dir {
+            let mut record = Record::new();
+            record.fields.push(Field {
+                values: vec![Value { sub_values: vec![d.to_string()] }]
+            });
+            accounts_table.records.insert(name.to_string(), record);
+        }
+
+        accounts_table.dirty = true;
+        self.save()?;
+
+        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
+            self.logto(&prev_acc)?;
+        } else if prev_acc.is_empty() {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
+        }
+        Ok(())
+    }
+
+    fn ensure_system_logs(&mut self) -> io::Result<()> {
+        let prev_acc = self.current_account.clone();
+        self.logto("SYSTEM")?;
+        if !self.available_tables.contains("$LOGS") {
+            self.create_table("$LOGS")?;
+        }
+        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
+            self.logto(&prev_acc)?;
+        } else if prev_acc.is_empty() {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
+        }
+        Ok(())
+    }
+
+    pub fn log_error(&mut self, account: &str, message: &str) -> io::Result<()> {
+        let prev_acc = self.current_account.clone();
+        self.logto("SYSTEM")?;
+
+        let now = time::OffsetDateTime::now_utc();
+        let date_str = format!("{:04}{:02}{:02}", now.year(), now.month() as u8, now.day());
+        let time_str = format!("{:02}{:02}{:02}", now.hour(), now.minute(), now.second());
+        // Add a microsecond component to ensure key uniqueness during fast tests
+        let key = format!("{}*{}*{}*{}", date_str, time_str, now.microsecond(), account);
+
+        let mut record = Record::new();
+        // Field 1: Message
+        record.fields.push(Field {
+            values: vec![Value { sub_values: vec![message.to_string()] }]
+        });
+
+        // Field 2: Detail
+        if self.log_detail == "detailed" {
+            record.fields.push(Field {
+                values: vec![Value { sub_values: vec![format!("UTC: {}", now)] }]
+            });
+        }
+
+        let max_records = self.max_log_records;
+        {
+            let table = self.get_table_mut("$LOGS");
+            table.records.insert(key, record);
+            table.dirty = true;
+
+            if table.records.len() > max_records {
+                let mut keys: Vec<_> = table.records.keys().cloned().collect();
+                keys.sort();
+                while keys.len() > max_records {
+                    let oldest = keys.remove(0);
+                    table.records.remove(&oldest);
+                }
+            }
+        }
+        self.save()?;
+
+        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
+            self.logto(&prev_acc)?;
+        } else if prev_acc.is_empty() {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
+        }
+        Ok(())
     }
 
     pub fn save_certs(&self) -> io::Result<()> {
@@ -356,20 +525,23 @@ impl Database {
     }
 
     fn get_account_dir(&self, account_name: &str) -> Option<String> {
-        // Search in accounts_config (Record: fields correspond to accounts)
-        // Let's say field 1 contains account names and field 2 contains their directories.
-        // Actually, easier: field 1 is names, field 2 is directories.
         let names_field = self.accounts_config.fields.get(0)?;
         let dirs_field = self.accounts_config.fields.get(1)?;
 
+        // Search for the account name and return its directory.
+        // If multiple entries for the same name exist, return the last one
+        // to handle potential duplicate entries from previous bugs/crashes.
+        let mut found_dir = None;
         for (i, v) in names_field.values.iter().enumerate() {
             if let Some(name) = v.sub_values.get(0) {
                 if name == account_name {
-                    return dirs_field.values.get(i)?.sub_values.get(0).cloned();
+                    if let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.get(0)) {
+                        found_dir = Some(dir.clone());
+                    }
                 }
             }
         }
-        None
+        found_dir
     }
 
     pub fn create_account(&mut self, name: &str, directory: Option<&str>) -> io::Result<()> {
@@ -389,24 +561,43 @@ impl Database {
             self.accounts_config.fields.push(Field::default()); // Names and Dirs
         }
 
+        // Ensure both fields have the same number of values before pushing.
+        // This handles cases where fields might have become out-of-sync.
+        let names_len = self.accounts_config.fields[0].values.len();
+        let dirs_len = self.accounts_config.fields[1].values.len();
+        let max_len = names_len.max(dirs_len);
+
+        while self.accounts_config.fields[0].values.len() < max_len {
+            self.accounts_config.fields[0].values.push(Value::default());
+        }
+        while self.accounts_config.fields[1].values.len() < max_len {
+            self.accounts_config.fields[1].values.push(Value::default());
+        }
+
         self.accounts_config.fields[0].values.push(Value { sub_values: vec![name.to_string()] });
-        self.accounts_config.fields[1].values.push(Value { sub_values: vec![dir] });
+        self.accounts_config.fields[1].values.push(Value { sub_values: vec![dir.clone()] });
 
         self.save_registry()?;
 
+        // Update $ACCOUNTS in SYSTEM account
+        self.update_system_accounts(name, Some(&dir), false)?;
+
         // Initialize DIR file for the new account
         let prev_account = self.current_account.clone();
-        if self.logto(name).is_ok() {
-            let _ = self.create_dir_file();
-            // Restore previous account context if any
-            if !prev_account.is_empty() {
-                let _ = self.logto(&prev_account);
-            } else {
-                self.current_account = String::new();
-                self.loaded_tables.clear();
-                self.available_tables.clear();
-                self.lru_order.clear();
-            }
+        if let Err(e) = self.logto(name) {
+            return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to log into newly created account '{}': {}", name, e)));
+        }
+
+        let _ = self.create_dir_file();
+
+        // Restore previous account context if any
+        if !prev_account.is_empty() {
+            let _ = self.logto(&prev_account);
+        } else {
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
         }
 
         Ok(())
@@ -450,6 +641,10 @@ impl Database {
         let _ = fs::remove_dir_all(dir);
 
         self.save_registry()?;
+
+        // Update $ACCOUNTS in SYSTEM account
+        self.update_system_accounts(name, None, true)?;
+        
         Ok(())
     }
 
@@ -672,6 +867,7 @@ impl Database {
         value.to_string()
     }
 
+    #[allow(dead_code)]
     pub fn query(&mut self, table_name: &str, use_dict_section: bool, dict_name: &str, op: &str, value: &str, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
         let field_idx = match self.get_field_index(table_name, dict_name) {
             Some(idx) => idx,
@@ -952,6 +1148,115 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_system_account_auto_creation() -> io::Result<()> {
+        let base_dir = "test_system_account_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+
+        {
+            let db = Database::new(base_dir)?;
+            // Check if SYSTEM account exists
+            assert!(db.get_account_dir("SYSTEM").is_some(), "SYSTEM account should be automatically created");
+        }
+
+        fs::remove_dir_all(base_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_system_logs_auto_creation() -> io::Result<()> {
+        let base_dir = "test_system_logs_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+
+        {
+            let mut db = Database::new(base_dir)?;
+            // Check if $LOGS file exists in SYSTEM account
+            db.logto("SYSTEM")?;
+            assert!(db.available_tables.contains("$LOGS"), "$LOGS table should be automatically created in SYSTEM account");
+        }
+
+        fs::remove_dir_all(base_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_error_logging() -> io::Result<()> {
+        let base_dir = "test_error_logging_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+
+        {
+            let mut db = Database::new(base_dir)?;
+            db.log_detail = "detailed".to_string();
+            db.max_log_records = 2;
+
+            db.log_error("TEST_ACC", "First error")?;
+            db.log_error("TEST_ACC", "Second error")?;
+            db.log_error("TEST_ACC", "Third error")?; // Should evict first
+
+            db.logto("SYSTEM")?;
+            let logs = db.get_table("$LOGS").expect("$LOGS should exist");
+            assert_eq!(logs.records.len(), 2, "Should respect max_log_records");
+
+            let mut keys: Vec<_> = logs.records.keys().cloned().collect();
+            keys.sort();
+
+            // Check contents
+            let rec2 = logs.records.get(&keys[0]).unwrap();
+            assert_eq!(rec2.fields[0].values[0].sub_values[0], "Second error");
+            assert!(rec2.fields.len() > 1, "Should have detailed field");
+
+            let rec3 = logs.records.get(&keys[1]).unwrap();
+            assert_eq!(rec3.fields[0].values[0].sub_values[0], "Third error");
+        }
+
+        fs::remove_dir_all(base_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_system_accounts_file() -> io::Result<()> {
+        let base_dir = "test_system_accounts_file_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+
+        {
+            let mut db = Database::new(base_dir)?;
+            db.create_account("USER1", None)?;
+            db.create_account("USER2", Some("custom_path/user2"))?;
+
+            // Verify $ACCOUNTS exists and contains USER1 and USER2
+            db.logto("SYSTEM")?;
+            assert!(db.available_tables.contains("$ACCOUNTS"), "$ACCOUNTS table should exist in SYSTEM account");
+
+            let accounts_table = db.get_table("$ACCOUNTS").expect("$ACCOUNTS should be loadable");
+            assert!(accounts_table.records.contains_key("USER1"), "$ACCOUNTS should contain USER1");
+            assert!(accounts_table.records.contains_key("USER2"), "$ACCOUNTS should contain USER2");
+            assert!(!accounts_table.records.contains_key("SYSTEM"), "$ACCOUNTS should NOT contain SYSTEM");
+
+            let rec1 = accounts_table.records.get("USER1").unwrap();
+            assert!(rec1.fields[0].values[0].sub_values[0].contains("USER1"));
+
+            let rec2 = accounts_table.records.get("USER2").unwrap();
+            assert_eq!(rec2.fields[0].values[0].sub_values[0], "custom_path/user2");
+
+            // Test deletion
+            db.delete_account("USER1")?;
+            db.logto("SYSTEM")?;
+            let accounts_table = db.get_table("$ACCOUNTS").unwrap();
+            assert!(!accounts_table.records.contains_key("USER1"), "$ACCOUNTS should not contain USER1 after deletion");
+        }
+
+        // Test auto-population on restart
+        {
+            let mut db = Database::new(base_dir)?;
+            db.logto("SYSTEM")?;
+            let accounts_table = db.get_table("$ACCOUNTS").unwrap();
+            assert!(accounts_table.records.contains_key("USER2"), "$ACCOUNTS should contain USER2 after restart");
+        }
+
+        fs::remove_dir_all(base_dir)?;
+        Ok(())
+    }
 
     #[test]
     fn test_accounts() -> io::Result<()> {

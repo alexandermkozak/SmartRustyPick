@@ -152,6 +152,8 @@ fn handle_request(req: Request, db: &Arc<Mutex<Database>>) -> Response {
     // If account is specified, logto it
     if let Some(acc) = req.account {
         if let Err(e) = db.logto(&acc) {
+            let msg = format!("Remote login error for account {}: {}", acc, e);
+            let _ = db.log_error("REMOTE", &msg);
             return Response { status: "ERROR".to_string(), message: Some(format!("Failed to login to account: {}", e)), record: None, results: None, keys: None, count: None };
         }
     } else if db.current_account.is_empty() {

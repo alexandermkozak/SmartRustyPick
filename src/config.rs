@@ -10,6 +10,8 @@ pub struct Config {
     pub key_path: Option<String>,
     pub ca_path: Option<String>,
     pub server_addr: Option<String>,
+    pub log_detail: Option<String>,
+    pub max_log_records: Option<usize>,
 }
 
 impl Config {
@@ -30,6 +32,8 @@ impl Config {
             key_path: None,
             ca_path: None,
             server_addr: Some("127.0.0.1".to_string()),
+            log_detail: Some("normal".to_string()),
+            max_log_records: Some(100),
         }
     }
 }
