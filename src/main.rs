@@ -953,10 +953,6 @@ fn handle_list_files(db: &mut Database) {
 }
 
 fn handle_authorize_conn(db: &mut Database, parts: &[&str]) {
-    if db.current_account != "SYSTEM" {
-        println!("Error: AUTHORIZE.CONN can only be executed from the SYSTEM account");
-        return;
-    }
     if parts.len() < 4 {
         println!("Usage: AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts>");
         println!("  'accounts' is a comma separated list of allowed accounts.");
@@ -990,10 +986,6 @@ fn handle_authorize_conn(db: &mut Database, parts: &[&str]) {
 }
 
 fn handle_add_client_account(db: &mut Database, parts: &[&str]) {
-    if db.current_account != "SYSTEM" {
-        println!("Error: ADD.CLIENT.ACCOUNT can only be executed from the SYSTEM account");
-        return;
-    }
     if parts.len() < 3 {
         println!("Usage: ADD.CLIENT.ACCOUNT <name> <accounts>");
         return;
@@ -1016,10 +1008,6 @@ fn handle_add_client_account(db: &mut Database, parts: &[&str]) {
 }
 
 fn handle_remove_client_account(db: &mut Database, parts: &[&str]) {
-    if db.current_account != "SYSTEM" {
-        println!("Error: REMOVE.CLIENT.ACCOUNT can only be executed from the SYSTEM account");
-        return;
-    }
     if parts.len() < 3 {
         println!("Usage: REMOVE.CLIENT.ACCOUNT <name> <accounts>");
         return;
@@ -1042,10 +1030,6 @@ fn handle_remove_client_account(db: &mut Database, parts: &[&str]) {
 }
 
 fn handle_deauthorize_conn(db: &mut Database, parts: &[&str]) {
-    if db.current_account != "SYSTEM" {
-        println!("Error: DEAUTHORIZE.CONN can only be executed from the SYSTEM account");
-        return;
-    }
     if parts.len() < 2 {
         println!("Usage: DEAUTHORIZE.CONN <name>");
         return;
@@ -1059,52 +1043,40 @@ fn handle_deauthorize_conn(db: &mut Database, parts: &[&str]) {
 }
 
 fn handle_list_conns(db: &mut Database) {
-    if db.current_account != "SYSTEM" {
-        println!("Error: LIST.CONNS can only be executed from the SYSTEM account");
-        return;
-    }
-
-    let prev_acc = db.current_account.clone();
-    if let Err(e) = db.logto("SYSTEM") {
-        println!("Error accessing SYSTEM account: {}", e);
-        return;
-    }
-
     println!("{:<20} {:<64}", "Name", "Thumbprint");
     println!("{:-<20} {:-<64}", "", "");
 
-    let table = db.get_table_mut("$CLIENTS");
-    let mut names: Vec<_> = table.records.keys().cloned().collect();
-    names.sort();
+    let _ = db.run_in_system_account(|db| {
+        let table = db.get_table_mut("$CLIENTS");
+        let mut names: Vec<_> = table.records.keys().cloned().collect();
+        names.sort();
 
-    for name in names {
-        if let Some(record) = table.records.get(&name) {
-            let thumbprint = record.fields.get(0)
-                .and_then(|f| f.values.get(0))
-                .and_then(|v| v.sub_values.get(0))
-                .cloned()
-                .unwrap_or_else(|| "N/A".to_string());
-            println!("{:<20} {:<64}", name, thumbprint);
+        for name in names {
+            if let Some(record) = table.records.get(&name) {
+                let thumbprint = record.fields.get(0)
+                    .and_then(|f| f.values.get(0))
+                    .and_then(|v| v.sub_values.get(0))
+                    .cloned()
+                    .unwrap_or_else(|| "N/A".to_string());
+                println!("{:<20} {:<64}", name, thumbprint);
+            }
         }
-    }
-
-    if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
-        let _ = db.logto(&prev_acc);
-    }
+        Ok(())
+    });
 }
 
 fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
-    if db.current_account != "SYSTEM" {
-        println!("Error: GENERATE.CERT can only be executed from the SYSTEM account");
-        return;
-    }
-
     if parts.len() < 2 {
         println!("Usage: GENERATE.CERT <common_name>");
         return;
     }
 
     let cn = parts[1];
+    // Sanitize common_name to prevent option injection or directory traversal
+    if cn.starts_with('-') || cn.contains('/') || cn.contains('\\') || cn.contains("..") {
+        println!("Error: Invalid common_name. Must not start with '-' or contain path separators.");
+        return;
+    }
     let key_file = format!("{}.key", cn);
     let csr_file = format!("{}.csr", cn);
     let crt_file = format!("{}.crt", cn);

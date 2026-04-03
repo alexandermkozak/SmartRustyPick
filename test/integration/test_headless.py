@@ -51,11 +51,9 @@ def test_headless_and_cli_attachment():
     thumbprint = generate_certs()
     print(f"Generated client thumbprint: {thumbprint}")
 
-    os.makedirs("db_storage_test", exist_ok=True)
-    os.makedirs("TEST_ACC_DIR", exist_ok=True)
-    
-    # Pre-create a valid DIR file to avoid prompt
-    # In this app, tables are directories with 'data' and 'dict' files inside.
+    os.makedirs("db_storage_test/SYSTEM/$CLIENTS", exist_ok=True)
+    with open("db_storage_test/SYSTEM/$CLIENTS/dict", "wb") as f:
+        pass
     os.makedirs("TEST_ACC_DIR/DIR", exist_ok=True)
     with open("TEST_ACC_DIR/DIR/data", "wb") as f:
         pass # Empty file is a valid section
@@ -75,19 +73,10 @@ def test_headless_and_cli_attachment():
     acc_dir_data = os.path.abspath('TEST_ACC_DIR').encode()
     
     # Record structure for accounts.reg:
-    # Field 1 (Names): Value { sub_values: ["TEST_ACC"] }
-    # Field 2 (Dirs): Value { sub_values: [abspath] }
-    registry_data = acc_name_data + b"\xfe" + acc_dir_data
-    # Wait, the binary format uses bytes directly.
-    # From db.rs:175: Record is mapped from registry file.
-    # Record::to_bytes() puts FM (254) between fields.
-    # But it also puts VM (253) between values and SVM (252) between sub-values.
-    # Single name "TEST_ACC" in field 0, single dir in field 1.
-    # Let's be precise.
-    
-    # Field 0: [Value{["TEST_ACC"]}] -> b"TEST_ACC"
-    # Field 1: [Value{[abspath]}] -> b"abspath"
+    # Field 0 (Names): Value { sub_values: ["TEST_ACC"] }
+    # Field 1 (Dirs): Value { sub_values: [abspath] }
     # Length prefixed storage format: <key_len><key><data_len><data>
+    registry_data = acc_name_data + b"\xfe" + acc_dir_data
     with open("db_storage_test/accounts.reg", "wb") as f:
         key = b"registry"
         f.write(len(key).to_bytes(4, 'little'))
@@ -95,14 +84,16 @@ def test_headless_and_cli_attachment():
         f.write(len(registry_data).to_bytes(4, 'little'))
         f.write(registry_data)
 
-    # Certs registry (Field 1: thumbprints)
-    certs_data = thumbprint.encode()
-    with open("db_storage_test/certs.reg", "wb") as f:
-        key = b"certs"
+    # $CLIENTS record for test client (Thumbprint, Accounts, Admin)
+    # Using Field 0 for Thumbprint, Field 1 for Accounts (empty), Field 2 for Admin (Y)
+    # Data: <thumbprint>\xfe\xfeY
+    client_rec_data = thumbprint.encode() + b"\xfe\xfeY"
+    with open("db_storage_test/SYSTEM/$CLIENTS/data", "wb") as f:
+        key = b"test_client"
         f.write(len(key).to_bytes(4, 'little'))
         f.write(key)
-        f.write(len(certs_data).to_bytes(4, 'little'))
-        f.write(certs_data)
+        f.write(len(client_rec_data).to_bytes(4, 'little'))
+        f.write(client_rec_data)
 
     # Create config.toml
     config_content = f"""
@@ -134,9 +125,9 @@ ca_path = "ca.crt"
         resp = run_request(9998, {"command": "READ", "table": "USERS", "key": "K1"}, "client.crt", "client.key", "ca.crt")
         print(f"Server response: {resp}")
         assert resp is not None
-        # Should be "ERROR" with "Not logged into any account" message
+        # Should be "ERROR" with "Account not specified" message
         assert resp["status"] == "ERROR"
-        assert "Not logged into any account" in resp["message"]
+        assert "Account not specified" in resp["message"]
 
         # 2. Test CLI attachment
         print("Testing CLI attachment...")

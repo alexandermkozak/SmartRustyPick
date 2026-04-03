@@ -239,55 +239,98 @@ impl Database {
             }
         }
 
-        // Load authorized certificates
-        let certs_path = format!("{}/certs.reg", db.storage_dir);
-        if Path::new(&certs_path).exists() {
-            let mut map = HashMap::new();
-            Self::load_section(&mut map, &certs_path)?;
-            if let Some(certs_rec) = map.remove("certs") {
-                if let Some(f) = certs_rec.fields.get(0) {
-                    for v in &f.values {
-                        for sv in &v.sub_values {
-                            db.authorized_certs.insert(sv.clone());
-                        }
-                    }
-                }
-            }
-        }
-
         // Ensure SYSTEM account exists
         if db.get_account_dir("SYSTEM").is_none() {
             db.create_account("SYSTEM", None)?;
         }
 
-        // Ensure $LOGS file exists in SYSTEM account
-        db.ensure_system_logs()?;
+        // Perform all system setup within a single account switch
+        db.run_in_system_account(|db| {
+            // Ensure $LOGS file exists
+            if !db.available_tables.contains("$LOGS") {
+                db.create_table("$LOGS")?;
+            }
 
-        // Ensure $ACCOUNTS file exists in SYSTEM account
-        db.ensure_system_accounts_file()?;
-
-        // Ensure $CLIENTS file exists in SYSTEM account
-        db.ensure_system_clients_file()?;
-
-        // Self-heal default dictionaries for all $ files
-        db.ensure_all_system_dictionaries()?;
-        
-        Ok(db)
-    }
-
-    fn ensure_all_system_dictionaries(&mut self) -> io::Result<()> {
-        let prev_acc = self.current_account.clone();
-        self.logto("SYSTEM")?;
-
-        let table_names: Vec<String> = self.available_tables.iter()
-            .filter(|n| n.starts_with('$'))
-            .cloned()
-            .collect();
-
-        for table_name in table_names {
-            let mut updated = false;
+            // Ensure $ACCOUNTS file exists
+            if !db.available_tables.contains("$ACCOUNTS") {
+                db.create_table("$ACCOUNTS")?;
+            }
+            // Populate $ACCOUNTS with all non-SYSTEM accounts
+            let mut accounts_to_list = Vec::new();
+            if let Some(names_field) = db.accounts_config.fields.get(0) {
+                if let Some(dirs_field) = db.accounts_config.fields.get(1) {
+                    for (i, v) in names_field.values.iter().enumerate() {
+                        if let Some(name) = v.sub_values.get(0) {
+                            if name != "SYSTEM" {
+                                if let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.get(0)) {
+                                    accounts_to_list.push((name.clone(), dir.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             {
-                let table = self.get_table_mut(&table_name);
+                let accounts_table = db.get_table_mut("$ACCOUNTS");
+                for (name, dir) in accounts_to_list {
+                    let mut record = Record::new();
+                    record.fields.push(Field {
+                        values: vec![Value { sub_values: vec![dir] }]
+                    });
+                    accounts_table.records.insert(name, record);
+                }
+                accounts_table.dirty = true;
+            }
+
+            // Ensure $CLIENTS file exists
+            if !db.available_tables.contains("$CLIENTS") {
+                db.create_table("$CLIENTS")?;
+            }
+
+            // One-time migration from certs.reg to $CLIENTS
+            let certs_path = format!("{}/certs.reg", db.storage_dir);
+            if Path::new(&certs_path).exists() {
+                let mut map = HashMap::new();
+                if Self::load_section(&mut map, &certs_path).is_ok() {
+                    if let Some(certs_rec) = map.remove("certs") {
+                        if let Some(f) = certs_rec.fields.get(0) {
+                            let table = db.get_table_mut("$CLIENTS");
+                            for v in &f.values {
+                                for sv in &v.sub_values {
+                                    if !sv.is_empty() {
+                                        let tp_lower = sv.to_lowercase();
+                                        // Migrate if not already present
+                                        let already_exists = table.records.values().any(|r| {
+                                            r.fields.get(0).and_then(|f| f.values.get(0)).and_then(|v| v.sub_values.get(0)) == Some(&tp_lower)
+                                        });
+                                        if !already_exists {
+                                            let mut rec = Record::new();
+                                            rec.fields.push(Field { values: vec![Value { sub_values: vec![tp_lower] }] }); // Thumbprint
+                                            rec.fields.push(Field { values: vec![] }); // No specific accounts
+                                            rec.fields.push(Field { values: vec![Value { sub_values: vec!["Y".to_string()] }] }); // Admin by default for legacy certs
+                                            table.records.insert(format!("migrated_{}", &sv[..8]), rec);
+                                            table.dirty = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Optional: Rename or remove certs.reg after migration to prevent re-migration
+                let _ = fs::rename(&certs_path, format!("{}.migrated", certs_path));
+            }
+
+            // Self-heal default dictionaries for all $ files
+            let table_names: Vec<String> = db.available_tables.iter()
+                .filter(|n| n.starts_with('$'))
+                .cloned()
+                .collect();
+
+            let mut any_updated = false;
+            for table_name in table_names {
+                let mut updated = false;
+                let table = db.get_table_mut(&table_name);
                 match table_name.as_str() {
                     "$LOGS" => {
                         if !table.dictionary.contains_key("MESSAGE") {
@@ -323,136 +366,87 @@ impl Database {
                 }
                 if updated {
                     table.dirty = true;
+                    any_updated = true;
                 }
             }
-            if updated {
-                self.save()?;
-            }
-        }
 
-        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
-            self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
-        }
-        Ok(())
-    }
+            // Load authorized clients from $CLIENTS into in-memory structures
+            let mut loaded_clients = Vec::new();
+            {
+                let clients_table = db.get_table_mut("$CLIENTS");
+                for (_name, record) in &clients_table.records {
+                    let thumbprint = record.fields.get(0)
+                        .and_then(|f| f.values.get(0))
+                        .and_then(|v| v.sub_values.get(0))
+                        .cloned();
 
-    fn ensure_system_clients_file(&mut self) -> io::Result<()> {
-        let prev_acc = self.current_account.clone();
-        self.logto("SYSTEM")?;
-
-        if !self.available_tables.contains("$CLIENTS") {
-            self.create_table("$CLIENTS")?;
-        }
-
-        // Load authorized clients from $CLIENTS into in-memory structures
-        let mut loaded_clients = Vec::new();
-        {
-            let clients_table = self.get_table_mut("$CLIENTS");
-            for (_name, record) in &clients_table.records {
-                let thumbprint = record.fields.get(0)
-                    .and_then(|f| f.values.get(0))
-                    .and_then(|v| v.sub_values.get(0))
-                    .cloned();
-
-                if let Some(tp) = thumbprint {
-                    let tp_lower = tp.to_lowercase();
-
-                    let mut allowed_accounts = Vec::new();
-                    if let Some(f) = record.fields.get(1) {
-                        for v in &f.values {
-                            if let Some(acc) = v.sub_values.get(0) {
-                                if !acc.is_empty() {
-                                    allowed_accounts.push(acc.clone());
+                    if let Some(tp) = thumbprint {
+                        let tp_lower = tp.to_lowercase();
+                        let mut allowed_accounts = Vec::new();
+                        if let Some(f) = record.fields.get(1) {
+                            for v in &f.values {
+                                if let Some(acc) = v.sub_values.get(0) {
+                                    if !acc.is_empty() {
+                                        allowed_accounts.push(acc.clone());
+                                    }
                                 }
                             }
                         }
+                        let is_admin = record.fields.get(2)
+                            .and_then(|f| f.values.get(0))
+                            .and_then(|v| v.sub_values.get(0))
+                            .map(|s| s == "Y")
+                            .unwrap_or(false);
+                        loaded_clients.push(ClientInfo {
+                            thumbprint: tp_lower,
+                            allowed_accounts,
+                            is_admin,
+                        });
                     }
-
-                    let is_admin = record.fields.get(2)
-                        .and_then(|f| f.values.get(0))
-                        .and_then(|v| v.sub_values.get(0))
-                        .map(|s| s == "Y")
-                        .unwrap_or(false);
-
-                    loaded_clients.push(ClientInfo {
-                        thumbprint: tp_lower,
-                        allowed_accounts,
-                        is_admin,
-                    });
                 }
             }
-        }
-        self.authorized_clients.clear();
-        self.authorized_certs.clear();
-        for info in loaded_clients {
-            let tp = info.thumbprint.clone();
-            self.authorized_clients.insert(tp.clone(), info);
-            self.authorized_certs.insert(tp);
-        }
+            db.authorized_clients.clear();
+            db.authorized_certs.clear();
+            for info in loaded_clients {
+                let tp = info.thumbprint.clone();
+                db.authorized_clients.insert(tp.clone(), info);
+                db.authorized_certs.insert(tp);
+            }
 
-        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
-            self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
-        }
-        Ok(())
+            if any_updated || !db.loaded_tables.is_empty() {
+                db.save()?;
+            }
+            Ok(())
+        })?;
+
+        Ok(db)
     }
 
-    fn ensure_system_accounts_file(&mut self) -> io::Result<()> {
+    /// Helper to switch to SYSTEM account, run a closure, and restore previous state.
+    pub fn run_in_system_account<F, R>(&mut self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut Database) -> io::Result<R>,
+    {
         let prev_acc = self.current_account.clone();
-        self.logto("SYSTEM")?;
-
-        if !self.available_tables.contains("$ACCOUNTS") {
-            self.create_table("$ACCOUNTS")?;
+        if prev_acc != "SYSTEM" {
+            self.logto("SYSTEM")?;
         }
 
-        // Populate $ACCOUNTS with all non-SYSTEM accounts
-        let mut accounts_to_list = Vec::new();
-        if let Some(names_field) = self.accounts_config.fields.get(0) {
-            if let Some(dirs_field) = self.accounts_config.fields.get(1) {
-                for (i, v) in names_field.values.iter().enumerate() {
-                    if let Some(name) = v.sub_values.get(0) {
-                        if name != "SYSTEM" {
-                            if let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.get(0)) {
-                                accounts_to_list.push((name.clone(), dir.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let result = f(self);
 
-        let accounts_table = self.get_table_mut("$ACCOUNTS");
-        // Clear or update? Requirement says "contain all non-SYSTEM accounts". 
-        // I'll ensure they are all present.
-        for (name, dir) in accounts_to_list {
-            let mut record = Record::new();
-            record.fields.push(Field {
-                values: vec![Value { sub_values: vec![dir] }]
-            });
-            accounts_table.records.insert(name, record);
-        }
-        accounts_table.dirty = true;
-        self.save()?;
-
-        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
-            self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
+        if prev_acc.is_empty() {
+            // Restore "logged out" state
             self.current_account = String::new();
             self.loaded_tables.clear();
             self.available_tables.clear();
             self.lru_order.clear();
+        } else if prev_acc != "SYSTEM" {
+            self.logto(&prev_acc)?;
         }
-        Ok(())
+
+        result
     }
+
 
     fn update_system_accounts(&mut self, name: &str, dir: Option<&str>, remove: bool) -> io::Result<()> {
         if name == "SYSTEM" {
@@ -491,271 +485,232 @@ impl Database {
         Ok(())
     }
 
-    fn ensure_system_logs(&mut self) -> io::Result<()> {
-        let prev_acc = self.current_account.clone();
-        self.logto("SYSTEM")?;
-        if !self.available_tables.contains("$LOGS") {
-            self.create_table("$LOGS")?;
-        }
-
-        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
-            self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
-        }
-        Ok(())
-    }
 
     pub fn log_error(&mut self, account: &str, message: &str) -> io::Result<()> {
-        let prev_acc = self.current_account.clone();
-        self.logto("SYSTEM")?;
+        self.run_in_system_account(|db| {
+            let now = time::OffsetDateTime::now_utc();
+            let date_str = format!("{:04}{:02}{:02}", now.year(), now.month() as u8, now.day());
+            let time_str = format!("{:02}{:02}{:02}", now.hour(), now.minute(), now.second());
+            // Add a microsecond component to ensure key uniqueness during fast tests
+            let key = format!("{}*{}*{}*{}", date_str, time_str, now.microsecond(), account);
 
-        let now = time::OffsetDateTime::now_utc();
-        let date_str = format!("{:04}{:02}{:02}", now.year(), now.month() as u8, now.day());
-        let time_str = format!("{:02}{:02}{:02}", now.hour(), now.minute(), now.second());
-        // Add a microsecond component to ensure key uniqueness during fast tests
-        let key = format!("{}*{}*{}*{}", date_str, time_str, now.microsecond(), account);
-
-        let mut record = Record::new();
-        // Field 1: Message
-        record.fields.push(Field {
-            values: vec![Value { sub_values: vec![message.to_string()] }]
-        });
-
-        // Field 2: Detail
-        if self.log_detail == "detailed" {
+            let mut record = Record::new();
+            // Field 1: Message
             record.fields.push(Field {
-                values: vec![Value { sub_values: vec![format!("UTC: {}", now)] }]
+                values: vec![Value { sub_values: vec![message.to_string()] }]
             });
-        }
 
-        let max_records = self.max_log_records;
-        {
-            let table = self.get_table_mut("$LOGS");
-            table.records.insert(key, record);
-            table.dirty = true;
+            // Field 2: Detail
+            if db.log_detail == "detailed" {
+                record.fields.push(Field {
+                    values: vec![Value { sub_values: vec![format!("UTC: {}", now)] }]
+                });
+            }
 
-            if table.records.len() > max_records {
-                let mut keys: Vec<_> = table.records.keys().cloned().collect();
-                keys.sort();
-                while keys.len() > max_records {
-                    let oldest = keys.remove(0);
-                    table.records.remove(&oldest);
+            let max_records = db.max_log_records;
+            {
+                let table = db.get_table_mut("$LOGS");
+                table.records.insert(key, record);
+                table.dirty = true;
+
+                if table.records.len() > max_records {
+                    let mut keys: Vec<_> = table.records.keys().cloned().collect();
+                    keys.sort();
+                    while keys.len() > max_records {
+                        let oldest = keys.remove(0);
+                        table.records.remove(&oldest);
+                    }
                 }
             }
-        }
-        self.save()?;
-
-        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
-            self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
-        }
-        Ok(())
+            db.save()
+        })
     }
 
     pub fn add_authorized_client(&mut self, name: &str, thumbprint: &str, allowed_accounts: Vec<String>, is_admin: bool) -> io::Result<()> {
-        let prev_acc = self.current_account.clone();
-        self.logto("SYSTEM")?;
+        self.run_in_system_account(|db| {
+            let thumbprint_lower = thumbprint.to_lowercase();
 
-        let thumbprint_lower = thumbprint.to_lowercase();
+            // Update $CLIENTS table
+            {
+                let table = db.get_table_mut("$CLIENTS");
+                let mut record = Record::new();
+                // Field 0: Thumbprint
+                record.fields.push(Field {
+                    values: vec![Value { sub_values: vec![thumbprint_lower.clone()] }]
+                });
+                // Field 1: Allowed Accounts
+                let mut accounts_field = Field::default();
+                for acc in &allowed_accounts {
+                    accounts_field.values.push(Value { sub_values: vec![acc.clone()] });
+                }
+                record.fields.push(accounts_field);
+                // Field 2: Admin flag
+                record.fields.push(Field {
+                    values: vec![Value { sub_values: vec![if is_admin { "Y".to_string() } else { "".to_string() }] }]
+                });
 
-        // Update $CLIENTS table
-        {
-            let table = self.get_table_mut("$CLIENTS");
-            let mut record = Record::new();
-            // Field 0: Thumbprint
-            record.fields.push(Field {
-                values: vec![Value { sub_values: vec![thumbprint_lower.clone()] }]
-            });
-            // Field 1: Allowed Accounts
-            let mut accounts_field = Field::default();
-            for acc in &allowed_accounts {
-                accounts_field.values.push(Value { sub_values: vec![acc.clone()] });
+                table.records.insert(name.to_string(), record);
+                table.dirty = true;
             }
-            record.fields.push(accounts_field);
-            // Field 2: Admin flag
-            record.fields.push(Field {
-                values: vec![Value { sub_values: vec![if is_admin { "Y".to_string() } else { "".to_string() }] }]
+            db.save()?;
+
+            // Update in-memory structures
+            db.authorized_clients.insert(thumbprint_lower.clone(), ClientInfo {
+                thumbprint: thumbprint_lower.clone(),
+                allowed_accounts,
+                is_admin,
             });
+            db.authorized_certs.insert(thumbprint_lower);
 
-            table.records.insert(name.to_string(), record);
-            table.dirty = true;
-        }
-        self.save()?;
-
-        // Update in-memory structures
-        self.authorized_clients.insert(thumbprint_lower.clone(), ClientInfo {
-            thumbprint: thumbprint_lower.clone(),
-            allowed_accounts,
-            is_admin,
-        });
-        self.authorized_certs.insert(thumbprint_lower);
-
-        // Sync with certs.reg for backward compatibility (optional but safe)
-        self.save_certs()?;
-
-        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
-            self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
-        }
-        Ok(())
+            // Sync with certs.reg for backward compatibility (optional but safe)
+            db.save_certs()
+        })
     }
 
     pub fn add_client_account(&mut self, name: &str, account: &str) -> io::Result<bool> {
-        let prev_acc = self.current_account.clone();
-        self.logto("SYSTEM")?;
+        self.run_in_system_account(|db| {
+            let mut thumbprint = None;
+            let mut success = false;
+            let mut existing_accounts = Vec::new();
+            let mut is_admin = false;
+            {
+                let table = db.get_table_mut("$CLIENTS");
+                if let Some(record) = table.records.get_mut(name) {
+                    // Get thumbprint for updating in-memory map later
+                    thumbprint = record.fields.get(0)
+                        .and_then(|f| f.values.get(0))
+                        .and_then(|v| v.sub_values.get(0))
+                        .cloned();
 
-        let mut thumbprint = None;
-        let mut success = false;
-        {
-            let table = self.get_table_mut("$CLIENTS");
-            if let Some(record) = table.records.get_mut(name) {
-                // Get thumbprint for updating in-memory map later
-                thumbprint = record.fields.get(0)
-                    .and_then(|f| f.values.get(0))
-                    .and_then(|v| v.sub_values.get(0))
-                    .cloned();
-
-                // Ensure Field 1 exists
-                while record.fields.len() <= 1 {
-                    record.fields.push(Field::default());
-                }
-
-                // Check if account already exists in Field 1
-                let accounts_field = &mut record.fields[1];
-                let exists = accounts_field.values.iter().any(|v| v.sub_values.get(0).map(|s| s == account).unwrap_or(false));
-
-                if !exists {
-                    accounts_field.values.push(Value { sub_values: vec![account.to_string()] });
-                    table.dirty = true;
-                    success = true;
-                }
-            }
-        }
-
-        if success {
-            self.save()?;
-            if let Some(tp) = thumbprint {
-                let tp_lower = tp.to_lowercase();
-                if let Some(info) = self.authorized_clients.get_mut(&tp_lower) {
-                    if !info.allowed_accounts.contains(&account.to_string()) {
-                        info.allowed_accounts.push(account.to_string());
+                    // Ensure Field 1 exists
+                    while record.fields.len() <= 1 {
+                        record.fields.push(Field::default());
                     }
-                }
-            }
-        }
 
-        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
-            self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
-        }
-        Ok(success)
-    }
-
-    pub fn remove_client_account(&mut self, name: &str, account: &str) -> io::Result<bool> {
-        let prev_acc = self.current_account.clone();
-        self.logto("SYSTEM")?;
-
-        let mut thumbprint = None;
-        let mut success = false;
-        {
-            let table = self.get_table_mut("$CLIENTS");
-            if let Some(record) = table.records.get_mut(name) {
-                thumbprint = record.fields.get(0)
-                    .and_then(|f| f.values.get(0))
-                    .and_then(|v| v.sub_values.get(0))
-                    .cloned();
-
-                if record.fields.len() > 1 {
+                    // Check if account already exists in Field 1
                     let accounts_field = &mut record.fields[1];
-                    let original_len = accounts_field.values.len();
-                    accounts_field.values.retain(|v| v.sub_values.get(0).map(|s| s != account).unwrap_or(true));
+                    let exists = accounts_field.values.iter().any(|v| v.sub_values.get(0).map(|s| s == account).unwrap_or(false));
 
-                    if accounts_field.values.len() < original_len {
+                    if !exists {
+                        accounts_field.values.push(Value { sub_values: vec![account.to_string()] });
                         table.dirty = true;
                         success = true;
                     }
+
+                    for v in &accounts_field.values {
+                        if let Some(acc) = v.sub_values.get(0) {
+                            existing_accounts.push(acc.clone());
+                        }
+                    }
+
+                    is_admin = record.fields.get(2)
+                        .and_then(|f| f.values.get(0))
+                        .and_then(|v| v.sub_values.get(0))
+                        .map(|s| s == "Y")
+                        .unwrap_or(false);
                 }
             }
-        }
 
-        if success {
-            self.save()?;
-            if let Some(tp) = thumbprint {
-                let tp_lower = tp.to_lowercase();
-                if let Some(info) = self.authorized_clients.get_mut(&tp_lower) {
-                    info.allowed_accounts.retain(|a| a != account);
+            if success {
+                db.save()?;
+                if let Some(tp) = thumbprint {
+                    let tp_lower = tp.to_lowercase();
+                    db.authorized_clients.insert(tp_lower.clone(), ClientInfo {
+                        thumbprint: tp_lower,
+                        allowed_accounts: existing_accounts,
+                        is_admin,
+                    });
                 }
             }
-        }
+            Ok(success)
+        })
+    }
 
-        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
-            self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
-        }
-        Ok(success)
+    pub fn remove_client_account(&mut self, name: &str, account: &str) -> io::Result<bool> {
+        self.run_in_system_account(|db| {
+            let mut thumbprint = None;
+            let mut success = false;
+            let mut existing_accounts = Vec::new();
+            let mut is_admin = false;
+            {
+                let table = db.get_table_mut("$CLIENTS");
+                if let Some(record) = table.records.get_mut(name) {
+                    thumbprint = record.fields.get(0)
+                        .and_then(|f| f.values.get(0))
+                        .and_then(|v| v.sub_values.get(0))
+                        .cloned();
+
+                    if record.fields.len() > 1 {
+                        let accounts_field = &mut record.fields[1];
+                        let original_len = accounts_field.values.len();
+                        accounts_field.values.retain(|v| v.sub_values.get(0).map(|s| s != account).unwrap_or(true));
+
+                        if accounts_field.values.len() < original_len {
+                            table.dirty = true;
+                            success = true;
+                        }
+
+                        for v in &accounts_field.values {
+                            if let Some(acc) = v.sub_values.get(0) {
+                                existing_accounts.push(acc.clone());
+                            }
+                        }
+                    }
+
+                    is_admin = record.fields.get(2)
+                        .and_then(|f| f.values.get(0))
+                        .and_then(|v| v.sub_values.get(0))
+                        .map(|s| s == "Y")
+                        .unwrap_or(false);
+                }
+            }
+
+            if success {
+                db.save()?;
+                if let Some(tp) = thumbprint {
+                    let tp_lower = tp.to_lowercase();
+                    db.authorized_clients.insert(tp_lower.clone(), ClientInfo {
+                        thumbprint: tp_lower,
+                        allowed_accounts: existing_accounts,
+                        is_admin,
+                    });
+                }
+            }
+            Ok(success)
+        })
     }
 
     pub fn remove_authorized_client(&mut self, name: &str) -> io::Result<bool> {
-        let prev_acc = self.current_account.clone();
-        self.logto("SYSTEM")?;
-
-        let mut removed_thumbprint = None;
-        let found = {
-            let table = self.get_table_mut("$CLIENTS");
-            if let Some(record) = table.records.remove(name) {
-                if let Some(f) = record.fields.get(0) {
-                    if let Some(v) = f.values.get(0) {
-                        if let Some(tp) = v.sub_values.get(0) {
-                            removed_thumbprint = Some(tp.clone());
+        self.run_in_system_account(|db| {
+            let mut removed_thumbprint = None;
+            let found = {
+                let table = db.get_table_mut("$CLIENTS");
+                if let Some(record) = table.records.remove(name) {
+                    if let Some(f) = record.fields.get(0) {
+                        if let Some(v) = f.values.get(0) {
+                            if let Some(tp) = v.sub_values.get(0) {
+                                removed_thumbprint = Some(tp.clone());
+                            }
                         }
                     }
+                    table.dirty = true;
+                    true
+                } else {
+                    false
                 }
-                table.dirty = true;
-                true
-            } else {
-                false
-            }
-        };
+            };
 
-        if found {
-            self.save()?;
-            if let Some(tp) = removed_thumbprint {
-                let tp_lower = tp.to_lowercase();
-                self.authorized_certs.remove(&tp_lower);
-                self.authorized_clients.remove(&tp_lower);
-                self.save_certs()?;
+            if found {
+                db.save()?;
+                if let Some(tp) = removed_thumbprint {
+                    let tp_lower = tp.to_lowercase();
+                    db.authorized_certs.remove(&tp_lower);
+                    db.authorized_clients.remove(&tp_lower);
+                    db.save_certs()?;
+                }
             }
-        }
-
-        if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
-            self.logto(&prev_acc)?;
-        } else if prev_acc.is_empty() {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
-        }
-        Ok(found)
+            Ok(found)
+        })
     }
 
     pub fn save_certs(&self) -> io::Result<()> {
@@ -1473,7 +1428,13 @@ impl Database {
         self.save()?;
 
         // 7. Log back to original account (usually SYSTEM)
-        if !original_account.is_empty() {
+        if original_account.is_empty() {
+            // Restore "logged out" state
+            self.current_account = String::new();
+            self.loaded_tables.clear();
+            self.available_tables.clear();
+            self.lru_order.clear();
+        } else {
             self.logto(&original_account)?;
         }
 
