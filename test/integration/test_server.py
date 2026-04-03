@@ -11,7 +11,12 @@ def generate_certs():
     subprocess.run("openssl req -x509 -new -nodes -key ca.key -sha256 -days 365 -out ca.crt -subj '/CN=Test CA' -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign,cRLSign'", shell=True, check=True, capture_output=True)
     subprocess.run("openssl genrsa -out server.key 2048", shell=True, check=True, capture_output=True)
     subprocess.run("openssl req -new -key server.key -out server.csr -subj '/CN=localhost'", shell=True, check=True, capture_output=True)
-    subprocess.run("openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -sha256", shell=True, check=True, capture_output=True)
+    # Use -extfile for SAN during signing
+    with open("server.ext", "w") as f:
+        f.write("subjectAltName = DNS:localhost, IP:127.0.0.1")
+    subprocess.run("openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -sha256 -extfile server.ext", shell=True, check=True, capture_output=True)
+    os.remove("server.ext")
+    
     subprocess.run("openssl genrsa -out client.key 2048", shell=True, check=True, capture_output=True)
     subprocess.run("openssl req -new -key client.key -out client.csr -subj '/CN=Test Client'", shell=True, check=True, capture_output=True)
     subprocess.run("openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 365 -sha256", shell=True, check=True, capture_output=True)

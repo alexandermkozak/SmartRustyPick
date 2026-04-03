@@ -1090,6 +1090,7 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
     let csr_file = format!("{}.csr", cn);
     let crt_file = format!("{}.crt", cn);
     let pfx_file = format!("{}.pfx", cn);
+    let ext_file = format!("{}.ext", cn);
 
     // 1. Generate RSA key
     let status = std::process::Command::new("openssl")
@@ -1112,7 +1113,17 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
         return;
     }
 
-    // 3. Sign CSR with system CA
+    // 3. Create extension file for SAN if needed
+    let mut san = format!("subjectAltName = DNS:{}", cn);
+    if cn == "localhost" {
+        san.push_str(", IP:127.0.0.1");
+    }
+    if let Err(e) = std::fs::write(&ext_file, san) {
+        println!("Error creating extension file: {}", e);
+        return;
+    }
+
+    // 4. Sign CSR with system CA
     // Assuming ca.crt and ca.key are in the root directory (as seen in the project root)
     let status = std::process::Command::new("openssl")
         .args(&[
@@ -1123,16 +1134,19 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
             "-CAcreateserial",
             "-out", &crt_file,
             "-days", "365",
-            "-sha256"
+            "-sha256",
+            "-extfile", &ext_file
         ])
         .status();
+
+    let _ = std::fs::remove_file(&ext_file);
 
     if status.is_err() || !status.unwrap().success() {
         println!("Error signing certificate. Ensure ca.crt and ca.key are in the project root.");
         return;
     }
 
-    // 4. Create PFX file
+    // 5. Create PFX file
     let status = std::process::Command::new("openssl")
         .args(&[
             "pkcs12", "-export",
@@ -1300,7 +1314,9 @@ fn ensure_certificates(config: &Config) -> io::Result<()> {
                 "-newkey", "rsa:2048",
                 "-keyout", ca_key_path,
                 "-out", ca_path,
-                "-subj", "/CN=SmartRustyPick Root CA"
+                "-subj", "/CN=SmartRustyPick Root CA",
+                "-addext", "basicConstraints=critical,CA:TRUE",
+                "-addext", "keyUsage=critical,keyCertSign,cRLSign"
             ])
             .status()?;
         if !status.success() {
@@ -1327,6 +1343,9 @@ fn ensure_certificates(config: &Config) -> io::Result<()> {
         }
 
         // 3. Sign server certificate with CA
+        let ext_path = "server.ext";
+        std::fs::write(&ext_path, "subjectAltName = DNS:localhost, IP:127.0.0.1")?;
+
         let status = std::process::Command::new("openssl")
             .args(&[
                 "x509", "-req",
@@ -1336,11 +1355,13 @@ fn ensure_certificates(config: &Config) -> io::Result<()> {
                 "-CAcreateserial",
                 "-out", cert_path,
                 "-days", "365",
-                "-sha256"
+                "-sha256",
+                "-extfile", ext_path
             ])
             .status()?;
 
         let _ = std::fs::remove_file(csr_path);
+        let _ = std::fs::remove_file(ext_path);
 
         if !status.success() {
             return Err(io::Error::new(io::ErrorKind::Other, "Failed to sign server certificate"));
