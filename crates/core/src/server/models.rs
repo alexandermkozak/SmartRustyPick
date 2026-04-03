@@ -1,7 +1,7 @@
 use crate::db::QueryNode;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Request {
     pub command: String,
     pub account: Option<String>,

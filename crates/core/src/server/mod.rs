@@ -1,6 +1,8 @@
 pub mod models;
 pub mod certs;
 pub mod handler;
+#[cfg(test)]
+mod handler_tests;
 
 use crate::config::Config;
 use crate::db::Database;
