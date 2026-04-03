@@ -4,3 +4,4 @@ cert_path = "server.crt"
 key_path = "server.key"
 ca_path = "ca.crt"
 editor = "nano"
+

@@ -55,10 +55,13 @@ def test_integration():
     # Start the application
     proc = subprocess.Popen(["./target/debug/SmartRustyPick"], stdin=subprocess.PIPE, text=True)
     
-    # Initialize account and setup table
-    proc.stdin.write("TEST_ACC\nY\nY\n") # Account, Create, DIR Create
+    # Initialize SYSTEM and authorize client
+    proc.stdin.write("SYSTEM\n") # Log into SYSTEM
+    proc.stdin.write(f"AUTHORIZE.CONN {thumbprint} test_client ADMIN\n")
+    proc.stdin.write("CREATE.ACCOUNT TEST_ACC\n")
+    proc.stdin.write("LOGTO TEST_ACC\n")
+    proc.stdin.write("Y\n") # Create DIR if prompted
     proc.stdin.write("CREATE.FILE USERS\n")
-    proc.stdin.write(f"AUTHORIZE.CONN {thumbprint}\n")
     proc.stdin.write("START.SERVER 127.0.0.1:9999 server.crt server.key ca.crt\n")
     proc.stdin.flush()
 
@@ -75,26 +78,31 @@ def test_integration():
             with context.wrap_socket(sock, server_hostname='localhost') as ssock:
                 # 1. WRITE
                 print("Testing WRITE...")
-                resp = run_request(port, {"command": "WRITE", "table": "USERS", "key": "USER1", "data": "John^Doe^30"}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                req = {"command": "WRITE", "table": "USERS", "key": "USER1", "data": "John^Doe^30", "account": "TEST_ACC"}
+                resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                print(f"WRITE response: {resp}")
                 assert resp["status"] == "OK"
 
                 # 2. READ
                 print("Testing READ...")
-                resp = run_request(port, {"command": "READ", "table": "USERS", "key": "USER1"}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                req = {"command": "READ", "table": "USERS", "key": "USER1", "account": "TEST_ACC"}
+                resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 assert resp["status"] == "OK"
                 assert resp["record"] == "John^Doe^30"
 
                 print("Testing QUERY...")
                 # Use field 1 which corresponds to "John"
                 # Since table USERS might not have a dictionary yet, it relies on numeric index
-                resp = run_request(port, {"command": "QUERY", "table": "USERS", "query_string": "WITH 1 = John"}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                req = {"command": "QUERY", "table": "USERS", "query_string": "WITH 1 = John", "account": "TEST_ACC"}
+                resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 print(f"QUERY response: {resp}")
                 assert resp["status"] == "OK"
                 # Results is a list of [key, record_string]
                 # Let's check what we got
                 if not resp["results"]:
                     # Maybe it needs quotes?
-                    resp = run_request(port, {"command": "QUERY", "table": "USERS", "query_string": "WITH 1 = \"John\""}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                    req = {"command": "QUERY", "table": "USERS", "query_string": "WITH 1 = \"John\"", "account": "TEST_ACC"}
+                    resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                     print(f"QUERY response with quotes: {resp}")
                 
                 keys = [item[0] for item in resp["results"]]
@@ -102,24 +110,28 @@ def test_integration():
 
                 # 4. SELECT LIST (QUERY with list_name)
                 print("Testing SELECT LIST...")
-                resp = run_request(port, {"command": "QUERY", "table": "USERS", "query_string": "WITH 1 = John", "list_name": "MYLIST"}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                req = {"command": "QUERY", "table": "USERS", "query_string": "WITH 1 = John", "list_name": "MYLIST", "account": "TEST_ACC"}
+                resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 assert resp["status"] == "OK"
                 assert resp["count"] == 1
 
                 # 5. READNEXT
                 print("Testing READNEXT...")
-                resp = run_request(port, {"command": "READNEXT", "list_name": "MYLIST", "batch_size": 1}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                req = {"command": "READNEXT", "list_name": "MYLIST", "batch_size": 1, "account": "TEST_ACC"}
+                resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 assert resp["status"] == "OK"
                 assert resp["keys"] == ["USER1"]
 
                 # 6. DELETE
                 print("Testing DELETE...")
-                resp = run_request(port, {"command": "DELETE", "table": "USERS", "key": "USER1"}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                req = {"command": "DELETE", "table": "USERS", "key": "USER1", "account": "TEST_ACC"}
+                resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 assert resp["status"] == "OK"
 
                 # 7. READ (should fail)
                 print("Testing READ (after DELETE)...")
-                resp = run_request(port, {"command": "READ", "table": "USERS", "key": "USER1"}, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                req = {"command": "READ", "table": "USERS", "key": "USER1", "account": "TEST_ACC"}
+                resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 assert resp["status"] == "NOT_FOUND"
 
                 print("Integration tests PASSED")
