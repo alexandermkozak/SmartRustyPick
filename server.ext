@@ -1,3 +1,0 @@
-basicConstraints=critical,CA:FALSE
-keyUsage=critical,digitalSignature,keyEncipherment
-subjectAltName = DNS:localhost, IP:127.0.0.1

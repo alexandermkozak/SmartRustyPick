@@ -414,6 +414,10 @@ impl Database {
         self.get_account_dir(&self.current_account).unwrap_or_else(|| self.storage_dir.clone())
     }
 
+    pub fn get_table_read_only(&self, name: &str) -> Option<&Table> {
+        self.loaded_tables.get(name)
+    }
+
     pub fn get_table(&mut self, name: &str) -> Option<&Table> {
         if !self.available_tables.contains(name) {
             return None;
@@ -699,21 +703,24 @@ impl Database {
         None
     }
 
-    pub fn get_conversion_code(&mut self, table_name: &str, field_name: &str) -> Option<String> {
-        let table = self.get_table(table_name)?;
+    pub fn get_conversion_code_read_only(&self, table_name: &str, field_name: &str) -> Option<String> {
+        let table = self.get_table_read_only(table_name)?;
         if let Some(rec) = table.dictionary.get(field_name) {
             // Pick MDn conversion is in Field 8
             if let Some(f8) = rec.fields.get(7) {
                 if let Some(v) = f8.values.get(0) {
-                    if let Some(code) = v.sub_values.get(0) {
-                        if !code.is_empty() {
-                            return Some(code.clone());
-                        }
+                    let code: &String = v.sub_values.get(0)?;
+                    if !code.is_empty() {
+                        return Some(code.clone());
                     }
                 }
             }
         }
         None
+    }
+
+    pub fn get_conversion_code(&mut self, table_name: &str, field_name: &str) -> Option<String> {
+        self.get_conversion_code_read_only(table_name, field_name)
     }
 
     pub fn apply_conversion(val: &str, code: &str) -> String {
@@ -732,24 +739,43 @@ impl Database {
         val.to_string()
     }
 
-    pub fn get_field_index(&mut self, table_name: &str, field_name: &str) -> Option<usize> {
+    pub fn format_record_field(&self, table_name: &str, record: &Record, field_name: &str) -> String {
+        let field_idx = match self.get_field_index_read_only(table_name, field_name) {
+            Some(idx) => idx,
+            None => return String::new(),
+        };
+
+        let raw_val = record.get_field_display_string(field_idx);
+        let conv = self.get_conversion_code_read_only(table_name, field_name);
+
+        if let Some(code) = conv {
+            Self::apply_conversion(&raw_val, &code)
+        } else {
+            raw_val
+        }
+    }
+
+    pub fn get_field_index_read_only(&self, table_name: &str, field_name: &str) -> Option<usize> {
         if field_name == "ID" { return Some(0); }
-        let table = self.get_table(table_name)?;
+        let table = self.get_table_read_only(table_name)?;
         if let Some(rec) = table.dictionary.get(field_name) {
             if let Some(f1) = rec.fields.get(0) {
                 if let Some(v1) = f1.values.get(0) {
-                    if let Some(idx_str) = v1.sub_values.get(0) {
-                        if let Ok(idx) = idx_str.parse::<usize>() {
-                            // Pick attribute 1 is 0-indexed 0 in our internal fields vector
-                            if idx > 0 {
-                                return Some(idx - 1);
-                            }
+                    let idx_str: &String = v1.sub_values.get(0)?;
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        // Pick attribute 1 is 0-indexed 0 in our internal fields vector
+                        if idx > 0 {
+                            return Some(idx - 1);
                         }
                     }
                 }
             }
         }
         None
+    }
+
+    pub fn get_field_index(&mut self, table_name: &str, field_name: &str) -> Option<usize> {
+        self.get_field_index_read_only(table_name, field_name)
     }
 
     pub fn log_error(&mut self, account: &str, message: &str) -> io::Result<()> {

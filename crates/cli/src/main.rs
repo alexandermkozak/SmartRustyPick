@@ -444,8 +444,10 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
         }
     }
 
-    if field_names.is_empty() {
-        if let Some(table) = db.get_table(table_name) {
+    let table_exists = db.list_tables().contains(&table_name.to_string());
+    if table_exists {
+        let (map_keys, is_dict_val) = {
+            let table = db.get_table_mut(table_name);
             let map = if is_dict { &table.dictionary } else { &table.records };
             let keys = if use_select_list {
                 selected_keys
@@ -454,51 +456,44 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
                 k.sort();
                 k
             };
-            for key in keys {
+            (keys, is_dict)
+        };
+
+        if field_names.is_empty() {
+            for key in map_keys {
                 println!("{}", key);
             }
         } else {
-            println!("TABLE NOT FOUND");
-        }
-    } else {
-        // Resolve field names to indices
-        let mut field_indices = Vec::new();
-        let mut conversion_codes = Vec::new();
-        for name in field_names {
-            field_indices.push(db.get_field_index(table_name, name));
-            conversion_codes.push(db.get_conversion_code(table_name, name));
-        }
+            // Resolve field info once while we have a mutable borrow of db
+            let mut field_info = Vec::new();
+            for name in field_names {
+                let idx = db.get_field_index(table_name, name);
+                let conv = db.get_conversion_code(table_name, name);
+                field_info.push((idx, conv));
+            }
 
-        if let Some(table) = db.get_table(table_name) {
-            let map = if is_dict { &table.dictionary } else { &table.records };
-            let keys = if use_select_list {
-                selected_keys
-            } else {
-                let mut k: Vec<_> = map.keys().cloned().collect();
-                k.sort();
-                k
-            };
-            for key in keys {
-                if let Some(record) = map.get(&key) {
+            // Now iterate over records
+            for key in map_keys {
+                let formatted_row = {
+                    let table = db.get_table_mut(table_name);
+                    let map = if is_dict_val { &table.dictionary } else { &table.records };
+                    map.get(&key).map(|r| r.clone())
+                };
+
+                if let Some(record) = formatted_row {
                     let mut line = key.clone();
-                    for (i, opt_idx) in field_indices.iter().enumerate() {
+                    for name in field_names {
                         line.push(' ');
-                        if let Some(idx) = *opt_idx {
-                            let raw_val = record.get_field_display_string(idx);
-                            let formatted_val = if let Some(code) = &conversion_codes[i] {
-                                Database::apply_conversion(&raw_val, code)
-                            } else {
-                                raw_val
-                            };
-                            line.push_str(&formatted_val);
-                        }
+                        // Now we can call format_record_field because the mutable borrow of table is over
+                        let formatted_val = db.format_record_field(table_name, &record, name);
+                        line.push_str(&formatted_val);
                     }
                     println!("{}", line);
                 }
             }
-        } else {
-            println!("TABLE NOT FOUND");
         }
+    } else {
+        println!("TABLE NOT FOUND");
     }
 
     if use_select_list {

@@ -26,10 +26,11 @@ A `Sub-Value` is the most granular unit of data, stored as a `String`.
 #### Dictionary Items
 Dictionary items are special records stored in the `dict` section of a table. They define how data in the `data` section is interpreted.
 - **Field 1**: Field index (1-based).
-- **Field 7**: Conversion Code (optional).
+- **Field 8**: Conversion Code (optional).
   - `D4-`: Date with 4-digit year (e.g., 03-21-2026).
   - `D2/`: Date with 2-digit year (e.g., 03/21/26).
   - `MR<n>`: Number with `<n>` decimal places (e.g., `MR2` converts `12345` to `123.45`).
+  - `MD<n>`: Number with `<n>` decimal places (e.g., `MD2` converts `12345` to `1234.50`).
 
 #### Database Layout
 The database is stored in the `db_storage` directory:

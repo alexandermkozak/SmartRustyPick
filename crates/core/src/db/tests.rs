@@ -343,6 +343,10 @@ mod tests {
             // 2 -> Jane Smith^jane@example.com
 
             // Verify field indices
+            // Ensure tables are loaded for read-only index lookups
+            db.get_table("USERS").unwrap();
+            db.get_table("PRODUCTS").unwrap();
+
             // "ID" should always be 0
             assert_eq!(db.get_field_index("USERS", "ID"), Some(0));
             // "NAME" should be 0 (Attribute 1 - 1 = 0)
@@ -369,8 +373,10 @@ mod tests {
             let desc_idx = db.get_field_index("PRODUCTS", "DESC").unwrap();
             let price_idx = db.get_field_index("PRODUCTS", "PRICE").unwrap();
 
-            let products = db.get_table("PRODUCTS").unwrap();
-            let p1 = products.records.get("P1").unwrap();
+            let p1 = {
+                let products = db.get_table("PRODUCTS").unwrap();
+                products.records.get("P1").unwrap().clone()
+            };
 
             assert_eq!(p1.get_field_display_string(desc_idx), "Laptop");
             assert_eq!(p1.get_field_display_string(price_idx), "120000");
@@ -378,8 +384,13 @@ mod tests {
             // Verify conversion
             let price_conv = db.get_conversion_code("PRODUCTS", "PRICE");
             assert_eq!(price_conv, Some("MD2".to_string()));
-            let formatted_price = Database::apply_conversion("120000", &price_conv.unwrap());
+            let raw_price = p1.get_field_display_string(price_idx);
+            let formatted_price = Database::apply_conversion(&raw_price, &price_conv.unwrap());
             assert_eq!(formatted_price, "1200.00");
+
+            // Test unified formatting method
+            assert_eq!(db.format_record_field("PRODUCTS", &p1, "DESC"), "Laptop");
+            assert_eq!(db.format_record_field("PRODUCTS", &p1, "PRICE"), "1200.00");
         }
 
         fs::remove_dir_all(base_dir)?;
