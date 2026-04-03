@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 fn main() {
     let config = Config::load();
 
-    let cert_path = config.cert_path.clone().expect("headless mode requires cert_path in config.toml");
-    let key_path = config.key_path.clone().expect("headless mode requires key_path in config.toml");
-    let ca_path = config.ca_path.clone().expect("headless mode requires ca_path in config.toml");
+    let _ = config.cert_path.clone().expect("headless mode requires cert_path in config.toml");
+    let _ = config.key_path.clone().expect("headless mode requires key_path in config.toml");
+    let _ = config.ca_path.clone().expect("headless mode requires ca_path in config.toml");
 
     if let Err(e) = server::ensure_certificates(&config) {
         eprintln!("Failed to ensure certificates: {}", e);
@@ -24,7 +24,7 @@ fn main() {
     println!("Starting headless database service on {}...", full_addr);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        if let Err(e) = server::run_server(&full_addr, db, &cert_path, &key_path, &ca_path).await {
+        if let Err(e) = smart_rusty_pick_core::server::start_server(Arc::new(config), db, None).await {
             eprintln!("Server error: {}", e);
         }
     });

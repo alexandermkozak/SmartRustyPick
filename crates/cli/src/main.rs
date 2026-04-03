@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 fn main() -> io::Result<()> {
-    let config = Config::load();
+    let config = Arc::new(Config::load());
 
     // We use a directory "db_storage" to hold our tables
     let db = Arc::new(Mutex::new(Database::new("db_storage")?));
@@ -16,19 +16,16 @@ fn main() -> io::Result<()> {
             eprintln!("Failed to ensure certificates: {}", e);
         }
 
-        let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = config.server_port.unwrap_or(8443);
-        let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
-
         let db_clone = db.clone();
-        let cert_path = config.cert_path.clone().unwrap();
-        let key_path = config.key_path.clone().unwrap();
-        let ca_path = config.ca_path.clone().unwrap();
+        let config_clone = config.clone();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let _ = server::run_server(&full_addr, db_clone, &cert_path, &key_path, &ca_path).await;
+                let addr = config_clone.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+                let port = config_clone.server_port.unwrap_or(8443);
+                let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
+                let _ = server::start_server(config_clone, db_clone, Some(full_addr)).await;
             });
         });
         println!("Database service attached and running in background.");
@@ -45,7 +42,8 @@ fn main() -> io::Result<()> {
 
     if let Some(account_name) = auto_account {
         let mut db_lock = db.lock().unwrap();
-        if db_lock.logto(&account_name).is_ok() {
+        let acc_to_log = account_name.clone();
+        if db_lock.logto(&acc_to_log).is_ok() {
             println!("Auto-logged into account '{}' based on current directory.", account_name);
             let _ = check_dir_file(&mut db_lock);
         }
@@ -245,7 +243,7 @@ fn main() -> io::Result<()> {
                 }
             }
             "START.SERVER" => {
-                handle_start_server(db.clone(), &parts, &config);
+                handle_start_server(db.clone(), &parts, config.clone());
             }
             "SAVE" => {
                 db.lock().unwrap().save()?;
@@ -1216,7 +1214,7 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
     }
 }
 
-fn handle_start_server(db: Arc<Mutex<Database>>, parts: &[&str], config: &Config) {
+fn handle_start_server(db: Arc<Mutex<Database>>, parts: &[&str], config: Arc<Config>) {
     let mut offset = 1;
     let mut addr = "127.0.0.1".to_string();
 
@@ -1242,15 +1240,15 @@ fn handle_start_server(db: Arc<Mutex<Database>>, parts: &[&str], config: &Config
         return;
     }
 
-    let cert_path = parts[offset].to_string();
-    let key_path = parts[offset + 1].to_string();
-    let ca_path = parts[offset + 2].to_string();
+    let _ = parts[offset].to_string();
+    let _ = parts[offset + 1].to_string();
+    let _ = parts[offset + 2].to_string();
 
     let addr_clone = addr.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let _ = server::run_server(&addr_clone, db, &cert_path, &key_path, &ca_path).await;
+            let _ = server::start_server(config, db, Some(addr_clone)).await;
         });
     });
     println!("Server start initiated on {}.", addr);
