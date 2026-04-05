@@ -1,0 +1,8 @@
+[package]
+name = "smart-rusty-pick-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smart-rusty-pick-core = { path = "../core" }
+tokio = { version = "1.0", features = ["full"] }

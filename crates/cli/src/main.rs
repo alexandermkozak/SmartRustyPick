@@ -1,64 +1,41 @@
-mod db;
-mod config;
-mod server;
-
-use config::Config;
-use db::{Database, Record};
+use smart_rusty_pick_core::config::Config;
+use smart_rusty_pick_core::db::{Database, Record};
+use smart_rusty_pick_core::server;
 use std::io::{self, Write};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 fn main() -> io::Result<()> {
-    let config = Config::load();
-
     let args: Vec<String> = std::env::args().collect();
-    let headless = args.iter().any(|arg| arg == "--headless");
+    let mut initial_account = None;
+    if let Some(pos) = args.iter().position(|a| a == "--account") {
+        if pos + 1 < args.len() {
+            initial_account = Some(args[pos + 1].clone());
+        }
+    }
+
+    let config = Config::load();
+    let config_arc = Arc::new(config.clone());
 
     // We use a directory "db_storage" to hold our tables
-    let db = Arc::new(Mutex::new(Database::new("db_storage")?));
-
-    if headless {
-        let cert_path = config.cert_path.clone().expect("headless mode requires cert_path in config.toml");
-        let key_path = config.key_path.clone().expect("headless mode requires key_path in config.toml");
-        let ca_path = config.ca_path.clone().expect("headless mode requires ca_path in config.toml");
-
-        if let Err(e) = ensure_certificates(&config) {
-            eprintln!("Failed to ensure certificates: {}", e);
-        }
-
-        let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = config.server_port.unwrap_or(8443);
-        let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
-
-        println!("Starting headless database service on {}...", full_addr);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            if let Err(e) = server::run_server(&full_addr, db, &cert_path, &key_path, &ca_path).await {
-                eprintln!("Server error: {}", e);
-            }
-        });
-        return Ok(());
-    }
+    let db = Arc::new(Mutex::new(Database::new("db_storage", Some(config.clone()))?));
 
     // Check if server should be auto-started in background for CLI
     if config.cert_path.is_some() && config.key_path.is_some() && config.ca_path.is_some() {
-        if let Err(e) = ensure_certificates(&config) {
+        if let Err(e) = server::ensure_certificates(&config) {
             eprintln!("Failed to ensure certificates: {}", e);
         }
 
-        let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = config.server_port.unwrap_or(8443);
-        let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
-
         let db_clone = db.clone();
-        let cert_path = config.cert_path.clone().unwrap();
-        let key_path = config.key_path.clone().unwrap();
-        let ca_path = config.ca_path.clone().unwrap();
+        let config_clone = config.clone();
 
+        let config_arc_clone = config_arc.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let _ = server::run_server(&full_addr, db_clone, &cert_path, &key_path, &ca_path).await;
+                let addr = config_clone.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+                let port = config_clone.server_port.unwrap_or(8443);
+                let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
+                let _ = server::start_server(config_arc_clone, db_clone, Some(full_addr)).await;
             });
         });
         println!("Database service attached and running in background.");
@@ -75,7 +52,8 @@ fn main() -> io::Result<()> {
 
     if let Some(account_name) = auto_account {
         let mut db_lock = db.lock().unwrap();
-        if db_lock.logto(&account_name).is_ok() {
+        let acc_to_log = account_name.clone();
+        if db_lock.logto(&acc_to_log).is_ok() {
             println!("Auto-logged into account '{}' based on current directory.", account_name);
             let _ = check_dir_file(&mut db_lock);
         }
@@ -89,19 +67,25 @@ fn main() -> io::Result<()> {
                 break;
             }
         }
-        print!("Account: ");
-        io::stdout().flush()?;
-        let mut account_input = String::new();
-        if io::stdin().read_line(&mut account_input)? == 0 {
-            return Ok(());
-        }
-        let account_name = account_input.trim();
+
+        let account_name = if let Some(acc) = initial_account.take() {
+            acc
+        } else {
+            print!("Account: ");
+            io::stdout().flush()?;
+            let mut account_input = String::new();
+            if io::stdin().read_line(&mut account_input)? == 0 {
+                return Ok(());
+            }
+            account_input.trim().to_string()
+        };
+
         if account_name.is_empty() {
             continue;
         }
 
         let mut db_lock = db.lock().unwrap();
-        if let Err(e) = db_lock.logto(account_name) {
+        if let Err(e) = db_lock.logto(&account_name) {
             let msg = format!("Login error: {}", e);
             let _ = db_lock.log_error("CLI", &msg);
             println!("Error: {}", e);
@@ -110,8 +94,8 @@ fn main() -> io::Result<()> {
             let mut choice = String::new();
             io::stdin().read_line(&mut choice)?;
             if choice.trim().to_uppercase() == "Y" {
-                db_lock.create_account(account_name, None)?;
-                db_lock.logto(account_name)?;
+                db_lock.create_account(&account_name, None)?;
+                db_lock.logto(&account_name)?;
                 let _ = check_dir_file(&mut db_lock);
                 break;
             } else {
@@ -179,13 +163,20 @@ fn main() -> io::Result<()> {
                 handle_get_list(&mut db.lock().unwrap(), &parts);
             }
             "CREATE.FILE" => {
-                handle_create_file(&mut db.lock().unwrap(), &parts);
+                let mut db_lock = db.lock().unwrap();
+                handle_create_file(&mut db_lock, &parts);
             }
             "DELETE.FILE" => {
-                handle_delete_file(&mut db.lock().unwrap(), &parts);
+                let mut db_lock = db.lock().unwrap();
+                handle_delete_file(&mut db_lock, &parts);
             }
             "CREATE.ACCOUNT" => {
-                handle_create_account(&mut db.lock().unwrap(), &parts);
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_create_account(&mut db_lock, &parts);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
             }
             "CREATE.TEST.ACCOUNT" => {
                 let mut db_lock = db.lock().unwrap();
@@ -196,7 +187,12 @@ fn main() -> io::Result<()> {
                 }
             }
             "DELETE.ACCOUNT" => {
-                handle_delete_account(&mut db.lock().unwrap(), &parts);
+                let mut db_lock = db.lock().unwrap();
+                if db_lock.current_account == "SYSTEM" {
+                    handle_delete_account(&mut db_lock, &parts);
+                } else {
+                    println!("Unknown command: {}", command);
+                }
             }
             "LOGTO" => {
                 let mut db_lock = db.lock().unwrap();
@@ -255,7 +251,7 @@ fn main() -> io::Result<()> {
                 }
             }
             "START.SERVER" => {
-                handle_start_server(db.clone(), &parts, &config);
+                handle_start_server(db.clone(), &parts, config_arc.clone());
             }
             "SAVE" => {
                 db.lock().unwrap().save()?;
@@ -293,8 +289,14 @@ fn handle_set(db: &mut Database, parts: &[&str]) {
     let table_name = parts[offset];
     let key = parts[offset + 1].to_string();
     let data = parts[offset + 2..].join(" ");
-    
-    let table = db.get_table_mut(table_name);
+
+    let table = match db.get_table_mut(table_name) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
     let record = Record::from_display_string(&data);
     if is_dict {
         table.dictionary.insert(key, record);
@@ -321,7 +323,7 @@ fn handle_get(db: &mut Database, parts: &[&str]) {
     }
 
     let table_name = parts[offset];
-    
+
     if parts.len() < offset + 2 {
         // Try to use active select list
         let mut keys_from_list = None;
@@ -391,7 +393,13 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
         }
 
         if used_list {
-            let table = db.get_table_mut(table_name);
+            let table = match db.get_table_mut(table_name) {
+                Ok(t) => t,
+                Err(e) => {
+                    println!("Error: {}", e);
+                    return;
+                }
+            };
             let map = if is_dict { &mut table.dictionary } else { &mut table.records };
             let mut count = 0;
             for key in keys_to_delete {
@@ -415,7 +423,13 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
 
     let key = parts[offset + 1];
 
-    let table = db.get_table_mut(table_name);
+    let table = match db.get_table_mut(table_name) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
     let map = if is_dict { &mut table.dictionary } else { &mut table.records };
     if map.remove(key).is_some() {
         table.dirty = true;
@@ -456,8 +470,16 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
         }
     }
 
-    if field_names.is_empty() {
-        if let Some(table) = db.get_table(table_name) {
+    let table_exists = db.list_tables().contains(&table_name.to_string());
+    if table_exists {
+        let (map_keys, is_dict_val) = {
+            let table = match db.get_table_mut(table_name) {
+                Ok(t) => t,
+                Err(e) => {
+                    println!("Error: {}", e);
+                    return;
+                }
+            };
             let map = if is_dict { &table.dictionary } else { &table.records };
             let keys = if use_select_list {
                 selected_keys
@@ -466,51 +488,50 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
                 k.sort();
                 k
             };
-            for key in keys {
+            (keys, is_dict)
+        };
+
+        if field_names.is_empty() {
+            for key in map_keys {
                 println!("{}", key);
             }
         } else {
-            println!("TABLE NOT FOUND");
-        }
-    } else {
-        // Resolve field names to indices
-        let mut field_indices = Vec::new();
-        let mut conversion_codes = Vec::new();
-        for name in field_names {
-            field_indices.push(db.get_field_index(table_name, name));
-            conversion_codes.push(db.get_conversion_code(table_name, name));
-        }
+            // Resolve field info once while we have a mutable borrow of db
+            let mut field_info = Vec::new();
+            for name in field_names {
+                let idx = db.get_field_index(table_name, name);
+                let conv = db.get_conversion_code(table_name, name);
+                field_info.push((idx, conv));
+            }
 
-        if let Some(table) = db.get_table(table_name) {
-            let map = if is_dict { &table.dictionary } else { &table.records };
-            let keys = if use_select_list {
-                selected_keys
-            } else {
-                let mut k: Vec<_> = map.keys().cloned().collect();
-                k.sort();
-                k
-            };
-            for key in keys {
-                if let Some(record) = map.get(&key) {
-                    let mut line = key.clone();
-                    for (i, opt_idx) in field_indices.iter().enumerate() {
-                        line.push(' ');
-                        if let Some(idx) = *opt_idx {
-                            let raw_val = record.get_field_display_string(idx);
-                            let formatted_val = if let Some(code) = &conversion_codes[i] {
-                                Database::apply_conversion(&raw_val, code)
-                            } else {
-                                raw_val
-                            };
-                            line.push_str(&formatted_val);
+            // Now iterate over records
+            for key in map_keys {
+                let formatted_row = {
+                    let table = match db.get_table_mut(table_name) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            println!("Error: {}", e);
+                            return;
                         }
+                    };
+                    let map = if is_dict_val { &table.dictionary } else { &table.records };
+                    map.get(&key).map(|r| r.clone())
+                };
+
+                if let Some(record) = formatted_row {
+                    let mut line = key.clone();
+                    for name in field_names {
+                        line.push(' ');
+                        // Now we can call format_record_field because the mutable borrow of table is over
+                        let formatted_val = db.format_record_field(table_name, &record, name);
+                        line.push_str(&formatted_val);
                     }
                     println!("{}", line);
                 }
             }
-        } else {
-            println!("TABLE NOT FOUND");
         }
+    } else {
+        println!("TABLE NOT FOUND");
     }
 
     if use_select_list {
@@ -575,7 +596,7 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
     } else {
         let keys: Vec<String> = results.iter().map(|(k, _)| k.clone()).collect();
         println!("[{}] records selected", keys.len());
-        db.active_select_list = Some(db::SelectList {
+        db.active_select_list = Some(smart_rusty_pick_core::db::SelectList {
             table_name: table_name.to_string(),
             is_dict,
             keys,
@@ -643,7 +664,13 @@ fn handle_edit(db: &mut Database, parts: &[&str], config: &Config) {
             // Read back the content
             match std::fs::read_to_string(&temp_file_path) {
                 Ok(new_content) => {
-                    let table = db.get_table_mut(table_name);
+                    let table = match db.get_table_mut(table_name) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            println!("Error: {}", e);
+                            return;
+                        }
+                    };
                     let record = Record::from_edit_string(&new_content);
                     let key_str = key.to_string();
                     if is_dict {
@@ -730,15 +757,15 @@ fn print_record_fields(record: &Record) {
     for (i, field) in record.fields.iter().enumerate() {
         let mut res = Vec::new();
         for (j, v) in field.values.iter().enumerate() {
-            if j > 0 { res.push(db::VM); }
+            if j > 0 { res.push(smart_rusty_pick_core::db::VM); }
             for (k, sv) in v.sub_values.iter().enumerate() {
-                if k > 0 { res.push(db::SVM); }
+                if k > 0 { res.push(smart_rusty_pick_core::db::SVM); }
                 res.extend_from_slice(sv.as_bytes());
             }
         }
         let display_bytes: Vec<u8> = res.iter().map(|&b| match b {
-            db::VM => b']',
-            db::SVM => b'\\',
+            smart_rusty_pick_core::db::VM => b']',
+            smart_rusty_pick_core::db::SVM => b'\\',
             _ => b
         }).collect();
         println!("{:03} {}", i + 1, String::from_utf8_lossy(&display_bytes));
@@ -760,13 +787,13 @@ fn print_help(current_account: &str) {
     println!("  HELP                                  - Show this help.");
     println!("  SAVE-LIST <name>                      - Save active select list.");
     println!("  GET-LIST <name>                       - Restore a saved select list.");
-    println!("  CREATE.FILE <name>                    - Create a new file (data and dict).");
-    println!("  DELETE.FILE <name>                    - Delete a file (data and dict).");
-    println!("  CREATE.ACCOUNT <name> [<dir>]         - Create a new account.");
+    println!("  CREATE.FILE <name>                    - Create a new file (data and dict) (SYSTEM only).");
+    println!("  DELETE.FILE <name>                    - Delete a file (data and dict) (SYSTEM only).");
+    println!("  CREATE.ACCOUNT <name> [<dir>]         - Create a new account (SYSTEM only).");
     if current_account == "SYSTEM" {
         println!("  CREATE.TEST.ACCOUNT <name>            - Create and populate a test account (SYSTEM only).");
     }
-    println!("  DELETE.ACCOUNT <name>                 - Delete an account and all its files.");
+    println!("  DELETE.ACCOUNT <name>                 - Delete an account and all its files (SYSTEM only).");
     println!("  LOGTO <name>                          - Switch to a different account.");
     println!("  LIST.FILES                            - List all files in the current account.");
     if current_account == "SYSTEM" {
@@ -800,18 +827,18 @@ fn handle_save_list(db: &mut Database, parts: &[&str]) {
 
     let mut data = Vec::new();
     data.extend_from_slice(list.table_name.as_bytes());
-    data.push(db::FM);
+    data.push(smart_rusty_pick_core::db::FM);
     data.extend_from_slice(if list.is_dict { b"1" } else { b"0" });
     for key in &list.keys {
-        data.push(db::FM);
+        data.push(smart_rusty_pick_core::db::FM);
         data.extend_from_slice(key.as_bytes());
     }
-    
+
     let record = Record::from_bytes(&data);
-    let table = db.get_table_mut("$SAVEDLISTS");
+    let table = db.get_table_mut("$SAVEDLISTS").unwrap();
     table.records.insert(list_name.to_string(), record);
     table.dirty = true;
-    
+
     db.active_select_list = None;
     println!("List '{}' saved", list_name);
 }
@@ -823,25 +850,25 @@ fn handle_get_list(db: &mut Database, parts: &[&str]) {
     }
 
     let list_name = parts[1];
-    
-    let table = db.get_table_mut("$SAVEDLISTS");
+
+    let table = db.get_table_mut("$SAVEDLISTS").unwrap();
     if let Some(record) = table.records.get(list_name) {
         let data = record.to_bytes();
-        let fields: Vec<&[u8]> = data.split(|&b| b == db::FM).collect();
-        
+        let fields: Vec<&[u8]> = data.split(|&b| b == smart_rusty_pick_core::db::FM).collect();
+
         if fields.len() < 2 {
             println!("INVALID SAVED LIST FORMAT");
             return;
         }
-        
+
         let table_name = String::from_utf8_lossy(fields[0]).to_string();
         let is_dict = fields[1] == b"1";
         let mut keys = Vec::new();
         for f in &fields[2..] {
             keys.push(String::from_utf8_lossy(f).to_string());
         }
-        
-        db.active_select_list = Some(db::SelectList {
+
+        db.active_select_list = Some(smart_rusty_pick_core::db::SelectList {
             table_name,
             is_dict,
             keys,
@@ -989,7 +1016,7 @@ fn handle_authorize_conn(db: &mut Database, parts: &[&str]) {
             } else {
                 println!("Authorized: {} as {}", thumbprint, name);
             }
-        },
+        }
         Err(e) => println!("Error authorizing: {}", e),
     }
 }
@@ -1006,7 +1033,7 @@ fn handle_add_client_account(db: &mut Database, parts: &[&str]) {
     for acc in accounts {
         match db.add_client_account(name, acc) {
             Ok(true) => count += 1,
-            Ok(false) => {},
+            Ok(false) => {}
             Err(e) => {
                 println!("Error adding account {}: {}", acc, e);
                 return;
@@ -1028,7 +1055,7 @@ fn handle_remove_client_account(db: &mut Database, parts: &[&str]) {
     for acc in accounts {
         match db.remove_client_account(name, acc) {
             Ok(true) => count += 1,
-            Ok(false) => {},
+            Ok(false) => {}
             Err(e) => {
                 println!("Error removing account {}: {}", acc, e);
                 return;
@@ -1056,7 +1083,7 @@ fn handle_list_conns(db: &mut Database) {
     println!("{:-<20} {:-<64}", "", "");
 
     let _ = db.run_in_system_account(|db| {
-        let table = db.get_table_mut("$CLIENTS");
+        let table = db.get_table_mut("$CLIENTS")?;
         let mut names: Vec<_> = table.records.keys().cloned().collect();
         names.sort();
 
@@ -1214,7 +1241,7 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
                         } else {
                             println!("Successfully authorized: {} as {}", thumbprint, auth_name);
                         }
-                    },
+                    }
                     Err(e) => println!("Error authorizing: {}", e),
                 }
             }
@@ -1226,7 +1253,7 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
     }
 }
 
-fn handle_start_server(db: Arc<Mutex<Database>>, parts: &[&str], config: &Config) {
+fn handle_start_server(db: Arc<Mutex<Database>>, parts: &[&str], config: Arc<Config>) {
     let mut offset = 1;
     let mut addr = "127.0.0.1".to_string();
 
@@ -1252,17 +1279,15 @@ fn handle_start_server(db: Arc<Mutex<Database>>, parts: &[&str], config: &Config
         return;
     }
 
-    let cert_path = parts[offset].to_string();
-    let key_path = parts[offset + 1].to_string();
-    let ca_path = parts[offset + 2].to_string();
+    let _ = parts[offset].to_string();
+    let _ = parts[offset + 1].to_string();
+    let _ = parts[offset + 2].to_string();
 
     let addr_clone = addr.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            if let Err(e) = server::run_server(&addr_clone, db, &cert_path, &key_path, &ca_path).await {
-                eprintln!("Server error: {}", e);
-            }
+            let _ = server::start_server(config, db, Some(addr_clone)).await;
         });
     });
     println!("Server start initiated on {}.", addr);
@@ -1287,87 +1312,4 @@ fn check_dir_file(db: &mut Database) -> io::Result<()> {
             Err(e)
         }
     }
-}
-
-fn ensure_certificates(config: &Config) -> io::Result<()> {
-    let cert_path = config.cert_path.as_ref().expect("cert_path missing");
-    let key_path = config.key_path.as_ref().expect("key_path missing");
-    let ca_path = config.ca_path.as_ref().expect("ca_path missing");
-    let ca_key_path = "ca.key"; // Private key for CA
-
-    let cert_exists = Path::new(cert_path).exists();
-    let key_exists = Path::new(key_path).exists();
-    let ca_exists = Path::new(ca_path).exists();
-
-    if cert_exists && key_exists && ca_exists {
-        return Ok(());
-    }
-
-    println!("Generating certificates for first-time startup...");
-
-    // 1. Generate CA key and certificate if needed
-    if !Path::new(ca_key_path).exists() || !ca_exists {
-        println!("Generating CA certificate...");
-        let status = std::process::Command::new("openssl")
-            .args(&[
-                "req", "-new", "-x509", "-days", "3650",
-                "-nodes",
-                "-newkey", "rsa:2048",
-                "-keyout", ca_key_path,
-                "-out", ca_path,
-                "-subj", "/CN=SmartRustyPick Root CA",
-                "-addext", "basicConstraints=critical,CA:TRUE",
-                "-addext", "keyUsage=critical,keyCertSign,cRLSign"
-            ])
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Failed to generate CA certificate"));
-        }
-    }
-
-    // 2. Generate server key and CSR
-    if !key_exists {
-        println!("Generating server certificate...");
-        let csr_path = "server.csr";
-        let status = std::process::Command::new("openssl")
-            .args(&[
-                "req", "-new",
-                "-nodes",
-                "-newkey", "rsa:2048",
-                "-keyout", key_path,
-                "-out", csr_path,
-                "-subj", "/CN=localhost"
-            ])
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Failed to generate server CSR"));
-        }
-
-        // 3. Sign server certificate with CA
-        let ext_path = "server.ext";
-        std::fs::write(&ext_path, "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nsubjectAltName = DNS:localhost, IP:127.0.0.1")?;
-
-        let status = std::process::Command::new("openssl")
-            .args(&[
-                "x509", "-req",
-                "-in", csr_path,
-                "-CA", ca_path,
-                "-CAkey", ca_key_path,
-                "-CAcreateserial",
-                "-out", cert_path,
-                "-days", "365",
-                "-sha256",
-                "-extfile", ext_path
-            ])
-            .status()?;
-
-        let _ = std::fs::remove_file(csr_path);
-        let _ = std::fs::remove_file(ext_path);
-
-        if !status.success() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Failed to sign server certificate"));
-        }
-    }
-
-    Ok(())
 }

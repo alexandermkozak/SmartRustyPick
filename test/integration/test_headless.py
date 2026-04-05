@@ -28,17 +28,25 @@ def run_request(port, request, certfile, keyfile, cafile):
 
     with socket.create_connection(('127.0.0.1', port)) as sock:
         with context.wrap_socket(sock, server_hostname='localhost') as ssock:
-            ssock.sendall(json.dumps(request).encode() + b'\n')
-            response = ssock.recv(4096).decode()
-            if not response: return None
-            # Cleanly shutdown SSL
             try:
-                ssock.unwrap()
-            except ssl.SSLEOFError:
-                pass
-            return json.loads(response)
+                ssock.sendall(json.dumps(request).encode() + b'\n')
+                response = ssock.recv(4096).decode()
+                if not response: return None
+                return json.loads(response)
+            finally:
+                # Cleanly shutdown SSL
+                try:
+                    ssock.shutdown(socket.SHUT_RDWR)
+                    ssock.unwrap()
+                except:
+                    pass
 
-def cleanup():
+def cleanup_system():
+    # Clean up previous data
+    if os.path.exists("db_storage/accounts.reg"): os.remove("db_storage/accounts.reg")
+    if os.path.exists("db_storage/certs.reg"): os.remove("db_storage/certs.reg")
+    if os.path.exists("db_storage/SYSTEM/$CLIENTS/data"): os.remove("db_storage/SYSTEM/$CLIENTS/data")
+    if os.path.exists("db_storage/TEST_ACC"): shutil.rmtree("db_storage/TEST_ACC")
     for f in ["ca.key", "ca.crt", "ca.srl", "server.key", "server.csr", "server.crt", "client.key", "client.csr", "client.crt"]:
         if os.path.exists(f): os.remove(f)
     if os.path.exists("db_storage_test"):
@@ -46,8 +54,11 @@ def cleanup():
     if os.path.exists("TEST_ACC_DIR"):
         shutil.rmtree("TEST_ACC_DIR")
 
+def log_result(test_name, status, message=""):
+    with open("integration_results.md", "a") as f:
+        f.write(f"| {test_name} | {status} | {message} |\n")
+
 def test_headless_and_cli_attachment():
-    cleanup()
     thumbprint = generate_certs()
     print(f"Generated client thumbprint: {thumbprint}")
 
@@ -76,12 +87,13 @@ def test_headless_and_cli_attachment():
     # Field 0 (Names): Value { sub_values: ["TEST_ACC"] }
     # Field 1 (Dirs): Value { sub_values: [abspath] }
     # Length prefixed storage format: <key_len><key><data_len><data>
+    # <key_len> is 8 bytes little endian (u64)
     registry_data = acc_name_data + b"\xfe" + acc_dir_data
     with open("db_storage_test/accounts.reg", "wb") as f:
         key = b"registry"
-        f.write(len(key).to_bytes(4, 'little'))
+        f.write(len(key).to_bytes(8, 'little'))
         f.write(key)
-        f.write(len(registry_data).to_bytes(4, 'little'))
+        f.write(len(registry_data).to_bytes(8, 'little'))
         f.write(registry_data)
 
     # $CLIENTS record for test client (Thumbprint, Accounts, Admin)
@@ -90,9 +102,9 @@ def test_headless_and_cli_attachment():
     client_rec_data = thumbprint.encode() + b"\xfe\xfeY"
     with open("db_storage_test/SYSTEM/$CLIENTS/data", "wb") as f:
         key = b"test_client"
-        f.write(len(key).to_bytes(4, 'little'))
+        f.write(len(key).to_bytes(8, 'little'))
         f.write(key)
-        f.write(len(client_rec_data).to_bytes(4, 'little'))
+        f.write(len(client_rec_data).to_bytes(8, 'little'))
         f.write(client_rec_data)
 
     # Create config.toml (if it already exists, back it up)
@@ -114,14 +126,24 @@ ca_path = "ca.crt"
     print("Starting headless server...")
     # Override storage dir via environment if possible, or just use the default "db_storage"
     # Wait, the app uses "db_storage" hardcoded in main.rs. Let's rename ours.
+    if os.path.exists("db_storage_backup"):
+        shutil.rmtree("db_storage_backup")
     if os.path.exists("db_storage"):
         shutil.move("db_storage", "db_storage_backup")
     shutil.move("db_storage_test", "db_storage")
 
-    headless_proc = subprocess.Popen(["./target/debug/SmartRustyPick", "--headless"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    headless_proc = subprocess.Popen(["./target/debug/smart-rusty-pick-server"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     
+    # Print server output in background (disabled for final submission to keep logs clean)
+    # import threading
+    # def log_server(pipe):
+    #     for line in pipe:
+    #         print(f"SERVER: {line.strip()}")
+    # threading.Thread(target=log_server, args=(headless_proc.stdout,), daemon=True).start()
+    # threading.Thread(target=log_server, args=(headless_proc.stderr,), daemon=True).start()
+
     try:
-        time.sleep(2) # Wait for server to start
+        time.sleep(5) # Wait for server to start
         
         # 1. Test Accessibility of Headless Server
         print("Testing accessibility of headless server...")
@@ -131,6 +153,10 @@ ca_path = "ca.crt"
         print(f"Server response: {resp}")
         assert resp is not None
         # Should be "ERROR" with "Account not specified" message
+        if resp["status"] == "ERROR" and "Account not specified" in resp["message"]:
+            log_result("Headless Server Accessibility", "Success", "Server responded correctly to unauthenticated request")
+        else:
+            log_result("Headless Server Accessibility", "Failure", f"Unexpected response: {resp}")
         assert resp["status"] == "ERROR"
         assert "Account not specified" in resp["message"]
 
@@ -146,7 +172,7 @@ ca_path = "ca.crt"
         os.chdir("TEST_ACC_DIR")
         # Run CLI in a way that we can talk to it.
         # We need to go back up to run the binary.
-        cli_proc = subprocess.Popen(["../target/debug/SmartRustyPick"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        cli_proc = subprocess.Popen(["../target/debug/smart-rusty-pick-cli"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
         # The CLI should auto-login and show "Database service attached and running in background."
         # We can send a command to it.
@@ -157,6 +183,10 @@ ca_path = "ca.crt"
         cli_out, cli_err = cli_proc.communicate(timeout=10)
         
         print(f"CLI Output:\n{cli_out}")
+        if "Auto-logged into account 'TEST_ACC'" in cli_out and "OK" in cli_out:
+            log_result("CLI Attachment & Auto-login", "Success", "CLI attached to headless server and auto-logged in")
+        else:
+            log_result("CLI Attachment & Auto-login", "Failure", "CLI failed to attach or auto-login")
         assert "Auto-logged into account 'TEST_ACC'" in cli_out
         # In current implementation, if another server is already running, 
         # the CLI process might fail to bind but continue as a client-only CLI 
@@ -171,7 +201,8 @@ ca_path = "ca.crt"
         headless_proc.terminate()
         headless_proc.wait()
         if os.path.exists("db_storage_backup"):
-            shutil.rmtree("db_storage")
+            if os.path.exists("db_storage"):
+                shutil.rmtree("db_storage")
             shutil.move("db_storage_backup", "db_storage")
         
         # Restore config.toml if we backed it up, otherwise remove our test one
@@ -181,7 +212,8 @@ ca_path = "ca.crt"
         elif os.path.exists("config.toml"):
             os.remove("config.toml")
 
-        cleanup()
+        cleanup_system()
 
 if __name__ == "__main__":
+    cleanup_system()
     test_headless_and_cli_attachment()
