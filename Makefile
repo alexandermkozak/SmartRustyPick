@@ -18,6 +18,7 @@ test-integration: build
 	@echo "Running integration tests..."
 	python3 test/integration/test_server.py
 	python3 test/integration/test_headless.py
+	python3 test/integration/test_security.py
 
 test-performance: build
 	@echo "Running performance tests..."

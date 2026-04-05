@@ -53,7 +53,18 @@ def run_request(port, request, certfile, keyfile, cafile, existing_ssock=None):
                 except:
                     pass
 
+def log_result(test_name, status, message=""):
+    with open("integration_results.md", "a") as f:
+        f.write(f"| {test_name} | {status} | {message} |\n")
+
 def test_integration():
+    # Initialize integration_results.md
+    with open("integration_results.md", "w") as f:
+        f.write("# Integration Test Results\n\n")
+        f.write(f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("| Test Name | Status | Details |\n")
+        f.write("| --- | --- | --- |\n")
+
     thumbprint = generate_certs()
     print(f"Generated client thumbprint: {thumbprint}")
 
@@ -108,12 +119,20 @@ def test_integration():
                 req = {"command": "WRITE", "table": "USERS", "key": "USER1", "data": "John^Doe^30", "account": "TEST_ACC"}
                 resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 print(f"WRITE response: {resp}")
+                if resp["status"] == "OK":
+                    log_result("WRITE", "Success", "Record USER1 created")
+                else:
+                    log_result("WRITE", "Failure", resp.get("message", "Unknown error"))
                 assert resp["status"] == "OK"
 
                 # 2. READ
                 print("Testing READ...")
                 req = {"command": "READ", "table": "USERS", "key": "USER1", "account": "TEST_ACC"}
                 resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                if resp["status"] == "OK" and resp["record"] == "John^Doe^30":
+                    log_result("READ", "Success", "Record USER1 read correctly")
+                else:
+                    log_result("READ", "Failure", resp.get("message", "Data mismatch"))
                 assert resp["status"] == "OK"
                 assert resp["record"] == "John^Doe^30"
 
@@ -125,6 +144,10 @@ def test_integration():
                 print(f"QUERY by ID response: {resp}")
                 assert resp["status"] == "OK"
                 keys = [item[0] for item in resp["results"]]
+                if "USER1" in keys:
+                    log_result("QUERY (by ID)", "Success", "Found USER1")
+                else:
+                    log_result("QUERY (by ID)", "Failure", "USER1 not found in results")
                 assert "USER1" in keys
 
                 # Try querying by NAME with the dictionary we set up
@@ -133,12 +156,20 @@ def test_integration():
                 print(f"QUERY by NAME response: {resp}")
                 assert resp["status"] == "OK"
                 keys = [item[0] for item in resp["results"]]
+                if "USER1" in keys:
+                    log_result("QUERY (by NAME)", "Success", "Found USER1 by NAME")
+                else:
+                    log_result("QUERY (by NAME)", "Failure", "USER1 not found by NAME")
                 assert "USER1" in keys
 
                 # 4. SELECT (Create named list)
                 print("Testing SELECT...")
                 req = {"command": "SELECT", "table": "USERS", "query_string": "WITH NAME = John", "list_name": "MYLIST", "account": "TEST_ACC"}
                 resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                if resp["status"] == "OK" and resp["count"] == 1:
+                    log_result("SELECT", "Success", "Created MYLIST with 1 record")
+                else:
+                    log_result("SELECT", "Failure", resp.get("message", "Count mismatch"))
                 assert resp["status"] == "OK"
                 assert resp["count"] == 1
 
@@ -149,12 +180,20 @@ def test_integration():
                 assert resp["status"] == "OK"
                 # Results is a list of [key, record_string]
                 keys = [item[0] for item in resp["results"]]
+                if keys == ["USER1"]:
+                    log_result("GET.NEXT", "Success", "Retrieved USER1 from MYLIST")
+                else:
+                    log_result("GET.NEXT", "Failure", f"Got {keys} instead of USER1")
                 assert keys == ["USER1"]
 
                 # 6. DELETE
                 print("Testing DELETE...")
                 req = {"command": "DELETE", "table": "USERS", "key": "USER1", "account": "TEST_ACC"}
                 resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                if resp["status"] == "OK":
+                    log_result("DELETE", "Success", "Record USER1 deleted")
+                else:
+                    log_result("DELETE", "Failure", resp.get("message", "Delete failed"))
                 assert resp["status"] == "OK"
 
                 # 7. READ (should fail)
@@ -162,6 +201,10 @@ def test_integration():
                 req = {"command": "READ", "table": "USERS", "key": "USER1", "account": "TEST_ACC"}
                 resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 print(f"READ after DELETE response: {resp}")
+                if resp["status"] == "ERROR" and "Record not found" in resp["message"]:
+                    log_result("READ (after DELETE)", "Success", "Confirmed record deleted")
+                else:
+                    log_result("READ (after DELETE)", "Failure", "Record still exists or unexpected error")
                 assert resp["status"] == "ERROR"
                 assert "Record not found" in resp["message"]
 

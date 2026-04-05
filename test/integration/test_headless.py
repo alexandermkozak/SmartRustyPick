@@ -54,8 +54,11 @@ def cleanup_system():
     if os.path.exists("TEST_ACC_DIR"):
         shutil.rmtree("TEST_ACC_DIR")
 
+def log_result(test_name, status, message=""):
+    with open("integration_results.md", "a") as f:
+        f.write(f"| {test_name} | {status} | {message} |\n")
+
 def test_headless_and_cli_attachment():
-    cleanup_system()
     thumbprint = generate_certs()
     print(f"Generated client thumbprint: {thumbprint}")
 
@@ -150,6 +153,10 @@ ca_path = "ca.crt"
         print(f"Server response: {resp}")
         assert resp is not None
         # Should be "ERROR" with "Account not specified" message
+        if resp["status"] == "ERROR" and "Account not specified" in resp["message"]:
+            log_result("Headless Server Accessibility", "Success", "Server responded correctly to unauthenticated request")
+        else:
+            log_result("Headless Server Accessibility", "Failure", f"Unexpected response: {resp}")
         assert resp["status"] == "ERROR"
         assert "Account not specified" in resp["message"]
 
@@ -176,6 +183,10 @@ ca_path = "ca.crt"
         cli_out, cli_err = cli_proc.communicate(timeout=10)
         
         print(f"CLI Output:\n{cli_out}")
+        if "Auto-logged into account 'TEST_ACC'" in cli_out and "OK" in cli_out:
+            log_result("CLI Attachment & Auto-login", "Success", "CLI attached to headless server and auto-logged in")
+        else:
+            log_result("CLI Attachment & Auto-login", "Failure", "CLI failed to attach or auto-login")
         assert "Auto-logged into account 'TEST_ACC'" in cli_out
         # In current implementation, if another server is already running, 
         # the CLI process might fail to bind but continue as a client-only CLI 
@@ -204,4 +215,5 @@ ca_path = "ca.crt"
         cleanup_system()
 
 if __name__ == "__main__":
+    cleanup_system()
     test_headless_and_cli_attachment()

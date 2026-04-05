@@ -47,6 +47,10 @@ def cleanup():
     if os.path.exists("db_storage_sec"):
         shutil.rmtree("db_storage_sec")
 
+def log_result(test_name, status, message=""):
+    with open("integration_results.md", "a") as f:
+        f.write(f"| {test_name} | {status} | {message} |\n")
+
 def test_security():
     cleanup()
     admin_tp, user_tp = generate_certs()
@@ -96,6 +100,10 @@ def test_security():
         req = {"command": "CREATE.ACCOUNT", "target_account": "EVIL_ACC"}
         resp = run_request(9997, req, "user.crt", "user.key", "ca.crt")
         print(f"Response: {resp}")
+        if resp["status"] == "ERROR" and "Admin privileges required" in resp["message"]:
+            log_result("Security: User CREATE.ACCOUNT", "Success", "Correctly blocked")
+        else:
+            log_result("Security: User CREATE.ACCOUNT", "Failure", f"Unexpected response: {resp}")
         assert resp["status"] == "ERROR"
         assert "Admin privileges required" in resp["message"]
 
@@ -104,6 +112,10 @@ def test_security():
         req = {"command": "CREATE.ACCOUNT", "target_account": "NEW_ACC"}
         resp = run_request(9997, req, "admin.crt", "admin.key", "ca.crt")
         print(f"Response: {resp}")
+        if resp["status"] == "OK":
+            log_result("Security: Admin CREATE.ACCOUNT", "Success", "Allowed")
+        else:
+            log_result("Security: Admin CREATE.ACCOUNT", "Failure", resp.get("message", "Error"))
         assert resp["status"] == "OK"
 
         # 3. User attempts to create a file (Should FAIL)
@@ -111,6 +123,10 @@ def test_security():
         req = {"command": "CREATE.FILE", "table": "EVIL_TABLE", "account": "TEST_ACC"}
         resp = run_request(9997, req, "user.crt", "user.key", "ca.crt")
         print(f"Response: {resp}")
+        if resp["status"] == "ERROR" and "Admin privileges required" in resp["message"]:
+            log_result("Security: User CREATE.FILE", "Success", "Correctly blocked")
+        else:
+            log_result("Security: User CREATE.FILE", "Failure", f"Unexpected response: {resp}")
         assert resp["status"] == "ERROR"
         assert "Admin privileges required" in resp["message"]
 
@@ -119,6 +135,10 @@ def test_security():
         req = {"command": "CREATE.FILE", "table": "GOOD_TABLE", "account": "TEST_ACC"}
         resp = run_request(9997, req, "admin.crt", "admin.key", "ca.crt")
         print(f"Response: {resp}")
+        if resp["status"] == "OK":
+            log_result("Security: Admin CREATE.FILE", "Success", "Allowed")
+        else:
+            log_result("Security: Admin CREATE.FILE", "Failure", resp.get("message", "Error"))
         assert resp["status"] == "OK"
 
         # 5. User attempts to authorize a new client (Should FAIL)
@@ -126,6 +146,10 @@ def test_security():
         req = {"command": "AUTHORIZE.CONN", "thumbprint": "1234", "name": "evil_client", "is_admin": True}
         resp = run_request(9997, req, "user.crt", "user.key", "ca.crt")
         print(f"Response: {resp}")
+        if resp["status"] == "ERROR" and "Admin privileges required" in resp["message"]:
+            log_result("Security: User AUTHORIZE.CONN", "Success", "Correctly blocked")
+        else:
+            log_result("Security: User AUTHORIZE.CONN", "Failure", f"Unexpected response: {resp}")
         assert resp["status"] == "ERROR"
         assert "Admin privileges required" in resp["message"]
 
@@ -134,6 +158,10 @@ def test_security():
         req = {"command": "AUTHORIZE.CONN", "thumbprint": "5678", "name": "new_client", "accounts_list": ["TEST_ACC"]}
         resp = run_request(9997, req, "admin.crt", "admin.key", "ca.crt")
         print(f"Response: {resp}")
+        if resp["status"] == "OK":
+            log_result("Security: Admin AUTHORIZE.CONN", "Success", "Allowed")
+        else:
+            log_result("Security: Admin AUTHORIZE.CONN", "Failure", resp.get("message", "Error"))
         assert resp["status"] == "OK"
 
         print("\nSecurity verification PASSED!")

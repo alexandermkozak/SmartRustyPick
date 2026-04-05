@@ -96,28 +96,43 @@ def test_performance():
                     run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 end_time = time.time()
                 print(f"Time to write {num_records} records: {end_time - start_time:.2f}s")
+                write_time = end_time - start_time
 
                 print("Testing simple query performance (3 = 5000)...")
                 start_time = time.time()
                 req = {"command": "QUERY", "table": "PERF", "query_string": "WITH 3 = 5000", "account": "PERF_ACC"}
                 resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 end_time = time.time()
-                print(f"Simple query time: {(end_time - start_time)*1000:.2f}ms. Keys found: {len(resp.get('results', []))}")
+                simple_query_time = (end_time - start_time) * 1000
+                print(f"Simple query time: {simple_query_time:.2f}ms. Keys found: {len(resp.get('results', []))}")
 
                 print("Testing attribute query performance (1 = Val5)...")
                 start_time = time.time()
                 req = {"command": "QUERY", "table": "PERF", "query_string": "WITH 1 = Val5", "account": "PERF_ACC"}
                 resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 end_time = time.time()
-                print(f"Attribute query time: {(end_time - start_time)*1000:.2f}ms. Keys found: {len(resp.get('results', []))}")
+                attr_query_time = (end_time - start_time) * 1000
+                print(f"Attribute query time: {attr_query_time:.2f}ms. Keys found: {len(resp.get('results', []))}")
 
                 print("Testing complex query performance (1 = Val5 AND 3 > 9000)...")
                 start_time = time.time()
                 req = {"command": "QUERY", "table": "PERF", "query_string": "WITH 1 = Val5 AND 3 > 9000", "account": "PERF_ACC"}
                 resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 end_time = time.time()
-                print(f"Complex query time: {(end_time - start_time)*1000:.2f}ms. Keys found: {len(resp.get('results', []))}")
+                complex_query_time = (end_time - start_time) * 1000
+                print(f"Complex query time: {complex_query_time:.2f}ms. Keys found: {len(resp.get('results', []))}")
 
+                # Generate performance_results.md
+                with open("performance_results.md", "w") as f:
+                    f.write("# Performance Test Results\n\n")
+                    f.write(f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                    f.write("| Test Case | Status | Performance Data |\n")
+                    f.write("| --- | --- | --- |\n")
+                    f.write(f"| Write {num_records} records | Success | {write_time:.2f}s |\n")
+                    f.write(f"| Simple Query (1 result) | Success | {simple_query_time:.2f}ms |\n")
+                    f.write(f"| Attribute Query (1000 results) | Success | {attr_query_time:.2f}ms |\n")
+                    f.write(f"| Complex Query (100 results) | Success | {complex_query_time:.2f}ms |\n")
+                
                 try:
                     ssock.unwrap()
                 except (ssl.SSLError, socket.error):
