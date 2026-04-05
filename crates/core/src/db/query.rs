@@ -78,39 +78,41 @@ impl Database {
     }
 
     pub fn query(&mut self, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
-        let (source_map, field_map) = {
-            let table = self.get_table_mut(table_name);
-
-            let source_map = if use_dict_section {
-                table.dictionary.clone()
-            } else {
-                table.records.clone()
-            };
-
-            // Pre-calculate field indices to avoid repeated mutable borrows of self
-            let mut field_map = HashMap::new();
-            self.collect_field_indices(table_name, query, &mut field_map);
-
-            (source_map, field_map)
-        };
+        // Pre-calculate field indices to avoid repeated mutable borrows of self
+        let mut field_map = HashMap::new();
+        self.collect_field_indices(table_name, query, &mut field_map);
 
         let mut results = Vec::new();
 
-        let keys: Vec<String> = if let Some(filter_keys) = keys_to_filter {
-            filter_keys.to_vec()
-        } else {
-            source_map.keys().cloned().collect()
-        };
+        // Use a block to limit the borrow of `table`
+        {
+            let table = self.get_table_mut(table_name);
+            let source_map = if use_dict_section {
+                &table.dictionary
+            } else {
+                &table.records
+            };
 
-        for key in keys {
-            if let Some(record) = source_map.get(&key) {
-                if self.evaluate_node_static_with_id(&key, record, query, &field_map) {
-                    results.push((key.clone(), record.clone()));
+            if let Some(filter_keys) = keys_to_filter {
+                for key in filter_keys {
+                    if let Some(record) = source_map.get(key) {
+                        if Self::evaluate_node_static_with_id(key, record, query, &field_map) {
+                            results.push((key.clone(), record.clone()));
+                        }
+                    }
+                }
+            } else {
+                let mut keys: Vec<String> = source_map.keys().cloned().collect();
+                keys.sort();
+                for key in keys {
+                    let record = source_map.get(&key).unwrap();
+                    if Self::evaluate_node_static_with_id(&key, record, query, &field_map) {
+                        results.push((key.clone(), record.clone()));
+                    }
                 }
             }
         }
 
-        results.sort_by(|a, b| a.0.cmp(&b.0));
         results
     }
 
@@ -131,30 +133,38 @@ impl Database {
         }
     }
 
-    pub(crate) fn evaluate_node_static_with_id(&self, key: &str, record: &Record, node: &QueryNode, field_map: &HashMap<String, usize>) -> bool {
+    pub(crate) fn evaluate_node_static_with_id(key: &str, record: &Record, node: &QueryNode, field_map: &HashMap<String, usize>) -> bool {
         match node {
             QueryNode::Condition(cond) => {
                 if cond.field_name == "ID" {
-                    let result = Self::compare_values(key, &cond.op, &cond.value);
-                    return result;
+                    return Self::compare_values(key, &cond.op, &cond.value);
                 }
                 let field_idx = match field_map.get(&cond.field_name) {
                     Some(idx) => *idx,
                     None => return false,
                 };
+
                 if let Some(field) = record.fields.get(field_idx) {
+                    if field.values.is_empty() {
+                        return Self::compare_values("", &cond.op, &cond.value);
+                    }
                     for v in &field.values {
+                        if v.sub_values.is_empty() {
+                            if Self::compare_values("", &cond.op, &cond.value) { return true; }
+                        }
                         if v.sub_values.iter().any(|sv| Self::compare_values(sv, &cond.op, &cond.value)) {
                             return true;
                         }
                     }
+                } else {
+                    return Self::compare_values("", &cond.op, &cond.value);
                 }
                 false
             }
             QueryNode::Logical { op, left, right } => {
                 match op {
-                    LogicalOp::And => self.evaluate_node_static_with_id(key, record, left, field_map) && self.evaluate_node_static_with_id(key, record, right, field_map),
-                    LogicalOp::Or => self.evaluate_node_static_with_id(key, record, left, field_map) || self.evaluate_node_static_with_id(key, record, right, field_map),
+                    LogicalOp::And => Self::evaluate_node_static_with_id(key, record, left, field_map) && Self::evaluate_node_static_with_id(key, record, right, field_map),
+                    LogicalOp::Or => Self::evaluate_node_static_with_id(key, record, left, field_map) || Self::evaluate_node_static_with_id(key, record, right, field_map),
                 }
             }
         }

@@ -11,7 +11,7 @@ mod tests {
         if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
 
         {
-            let mut db = Database::new(base_dir)?;
+            let mut db = Database::new(base_dir, None)?;
             db.logto("SYSTEM")?;
 
             // Verify $LOGS dictionary
@@ -51,7 +51,7 @@ mod tests {
 
         // Restart and check for self-healing
         {
-            let mut db = Database::new(base_dir)?;
+            let mut db = Database::new(base_dir, None)?;
             db.logto("SYSTEM")?;
 
             let logs = db.get_table("$LOGS").unwrap();
@@ -73,7 +73,7 @@ mod tests {
         if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
 
         {
-            let db = Database::new(base_dir)?;
+            let db = Database::new(base_dir, None)?;
             // Check if SYSTEM account exists
             assert!(db.get_account_dir("SYSTEM").is_some(), "SYSTEM account should be automatically created");
         }
@@ -88,7 +88,7 @@ mod tests {
         if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
 
         {
-            let mut db = Database::new(base_dir)?;
+            let mut db = Database::new(base_dir, None)?;
             // Check if $LOGS file exists in SYSTEM account
             db.logto("SYSTEM")?;
             assert!(db.available_tables.contains("$LOGS"), "$LOGS table should be automatically created in SYSTEM account");
@@ -104,7 +104,7 @@ mod tests {
         if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
 
         {
-            let mut db = Database::new(base_dir)?;
+            let mut db = Database::new(base_dir, None)?;
             db.log_detail = "detailed".to_string();
             db.max_log_records = 2;
 
@@ -138,7 +138,7 @@ mod tests {
         if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
 
         {
-            let mut db = Database::new(base_dir)?;
+            let mut db = Database::new(base_dir, None)?;
             db.add_authorized_client("CLIENT1", "aabbccdd", vec!["ACC1".to_string()], false)?;
             db.add_authorized_client("CLIENT2", "11223344", vec![], true)?; // ADMIN
 
@@ -195,7 +195,7 @@ mod tests {
 
         // Test auto-population on restart
         {
-            let db = Database::new(base_dir)?;
+            let db = Database::new(base_dir, None)?;
             assert!(db.authorized_clients.contains_key("11223344"), "Should load CLIENT2 from $CLIENTS on restart");
             assert!(db.authorized_clients.get("11223344").unwrap().is_admin);
         }
@@ -210,7 +210,8 @@ mod tests {
         if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
 
         {
-            let mut db = Database::new(base_dir)?;
+            let mut db = Database::new(base_dir, None)?;
+            db.logto("SYSTEM")?;
             db.create_account("USER1", None)?;
             db.create_account("USER2", Some("custom_path/user2"))?;
 
@@ -238,7 +239,7 @@ mod tests {
 
         // Test auto-population on restart
         {
-            let mut db = Database::new(base_dir)?;
+            let mut db = Database::new(base_dir, None)?;
             db.logto("SYSTEM")?;
             let accounts_table = db.get_table("$ACCOUNTS").unwrap();
             assert!(accounts_table.records.contains_key("USER2"), "$ACCOUNTS should contain USER2 after restart");
@@ -254,7 +255,7 @@ mod tests {
         if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
 
         {
-            let mut db = Database::new(base_dir)?;
+            let mut db = Database::new(base_dir, None)?;
             db.create_account("ACC1", None)?;
             db.create_account("ACC2", None)?;
 
@@ -277,7 +278,7 @@ mod tests {
 
         // Re-open and verify isolation
         {
-            let mut db = Database::new(base_dir)?;
+            let mut db = Database::new(base_dir, None)?;
             db.logto("ACC1")?;
             let t1 = db.get_table("T1").unwrap();
             assert_eq!(String::from_utf8_lossy(&t1.records.get("K1").unwrap().to_bytes()), "VAL1");
@@ -297,7 +298,7 @@ mod tests {
         if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
 
         {
-            let mut db = Database::new(base_dir)?;
+            let mut db = Database::new(base_dir, None)?;
             db.logto("SYSTEM")?;
             assert!(db.available_tables.contains("DIR"), "DIR table should be automatically created in SYSTEM account");
 
@@ -331,7 +332,7 @@ mod tests {
         if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
 
         {
-            let mut db = Database::new(base_dir)?;
+            let mut db = Database::new(base_dir, None)?;
             db.create_test_account("DICT_TEST")?;
             db.logto("DICT_TEST")?;
 

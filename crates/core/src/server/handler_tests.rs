@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 fn test_handle_request_read_write() {
     let base_dir = "test_server_handler_dir";
     if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir).unwrap();
+    let mut db = Database::new(base_dir, None).unwrap();
     db.create_test_account("SERVER_TEST").unwrap();
 
     let db_arc = Arc::new(Mutex::new(db));
@@ -62,8 +62,9 @@ fn test_handle_request_read_write() {
 fn test_handle_request_query_select() {
     let base_dir = "test_server_query_dir";
     if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir).unwrap();
+    let mut db = Database::new(base_dir, None).unwrap();
     db.create_test_account("QUERY_TEST").unwrap();
+    db.logto("QUERY_TEST").unwrap();
 
     let db_arc = Arc::new(Mutex::new(db));
     let client_info = ClientInfo {

@@ -71,13 +71,12 @@ def test_integration():
     if os.path.exists("db_storage/SYSTEM/$CLIENTS/data"): os.remove("db_storage/SYSTEM/$CLIENTS/data")
 
     # Start the application
-    proc = subprocess.Popen(["./target/debug/smart-rusty-pick-cli"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(["./target/debug/smart-rusty-pick-cli", "--account", "SYSTEM"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     
     # Wait for initial prompt and handle auto-login if any
     time.sleep(2)
     
-    # Login to SYSTEM
-    proc.stdin.write("LOGTO SYSTEM\n")
+    # Authorize client thumbprint
     proc.stdin.write(f"AUTHORIZE.CONN {thumbprint} test_client ADMIN\n")
     proc.stdin.write("CREATE.ACCOUNT TEST_ACC\n")
     proc.stdin.write("LOGTO TEST_ACC\n")

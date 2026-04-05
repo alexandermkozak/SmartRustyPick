@@ -22,8 +22,8 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn new(base_storage_dir: &str) -> io::Result<Self> {
-        let config = crate::config::Config::load();
+    pub fn new(base_storage_dir: &str, config: Option<crate::config::Config>) -> io::Result<Self> {
+        let config = config.unwrap_or_else(crate::config::Config::load);
         let mut db = Database {
             storage_dir: base_storage_dir.to_string(),
             current_account: String::new(),
@@ -47,9 +47,6 @@ impl Database {
 
         db.load_account_registry()?;
         db.ensure_system_account()?;
-
-        // Explicitly log to SYSTEM to populate available_tables
-        db.logto("SYSTEM")?;
 
         // Perform all system setup within a single account switch
         db.run_in_system_account(|db| {
@@ -285,16 +282,17 @@ impl Database {
         F: FnOnce(&mut Database) -> io::Result<R>,
     {
         let original_account = self.current_account.clone();
-        if original_account != "SYSTEM" {
+        let already_system = original_account == "SYSTEM";
+
+        if !already_system {
             self.logto("SYSTEM")?;
         }
+
         let result = f(self);
-        if original_account != "SYSTEM" {
+
+        if !already_system {
             if original_account.is_empty() {
-                self.current_account = String::new();
-                self.loaded_tables.clear();
-                self.available_tables.clear();
-                self.lru_order.clear();
+                self.logout();
             } else {
                 let _ = self.logto(&original_account);
             }
@@ -302,27 +300,36 @@ impl Database {
         result
     }
 
+    pub fn logout(&mut self) {
+        let _ = self.save();
+        self.current_account = String::new();
+        self.loaded_tables.clear();
+        self.lru_order.clear();
+        self.available_tables.clear();
+    }
+
     pub fn logto(&mut self, account_name: &str) -> io::Result<()> {
         let account_dir = self.get_account_dir(account_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", account_name)))?;
 
-        self.save()?; // Save current account's dirty tables
-        self.current_account = account_name.to_string();
-        self.loaded_tables.clear();
-        self.lru_order.clear();
-        self.available_tables.clear();
+        if self.current_account != account_name {
+            self.save()?; // Save current account's dirty tables
+            self.current_account = account_name.to_string();
+            self.loaded_tables.clear();
+            self.lru_order.clear();
+            self.available_tables.clear();
 
-        // Populate available tables
-        if let Ok(entries) = fs::read_dir(&account_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        self.available_tables.insert(name.to_string());
+            // Populate available tables
+            if let Ok(entries) = fs::read_dir(&account_dir) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            self.available_tables.insert(name.to_string());
+                        }
                     }
                 }
             }
         }
-
         Ok(())
     }
 
@@ -469,6 +476,16 @@ impl Database {
     }
 
     pub fn get_table_mut(&mut self, name: &str) -> &mut Table {
+        // Sanitize name to prevent directory traversal
+        if name.contains('/') || name.contains('\\') || name.contains("..") {
+            // If invalid, return a fresh empty table that won't be saved correctly
+            // or just return one that's not in the filesystem.
+            // Better yet, we should probably return an Option or Result,
+            // but for now let's just use a dummy key to avoid traversal.
+            self.loaded_tables.entry("INVALID_TABLE_NAME".to_string()).or_insert_with(Table::new);
+            return self.loaded_tables.get_mut("INVALID_TABLE_NAME").unwrap();
+        }
+
         if !self.loaded_tables.contains_key(name) {
             if let Ok(table) = self.load_table(name) {
                 if self.loaded_tables.len() >= self.max_loaded {
@@ -484,9 +501,9 @@ impl Database {
                 let storage = self.current_storage_dir();
                 let table_dir = format!("{}/{}", storage, name);
                 if !Path::new(&table_dir).exists() {
-                    let _ = fs::create_dir_all(&table_dir);
-                    let _ = File::create(format!("{}/data", table_dir));
-                    let _ = File::create(format!("{}/dict", table_dir));
+                    fs::create_dir_all(&table_dir).ok();
+                    File::create(format!("{}/data", table_dir)).ok();
+                    File::create(format!("{}/dict", table_dir)).ok();
                     self.available_tables.insert(name.to_string());
                 }
 
@@ -765,6 +782,8 @@ impl Database {
     }
 
     pub fn get_field_index(&mut self, table_name: &str, field_name: &str) -> Option<usize> {
+        if field_name == "ID" { return Some(0); }
+        let _ = self.get_table_mut(table_name);
         self.get_field_index_read_only(table_name, field_name)
     }
 
@@ -958,10 +977,7 @@ impl Database {
         if !original_account.is_empty() {
             let _ = self.logto(&original_account);
         } else {
-            self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
+            self.logout();
         }
         Ok(())
     }

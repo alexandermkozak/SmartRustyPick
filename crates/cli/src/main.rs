@@ -5,10 +5,19 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 fn main() -> io::Result<()> {
-    let config = Arc::new(Config::load());
+    let args: Vec<String> = std::env::args().collect();
+    let mut initial_account = None;
+    if let Some(pos) = args.iter().position(|a| a == "--account") {
+        if pos + 1 < args.len() {
+            initial_account = Some(args[pos + 1].clone());
+        }
+    }
+
+    let config = Config::load();
+    let config_arc = Arc::new(config.clone());
 
     // We use a directory "db_storage" to hold our tables
-    let db = Arc::new(Mutex::new(Database::new("db_storage")?));
+    let db = Arc::new(Mutex::new(Database::new("db_storage", Some(config.clone()))?));
 
     // Check if server should be auto-started in background for CLI
     if config.cert_path.is_some() && config.key_path.is_some() && config.ca_path.is_some() {
@@ -19,13 +28,14 @@ fn main() -> io::Result<()> {
         let db_clone = db.clone();
         let config_clone = config.clone();
 
+        let config_arc_clone = config_arc.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 let addr = config_clone.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
                 let port = config_clone.server_port.unwrap_or(8443);
                 let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
-                let _ = server::start_server(config_clone, db_clone, Some(full_addr)).await;
+                let _ = server::start_server(config_arc_clone, db_clone, Some(full_addr)).await;
             });
         });
         println!("Database service attached and running in background.");
@@ -57,19 +67,25 @@ fn main() -> io::Result<()> {
                 break;
             }
         }
-        print!("Account: ");
-        io::stdout().flush()?;
-        let mut account_input = String::new();
-        if io::stdin().read_line(&mut account_input)? == 0 {
-            return Ok(());
-        }
-        let account_name = account_input.trim();
+
+        let account_name = if let Some(acc) = initial_account.take() {
+            acc
+        } else {
+            print!("Account: ");
+            io::stdout().flush()?;
+            let mut account_input = String::new();
+            if io::stdin().read_line(&mut account_input)? == 0 {
+                return Ok(());
+            }
+            account_input.trim().to_string()
+        };
+
         if account_name.is_empty() {
             continue;
         }
 
         let mut db_lock = db.lock().unwrap();
-        if let Err(e) = db_lock.logto(account_name) {
+        if let Err(e) = db_lock.logto(&account_name) {
             let msg = format!("Login error: {}", e);
             let _ = db_lock.log_error("CLI", &msg);
             println!("Error: {}", e);
@@ -78,8 +94,8 @@ fn main() -> io::Result<()> {
             let mut choice = String::new();
             io::stdin().read_line(&mut choice)?;
             if choice.trim().to_uppercase() == "Y" {
-                db_lock.create_account(account_name, None)?;
-                db_lock.logto(account_name)?;
+                db_lock.create_account(&account_name, None)?;
+                db_lock.logto(&account_name)?;
                 let _ = check_dir_file(&mut db_lock);
                 break;
             } else {
@@ -243,7 +259,7 @@ fn main() -> io::Result<()> {
                 }
             }
             "START.SERVER" => {
-                handle_start_server(db.clone(), &parts, config.clone());
+                handle_start_server(db.clone(), &parts, config_arc.clone());
             }
             "SAVE" => {
                 db.lock().unwrap().save()?;

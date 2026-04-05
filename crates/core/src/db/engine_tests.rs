@@ -7,7 +7,7 @@ use std::path::Path;
 fn test_lru_eviction() {
     let base_dir = "test_lru_dir";
     if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir).unwrap();
+    let mut db = Database::new(base_dir, None).unwrap();
     db.logto("SYSTEM").unwrap();
 
     // Set max loaded to 2 for testing
@@ -50,7 +50,7 @@ fn test_lru_eviction() {
 fn test_delete_table_and_account() {
     let base_dir = "test_delete_dir";
     if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir).unwrap();
+    let mut db = Database::new(base_dir, None).unwrap();
 
     db.create_account("DEL_ACC", None).unwrap();
     db.logto("DEL_ACC").unwrap();
@@ -83,7 +83,7 @@ fn test_apply_conversion() {
 fn test_sync_dir_file() {
     let base_dir = "test_sync_dir";
     if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir).unwrap();
+    let mut db = Database::new(base_dir, None).unwrap();
     db.create_account("SYNC_ACC", None).unwrap();
     db.logto("SYNC_ACC").unwrap();
 
@@ -105,6 +105,40 @@ fn test_sync_dir_file() {
         assert!(dir.records.contains_key("T1"));
         assert!(dir.records.contains_key("T2"));
     }
+
+    fs::remove_dir_all(base_dir).unwrap();
+}
+
+#[test]
+fn test_directory_traversal_vulnerability() {
+    let base_dir = "test_traversal_dir";
+    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let mut db = Database::new(base_dir, None).unwrap();
+
+    // Create a "secret" account
+    db.create_account("SECRET", None).unwrap();
+    db.logto("SECRET").unwrap();
+    db.create_table("PRIVATE").unwrap();
+
+    // Switch to a normal account
+    db.create_account("USER", None).unwrap();
+    db.logto("USER").unwrap();
+
+    // Attempt directory traversal to access the SECRET account's table
+    let traversal_name = "../SECRET/PRIVATE";
+
+    // This call should now return a table that is NOT the secret one.
+    // Our implementation returns "INVALID_TABLE_NAME" table.
+    let _ = db.get_table_mut(traversal_name);
+
+    let _secret_table_path = Path::new(base_dir).join("SECRET").join("PRIVATE");
+    // It should NOT have been re-created or modified via the traversal path in USER's dir.
+    // Wait, create_table("PRIVATE") already created it.
+    // Let's use a name that DOESN'T exist.
+    let traversal_name_new = "../SECRET/NEW_PRIVATE";
+    let _ = db.get_table_mut(traversal_name_new);
+    let new_secret_table_path = Path::new(base_dir).join("SECRET").join("NEW_PRIVATE");
+    assert!(!new_secret_table_path.exists());
 
     fs::remove_dir_all(base_dir).unwrap();
 }

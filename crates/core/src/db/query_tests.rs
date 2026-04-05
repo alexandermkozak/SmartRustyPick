@@ -26,7 +26,7 @@ fn test_compare_values() {
 fn test_parse_query() {
     let base_dir = "test_parse_query_dir";
     if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir).unwrap();
+    let mut db = Database::new(base_dir, None).unwrap();
 
     // Simple WITH
     let q1 = db.parse_query("T1", &["WITH", "NAME", "=", "John"]);
@@ -67,7 +67,7 @@ fn test_parse_query() {
 fn test_query_execution() {
     let base_dir = "test_query_exec_dir";
     if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir).unwrap();
+    let mut db = Database::new(base_dir, None).unwrap();
     db.create_test_account("QUERY_TEST").unwrap();
     db.logto("QUERY_TEST").unwrap();
 

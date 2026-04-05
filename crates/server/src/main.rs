@@ -15,7 +15,7 @@ fn main() {
     }
 
     // We use a directory "db_storage" to hold our tables
-    let db = Arc::new(Mutex::new(Database::new("db_storage").expect("Failed to initialize database")));
+    let db = Arc::new(Mutex::new(Database::new("db_storage", Some(config.clone())).expect("Failed to initialize database")));
 
     let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
     let port = config.server_port.unwrap_or(8443);
