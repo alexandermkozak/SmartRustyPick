@@ -20,6 +20,23 @@ fn test_compare_values() {
 
     // Unknown operator
     assert!(!Database::compare_values("abc", "??", "abc"));
+
+    // Trim check
+    assert!(Database::compare_values("  abc  ", "=", "abc"));
+    assert!(!Database::compare_values("abc", "=", "  abc  ")); // search_val is no longer trimmed in compare_values
+}
+
+#[test]
+fn test_parse_query_trim() {
+    let base_dir = "test_parse_query_trim_dir";
+    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let mut db = Database::new(base_dir, None).unwrap();
+
+    let q = db.parse_query("T1", &["WITH", "NAME", "=", "  John  "]).unwrap();
+    if let QueryNode::Condition(c) = q {
+        assert_eq!(c.value, "John");
+    }
+    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]

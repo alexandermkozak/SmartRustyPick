@@ -447,14 +447,14 @@ impl Database {
     }
 
     pub fn get_table(&mut self, name: &str) -> Option<&Table> {
-        // Sanitize name to prevent directory traversal
-        if name.contains('/') || name.contains('\\') || name.contains("..") {
-            return None;
-        }
-
+        // Strict validation: name must be in available_tables
         if !self.available_tables.contains(name) {
             return None;
         }
+
+        // Use the validated name from available_tables
+        let validated_name = self.available_tables.get(name)?.clone();
+        let name = &validated_name;
 
         if !self.loaded_tables.contains_key(name) {
             if let Ok(table) = self.load_table(name) {
@@ -481,13 +481,17 @@ impl Database {
     }
 
     pub fn get_table_mut(&mut self, name: &str) -> &mut Table {
-        // Sanitize name to prevent directory traversal
-        if name.contains('/') || name.contains('\\') || name.contains("..") {
+        // Strict validation: name must be in available_tables
+        if !self.available_tables.contains(name) {
             // If invalid, return a fresh empty table that won't be saved correctly
-            // or just return one that's not in the filesystem.
+            // as it's not in available_tables.
             self.loaded_tables.entry("INVALID_TABLE_NAME".to_string()).or_insert_with(Table::new);
             return self.loaded_tables.get_mut("INVALID_TABLE_NAME").unwrap();
         }
+
+        // Use the validated name from available_tables
+        let validated_name = self.available_tables.get(name).unwrap().clone();
+        let name = &validated_name;
 
         if !self.loaded_tables.contains_key(name) {
             if let Ok(table) = self.load_table(name) {

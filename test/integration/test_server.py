@@ -81,15 +81,14 @@ def test_integration():
     proc.stdin.write("CREATE.ACCOUNT TEST_ACC\n")
     proc.stdin.write("LOGTO TEST_ACC\n")
     proc.stdin.write("Y\n") # Create DIR if prompted
-    proc.stdin.write("LOGTO SYSTEM\n")
     proc.stdin.write("CREATE.FILE USERS\n")
-    proc.stdin.write("LOGTO TEST_ACC\n")
     # Create dictionary entry for field 1. Field 2 in DICT is the attribute number.
     # We found in models.rs: DICT_FIELD_IDX = 0.
     # Pick standard: F1 = D (Type), F2 = Attribute#
     # Our code: rec.fields[DICT_FIELD_IDX] should contain Attribute#
     proc.stdin.write("SET DICT USERS NAME 1\n")
     proc.stdin.write("SAVE\n")
+    proc.stdin.write("LOGTO SYSTEM\n")
     proc.stdin.write("START.SERVER 127.0.0.1:9999 server.crt server.key ca.crt\n")
     proc.stdin.flush()
 

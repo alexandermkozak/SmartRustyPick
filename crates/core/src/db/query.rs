@@ -23,6 +23,7 @@ impl Database {
             if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
                 value = value[1..value.len() - 1].to_string();
             }
+            let value = value.trim().to_string();
 
             let condition = QueryNode::Condition(QueryCondition {
                 field_name: field_name.to_string(),
@@ -59,6 +60,7 @@ impl Database {
                 if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
                     value = value[1..value.len() - 1].to_string();
                 }
+                let value = value.trim().to_string();
                 let next_condition = QueryNode::Condition(QueryCondition {
                     field_name: field_name.to_string(),
                     op: op.to_string(),
@@ -170,16 +172,17 @@ impl Database {
     }
 
     pub(crate) fn compare_values(record_val: &str, op: &str, search_val: &str) -> bool {
+        let record_val = record_val.trim();
         match op {
-            "=" => record_val.trim() == search_val.trim(),
-            "!=" => record_val.trim() != search_val.trim(),
-            "<" => record_val.trim() < search_val.trim(),
-            ">" => record_val.trim() > search_val.trim(),
-            "<=" => record_val.trim() <= search_val.trim(),
-            ">=" => record_val.trim() >= search_val.trim(),
-            "[" => record_val.trim().ends_with(search_val.trim()),
-            "]" => record_val.trim().starts_with(search_val.trim()),
-            "[]" => record_val.trim().contains(search_val.trim()),
+            "=" => record_val == search_val,
+            "!=" => record_val != search_val,
+            "<" => record_val < search_val,
+            ">" => record_val > search_val,
+            "<=" => record_val <= search_val,
+            ">=" => record_val >= search_val,
+            "[" => record_val.ends_with(search_val),
+            "]" => record_val.starts_with(search_val),
+            "[]" => record_val.contains(search_val),
             _ => false,
         }
     }

@@ -164,19 +164,11 @@ fn main() -> io::Result<()> {
             }
             "CREATE.FILE" => {
                 let mut db_lock = db.lock().unwrap();
-                if db_lock.current_account == "SYSTEM" {
-                    handle_create_file(&mut db_lock, &parts);
-                } else {
-                    println!("Unknown command: {}", command);
-                }
+                handle_create_file(&mut db_lock, &parts);
             }
             "DELETE.FILE" => {
                 let mut db_lock = db.lock().unwrap();
-                if db_lock.current_account == "SYSTEM" {
-                    handle_delete_file(&mut db_lock, &parts);
-                } else {
-                    println!("Unknown command: {}", command);
-                }
+                handle_delete_file(&mut db_lock, &parts);
             }
             "CREATE.ACCOUNT" => {
                 let mut db_lock = db.lock().unwrap();
