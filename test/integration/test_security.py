@@ -59,25 +59,25 @@ def test_security():
     with open("db_storage_sec/SYSTEM/$CLIENTS/data", "wb") as f:
         key = b"admin"
         data = admin_tp.encode() + b"\xfe\xfeY"
-        f.write(len(key).to_bytes(4, 'little'))
+        f.write(len(key).to_bytes(8, 'little'))
         f.write(key)
-        f.write(len(data).to_bytes(4, 'little'))
+        f.write(len(data).to_bytes(8, 'little'))
         f.write(data)
         
         key = b"user"
         data = user_tp.encode() + b"\xfeTEST_ACC\xfeN"
-        f.write(len(key).to_bytes(4, 'little'))
+        f.write(len(key).to_bytes(8, 'little'))
         f.write(key)
-        f.write(len(data).to_bytes(4, 'little'))
+        f.write(len(data).to_bytes(8, 'little'))
         f.write(data)
 
     os.makedirs("db_storage_sec/TEST_ACC", exist_ok=True)
     with open("db_storage_sec/accounts.reg", "wb") as f:
         key = b"registry"
         data = b"TEST_ACC\xfe" + os.path.abspath("db_storage_sec/TEST_ACC").encode()
-        f.write(len(key).to_bytes(4, 'little'))
+        f.write(len(key).to_bytes(8, 'little'))
         f.write(key)
-        f.write(len(data).to_bytes(4, 'little'))
+        f.write(len(data).to_bytes(8, 'little'))
         f.write(data)
 
     with open("config.toml", "w") as f:

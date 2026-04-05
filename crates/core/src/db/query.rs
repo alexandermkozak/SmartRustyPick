@@ -102,14 +102,13 @@ impl Database {
                     }
                 }
             } else {
-                let mut keys: Vec<String> = source_map.keys().cloned().collect();
-                keys.sort();
-                for key in keys {
-                    let record = source_map.get(&key).unwrap();
-                    if Self::evaluate_node_static_with_id(&key, record, query, &field_map) {
-                        results.push((key.clone(), record.clone()));
-                    }
-                }
+                // Optimize: Filter before sorting.
+                // Avoid cloning the entire table by using an iterator.
+                results = source_map.iter()
+                    .filter(|(key, record)| Self::evaluate_node_static_with_id(key, record, query, &field_map))
+                    .map(|(key, record)| (key.clone(), record.clone()))
+                    .collect();
+                results.sort_by(|a, b| a.0.cmp(&b.0));
             }
         }
 

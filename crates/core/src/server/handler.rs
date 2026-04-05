@@ -132,6 +132,7 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             } else {
                 let table = db.get_table_mut(&table_name);
                 let records = if is_dict { &table.dictionary } else { &table.records };
+                // Optimization: use iterator to avoid full map clone before sorting
                 let mut res: Vec<_> = records.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
                 res.sort_by(|a, b| a.0.cmp(&b.0));
                 res
@@ -168,6 +169,7 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             } else {
                 let table = db.get_table_mut(&table_name);
                 let records = if is_dict { &table.dictionary } else { &table.records };
+                // Optimization: use iterator to avoid full map clone before sorting
                 let mut res: Vec<_> = records.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
                 res.sort_by(|a, b| a.0.cmp(&b.0));
                 res

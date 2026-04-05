@@ -82,15 +82,15 @@ impl Database {
     fn ensure_system_files(&mut self) -> io::Result<()> {
         // Ensure DIR file exists for SYSTEM account
         if !self.available_tables.contains("DIR") {
-            let _ = self.create_table("DIR");
-            let _ = self.sync_dir_file();
+            self.create_table("DIR")?;
+            self.sync_dir_file()?;
         }
 
         // Ensure mandatory system files exist
         let system_files = vec!["$LOGS", "$ACCOUNTS", "$CLIENTS", "$SAVEDLISTS"];
         for file in system_files {
             if !self.available_tables.contains(file) {
-                let _ = self.create_table(file);
+                self.create_table(file)?;
             }
         }
 
@@ -447,6 +447,11 @@ impl Database {
     }
 
     pub fn get_table(&mut self, name: &str) -> Option<&Table> {
+        // Sanitize name to prevent directory traversal
+        if name.contains('/') || name.contains('\\') || name.contains("..") {
+            return None;
+        }
+
         if !self.available_tables.contains(name) {
             return None;
         }
@@ -480,8 +485,6 @@ impl Database {
         if name.contains('/') || name.contains('\\') || name.contains("..") {
             // If invalid, return a fresh empty table that won't be saved correctly
             // or just return one that's not in the filesystem.
-            // Better yet, we should probably return an Option or Result,
-            // but for now let's just use a dummy key to avoid traversal.
             self.loaded_tables.entry("INVALID_TABLE_NAME".to_string()).or_insert_with(Table::new);
             return self.loaded_tables.get_mut("INVALID_TABLE_NAME").unwrap();
         }
@@ -501,9 +504,9 @@ impl Database {
                 let storage = self.current_storage_dir();
                 let table_dir = format!("{}/{}", storage, name);
                 if !Path::new(&table_dir).exists() {
-                    fs::create_dir_all(&table_dir).ok();
-                    File::create(format!("{}/data", table_dir)).ok();
-                    File::create(format!("{}/dict", table_dir)).ok();
+                    let _ = fs::create_dir_all(&table_dir);
+                    let _ = File::create(format!("{}/data", table_dir));
+                    let _ = File::create(format!("{}/dict", table_dir));
                     self.available_tables.insert(name.to_string());
                 }
 
