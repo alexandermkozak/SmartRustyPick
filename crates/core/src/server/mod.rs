@@ -110,7 +110,7 @@ pub async fn start_server(config: Arc<Config>, db: Arc<Mutex<Database>>, overrid
                         let req: Request = match serde_json::from_str(&line) {
                             Ok(r) => r,
                             Err(e) => {
-                                let resp = Response { status: "ERROR".to_string(), message: Some(format!("Invalid JSON: {}", e)), record: None, results: None, keys: None, count: None };
+                                let resp = Response { status: "ERROR".to_string(), message: Some(format!("Invalid JSON: {}", e)), ..Default::default() };
                                 if let Ok(resp_json) = serde_json::to_string(&resp) {
                                     let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
                                 }

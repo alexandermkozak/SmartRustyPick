@@ -23,7 +23,7 @@ fn test_handle_request_read_write() {
     let req_write = Request {
         command: "WRITE".to_string(),
         account: Some("SERVER_TEST".to_string()),
-        table: Some("USERS".to_string()),
+        file: Some("USERS".to_string()),
         key: Some("3".to_string()),
         data: Some("Alice^alice@example.com".to_string()),
         ..Default::default()
@@ -35,19 +35,23 @@ fn test_handle_request_read_write() {
     let req_read = Request {
         command: "READ".to_string(),
         account: Some("SERVER_TEST".to_string()),
-        table: Some("USERS".to_string()),
+        file: Some("USERS".to_string()),
         key: Some("3".to_string()),
         ..Default::default()
     };
     let resp_read = handle_request(req_read, &db_arc, &client_info);
     assert_eq!(resp_read.status, "OK");
-    assert_eq!(resp_read.record, Some("Alice^alice@example.com".to_string()));
+    // Verify record is now structured (Value::Object)
+    let record = resp_read.record.unwrap();
+    assert!(record.is_object());
+    assert_eq!(record.as_object().unwrap().get("name").unwrap().as_str().unwrap(), "Alice");
+    assert_eq!(record.as_object().unwrap().get("email").unwrap().as_str().unwrap(), "alice@example.com");
 
     // Test Access Denied
     let req_denied = Request {
         command: "READ".to_string(),
         account: Some("SYSTEM".to_string()),
-        table: Some("$ACCOUNTS".to_string()),
+        file: Some("$ACCOUNTS".to_string()),
         key: Some("SYSTEM".to_string()),
         ..Default::default()
     };
@@ -77,7 +81,7 @@ fn test_handle_request_query_select() {
     let req_query = Request {
         command: "QUERY".to_string(),
         account: Some("QUERY_TEST".to_string()),
-        table: Some("USERS".to_string()),
+        file: Some("USERS".to_string()),
         query_string: Some("NAME [] John".to_string()),
         ..Default::default()
     };
@@ -86,12 +90,15 @@ fn test_handle_request_query_select() {
     let results = resp_query.results.unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, "1");
+    // Verify results are now structured (Value::Object instead of Value::String)
+    assert!(results[0].1.is_object());
+    assert_eq!(results[0].1.as_object().unwrap().get("name").unwrap().as_str().unwrap(), "John Doe");
 
     // Test SELECT and GET.NEXT
     let req_select = Request {
         command: "SELECT".to_string(),
         account: Some("QUERY_TEST".to_string()),
-        table: Some("USERS".to_string()),
+        file: Some("USERS".to_string()),
         list_name: Some("MYLIST".to_string()),
         ..Default::default()
     };
@@ -107,7 +114,9 @@ fn test_handle_request_query_select() {
     };
     let resp_next = handle_request(req_next, &db_arc, &client_info);
     assert_eq!(resp_next.status, "OK");
-    assert_eq!(resp_next.results.unwrap().len(), 1);
+    let next_results = resp_next.results.unwrap();
+    assert_eq!(next_results.len(), 1);
+    assert!(next_results[0].1.is_object());
 
     fs::remove_dir_all(base_dir).unwrap();
 }

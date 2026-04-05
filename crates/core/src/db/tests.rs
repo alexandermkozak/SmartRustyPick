@@ -397,4 +397,52 @@ mod tests {
         fs::remove_dir_all(base_dir)?;
         Ok(())
     }
+
+    #[test]
+    fn test_record_serialization() -> io::Result<()> {
+        let base_dir = "test_serialization_dir";
+        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+
+        {
+            let mut db = Database::new(base_dir, None)?;
+            db.create_test_account("SERIAL_TEST")?;
+            db.logto("SERIAL_TEST")?;
+
+            // Setup a table with complex dictionary names
+            db.create_table("CUSTOM")?;
+            {
+                let table = db.get_table_mut("CUSTOM").unwrap();
+                table.dictionary.insert("FIRST.NAME".to_string(), Record::from_display_string("1^First Name^L^15"));
+                table.dictionary.insert("LAST.NAME".to_string(), Record::from_display_string("2^Last Name^L^15"));
+                table.dictionary.insert("AGE".to_string(), Record::from_display_string("3^Age^R^3"));
+                table.records.insert("K1".to_string(), Record::from_display_string("John^Doe^30"));
+                table.dirty = true;
+            }
+            db.save()?;
+
+            // Load to ensure available_tables is populated
+            db.get_table("CUSTOM").unwrap();
+
+            let record = Record::from_display_string("John^Doe^30");
+            let serialized = db.serialize_record("CUSTOM", &record);
+
+            assert!(serialized.is_object());
+            let obj = serialized.as_object().unwrap();
+
+            // Check camelCase conversion
+            assert_eq!(obj.get("firstName").unwrap().as_str().unwrap(), "John");
+            assert_eq!(obj.get("lastName").unwrap().as_str().unwrap(), "Doe");
+            assert_eq!(obj.get("age").unwrap().as_str().unwrap(), "30");
+
+            // Test Round-trip
+            let deserialized = db.deserialize_record("CUSTOM", &serialized).unwrap();
+            assert_eq!(deserialized.fields.len(), 3);
+            assert_eq!(deserialized.fields[0].values[0].sub_values[0], "John");
+            assert_eq!(deserialized.fields[1].values[0].sub_values[0], "Doe");
+            assert_eq!(deserialized.fields[2].values[0].sub_values[0], "30");
+        }
+
+        fs::remove_dir_all(base_dir)?;
+        Ok(())
+    }
 }

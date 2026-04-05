@@ -6,9 +6,10 @@ pub struct Request {
     pub command: String,
     pub account: Option<String>,
     pub target_account: Option<String>,
-    pub table: Option<String>,
+    pub file: Option<String>,
     pub key: Option<String>,
     pub data: Option<String>,
+    pub structured_data: Option<serde_json::Value>,
     pub is_dict: Option<bool>,
     pub query_node: Option<QueryNode>,
     pub query_string: Option<String>,
@@ -20,12 +21,12 @@ pub struct Request {
     pub is_admin: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Response {
     pub status: String,
     pub message: Option<String>,
-    pub record: Option<String>,
-    pub results: Option<Vec<(String, String)>>,
+    pub record: Option<serde_json::Value>,
+    pub results: Option<Vec<(String, serde_json::Value)>>,
     pub keys: Option<Vec<String>>,
     pub count: Option<usize>,
 }

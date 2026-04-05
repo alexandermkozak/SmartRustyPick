@@ -794,6 +794,88 @@ impl Database {
         self.get_field_index_read_only(table_name, field_name)
     }
 
+    pub fn serialize_record(&self, table_name: &str, record: &Record) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        let table = match self.get_table_read_only(table_name) {
+            Some(t) => t,
+            None => return serde_json::Value::Object(map),
+        };
+
+        for (dict_key, dict_rec) in &table.dictionary {
+            if let Some(f1) = dict_rec.fields.get(DICT_FIELD_IDX) {
+                if let Some(v1) = f1.values.get(0) {
+                    if let Some(idx_str) = v1.sub_values.get(0) {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            if idx > 0 {
+                                let _field_idx = idx - 1;
+                                let value = self.format_record_field(table_name, record, dict_key);
+                                let camel_key = self.to_camel_case(dict_key);
+                                map.insert(camel_key, serde_json::Value::String(value));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::Value::Object(map)
+    }
+
+    pub fn deserialize_record(&self, table_name: &str, data: &serde_json::Value) -> Option<Record> {
+        let obj = data.as_object()?;
+        let mut record = Record::new();
+        let table = self.get_table_read_only(table_name)?;
+
+        // Inverse mapping of camelCase or original dictionary keys to attribute indices
+        let mut attr_map = HashMap::new();
+        for (dict_key, dict_rec) in &table.dictionary {
+            if let Some(f1) = dict_rec.fields.get(DICT_FIELD_IDX) {
+                if let Some(v1) = f1.values.get(0) {
+                    if let Some(idx_str) = v1.sub_values.get(0) {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            if idx > 0 {
+                                attr_map.insert(self.to_camel_case(dict_key), idx - 1);
+                                attr_map.insert(dict_key.clone(), idx - 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (key, val) in obj {
+            if let Some(&idx) = attr_map.get(key) {
+                while record.fields.len() <= idx {
+                    record.fields.push(Field::default());
+                }
+                let val_str = match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
+                    _ => val.to_string(),
+                };
+                record.fields[idx].values = vec![Value { sub_values: vec![val_str] }];
+            }
+        }
+
+        Some(record)
+    }
+
+    fn to_camel_case(&self, s: &str) -> String {
+        let mut res = String::new();
+        let mut capitalize_next = false;
+        for c in s.chars() {
+            if c == '.' {
+                capitalize_next = true;
+            } else if capitalize_next {
+                res.push(c.to_ascii_uppercase());
+                capitalize_next = false;
+            } else {
+                res.push(c.to_ascii_lowercase());
+            }
+        }
+        res
+    }
+
     pub fn log_error(&mut self, account: &str, message: &str) -> io::Result<()> {
         self.run_in_system_account(|db| {
             let now = time::OffsetDateTime::now_utc();
