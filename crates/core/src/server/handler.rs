@@ -184,13 +184,11 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
                     Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), record: None, results: None, keys: None, count: None },
                 };
                 let records = if is_dict { &table.dictionary } else { &table.records };
-                // Optimization: use iterator to avoid full map clone before sorting
-                let mut res: Vec<_> = records.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
-                res.sort_by(|a, b| a.0.cmp(&b.0));
-                res
+                // Optimization: Collect and sort keys directly to avoid cloning full records
+                let mut keys: Vec<String> = records.keys().cloned().collect();
+                keys.sort();
+                keys
             };
-
-            let keys: Vec<String> = results.into_iter().map(|(k, _)| k).collect();
             let count = keys.len();
             db.remote_select_lists.insert(list_name.clone(), crate::db::SelectList { table_name, is_dict, keys });
             db.remote_select_cursors.insert(list_name, 0);
