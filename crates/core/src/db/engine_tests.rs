@@ -19,16 +19,16 @@ fn test_lru_eviction() {
     db.create_table("T3").unwrap();
 
     // Load T1 and T2
-    db.get_table_mut("T1").records.insert("K1".to_string(), Record::from_display_string("V1"));
-    db.get_table_mut("T1").dirty = true;
-    db.get_table_mut("T2");
+    db.get_table_mut("T1").unwrap().records.insert("K1".to_string(), Record::from_display_string("V1"));
+    db.get_table_mut("T1").unwrap().dirty = true;
+    let _ = db.get_table_mut("T2");
 
     assert_eq!(db.loaded_tables.len(), 2);
     assert!(db.loaded_tables.contains_key("T1"));
     assert!(db.loaded_tables.contains_key("T2"));
 
     // Loading T3 should evict T1 (oldest in LRU)
-    db.get_table_mut("T3");
+    let _ = db.get_table_mut("T3");
     assert_eq!(db.loaded_tables.len(), 2);
     assert!(!db.loaded_tables.contains_key("T1"));
     assert!(db.loaded_tables.contains_key("T2"));
@@ -93,7 +93,7 @@ fn test_sync_dir_file() {
 
     // Manually remove DIR entry
     {
-        let dir = db.get_table_mut("DIR");
+        let dir = db.get_table_mut("DIR").unwrap();
         dir.records.remove("T1");
         dir.dirty = true;
     }
@@ -127,18 +127,22 @@ fn test_directory_traversal_vulnerability() {
     // Attempt directory traversal to access the SECRET account's table
     let traversal_name = "../SECRET/PRIVATE";
 
-    // This call should now return a table that is NOT the secret one.
-    // Our implementation returns "INVALID_TABLE_NAME" table.
-    let _ = db.get_table_mut(traversal_name);
+    // This call should now return an error.
+    let res = db.get_table_mut(traversal_name);
+    assert!(res.is_err());
 
     let _secret_table_path = Path::new(base_dir).join("SECRET").join("PRIVATE");
     // It should NOT have been re-created or modified via the traversal path in USER's dir.
     // Wait, create_table("PRIVATE") already created it.
     // Let's use a name that DOESN'T exist.
     let traversal_name_new = "../SECRET/NEW_PRIVATE";
-    let _ = db.get_table_mut(traversal_name_new);
+    let res2 = db.get_table_mut(traversal_name_new);
+    assert!(res2.is_err());
     let new_secret_table_path = Path::new(base_dir).join("SECRET").join("NEW_PRIVATE");
     assert!(!new_secret_table_path.exists());
+
+    // Verify that "INVALID_TABLE_NAME" is NOT created in loaded_tables
+    assert!(!db.loaded_tables.contains_key("INVALID_TABLE_NAME"));
 
     fs::remove_dir_all(base_dir).unwrap();
 }

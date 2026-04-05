@@ -40,7 +40,7 @@ mod tests {
 
             // Manually corrupt dictionary for $LOGS
             {
-                let logs_mut = db.get_table_mut("$LOGS");
+                let logs_mut = db.get_table_mut("$LOGS").unwrap();
                 logs_mut.dictionary.remove("MESSAGE");
                 // Add an override
                 logs_mut.dictionary.insert("DETAIL".to_string(), Record::from_display_string("2^OVERRIDE_DETAIL^L^10"));
@@ -262,7 +262,7 @@ mod tests {
             // Log to ACC1 and create a table
             db.logto("ACC1")?;
             db.create_table("T1")?;
-            let t1 = db.get_table_mut("T1");
+            let t1 = db.get_table_mut("T1").unwrap();
             t1.records.insert("K1".to_string(), Record::from_bytes(b"VAL1"));
             t1.dirty = true;
             db.save()?;
@@ -270,7 +270,7 @@ mod tests {
             // Log to ACC2 and create a table with same name but different content
             db.logto("ACC2")?;
             db.create_table("T1")?;
-            let t1_acc2 = db.get_table_mut("T1");
+            let t1_acc2 = db.get_table_mut("T1").unwrap();
             t1_acc2.records.insert("K1".to_string(), Record::from_bytes(b"VAL2"));
             t1_acc2.dirty = true;
             db.save()?;

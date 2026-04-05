@@ -51,7 +51,10 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             };
             let is_dict = req.is_dict.unwrap_or(false);
 
-            let table = db.get_table_mut(&table_name);
+            let table = match db.get_table_mut(&table_name) {
+                Ok(t) => t,
+                Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), record: None, results: None, keys: None, count: None },
+            };
             let records = if is_dict { &table.dictionary } else { &table.records };
             match records.get(&key) {
                 Some(r) => Response { status: "OK".to_string(), message: None, record: Some(r.to_display_string()), results: None, keys: None, count: None },
@@ -76,7 +79,10 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             };
             let is_dict = req.is_dict.unwrap_or(false);
 
-            let table = db.get_table_mut(&table_name);
+            let table = match db.get_table_mut(&table_name) {
+                Ok(t) => t,
+                Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), record: None, results: None, keys: None, count: None },
+            };
             let records = if is_dict { &mut table.dictionary } else { &mut table.records };
             records.insert(key, Record::from_display_string(&data));
             table.dirty = true;
@@ -99,7 +105,10 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             };
             let is_dict = req.is_dict.unwrap_or(false);
 
-            let table = db.get_table_mut(&table_name);
+            let table = match db.get_table_mut(&table_name) {
+                Ok(t) => t,
+                Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), record: None, results: None, keys: None, count: None },
+            };
             let records = if is_dict { &mut table.dictionary } else { &mut table.records };
             records.remove(&key);
             table.dirty = true;
@@ -130,7 +139,10 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             let results = if let Some(q) = query_node {
                 db.query(&table_name, is_dict, &q, None)
             } else {
-                let table = db.get_table_mut(&table_name);
+                let table = match db.get_table_mut(&table_name) {
+                    Ok(t) => t,
+                    Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), record: None, results: None, keys: None, count: None },
+                };
                 let records = if is_dict { &table.dictionary } else { &table.records };
                 // Optimization: use iterator to avoid full map clone before sorting
                 let mut res: Vec<_> = records.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
@@ -167,7 +179,10 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             let results = if let Some(q) = query_node {
                 db.query(&table_name, is_dict, &q, None)
             } else {
-                let table = db.get_table_mut(&table_name);
+                let table = match db.get_table_mut(&table_name) {
+                    Ok(t) => t,
+                    Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), record: None, results: None, keys: None, count: None },
+                };
                 let records = if is_dict { &table.dictionary } else { &table.records };
                 // Optimization: use iterator to avoid full map clone before sorting
                 let mut res: Vec<_> = records.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
@@ -208,7 +223,10 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             };
 
             let mut results = Vec::new();
-            let table = db.get_table_mut(&table_name);
+            let table = match db.get_table_mut(&table_name) {
+                Ok(t) => t,
+                Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), record: None, results: None, keys: None, count: None },
+            };
             let records = if is_dict { &table.dictionary } else { &table.records };
 
             for key in &keys_batch {

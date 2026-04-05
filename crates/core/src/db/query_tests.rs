@@ -114,7 +114,7 @@ fn test_query_execution() {
     // Multi-value match (if it was supported/tested)
     // Create a record with multi-values
     {
-        let users = db.get_table_mut("USERS");
+        let users = db.get_table_mut("USERS").unwrap();
         let rec = Record::from_display_string("Skill]Rust]Go^rust@example.com");
         users.records.insert("3".to_string(), rec);
         users.dirty = true;

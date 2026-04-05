@@ -290,7 +290,13 @@ fn handle_set(db: &mut Database, parts: &[&str]) {
     let key = parts[offset + 1].to_string();
     let data = parts[offset + 2..].join(" ");
 
-    let table = db.get_table_mut(table_name);
+    let table = match db.get_table_mut(table_name) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
     let record = Record::from_display_string(&data);
     if is_dict {
         table.dictionary.insert(key, record);
@@ -387,7 +393,13 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
         }
 
         if used_list {
-            let table = db.get_table_mut(table_name);
+            let table = match db.get_table_mut(table_name) {
+                Ok(t) => t,
+                Err(e) => {
+                    println!("Error: {}", e);
+                    return;
+                }
+            };
             let map = if is_dict { &mut table.dictionary } else { &mut table.records };
             let mut count = 0;
             for key in keys_to_delete {
@@ -411,7 +423,13 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
 
     let key = parts[offset + 1];
 
-    let table = db.get_table_mut(table_name);
+    let table = match db.get_table_mut(table_name) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
     let map = if is_dict { &mut table.dictionary } else { &mut table.records };
     if map.remove(key).is_some() {
         table.dirty = true;
@@ -455,7 +473,13 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
     let table_exists = db.list_tables().contains(&table_name.to_string());
     if table_exists {
         let (map_keys, is_dict_val) = {
-            let table = db.get_table_mut(table_name);
+            let table = match db.get_table_mut(table_name) {
+                Ok(t) => t,
+                Err(e) => {
+                    println!("Error: {}", e);
+                    return;
+                }
+            };
             let map = if is_dict { &table.dictionary } else { &table.records };
             let keys = if use_select_list {
                 selected_keys
@@ -483,7 +507,13 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
             // Now iterate over records
             for key in map_keys {
                 let formatted_row = {
-                    let table = db.get_table_mut(table_name);
+                    let table = match db.get_table_mut(table_name) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            println!("Error: {}", e);
+                            return;
+                        }
+                    };
                     let map = if is_dict_val { &table.dictionary } else { &table.records };
                     map.get(&key).map(|r| r.clone())
                 };
@@ -634,7 +664,13 @@ fn handle_edit(db: &mut Database, parts: &[&str], config: &Config) {
             // Read back the content
             match std::fs::read_to_string(&temp_file_path) {
                 Ok(new_content) => {
-                    let table = db.get_table_mut(table_name);
+                    let table = match db.get_table_mut(table_name) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            println!("Error: {}", e);
+                            return;
+                        }
+                    };
                     let record = Record::from_edit_string(&new_content);
                     let key_str = key.to_string();
                     if is_dict {
@@ -799,7 +835,7 @@ fn handle_save_list(db: &mut Database, parts: &[&str]) {
     }
 
     let record = Record::from_bytes(&data);
-    let table = db.get_table_mut("$SAVEDLISTS");
+    let table = db.get_table_mut("$SAVEDLISTS").unwrap();
     table.records.insert(list_name.to_string(), record);
     table.dirty = true;
 
@@ -815,7 +851,7 @@ fn handle_get_list(db: &mut Database, parts: &[&str]) {
 
     let list_name = parts[1];
 
-    let table = db.get_table_mut("$SAVEDLISTS");
+    let table = db.get_table_mut("$SAVEDLISTS").unwrap();
     if let Some(record) = table.records.get(list_name) {
         let data = record.to_bytes();
         let fields: Vec<&[u8]> = data.split(|&b| b == smart_rusty_pick_core::db::FM).collect();
@@ -1047,7 +1083,7 @@ fn handle_list_conns(db: &mut Database) {
     println!("{:-<20} {:-<64}", "", "");
 
     let _ = db.run_in_system_account(|db| {
-        let table = db.get_table_mut("$CLIENTS");
+        let table = db.get_table_mut("$CLIENTS")?;
         let mut names: Vec<_> = table.records.keys().cloned().collect();
         names.sort();
 

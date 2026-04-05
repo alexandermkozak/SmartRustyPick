@@ -110,7 +110,7 @@ impl Database {
             }
         }
 
-        let accounts_table = self.get_table_mut("$ACCOUNTS");
+        let accounts_table = self.get_table_mut("$ACCOUNTS")?;
         for (name, dir) in accounts_to_list {
             let mut record = Record::new();
             while record.fields.len() <= SYS_ACCOUNTS_PATH_IDX {
@@ -133,7 +133,7 @@ impl Database {
         if Self::load_section(&mut map, &certs_path).is_ok() {
             if let Some(certs_rec) = map.remove("certs") {
                 if let Some(f) = certs_rec.fields.get(0) {
-                    let table = self.get_table_mut("$CLIENTS");
+                    let table = self.get_table_mut("$CLIENTS")?;
                     for v in &f.values {
                         for sv in &v.sub_values {
                             if !sv.is_empty() {
@@ -183,7 +183,7 @@ impl Database {
 
     fn ensure_default_dictionaries(&mut self, table_name: &str) -> io::Result<bool> {
         let mut updated = false;
-        let table = self.get_table_mut(table_name);
+        let table = self.get_table_mut(table_name)?;
         match table_name {
             "$LOGS" => {
                 if !table.dictionary.contains_key("MESSAGE") {
@@ -240,7 +240,7 @@ impl Database {
     }
 
     fn load_clients_from_table(&mut self) -> io::Result<()> {
-        let table = self.get_table_mut("$CLIENTS");
+        let table = self.get_table_mut("$CLIENTS")?;
         let mut clients = Vec::new();
         for record in table.records.values() {
             if let Some(tp) = record.fields.get(SYS_CLIENTS_THUMBPRINT_IDX).and_then(|f| f.values.get(0)).and_then(|v| v.sub_values.get(0)) {
@@ -359,7 +359,7 @@ impl Database {
         // Update $ACCOUNTS table if it exists
         self.run_in_system_account(|db| {
             if db.available_tables.contains("$ACCOUNTS") {
-                let accounts_table = db.get_table_mut("$ACCOUNTS");
+                let accounts_table = db.get_table_mut("$ACCOUNTS")?;
                 let mut record = Record::new();
                 while record.fields.len() <= SYS_ACCOUNTS_PATH_IDX {
                     record.fields.push(Field::default());
@@ -412,7 +412,7 @@ impl Database {
 
         // Remove from $ACCOUNTS table
         self.run_in_system_account(|db| {
-            let table = db.get_table_mut("$ACCOUNTS");
+            let table = db.get_table_mut("$ACCOUNTS")?;
             table.records.remove(name);
             table.dirty = true;
             db.save()
@@ -480,43 +480,43 @@ impl Database {
         self.loaded_tables.get(name)
     }
 
-    pub fn get_table_mut(&mut self, name: &str) -> &mut Table {
+    pub fn get_table_mut(&mut self, name: &str) -> io::Result<&mut Table> {
         // Strict validation: name must be in available_tables
         if !self.available_tables.contains(name) {
-            // If invalid, return a fresh empty table that won't be saved correctly
-            // as it's not in available_tables.
-            self.loaded_tables.entry("INVALID_TABLE_NAME".to_string()).or_insert_with(Table::new);
-            return self.loaded_tables.get_mut("INVALID_TABLE_NAME").unwrap();
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' not found", name)));
         }
 
         // Use the validated name from available_tables
         let validated_name = self.available_tables.get(name).unwrap().clone();
-        let name = &validated_name;
+        let name_owned = validated_name;
+        let name = &name_owned;
 
         if !self.loaded_tables.contains_key(name) {
-            if let Ok(table) = self.load_table(name) {
-                if self.loaded_tables.len() >= self.max_loaded {
-                    if let Some(oldest) = self.lru_order.pop_front() {
-                        let _ = self.save_table(&oldest);
-                        self.loaded_tables.remove(&oldest);
+            let table = match self.load_table(name) {
+                Ok(table) => table,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // This case should ideally not happen if available_tables is correct
+                    // but if it does, we create it.
+                    let storage = self.current_storage_dir();
+                    let table_dir = format!("{}/{}", storage, name);
+                    if !Path::new(&table_dir).exists() {
+                        fs::create_dir_all(&table_dir)?;
                     }
+                    File::create(format!("{}/data", table_dir))?;
+                    File::create(format!("{}/dict", table_dir))?;
+                    Table::new()
                 }
-                self.loaded_tables.insert(name.to_string(), table);
-                self.lru_order.push_back(name.to_string());
-            } else {
-                // Return a fresh table if load fails
-                let storage = self.current_storage_dir();
-                let table_dir = format!("{}/{}", storage, name);
-                if !Path::new(&table_dir).exists() {
-                    let _ = fs::create_dir_all(&table_dir);
-                    let _ = File::create(format!("{}/data", table_dir));
-                    let _ = File::create(format!("{}/dict", table_dir));
-                    self.available_tables.insert(name.to_string());
-                }
+                Err(e) => return Err(e),
+            };
 
-                self.loaded_tables.insert(name.to_string(), Table::new());
-                self.lru_order.push_back(name.to_string());
+            if self.loaded_tables.len() >= self.max_loaded {
+                if let Some(oldest) = self.lru_order.pop_front() {
+                    let _ = self.save_table(&oldest);
+                    self.loaded_tables.remove(&oldest);
+                }
             }
+            self.loaded_tables.insert(name.to_string(), table);
+            self.lru_order.push_back(name.to_string());
         } else {
             // Update LRU
             if let Some(pos) = self.lru_order.iter().position(|x| x == name) {
@@ -524,7 +524,7 @@ impl Database {
                 self.lru_order.push_back(n);
             }
         }
-        self.loaded_tables.get_mut(name).unwrap()
+        Ok(self.loaded_tables.get_mut(name).unwrap())
     }
 
     fn load_table(&self, name: &str) -> io::Result<Table> {
@@ -676,7 +676,7 @@ impl Database {
 
     pub fn sync_dir_file(&mut self) -> io::Result<()> {
         let tables = self.list_tables();
-        let dir_table = self.get_table_mut("DIR");
+        let dir_table = self.get_table_mut("DIR")?;
         dir_table.records.clear();
         for t in tables {
             if t != "DIR" {
@@ -790,7 +790,7 @@ impl Database {
 
     pub fn get_field_index(&mut self, table_name: &str, field_name: &str) -> Option<usize> {
         if field_name == "ID" { return Some(0); }
-        let _ = self.get_table_mut(table_name);
+        let _ = self.get_table_mut(table_name).ok();
         self.get_field_index_read_only(table_name, field_name)
     }
 
@@ -817,7 +817,7 @@ impl Database {
 
             let max_records = db.max_log_records;
             {
-                let table = db.get_table_mut("$LOGS");
+                let table = db.get_table_mut("$LOGS")?;
                 table.records.insert(key, record);
                 table.dirty = true;
 
@@ -840,7 +840,7 @@ impl Database {
 
             // Update $CLIENTS table
             {
-                let table = db.get_table_mut("$CLIENTS");
+                let table = db.get_table_mut("$CLIENTS")?;
                 let mut record = Record::new();
                 while record.fields.len() <= SYS_CLIENTS_ADMIN_IDX {
                     record.fields.push(Field::default());
@@ -871,7 +871,7 @@ impl Database {
         self.run_in_system_account(|db| {
             let mut success = false;
             {
-                let table = db.get_table_mut("$CLIENTS");
+                let table = db.get_table_mut("$CLIENTS")?;
                 if let Some(record) = table.records.get_mut(name) {
                     // Ensure mandatory fields exist
                     while record.fields.len() <= SYS_CLIENTS_ACCOUNTS_IDX {
@@ -902,7 +902,7 @@ impl Database {
         self.run_in_system_account(|db| {
             let mut success = false;
             {
-                let table = db.get_table_mut("$CLIENTS");
+                let table = db.get_table_mut("$CLIENTS")?;
                 if let Some(record) = table.records.get_mut(name) {
                     if record.fields.len() > SYS_CLIENTS_ACCOUNTS_IDX {
                         let original_len = record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len();
@@ -927,7 +927,7 @@ impl Database {
     pub fn remove_authorized_client(&mut self, name: &str) -> io::Result<bool> {
         self.run_in_system_account(|db| {
             let found = {
-                let table = db.get_table_mut("$CLIENTS");
+                let table = db.get_table_mut("$CLIENTS")?;
                 if table.records.remove(name).is_some() {
                     table.dirty = true;
                     true
@@ -965,7 +965,7 @@ impl Database {
         self.create_table("PRODUCTS")?;
         self.sync_dir_file()?;
         {
-            let table = self.get_table_mut("USERS");
+            let table = self.get_table_mut("USERS")?;
             table.dictionary.insert("NAME".to_string(), Record::from_display_string("1^NAME^L^15"));
             table.dictionary.insert("EMAIL".to_string(), Record::from_display_string("2^EMAIL^L^20"));
             table.records.insert("1".to_string(), Record::from_display_string("John Doe^john@example.com"));
@@ -973,7 +973,7 @@ impl Database {
             table.dirty = true;
         }
         {
-            let table = self.get_table_mut("PRODUCTS");
+            let table = self.get_table_mut("PRODUCTS")?;
             table.dictionary.insert("DESC".to_string(), Record::from_display_string("1^DESCRIPTION^L^20"));
             table.dictionary.insert("PRICE".to_string(), Record::from_display_string("2^PRICE^R^10^^^^MD2"));
             table.records.insert("P1".to_string(), Record::from_display_string("Laptop^120000"));

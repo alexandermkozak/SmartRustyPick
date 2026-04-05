@@ -88,7 +88,10 @@ impl Database {
 
         // Use a block to limit the borrow of `table`
         {
-            let table = self.get_table_mut(table_name);
+            let table = match self.get_table_mut(table_name) {
+                Ok(t) => t,
+                Err(_) => return results, // Return empty results if table not found
+            };
             let source_map = if use_dict_section {
                 &table.dictionary
             } else {
