@@ -21,7 +21,15 @@ def generate_certs():
 def run_request(port, request, certfile, keyfile, cafile, existing_ssock=None):
     if existing_ssock:
         existing_ssock.sendall(json.dumps(request).encode() + b'\n')
-        response = existing_ssock.recv(1024*1024).decode()
+        
+        # Read until newline to handle large responses
+        data = b''
+        while not data.endswith(b'\n'):
+            chunk = existing_ssock.recv(4096)
+            if not chunk: break
+            data += chunk
+        
+        response = data.decode()
         return json.loads(response)
 
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=cafile)
@@ -32,7 +40,15 @@ def run_request(port, request, certfile, keyfile, cafile, existing_ssock=None):
     with socket.create_connection(('127.0.0.1', port)) as sock:
         with context.wrap_socket(sock, server_hostname='localhost') as ssock:
             ssock.sendall(json.dumps(request).encode() + b'\n')
-            response = ssock.recv(1024*1024).decode()
+            
+            # Read until newline to handle large responses
+            data = b''
+            while not data.endswith(b'\n'):
+                chunk = ssock.recv(4096)
+                if not chunk: break
+                data += chunk
+            
+            response = data.decode()
             return json.loads(response)
 
 def test_performance():
@@ -46,7 +62,7 @@ def test_performance():
     if os.path.exists("certs.reg"): os.remove("certs.reg")
 
     port = 9999
-    num_records = 1000
+    num_records = 10000
 
     # Start the application
     proc = subprocess.Popen(["./target/debug/SmartRustyPick"], stdin=subprocess.PIPE, text=True)
@@ -73,21 +89,31 @@ def test_performance():
                 print(f"Loading {num_records} records...")
                 start_time = time.time()
                 for i in range(num_records):
-                    req = {"command": "WRITE", "table": "PERF", "key": f"REC{i}", "data": f"Val1^Val2^{i}", "account": "PERF_ACC"}
+                    # Rotate Val1, Val2 to make queries more interesting
+                    val1 = f"Val{i % 10}"
+                    val2 = f"Data{i % 100}"
+                    req = {"command": "WRITE", "table": "PERF", "key": f"REC{i}", "data": f"{val1}^{val2}^{i}", "account": "PERF_ACC"}
                     run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 end_time = time.time()
                 print(f"Time to write {num_records} records: {end_time - start_time:.2f}s")
 
-                print("Testing simple query performance...")
+                print("Testing simple query performance (3 = 5000)...")
                 start_time = time.time()
-                req = {"command": "QUERY", "table": "PERF", "query_string": "WITH 3 = 500", "account": "PERF_ACC"}
+                req = {"command": "QUERY", "table": "PERF", "query_string": "WITH 3 = 5000", "account": "PERF_ACC"}
                 resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 end_time = time.time()
                 print(f"Simple query time: {(end_time - start_time)*1000:.2f}ms. Keys found: {len(resp.get('results', []))}")
 
-                print("Testing complex query performance...")
+                print("Testing attribute query performance (1 = Val5)...")
                 start_time = time.time()
-                req = {"command": "QUERY", "table": "PERF", "query_string": "WITH 1 = Val1 AND 3 > 900", "account": "PERF_ACC"}
+                req = {"command": "QUERY", "table": "PERF", "query_string": "WITH 1 = Val5", "account": "PERF_ACC"}
+                resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
+                end_time = time.time()
+                print(f"Attribute query time: {(end_time - start_time)*1000:.2f}ms. Keys found: {len(resp.get('results', []))}")
+
+                print("Testing complex query performance (1 = Val5 AND 3 > 9000)...")
+                start_time = time.time()
+                req = {"command": "QUERY", "table": "PERF", "query_string": "WITH 1 = Val5 AND 3 > 9000", "account": "PERF_ACC"}
                 resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
                 end_time = time.time()
                 print(f"Complex query time: {(end_time - start_time)*1000:.2f}ms. Keys found: {len(resp.get('results', []))}")
