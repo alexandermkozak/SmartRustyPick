@@ -176,8 +176,9 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
                 None
             };
 
-            let results = if let Some(q) = query_node {
-                db.query(&table_name, is_dict, &q, None)
+            let keys = if let Some(q) = query_node {
+                let results = db.query(&table_name, is_dict, &q, None);
+                results.into_iter().map(|(k, _)| k).collect()
             } else {
                 let table = match db.get_table_mut(&table_name) {
                     Ok(t) => t,
