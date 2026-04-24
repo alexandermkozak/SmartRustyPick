@@ -25,7 +25,7 @@ fn test_handle_request_read_write() {
         account: Some("SERVER_TEST".to_string()),
         file: Some("USERS".to_string()),
         key: Some("3".to_string()),
-        data: Some("Alice^alice@example.com".to_string()),
+        data: Some(serde_json::Value::String("Alice^alice@example.com".to_string())),
         ..Default::default()
     };
     let resp_write = handle_request(req_write, &db_arc, &client_info);

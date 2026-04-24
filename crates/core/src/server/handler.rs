@@ -87,6 +87,12 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
                 Some(t) => t,
                 None => return Response { status: "ERROR".to_string(), message: Some("File not specified".to_string()), ..Default::default() },
             };
+
+            // Pre-load table to ensure dictionary is available for deserialization
+            if let Err(e) = db.get_table_mut(&table_name) {
+                return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() };
+            }
+
             let key = match req.key {
                 Some(k) => k,
                 None => return Response { status: "ERROR".to_string(), message: Some("Key not specified".to_string()), ..Default::default() },
@@ -98,8 +104,17 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
                     Some(r) => r,
                     None => return Response { status: "ERROR".to_string(), message: Some("Invalid structured data".to_string()), ..Default::default() },
                 }
-            } else if let Some(data) = req.data {
-                Record::from_display_string(&data)
+            } else if let Some(data_val) = req.data {
+                match data_val {
+                    serde_json::Value::String(s) => Record::from_display_string(&s),
+                    serde_json::Value::Object(_) => {
+                        match db.deserialize_record(&table_name, &data_val) {
+                            Some(r) => r,
+                            None => return Response { status: "ERROR".to_string(), message: Some("Invalid structured data in data field".to_string()), ..Default::default() },
+                        }
+                    }
+                    _ => return Response { status: "ERROR".to_string(), message: Some("Invalid data type in data field: expected string or object".to_string()), ..Default::default() },
+                }
             } else {
                 return Response { status: "ERROR".to_string(), message: Some("Data not specified".to_string()), ..Default::default() };
             };

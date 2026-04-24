@@ -8,7 +8,7 @@ pub struct Request {
     pub target_account: Option<String>,
     pub file: Option<String>,
     pub key: Option<String>,
-    pub data: Option<String>,
+    pub data: Option<serde_json::Value>,
     pub structured_data: Option<serde_json::Value>,
     pub is_dict: Option<bool>,
     pub query_node: Option<QueryNode>,
