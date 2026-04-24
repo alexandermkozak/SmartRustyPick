@@ -28,7 +28,7 @@ a single line of JSON.
   "account": "ACCOUNT_NAME", (optional, switches context if provided)
   "table": "TABLE_NAME",
   "key": "RECORD_KEY",
-  "data": "RECORD_DATA", (for WRITE, using display format: ^ for FM, ] for VM, \ for SVM)
+  "data": "RECORD_DATA" | {"field1": "value1", ...},
   "is_dict": true | false, (optional, default: false)
   "query_string": "WITH First.Name = \"Ted\" AND Last.Name = \"Smith\"",
   (optional,
@@ -59,7 +59,7 @@ a single line of JSON.
 {
   "status": "OK" | "ERROR" | "NOT_FOUND" | "EOF",
   "message": "Error message if any",
-  "record": "Returned record data for READ",
+  "record": {"field1": "value1", ...}, (Returned record data for READ)
   "results": [["key1", "data1"], ["key2", "data2"]], (for QUERY without list_name)
   "keys": ["key1", "key2", ...], (for READNEXT, GETLIST)
   "count": 42 (for QUERY with list_name, READNEXT, GETLIST)
@@ -74,6 +74,9 @@ Retrieves a record.
 
 - Required fields: `table`, `key`.
 - Optional fields: `is_dict`.
+- The `record` field in the response contains a JSON object mapping field names (or camelCase) to their
+  display-formatted values.
+- Values are automatically converted to display format (OCONV) if the dictionary specifies a conversion code.
 
 ### WRITE
 
@@ -81,6 +84,14 @@ Stores a record.
 
 - Required fields: `table`, `key`, `data`.
 - Optional fields: `is_dict`.
+- The `data` field can be either:
+    - A **string**: Uses the standard display format (with `^`, `]`, `\` separators).
+    - A **JSON object**: Maps field names (or their camelCase versions) to database attributes using the table's
+      dictionary.
+- When using a JSON object:
+    - Input values are automatically converted to internal format (ICONV) if the dictionary specifies a conversion
+      code (e.g., `MD2` for numbers).
+    - The dictionary for the table is automatically pre-loaded to ensure correct mapping.
 
 ### DELETE
 

@@ -30,7 +30,14 @@ Dictionary items are special records stored in the `dict` section of a table. Th
   - `D4-`: Date with 4-digit year (e.g., 03-21-2026).
   - `D2/`: Date with 2-digit year (e.g., 03/21/26).
   - `MR<n>`: Number with `<n>` decimal places (e.g., `MR2` converts `12345` to `123.45`).
-  - `MD<n>`: Number with `<n>` decimal places (e.g., `MD2` converts `12345` to `1234.50`).
+  - `MD<n>`: Number with `<n>` decimal places (e.g., `MD2` converts `12345` to `123.45`).
+
+#### Conversions (ICONV / OCONV)
+
+SmartRustyPick supports automatic data conversion between internal storage format and external display format:
+
+- **OCONV (Output Conversion)**: Applied when reading data (e.g., `12345` -> `123.45`).
+- **ICONV (Input Conversion)**: Applied when writing structured data (e.g., `123.45` -> `12345`).
 
 #### Database Layout
 The database is stored in the `db_storage` directory:

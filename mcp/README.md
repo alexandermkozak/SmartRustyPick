@@ -30,10 +30,11 @@ You can run the server directly using Python:
 python mcp/server.py
 ```
 
-## Tools Provided
+### Tools Provided
 
 - `read_record(table, key, is_dict=False, account=None)`: Retrieves a record from the database.
-- `write_record(table, key, data, is_dict=False, account=None)`: Stores a record in the database.
+- `write_record(table, key, data, is_dict=False, account=None)`: Stores a record in the database. The `data` parameter
+  can be a display-formatted string or a JSON object.
 - `delete_record(table, key, is_dict=False, account=None)`: Deletes a record from the database.
 - `query_records(table, query_string, list_name=None, is_dict=False, account=None)`: Performs a search.
 - `get_list_keys(list_name, account=None)`: Retrieves keys from a named server-side select list.
