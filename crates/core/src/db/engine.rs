@@ -740,13 +740,32 @@ impl Database {
     pub fn apply_conversion(val: &str, code: &str) -> String {
         if code.starts_with("MD") && code.len() > 2 {
             if let Ok(decimals) = code[2..].parse::<usize>() {
+                let divisor = 10f64.powi(decimals as i32);
                 if let Ok(num) = val.parse::<i64>() {
-                    let divisor = 10f64.powi(decimals as i32);
                     let mut s = format!("{:.width$}", num as f64 / divisor, width = decimals);
                     if decimals == 0 {
                         s = format!("{}", num);
                     }
                     return s;
+                } else if let Ok(f) = val.parse::<f64>() {
+                    // Robustness: handle cases where data might already be stored with a decimal point
+                    let mut s = format!("{:.width$}", f / divisor, width = decimals);
+                    if decimals == 0 {
+                        s = format!("{}", f.round() as i64);
+                    }
+                    return s;
+                }
+            }
+        }
+        val.to_string()
+    }
+
+    pub fn apply_iconv(val: &str, code: &str) -> String {
+        if code.starts_with("MD") && code.len() > 2 {
+            if let Ok(decimals) = code[2..].parse::<usize>() {
+                if let Ok(f) = val.parse::<f64>() {
+                    let multiplier = 10f64.powi(decimals as i32);
+                    return format!("{:.0}", (f * multiplier).round());
                 }
             }
         }
@@ -825,16 +844,24 @@ impl Database {
         let mut record = Record::new();
         let table = self.get_table_read_only(table_name)?;
 
-        // Inverse mapping of camelCase or original dictionary keys to attribute indices
+        // Inverse mapping of camelCase or original dictionary keys to attribute indices and conversion codes
         let mut attr_map = HashMap::new();
+        let mut conv_map = HashMap::new();
         for (dict_key, dict_rec) in &table.dictionary {
             if let Some(f1) = dict_rec.fields.get(DICT_FIELD_IDX) {
                 if let Some(v1) = f1.values.get(0) {
                     if let Some(idx_str) = v1.sub_values.get(0) {
                         if let Ok(idx) = idx_str.parse::<usize>() {
                             if idx > 0 {
-                                attr_map.insert(self.to_camel_case(dict_key), idx - 1);
-                                attr_map.insert(dict_key.clone(), idx - 1);
+                                let attr_idx = idx - 1;
+                                let camel_key = self.to_camel_case(dict_key);
+                                attr_map.insert(camel_key.clone(), attr_idx);
+                                attr_map.insert(dict_key.clone(), attr_idx);
+
+                                if let Some(code) = self.get_conversion_code_read_only(table_name, dict_key) {
+                                    conv_map.insert(camel_key, code.clone());
+                                    conv_map.insert(dict_key.clone(), code);
+                                }
                             }
                         }
                     }
@@ -853,7 +880,14 @@ impl Database {
                     serde_json::Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
                     _ => val.to_string(),
                 };
-                record.fields[idx].values = vec![Value { sub_values: vec![val_str] }];
+
+                let final_val = if let Some(code) = conv_map.get(key) {
+                    Self::apply_iconv(&val_str, code)
+                } else {
+                    val_str
+                };
+
+                record.fields[idx].values = vec![Value { sub_values: vec![final_val] }];
             }
         }
 
