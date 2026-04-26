@@ -13,13 +13,26 @@ fn test_compare_values() {
     assert!(Database::compare_values("5", ">", "10")); // "5" > "1"
     assert!(Database::compare_values("10", "<", "5")); // "1" < "5"
 
-    // Pick specific operators
-    assert!(Database::compare_values("football", "[", "ball")); // Ends with
-    assert!(Database::compare_values("football", "]", "foot")); // Starts with
-    assert!(Database::compare_values("football", "[]", "otba")); // Contains
+    // Wildcard handling in value (Pick style)
+    assert!(Database::compare_values("football", "=", "[ball")); // Ends with
+    assert!(Database::compare_values("football", "=", "foot]")); // Starts with
+    assert!(Database::compare_values("football", "=", "[otba]")); // Contains
+    assert!(!Database::compare_values("football", "!=", "[ball"));
+    assert!(Database::compare_values("football", "!=", "ball]"));
 
     // Unknown operator
     assert!(!Database::compare_values("abc", "??", "abc"));
+
+    // Word aliases
+    assert!(Database::compare_values("abc", "EQ", "abc"));
+    assert!(Database::compare_values("abc", "eq", "abc"));
+    assert!(Database::compare_values("abc", "NE", "def"));
+    assert!(Database::compare_values("10", "LT", "20"));
+    assert!(Database::compare_values("20", "GT", "10"));
+    assert!(Database::compare_values("10", "LE", "10"));
+    assert!(Database::compare_values("10", "LE", "20"));
+    assert!(Database::compare_values("20", "GE", "20"));
+    assert!(Database::compare_values("20", "GE", "10"));
 
     // Trim check
     assert!(Database::compare_values("  abc  ", "=", "abc"));
@@ -94,11 +107,17 @@ fn test_query_execution() {
     assert_eq!(results1.len(), 1);
     assert_eq!(results1[0].0, "1");
 
-    // Query USERS: WITH NAME [] "Smith"
-    let q2 = db.parse_query("USERS", &["NAME", "[]", "Smith"]).unwrap();
+    // Query USERS: WITH NAME = "[Smith]"
+    let q2 = db.parse_query("USERS", &["NAME", "=", "[Smith]"]).unwrap();
     let results2 = db.query("USERS", false, &q2, None);
     assert_eq!(results2.len(), 1);
     assert_eq!(results2[0].0, "2");
+
+    // Query USERS: WITH NAME EQ "[Smith]"
+    let q2_alt = db.parse_query("USERS", &["NAME", "EQ", "[Smith]"]).unwrap();
+    let results2_alt = db.query("USERS", false, &q2_alt, None);
+    assert_eq!(results2_alt.len(), 1);
+    assert_eq!(results2_alt[0].0, "2");
 
     // Query with ID
     let q3 = db.parse_query("USERS", &["ID", "=", "2"]).unwrap();
@@ -107,7 +126,7 @@ fn test_query_execution() {
     assert_eq!(results3[0].0, "2");
 
     // Query with AND
-    let q4 = db.parse_query("USERS", &["NAME", "[]", "John", "AND", "EMAIL", "[]", "example"]).unwrap();
+    let q4 = db.parse_query("USERS", &["NAME", "=", "[John]", "AND", "EMAIL", "=", "[example]"]).unwrap();
     let results4 = db.query("USERS", false, &q4, None);
     assert_eq!(results4.len(), 1);
 
@@ -181,6 +200,70 @@ fn test_query_with_conversion() {
     let results2 = db.query("PRODUCTS", false, &query2, None);
 
     assert_eq!(results2.len(), 0, "Should NOT have found P1 with PRICE = 200 (200 converted with MD2 would be 20000)");
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+#[test]
+fn test_query_with_wildcards() {
+    let test_dir = "test_query_wildcards";
+    if Path::new(test_dir).exists() {
+        fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    let mut db = Database::new(test_dir, None).unwrap();
+    db.create_account("ACC1", None).unwrap();
+    db.logto("ACC1").unwrap();
+
+    db.create_table("ITEMS").unwrap();
+    {
+        let table = db.get_table_mut("ITEMS").unwrap();
+
+        // Dictionary entry for DESC
+        let mut desc_dict = Record::new();
+        // Field 0: Attribute index (1-based). Let's use 1.
+        desc_dict.fields.push(Field { values: vec![Value { sub_values: vec!["1".to_string()] }] });
+        // Field 1: Name
+        desc_dict.fields.push(Field { values: vec![Value { sub_values: vec!["DESC".to_string()] }] });
+        table.dictionary.insert("DESC".to_string(), desc_dict);
+
+        let mut r1 = Record::new();
+        r1.fields.push(Field { values: vec![Value { sub_values: vec!["brand new item".to_string()] }] });
+        table.records.insert("1".to_string(), r1);
+
+        let mut r2 = Record::new();
+        r2.fields.push(Field { values: vec![Value { sub_values: vec!["old item".to_string()] }] });
+        table.records.insert("2".to_string(), r2);
+
+        let mut r3 = Record::new();
+        r3.fields.push(Field { values: vec![Value { sub_values: vec!["newest thing".to_string()] }] });
+        table.records.insert("3".to_string(), r3);
+    }
+
+    // DESC is field 0
+
+    // 1. Contains "new": [new]
+    let query1 = db.parse_query("ITEMS", &vec!["WITH", "DESC", "=", "[new]"]).unwrap();
+    let res1 = db.query("ITEMS", false, &query1, None);
+    // Should find "brand new item" and "newest thing"
+    assert!(res1.iter().any(|(id, _)| id == "1"), "Should find 'brand new item'");
+    assert!(res1.iter().any(|(id, _)| id == "3"), "Should find 'newest thing'");
+    assert!(!res1.iter().any(|(id, _)| id == "2"), "Should NOT find 'old item'");
+
+    // 2. Starts with "new": new]
+    let query2 = db.parse_query("ITEMS", &vec!["WITH", "DESC", "=", "new]"]).unwrap();
+    let res2 = db.query("ITEMS", false, &query2, None);
+    // Should find "newest thing"
+    assert!(res2.iter().any(|(id, _)| id == "3"), "Should find 'newest thing'");
+    assert!(!res2.iter().any(|(id, _)| id == "1"), "Should NOT find 'brand new item'");
+
+    // 3. Ends with "item": [item
+    let query3 = db.parse_query("ITEMS", &vec!["WITH", "DESC", "=", "[item"]).unwrap();
+    let res3 = db.query("ITEMS", false, &query3, None);
+    // Should find "brand new item" and "old item"
+    assert!(res3.iter().any(|(id, _)| id == "1"), "Should find 'brand new item'");
+    assert!(res3.iter().any(|(id, _)| id == "2"), "Should find 'old item'");
+    assert!(!res3.iter().any(|(id, _)| id == "3"), "Should NOT find 'newest thing'");
 
     fs::remove_dir_all(test_dir).unwrap();
 }

@@ -82,7 +82,7 @@ fn test_handle_request_query_select() {
         command: "QUERY".to_string(),
         account: Some("QUERY_TEST".to_string()),
         file: Some("USERS".to_string()),
-        query_string: Some("NAME [] John".to_string()),
+        query_string: Some("NAME = [John]".to_string()),
         ..Default::default()
     };
     let resp_query = handle_request(req_query, &db_arc, &client_info);

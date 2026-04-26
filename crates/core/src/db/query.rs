@@ -195,16 +195,37 @@ impl Database {
 
     pub(crate) fn compare_values(record_val: &str, op: &str, search_val: &str) -> bool {
         let record_val = record_val.trim();
-        match op {
-            "=" => record_val == search_val,
-            "!=" => record_val != search_val,
-            "<" => record_val < search_val,
-            ">" => record_val > search_val,
-            "<=" => record_val <= search_val,
-            ">=" => record_val >= search_val,
-            "[" => record_val.ends_with(search_val),
-            "]" => record_val.starts_with(search_val),
-            "[]" => record_val.contains(search_val),
+        let op_upper = op.to_uppercase();
+        match op_upper.as_str() {
+            "=" | "EQ" => {
+                let len = search_val.len();
+                if len >= 2 && search_val.starts_with('[') && search_val.ends_with(']') {
+                    record_val.contains(&search_val[1..len - 1])
+                } else if len >= 1 && search_val.ends_with(']') {
+                    record_val.starts_with(&search_val[..len - 1])
+                } else if len >= 1 && search_val.starts_with('[') {
+                    record_val.ends_with(&search_val[1..])
+                } else {
+                    record_val == search_val
+                }
+            }
+            "!=" | "#" | "<>" | "NE" => {
+                let len = search_val.len();
+                let matches = if len >= 2 && search_val.starts_with('[') && search_val.ends_with(']') {
+                    record_val.contains(&search_val[1..len - 1])
+                } else if len >= 1 && search_val.ends_with(']') {
+                    record_val.starts_with(&search_val[..len - 1])
+                } else if len >= 1 && search_val.starts_with('[') {
+                    record_val.ends_with(&search_val[1..])
+                } else {
+                    record_val == search_val
+                };
+                !matches
+            }
+            "<" | "LT" => record_val < search_val,
+            ">" | "GT" => record_val > search_val,
+            "<=" | "LE" => record_val <= search_val,
+            ">=" | "GE" => record_val >= search_val,
             _ => false,
         }
     }

@@ -788,8 +788,8 @@ fn print_help(current_account: &str) {
     println!("  DELETE [DICT] <table> [<key>]          - Remove record(s). Uses SELECT list if key omitted.");
     println!("  LIST [DICT] [<table> [<fields>...]]   - List tables, keys, or records. Uses SELECT list if applicable.");
     println!("  SELECT [DICT] <table> [WITH <field> <op> <value>] - Create/refine active select list.");
-    println!("    Operators: =, #, <, >, <=, >=, [ (ends with), ] (starts with), [] (contains)");
-    println!("    Wildcards in value with = or #: [ (ends with), ] (starts with), [ ] (contains)");
+    println!("    Operators: =, #, <>, <, >, <=, >=, EQ, NE, LT, GT, LE, GE");
+    println!("    Wildcards (with = or #): [value (ends with), value] (starts with), [value] (contains)");
     println!("  EDIT [DICT] <table> <key>             - Edit a record using external editor.");
     println!("  CT [DICT] <table> [<key>]             - Print record contents, field by field. Uses SELECT list if key omitted.");
     println!("  SAVE                                  - Save database to disk.");
