@@ -148,3 +148,35 @@ fn test_directory_traversal_vulnerability() {
 
     fs::remove_dir_all(base_dir).unwrap();
 }
+
+#[test]
+fn test_all_dict_fields() {
+    let base_dir = "test_dict_fields_dir";
+    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let mut db = Database::new(base_dir, None).unwrap();
+    db.logto("SYSTEM").unwrap();
+
+    db.create_table("USERS").unwrap();
+    {
+        let table = db.get_table_mut("USERS").unwrap();
+        // EMAIL -> field 1
+        table.dictionary.insert("EMAIL".to_string(), Record::from_display_string("1^Email Address^L^15"));
+        // NAME -> field 2
+        table.dictionary.insert("NAME".to_string(), Record::from_display_string("2^User Name^L^15"));
+        // ALT_NAME -> field 2
+        table.dictionary.insert("ALT_NAME".to_string(), Record::from_display_string("2^Alternate Name^L^15"));
+        // ZIP -> field 3
+        table.dictionary.insert("ZIP".to_string(), Record::from_display_string("3^Zip Code^L^5"));
+    }
+
+    let fields = db.get_all_dict_fields_read_only_for_account("SYSTEM", "USERS");
+
+    // Should contain EMAIL (1), then one of {ALT_NAME, NAME} (2), then ZIP (3).
+    // Based on sorting keys: ALT_NAME comes before NAME.
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0], "EMAIL");
+    assert_eq!(fields[1], "ALT_NAME");
+    assert_eq!(fields[2], "ZIP");
+
+    fs::remove_dir_all(base_dir).unwrap();
+}

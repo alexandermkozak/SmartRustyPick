@@ -877,6 +877,34 @@ impl Database {
         "L".to_string()
     }
 
+    pub fn get_all_dict_fields_read_only_for_account(&self, account: &str, table_name: &str) -> Vec<String> {
+        let table = match self.get_table_read_only_for_account(account, table_name) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+
+        let mut fields_map: HashMap<usize, String> = HashMap::new();
+        let mut keys: Vec<_> = table.dictionary.keys().cloned().collect();
+        keys.sort(); // Consistent order for "picking the first"
+
+        for key in keys {
+            if let Some(record) = table.dictionary.get(&key) {
+                if let Some(field_idx_str) = record.fields.get(DICT_FIELD_IDX).and_then(|f| f.values.get(0)).and_then(|v| v.sub_values.get(0)) {
+                    if let Ok(idx) = field_idx_str.parse::<usize>() {
+                        if idx > 0 && !fields_map.contains_key(&idx) {
+                            fields_map.insert(idx, key);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut sorted_indices: Vec<_> = fields_map.keys().cloned().collect();
+        sorted_indices.sort();
+
+        sorted_indices.into_iter().map(|idx| fields_map.get(&idx).unwrap().clone()).collect()
+    }
+
     pub fn apply_conversion(val: &str, code: &str) -> String {
         if code.starts_with("MD") && code.len() > 2 {
             if let Ok(decimals) = code[2..].parse::<usize>() {

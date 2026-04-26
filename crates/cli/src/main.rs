@@ -526,12 +526,21 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
                 justify: "L".to_string(),
             });
 
+            let mut expanded_fields = Vec::new();
             for &name in field_names {
+                if name == "*" {
+                    expanded_fields.extend(db.get_all_dict_fields_read_only_for_account(&db.current_account, table_name));
+                } else {
+                    expanded_fields.push(name.to_string());
+                }
+            }
+
+            for name in &expanded_fields {
                 let header = db.get_field_header_read_only_for_account(&db.current_account, table_name, name);
                 let width = db.get_field_width_read_only_for_account(&db.current_account, table_name, name);
                 let justify = db.get_field_justification_read_only_for_account(&db.current_account, table_name, name);
                 formats.push(FieldFormat {
-                    name: name.to_string(),
+                    name: name.clone(),
                     header,
                     width,
                     justify,
