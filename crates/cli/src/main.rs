@@ -13,11 +13,18 @@ fn main() -> io::Result<()> {
         }
     }
 
+    let mut db_dir = "db_storage".to_string();
+    if let Some(pos) = args.iter().position(|a| a == "-d" || a == "--db-dir") {
+        if pos + 1 < args.len() {
+            db_dir = args[pos + 1].clone();
+        }
+    }
+
     let config = Config::load();
     let config_arc = Arc::new(config.clone());
 
     // We use a directory "db_storage" to hold our tables
-    let db = Arc::new(Mutex::new(Database::new("db_storage", Some(config.clone()))?));
+    let db = Arc::new(Mutex::new(Database::new(&db_dir, Some(config.clone()))?));
 
     // Check if server should be auto-started in background for CLI
     if config.cert_path.is_some() && config.key_path.is_some() && config.ca_path.is_some() {
@@ -502,17 +509,57 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
                 println!("{}", key);
             }
         } else {
-            // Resolve field info once while we have a mutable borrow of db
-            let mut field_info = Vec::new();
-            for name in field_names {
-                let idx = db.get_field_index(table_name, name);
-                let conv = db.get_conversion_code(table_name, name);
-                field_info.push((idx, conv));
+            // Collect field info for headers and formatting
+            struct FieldFormat {
+                name: String,
+                header: String,
+                width: usize,
+                justify: String,
             }
+
+            let mut formats = Vec::new();
+            // First column is always ID
+            formats.push(FieldFormat {
+                name: "ID".to_string(),
+                header: "ID".to_string(),
+                width: 10,
+                justify: "L".to_string(),
+            });
+
+            for &name in field_names {
+                let header = db.get_field_header_read_only_for_account(&db.current_account, table_name, name);
+                let width = db.get_field_width_read_only_for_account(&db.current_account, table_name, name);
+                let justify = db.get_field_justification_read_only_for_account(&db.current_account, table_name, name);
+                formats.push(FieldFormat {
+                    name: name.to_string(),
+                    header,
+                    width,
+                    justify,
+                });
+            }
+
+            // Print headers
+            let mut header_line = String::new();
+            let mut separator_line = String::new();
+            for (i, fmt) in formats.iter().enumerate() {
+                if i > 0 {
+                    header_line.push(' ');
+                    separator_line.push(' ');
+                }
+                let cell = if fmt.justify == "R" {
+                    format!("{:>width$.width$}", fmt.header, width = fmt.width)
+                } else {
+                    format!("{:<width$.width$}", fmt.header, width = fmt.width)
+                };
+                header_line.push_str(&cell);
+                separator_line.push_str(&"-".repeat(fmt.width));
+            }
+            println!("{}", header_line);
+            println!("{}", separator_line);
 
             // Now iterate over records
             for key in map_keys {
-                let formatted_row = {
+                let record = {
                     let table = match db.get_table_mut(table_name) {
                         Ok(t) => t,
                         Err(e) => {
@@ -521,18 +568,30 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
                         }
                     };
                     let map = if is_dict_val { &table.dictionary } else { &table.records };
-                    map.get(&key).map(|r| r.clone())
+                    map.get(&key).cloned()
                 };
 
-                if let Some(record) = formatted_row {
-                    let mut line = key.clone();
-                    for name in field_names {
-                        line.push(' ');
-                        // Now we can call format_record_field because the mutable borrow of table is over
-                        let formatted_val = db.format_record_field(table_name, &record, name);
-                        line.push_str(&formatted_val);
+                if let Some(record) = record {
+                    let mut row_line = String::new();
+                    for (i, fmt) in formats.iter().enumerate() {
+                        if i > 0 {
+                            row_line.push(' ');
+                        }
+
+                        let formatted_val = if fmt.name == "ID" {
+                            key.clone()
+                        } else {
+                            db.format_record_field(table_name, &record, &fmt.name)
+                        };
+
+                        let cell = if fmt.justify == "R" {
+                            format!("{:>width$.width$}", formatted_val, width = fmt.width)
+                        } else {
+                            format!("{:<width$.width$}", formatted_val, width = fmt.width)
+                        };
+                        row_line.push_str(&cell);
                     }
-                    println!("{}", line);
+                    println!("{}", row_line);
                 }
             }
         }

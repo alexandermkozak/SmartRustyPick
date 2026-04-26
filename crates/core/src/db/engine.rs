@@ -817,6 +817,66 @@ impl Database {
         self.get_conversion_code_read_only_for_account(&account, table_name, field_name)
     }
 
+    pub fn get_field_header_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> String {
+        let table = match self.get_table_read_only_for_account(account, table_name) {
+            Some(t) => t,
+            None => return field_name.to_string(),
+        };
+        if field_name == "ID" { return "ID".to_string(); }
+        if let Some(rec) = table.dictionary.get(field_name) {
+            if let Some(f2) = rec.fields.get(DICT_NAME_IDX) {
+                if let Some(v1) = f2.values.get(0) {
+                    if let Some(header) = v1.sub_values.get(0) {
+                        if !header.is_empty() {
+                            return header.clone();
+                        }
+                    }
+                }
+            }
+        }
+        field_name.to_string()
+    }
+
+    pub fn get_field_width_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> usize {
+        let table = match self.get_table_read_only_for_account(account, table_name) {
+            Some(t) => t,
+            None => return 10,
+        };
+        if field_name == "ID" { return 10; }
+        if let Some(rec) = table.dictionary.get(field_name) {
+            if let Some(f4) = rec.fields.get(DICT_WIDTH_IDX) {
+                if let Some(v1) = f4.values.get(0) {
+                    if let Some(width_str) = v1.sub_values.get(0) {
+                        if let Ok(width) = width_str.parse::<usize>() {
+                            return width;
+                        }
+                    }
+                }
+            }
+        }
+        10
+    }
+
+    pub fn get_field_justification_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> String {
+        let table = match self.get_table_read_only_for_account(account, table_name) {
+            Some(t) => t,
+            None => return "L".to_string(),
+        };
+        if field_name == "ID" { return "L".to_string(); }
+        if let Some(rec) = table.dictionary.get(field_name) {
+            if let Some(f3) = rec.fields.get(DICT_JUSTIFY_IDX) {
+                if let Some(v1) = f3.values.get(0) {
+                    if let Some(just) = v1.sub_values.get(0) {
+                        if !just.is_empty() {
+                            return just.clone();
+                        }
+                    }
+                }
+            }
+        }
+        "L".to_string()
+    }
+
     pub fn apply_conversion(val: &str, code: &str) -> String {
         if code.starts_with("MD") && code.len() > 2 {
             if let Ok(decimals) = code[2..].parse::<usize>() {

@@ -38,7 +38,8 @@ field formatting, and complex select operations.
 
 - **Account-level Organization**: Multiple accounts can exist within a single system, providing data isolation.
 - **Hierarchical Records**: Support for Field Mark (FM), Value Mark (VM), and Sub-Value Mark (SVM).
-- **Dictionary Support**: Define field indices and formatting/conversions (Dates, Numbers).
+- **Dictionary Support**: Define field indices, display headers, justifications, column widths, and
+  formatting/conversions (Dates, Numbers).
 - **Active Select Lists**: Perform queries and refine them through sequential `SELECT` commands.
 - **Remote Access**: TCP SSL server with certificate authentication and CRUD protocol.
 - **Persistent Configuration**: Customize your environment (e.g., preferred editor, SSL certificates, server address).
