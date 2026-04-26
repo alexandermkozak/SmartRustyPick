@@ -80,15 +80,20 @@ impl Database {
     }
 
     pub fn query(&mut self, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
+        let account = self.current_account.clone();
+        self.query_for_account(&account, table_name, use_dict_section, query, keys_to_filter)
+    }
+
+    pub fn query_for_account(&mut self, account: &str, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
         // Pre-calculate field indices to avoid repeated mutable borrows of self
         let mut field_map = HashMap::new();
-        self.collect_field_indices(table_name, query, &mut field_map);
+        self.collect_field_indices_for_account(account, table_name, query, &mut field_map);
 
         let mut results = Vec::new();
 
         // Use a block to limit the borrow of `table`
         {
-            let table = match self.get_table_mut(table_name) {
+            let table = match self.get_table_mut_for_account(account, table_name) {
                 Ok(t) => t,
                 Err(_) => return results, // Return empty results if table not found
             };
@@ -120,19 +125,20 @@ impl Database {
         results
     }
 
-    pub(crate) fn collect_field_indices(&mut self, table_name: &str, node: &QueryNode, map: &mut HashMap<String, usize>) {
+
+    pub(crate) fn collect_field_indices_for_account(&mut self, account: &str, table_name: &str, node: &QueryNode, map: &mut HashMap<String, usize>) {
         match node {
             QueryNode::Condition(cond) => {
                 if cond.field_name == "ID" { return; }
                 if !map.contains_key(&cond.field_name) {
-                    if let Some(idx) = self.get_field_index(table_name, &cond.field_name) {
+                    if let Some(idx) = self.get_field_index_for_account(account, table_name, &cond.field_name) {
                         map.insert(cond.field_name.clone(), idx);
                     }
                 }
             }
             QueryNode::Logical { left, right, .. } => {
-                self.collect_field_indices(table_name, left, map);
-                self.collect_field_indices(table_name, right, map);
+                self.collect_field_indices_for_account(account, table_name, left, map);
+                self.collect_field_indices_for_account(account, table_name, right, map);
             }
         }
     }

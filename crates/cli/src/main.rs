@@ -304,6 +304,9 @@ fn handle_set(db: &mut Database, parts: &[&str]) {
         table.records.insert(key, record);
     }
     table.dirty = true;
+    if table_name == "$CLIENTS" {
+        let _ = db.save();
+    }
     println!("OK");
 }
 
@@ -433,6 +436,9 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
     let map = if is_dict { &mut table.dictionary } else { &mut table.records };
     if map.remove(key).is_some() {
         table.dirty = true;
+        if table_name == "$CLIENTS" {
+            let _ = db.save();
+        }
         println!("OK");
     } else {
         println!("NOT FOUND");
@@ -679,6 +685,9 @@ fn handle_edit(db: &mut Database, parts: &[&str], config: &Config) {
                         table.records.insert(key_str, record);
                     }
                     table.dirty = true;
+                    if table_name == "$CLIENTS" {
+                        let _ = db.save();
+                    }
                     println!("OK");
                 }
                 Err(e) => println!("Error reading back content: {}", e),

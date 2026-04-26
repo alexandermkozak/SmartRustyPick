@@ -8,9 +8,9 @@ pub struct Database {
     pub storage_dir: String,
     pub current_account: String,
     pub accounts_config: Record,
-    pub loaded_tables: HashMap<String, Table>,
-    pub available_tables: HashSet<String>,
-    pub lru_order: VecDeque<String>,
+    pub loaded_tables: HashMap<(String, String), Table>,
+    pub available_tables: HashMap<String, HashSet<String>>,
+    pub lru_order: VecDeque<(String, String)>,
     pub max_loaded: usize,
     pub active_select_list: Option<SelectList>,
     pub remote_select_lists: HashMap<String, SelectList>,
@@ -29,7 +29,7 @@ impl Database {
             current_account: String::new(),
             accounts_config: Record::new(),
             loaded_tables: HashMap::new(),
-            available_tables: HashSet::new(),
+            available_tables: HashMap::new(),
             lru_order: VecDeque::new(),
             max_loaded: 10,
             active_select_list: None,
@@ -80,8 +80,12 @@ impl Database {
     }
 
     fn ensure_system_files(&mut self) -> io::Result<()> {
+        let account = "SYSTEM".to_string();
+        self.ensure_available_tables(&account)?;
+        let available = self.available_tables.get(&account).unwrap();
+
         // Ensure DIR file exists for SYSTEM account
-        if !self.available_tables.contains("DIR") {
+        if !available.contains("DIR") {
             self.create_table("DIR")?;
             self.sync_dir_file()?;
         }
@@ -89,7 +93,7 @@ impl Database {
         // Ensure mandatory system files exist
         let system_files = vec!["$LOGS", "$ACCOUNTS", "$CLIENTS", "$SAVEDLISTS"];
         for file in system_files {
-            if !self.available_tables.contains(file) {
+            if !self.available_tables.get(&account).unwrap().contains(file) {
                 self.create_table(file)?;
             }
         }
@@ -163,7 +167,10 @@ impl Database {
     }
 
     fn self_heal_system_dictionaries(&mut self) -> io::Result<()> {
-        let table_names: Vec<String> = self.available_tables.iter()
+        let account = self.current_account.clone();
+        if account.is_empty() { return Ok(()); }
+        self.ensure_available_tables(&account)?;
+        let table_names: Vec<String> = self.available_tables.get(&account).unwrap().iter()
             .filter(|n| n.starts_with('$') || *n == "DIR")
             .cloned()
             .collect();
@@ -239,7 +246,7 @@ impl Database {
         Ok(updated)
     }
 
-    fn load_clients_from_table(&mut self) -> io::Result<()> {
+    pub fn load_clients_from_table(&mut self) -> io::Result<()> {
         let table = self.get_table_mut("$CLIENTS")?;
         let mut clients = Vec::new();
         for record in table.records.values() {
@@ -303,33 +310,39 @@ impl Database {
     pub fn logout(&mut self) {
         let _ = self.save();
         self.current_account = String::new();
-        self.loaded_tables.clear();
-        self.lru_order.clear();
-        self.available_tables.clear();
     }
 
     pub fn logto(&mut self, account_name: &str) -> io::Result<()> {
-        let account_dir = self.get_account_dir(account_name)
+        let _account_dir = self.get_account_dir(account_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", account_name)))?;
 
         if self.current_account != account_name {
             self.save()?; // Save current account's dirty tables
             self.current_account = account_name.to_string();
-            self.loaded_tables.clear();
-            self.lru_order.clear();
-            self.available_tables.clear();
+            self.ensure_available_tables(account_name)?;
+        }
+        Ok(())
+    }
 
-            // Populate available tables
-            if let Ok(entries) = fs::read_dir(&account_dir) {
-                for entry in entries.flatten() {
-                    if entry.path().is_dir() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            self.available_tables.insert(name.to_string());
-                        }
+    fn ensure_available_tables(&mut self, account_name: &str) -> io::Result<()> {
+        if self.available_tables.contains_key(account_name) {
+            return Ok(());
+        }
+
+        let account_dir = self.get_account_dir(account_name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", account_name)))?;
+
+        let mut tables = HashSet::new();
+        if let Ok(entries) = fs::read_dir(&account_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        tables.insert(name.to_string());
                     }
                 }
             }
         }
+        self.available_tables.insert(account_name.to_string(), tables);
         Ok(())
     }
 
@@ -358,7 +371,7 @@ impl Database {
 
         // Update $ACCOUNTS table if it exists
         self.run_in_system_account(|db| {
-            if db.available_tables.contains("$ACCOUNTS") {
+            if db.available_tables.get("SYSTEM").map(|s| s.contains("$ACCOUNTS")).unwrap_or(false) {
                 let accounts_table = db.get_table_mut("$ACCOUNTS")?;
                 let mut record = Record::new();
                 while record.fields.len() <= SYS_ACCOUNTS_PATH_IDX {
@@ -376,9 +389,6 @@ impl Database {
             let _ = self.logto(&prev_acc);
         } else if prev_acc.is_empty() {
             self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
         }
         Ok(())
     }
@@ -421,11 +431,21 @@ impl Database {
         // Delete physical directory
         let _ = fs::remove_dir_all(dir);
 
+        // Cleanup cache for this account
+        let keys_to_remove: Vec<(String, String)> = self.loaded_tables.keys()
+            .filter(|(acc, _)| acc == name)
+            .cloned()
+            .collect();
+        for key in keys_to_remove {
+            self.loaded_tables.remove(&key);
+            if let Some(pos) = self.lru_order.iter().position(|x| x == &key) {
+                self.lru_order.remove(pos);
+            }
+        }
+        self.available_tables.remove(name);
+
         if self.current_account == name {
             self.current_account = String::new();
-            self.loaded_tables.clear();
-            self.available_tables.clear();
-            self.lru_order.clear();
         }
 
         Ok(())
@@ -443,62 +463,79 @@ impl Database {
     }
 
     pub fn get_table_read_only(&self, name: &str) -> Option<&Table> {
-        self.loaded_tables.get(name)
+        self.get_table_read_only_for_account(&self.current_account, name)
+    }
+
+    pub fn get_table_read_only_for_account(&self, account: &str, name: &str) -> Option<&Table> {
+        self.loaded_tables.get(&(account.to_string(), name.to_string()))
     }
 
     pub fn get_table(&mut self, name: &str) -> Option<&Table> {
-        // Strict validation: name must be in available_tables
-        if !self.available_tables.contains(name) {
+        let account = self.current_account.clone();
+        self.get_table_for_account(&account, name)
+    }
+
+    pub fn get_table_for_account(&mut self, account: &str, name: &str) -> Option<&Table> {
+        // Strict validation: name must be in available_tables for this account
+        let available = self.available_tables.get(account)?;
+        if !available.contains(name) {
             return None;
         }
 
         // Use the validated name from available_tables
-        let validated_name = self.available_tables.get(name)?.clone();
-        let name = &validated_name;
+        let validated_name = available.get(name)?.clone();
+        let name_str = validated_name;
 
-        if !self.loaded_tables.contains_key(name) {
-            if let Ok(table) = self.load_table(name) {
+        let key = (account.to_string(), name_str.clone());
+        if !self.loaded_tables.contains_key(&key) {
+            if let Ok(table) = self.load_table_for_account(account, &name_str) {
                 if self.loaded_tables.len() >= self.max_loaded {
-                    if let Some(oldest) = self.lru_order.pop_front() {
-                        let _ = self.save_table(&oldest);
-                        self.loaded_tables.remove(&oldest);
+                    if let Some(oldest_key) = self.lru_order.pop_front() {
+                        let _ = self.save_table_for_account(&oldest_key.0, &oldest_key.1);
+                        self.loaded_tables.remove(&oldest_key);
                     }
                 }
-                self.loaded_tables.insert(name.to_string(), table);
-                self.lru_order.push_back(name.to_string());
+                self.loaded_tables.insert(key.clone(), table);
+                self.lru_order.push_back(key.clone());
             } else {
                 return None;
             }
         } else {
             // Update LRU
-            if let Some(pos) = self.lru_order.iter().position(|x| x == name) {
+            if let Some(pos) = self.lru_order.iter().position(|x| x == &key) {
                 let n = self.lru_order.remove(pos).unwrap();
                 self.lru_order.push_back(n);
             }
         }
 
-        self.loaded_tables.get(name)
+        self.loaded_tables.get(&key)
     }
 
     pub fn get_table_mut(&mut self, name: &str) -> io::Result<&mut Table> {
+        let account = self.current_account.clone();
+        self.get_table_mut_for_account(&account, name)
+    }
+
+    pub fn get_table_mut_for_account(&mut self, account: &str, name: &str) -> io::Result<&mut Table> {
+        self.ensure_available_tables(account)?;
+        let available = self.available_tables.get_mut(account).unwrap();
+
         // Strict validation: name must be in available_tables
-        if !self.available_tables.contains(name) {
-            return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' not found", name)));
+        if !available.contains(name) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' not found in account '{}'", name, account)));
         }
 
         // Use the validated name from available_tables
-        let validated_name = self.available_tables.get(name).unwrap().clone();
-        let name_owned = validated_name;
-        let name = &name_owned;
+        let validated_name = available.get(name).unwrap().clone();
+        let name_str = validated_name;
 
-        if !self.loaded_tables.contains_key(name) {
-            let table = match self.load_table(name) {
+        let key = (account.to_string(), name_str.clone());
+        if !self.loaded_tables.contains_key(&key) {
+            let table = match self.load_table_for_account(account, &name_str) {
                 Ok(table) => table,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    // This case should ideally not happen if available_tables is correct
-                    // but if it does, we create it.
-                    let storage = self.current_storage_dir();
-                    let table_dir = format!("{}/{}", storage, name);
+                    let storage = self.get_account_dir(account).unwrap_or_else(|| self.storage_dir.clone());
+                    let table_dir = format!("{}/{}", storage, name_str);
                     if !Path::new(&table_dir).exists() {
                         fs::create_dir_all(&table_dir)?;
                     }
@@ -510,35 +547,37 @@ impl Database {
             };
 
             if self.loaded_tables.len() >= self.max_loaded {
-                if let Some(oldest) = self.lru_order.pop_front() {
-                    let _ = self.save_table(&oldest);
-                    self.loaded_tables.remove(&oldest);
+                if let Some(oldest_key) = self.lru_order.pop_front() {
+                    let _ = self.save_table_for_account(&oldest_key.0, &oldest_key.1);
+                    self.loaded_tables.remove(&oldest_key);
                 }
             }
-            self.loaded_tables.insert(name.to_string(), table);
-            self.lru_order.push_back(name.to_string());
+            self.loaded_tables.insert(key.clone(), table);
+            self.lru_order.push_back(key.clone());
         } else {
             // Update LRU
-            if let Some(pos) = self.lru_order.iter().position(|x| x == name) {
+            if let Some(pos) = self.lru_order.iter().position(|x| x == &key) {
                 let n = self.lru_order.remove(pos).unwrap();
                 self.lru_order.push_back(n);
             }
         }
-        Ok(self.loaded_tables.get_mut(name).unwrap())
+        Ok(self.loaded_tables.get_mut(&key).unwrap())
     }
 
-    fn load_table(&self, name: &str) -> io::Result<Table> {
-        let storage = self.current_storage_dir();
+
+    fn load_table_for_account(&self, account: &str, name: &str) -> io::Result<Table> {
+        let storage = self.account_storage_dir(account);
         let mut table = Table::new();
         Self::load_section(&mut table.records, &format!("{}/{}/data", storage, name))?;
         Self::load_section(&mut table.dictionary, &format!("{}/{}/dict", storage, name))?;
         Ok(table)
     }
 
-    fn save_table(&self, name: &str) -> io::Result<()> {
-        if let Some(table) = self.loaded_tables.get(name) {
+
+    fn save_table_for_account(&self, account: &str, name: &str) -> io::Result<()> {
+        if let Some(table) = self.loaded_tables.get(&(account.to_string(), name.to_string())) {
             if table.dirty {
-                let storage = self.current_storage_dir();
+                let storage = self.account_storage_dir(account);
                 Self::save_section(&table.records, &format!("{}/{}/data", storage, name))?;
                 Self::save_section(&table.dictionary, &format!("{}/{}/dict", storage, name))?;
             }
@@ -546,13 +585,28 @@ impl Database {
         Ok(())
     }
 
+    pub fn account_storage_dir(&self, account_name: &str) -> String {
+        self.get_account_dir(account_name).unwrap_or_else(|| self.storage_dir.clone())
+    }
+
     pub fn save(&mut self) -> io::Result<()> {
-        let names: Vec<String> = self.loaded_tables.keys().cloned().collect();
-        for name in names {
-            self.save_table(&name)?;
-            if let Some(t) = self.loaded_tables.get_mut(&name) {
+        let keys: Vec<(String, String)> = self.loaded_tables.keys().cloned().collect();
+        let mut clients_updated = false;
+        for (account, name) in keys {
+            if account == "SYSTEM" && name == "$CLIENTS" {
+                if let Some(t) = self.loaded_tables.get(&(account.clone(), name.clone())) {
+                    if t.dirty {
+                        clients_updated = true;
+                    }
+                }
+            }
+            self.save_table_for_account(&account, &name)?;
+            if let Some(t) = self.loaded_tables.get_mut(&(account, name)) {
                 t.dirty = false;
             }
+        }
+        if clients_updated {
+            self.load_clients_from_table()?;
         }
         Ok(())
     }
@@ -617,20 +671,31 @@ impl Database {
     }
 
     pub fn list_tables(&self) -> Vec<String> {
-        let mut tables: Vec<_> = self.available_tables.iter().cloned().collect();
+        let mut tables: Vec<_> = self.available_tables.get(&self.current_account)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
         tables.sort();
         tables
     }
 
+    pub fn is_table_available(&self, name: &str) -> bool {
+        self.available_tables.get(&self.current_account)
+            .map(|s| s.contains(name))
+            .unwrap_or(false)
+    }
+
+    pub fn is_table_loaded(&self, name: &str) -> bool {
+        self.loaded_tables.contains_key(&(self.current_account.clone(), name.to_string()))
+    }
+
     pub fn create_table(&mut self, name: &str) -> io::Result<()> {
-        if self.current_account.is_empty() {
+        let account = self.current_account.clone();
+        if account.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
         }
-        if self.available_tables.contains(name) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("Table '{}' already exists", name)));
-        }
+        self.ensure_available_tables(&account)?;
 
-        let storage = self.current_storage_dir();
+        let storage = self.account_storage_dir(&account);
         let table_dir = format!("{}/{}", storage, name);
         if !Path::new(&table_dir).exists() {
             fs::create_dir_all(&table_dir)?;
@@ -638,15 +703,19 @@ impl Database {
         File::create(format!("{}/data", table_dir))?;
         File::create(format!("{}/dict", table_dir))?;
 
-        self.available_tables.insert(name.to_string());
+        let available = self.available_tables.get_mut(&account).unwrap();
+        if available.contains(name) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("Table '{}' already exists", name)));
+        }
+        available.insert(name.to_string());
 
         // Update DIR file if it exists and this is not the DIR file itself
-        if name != "DIR" && self.available_tables.contains("DIR") {
+        if name != "DIR" && available.contains("DIR") {
             let _ = self.sync_dir_file();
         }
 
         // Set default dictionary for SYSTEM files
-        if self.current_account == "SYSTEM" && (name.starts_with('$') || name == "DIR") {
+        if account == "SYSTEM" && (name.starts_with('$') || name == "DIR") {
             let _ = self.ensure_default_dictionaries(name);
         }
 
@@ -654,20 +723,23 @@ impl Database {
     }
 
     pub fn delete_table(&mut self, name: &str) -> io::Result<()> {
-        if self.current_account.is_empty() {
+        let account = self.current_account.clone();
+        if account.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
         }
-        if !self.available_tables.contains(name) {
+        self.ensure_available_tables(&account)?;
+        if !self.available_tables.get(&account).unwrap().contains(name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' not found", name)));
         }
 
-        self.loaded_tables.remove(name);
-        self.available_tables.remove(name);
-        if let Some(pos) = self.lru_order.iter().position(|x| x == name) {
+        let key = (account.clone(), name.to_string());
+        self.loaded_tables.remove(&key);
+        self.available_tables.get_mut(&account).unwrap().remove(name);
+        if let Some(pos) = self.lru_order.iter().position(|x| x == &key) {
             self.lru_order.remove(pos);
         }
 
-        let storage = self.current_storage_dir();
+        let storage = self.account_storage_dir(&account);
         let table_dir = format!("{}/{}", storage, name);
         let _ = fs::remove_dir_all(table_dir);
 
@@ -675,8 +747,9 @@ impl Database {
     }
 
     pub fn sync_dir_file(&mut self) -> io::Result<()> {
+        let account = self.current_account.clone();
         let tables = self.list_tables();
-        let dir_table = self.get_table_mut("DIR")?;
+        let dir_table = self.get_table_mut_for_account(&account, "DIR")?;
         dir_table.records.clear();
         for t in tables {
             if t != "DIR" {
@@ -692,7 +765,9 @@ impl Database {
     }
 
     pub fn ensure_dir_file(&mut self) -> io::Result<bool> {
-        if self.available_tables.contains("DIR") {
+        let account = self.current_account.clone();
+        self.ensure_available_tables(&account)?;
+        if self.available_tables.get(&account).unwrap().contains("DIR") {
             Ok(true)
         } else {
             Ok(false)
@@ -718,7 +793,11 @@ impl Database {
     }
 
     pub fn get_conversion_code_read_only(&self, table_name: &str, field_name: &str) -> Option<String> {
-        let table = self.get_table_read_only(table_name)?;
+        self.get_conversion_code_read_only_for_account(&self.current_account, table_name, field_name)
+    }
+
+    pub fn get_conversion_code_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> Option<String> {
+        let table = self.get_table_read_only_for_account(account, table_name)?;
         if let Some(rec) = table.dictionary.get(field_name) {
             // Pick MDn conversion is in Field 8
             if let Some(f8) = rec.fields.get(DICT_CONV_IDX) {
@@ -734,7 +813,8 @@ impl Database {
     }
 
     pub fn get_conversion_code(&mut self, table_name: &str, field_name: &str) -> Option<String> {
-        self.get_conversion_code_read_only(table_name, field_name)
+        let account = self.current_account.clone();
+        self.get_conversion_code_read_only_for_account(&account, table_name, field_name)
     }
 
     pub fn apply_conversion(val: &str, code: &str) -> String {
@@ -773,13 +853,18 @@ impl Database {
     }
 
     pub fn format_record_field(&self, table_name: &str, record: &Record, field_name: &str) -> String {
-        let field_idx = match self.get_field_index_read_only(table_name, field_name) {
+        let account = self.current_account.clone();
+        self.format_record_field_for_account(&account, table_name, record, field_name)
+    }
+
+    pub fn format_record_field_for_account(&self, account: &str, table_name: &str, record: &Record, field_name: &str) -> String {
+        let field_idx = match self.get_field_index_read_only_for_account(account, table_name, field_name) {
             Some(idx) => idx,
             None => return String::new(),
         };
 
         let raw_val = record.get_field_display_string(field_idx);
-        let conv = self.get_conversion_code_read_only(table_name, field_name);
+        let conv = self.get_conversion_code_read_only_for_account(account, table_name, field_name);
 
         if let Some(code) = conv {
             Self::apply_conversion(&raw_val, &code)
@@ -789,8 +874,12 @@ impl Database {
     }
 
     pub fn get_field_index_read_only(&self, table_name: &str, field_name: &str) -> Option<usize> {
+        self.get_field_index_read_only_for_account(&self.current_account, table_name, field_name)
+    }
+
+    pub fn get_field_index_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> Option<usize> {
         if field_name == "ID" { return Some(0); }
-        let table = self.get_table_read_only(table_name)?;
+        let table = self.get_table_read_only_for_account(account, table_name)?;
         if let Some(rec) = table.dictionary.get(field_name) {
             if let Some(f1) = rec.fields.get(DICT_FIELD_IDX) {
                 if let Some(v1) = f1.values.get(0) {
@@ -808,14 +897,23 @@ impl Database {
     }
 
     pub fn get_field_index(&mut self, table_name: &str, field_name: &str) -> Option<usize> {
+        let account = self.current_account.clone();
+        self.get_field_index_for_account(&account, table_name, field_name)
+    }
+
+    pub fn get_field_index_for_account(&mut self, account: &str, table_name: &str, field_name: &str) -> Option<usize> {
         if field_name == "ID" { return Some(0); }
-        let _ = self.get_table_mut(table_name).ok();
-        self.get_field_index_read_only(table_name, field_name)
+        let _ = self.get_table_mut_for_account(account, table_name).ok();
+        self.get_field_index_read_only_for_account(account, table_name, field_name)
     }
 
     pub fn serialize_record(&self, table_name: &str, record: &Record) -> serde_json::Value {
+        self.serialize_record_for_account(&self.current_account, table_name, record)
+    }
+
+    pub fn serialize_record_for_account(&self, account: &str, table_name: &str, record: &Record) -> serde_json::Value {
         let mut map = serde_json::Map::new();
-        let table = match self.get_table_read_only(table_name) {
+        let table = match self.get_table_read_only_for_account(account, table_name) {
             Some(t) => t,
             None => return serde_json::Value::Object(map),
         };
@@ -827,7 +925,7 @@ impl Database {
                         if let Ok(idx) = idx_str.parse::<usize>() {
                             if idx > 0 {
                                 let _field_idx = idx - 1;
-                                let value = self.format_record_field(table_name, record, dict_key);
+                                let value = self.format_record_field_for_account(account, table_name, record, dict_key);
                                 let camel_key = self.to_camel_case(dict_key);
                                 map.insert(camel_key, serde_json::Value::String(value));
                             }
@@ -840,9 +938,13 @@ impl Database {
     }
 
     pub fn deserialize_record(&self, table_name: &str, data: &serde_json::Value) -> Option<Record> {
+        self.deserialize_record_for_account(&self.current_account, table_name, data)
+    }
+
+    pub fn deserialize_record_for_account(&self, account: &str, table_name: &str, data: &serde_json::Value) -> Option<Record> {
         let obj = data.as_object()?;
         let mut record = Record::new();
-        let table = self.get_table_read_only(table_name)?;
+        let table = self.get_table_read_only_for_account(account, table_name)?;
 
         // Inverse mapping of camelCase or original dictionary keys to attribute indices and conversion codes
         let mut attr_map = HashMap::new();
@@ -858,7 +960,7 @@ impl Database {
                                 attr_map.insert(camel_key.clone(), attr_idx);
                                 attr_map.insert(dict_key.clone(), attr_idx);
 
-                                if let Some(code) = self.get_conversion_code_read_only(table_name, dict_key) {
+                                if let Some(code) = self.get_conversion_code_read_only_for_account(account, table_name, dict_key) {
                                     conv_map.insert(camel_key, code.clone());
                                     conv_map.insert(dict_key.clone(), code);
                                 }

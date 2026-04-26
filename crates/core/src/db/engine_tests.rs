@@ -9,6 +9,8 @@ fn test_lru_eviction() {
     if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
     let mut db = Database::new(base_dir, None).unwrap();
     db.logto("SYSTEM").unwrap();
+    db.loaded_tables.clear();
+    db.lru_order.clear();
 
     // Set max loaded to 2 for testing
     db.max_loaded = 2;
@@ -24,24 +26,24 @@ fn test_lru_eviction() {
     let _ = db.get_table_mut("T2");
 
     assert_eq!(db.loaded_tables.len(), 2);
-    assert!(db.loaded_tables.contains_key("T1"));
-    assert!(db.loaded_tables.contains_key("T2"));
+    assert!(db.is_table_loaded("T1"));
+    assert!(db.is_table_loaded("T2"));
 
     // Loading T3 should evict T1 (oldest in LRU)
     let _ = db.get_table_mut("T3");
     assert_eq!(db.loaded_tables.len(), 2);
-    assert!(!db.loaded_tables.contains_key("T1"));
-    assert!(db.loaded_tables.contains_key("T2"));
-    assert!(db.loaded_tables.contains_key("T3"));
+    assert!(!db.is_table_loaded("T1"));
+    assert!(db.is_table_loaded("T2"));
+    assert!(db.is_table_loaded("T3"));
 
     // Accessing T2 should move it to end of LRU
     db.get_table("T2");
 
     // Loading T1 should evict T3
     db.get_table("T1");
-    assert!(!db.loaded_tables.contains_key("T3"));
-    assert!(db.loaded_tables.contains_key("T2"));
-    assert!(db.loaded_tables.contains_key("T1"));
+    assert!(!db.is_table_loaded("T3"));
+    assert!(db.is_table_loaded("T2"));
+    assert!(db.is_table_loaded("T1"));
 
     fs::remove_dir_all(base_dir).unwrap();
 }
@@ -55,10 +57,10 @@ fn test_delete_table_and_account() {
     db.create_account("DEL_ACC", None).unwrap();
     db.logto("DEL_ACC").unwrap();
     db.create_table("DEL_TABLE").unwrap();
-    assert!(db.available_tables.contains("DEL_TABLE"));
+    assert!(db.is_table_available("DEL_TABLE"));
 
     db.delete_table("DEL_TABLE").unwrap();
-    assert!(!db.available_tables.contains("DEL_TABLE"));
+    assert!(!db.is_table_available("DEL_TABLE"));
 
     db.logto("SYSTEM").unwrap();
     db.delete_account("DEL_ACC").unwrap();
@@ -142,7 +144,7 @@ fn test_directory_traversal_vulnerability() {
     assert!(!new_secret_table_path.exists());
 
     // Verify that "INVALID_TABLE_NAME" is NOT created in loaded_tables
-    assert!(!db.loaded_tables.contains_key("INVALID_TABLE_NAME"));
+    assert!(!db.is_table_loaded("INVALID_TABLE_NAME"));
 
     fs::remove_dir_all(base_dir).unwrap();
 }
