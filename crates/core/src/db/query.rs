@@ -2,6 +2,12 @@ use crate::db::engine::Database;
 use crate::db::models::*;
 use std::collections::HashMap;
 
+#[derive(Clone, Debug)]
+pub struct FieldQueryInfo {
+    pub index: usize,
+    pub conversion: Option<String>,
+}
+
 impl Database {
     pub fn parse_query(&mut self, _table_name: &str, parts: &[&str]) -> Option<QueryNode> {
         // Simple parser for WITH <field> <op> <value> [AND/OR <field> <op> <value> ...]
@@ -85,7 +91,7 @@ impl Database {
     }
 
     pub fn query_for_account(&mut self, account: &str, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
-        // Pre-calculate field indices to avoid repeated mutable borrows of self
+        // Pre-calculate field indices and conversions to avoid repeated mutable borrows of self
         let mut field_map = HashMap::new();
         self.collect_field_indices_for_account(account, table_name, query, &mut field_map);
 
@@ -126,13 +132,14 @@ impl Database {
     }
 
 
-    pub(crate) fn collect_field_indices_for_account(&mut self, account: &str, table_name: &str, node: &QueryNode, map: &mut HashMap<String, usize>) {
+    pub(crate) fn collect_field_indices_for_account(&mut self, account: &str, table_name: &str, node: &QueryNode, map: &mut HashMap<String, FieldQueryInfo>) {
         match node {
             QueryNode::Condition(cond) => {
                 if cond.field_name == "ID" { return; }
                 if !map.contains_key(&cond.field_name) {
                     if let Some(idx) = self.get_field_index_for_account(account, table_name, &cond.field_name) {
-                        map.insert(cond.field_name.clone(), idx);
+                        let conversion = self.get_conversion_code_read_only_for_account(account, table_name, &cond.field_name);
+                        map.insert(cond.field_name.clone(), FieldQueryInfo { index: idx, conversion });
                     }
                 }
             }
@@ -143,31 +150,37 @@ impl Database {
         }
     }
 
-    pub(crate) fn evaluate_node_static_with_id(key: &str, record: &Record, node: &QueryNode, field_map: &HashMap<String, usize>) -> bool {
+    pub(crate) fn evaluate_node_static_with_id(key: &str, record: &Record, node: &QueryNode, field_map: &HashMap<String, FieldQueryInfo>) -> bool {
         match node {
             QueryNode::Condition(cond) => {
                 if cond.field_name == "ID" {
                     return Self::compare_values(key, &cond.op, &cond.value);
                 }
-                let field_idx = match field_map.get(&cond.field_name) {
-                    Some(idx) => *idx,
+                let info = match field_map.get(&cond.field_name) {
+                    Some(info) => info,
                     None => return false,
                 };
 
-                if let Some(field) = record.fields.get(field_idx) {
+                let search_val = if let Some(code) = &info.conversion {
+                    Self::apply_iconv(&cond.value, code)
+                } else {
+                    cond.value.clone()
+                };
+
+                if let Some(field) = record.fields.get(info.index) {
                     if field.values.is_empty() {
-                        return Self::compare_values("", &cond.op, &cond.value);
+                        return Self::compare_values("", &cond.op, &search_val);
                     }
                     for v in &field.values {
                         if v.sub_values.is_empty() {
-                            if Self::compare_values("", &cond.op, &cond.value) { return true; }
+                            if Self::compare_values("", &cond.op, &search_val) { return true; }
                         }
-                        if v.sub_values.iter().any(|sv| Self::compare_values(sv, &cond.op, &cond.value)) {
+                        if v.sub_values.iter().any(|sv| Self::compare_values(sv, &cond.op, &search_val)) {
                             return true;
                         }
                     }
                 } else {
-                    return Self::compare_values("", &cond.op, &cond.value);
+                    return Self::compare_values("", &cond.op, &search_val);
                 }
                 false
             }

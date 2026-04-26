@@ -128,3 +128,59 @@ fn test_query_execution() {
 
     fs::remove_dir_all(base_dir).unwrap();
 }
+
+#[test]
+fn test_query_with_conversion() {
+    let test_dir = "test_query_conv";
+    if Path::new(test_dir).exists() {
+        fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    let mut db = Database::new(test_dir, None).unwrap();
+    db.create_account("ACC1", None).unwrap();
+    db.logto("ACC1").unwrap();
+
+    // 1. Create a table and dictionary entry for PRICE with MD2
+    db.create_table("PRODUCTS").unwrap();
+    {
+        let table = db.get_table_mut("PRODUCTS").unwrap();
+
+        // PRICE dictionary entry
+        let mut price_dict = Record::new();
+        // Field 0: Attribute index (1-based)
+        price_dict.fields.push(Field { values: vec![Value { sub_values: vec!["1".to_string()] }] });
+        // Field 1: Name
+        price_dict.fields.push(Field { values: vec![Value { sub_values: vec!["PRICE".to_string()] }] });
+        // Field 2-6: empty
+        for _ in 0..5 { price_dict.fields.push(Field::default()); }
+        // Field 7: Conversion MD2
+        price_dict.fields.push(Field { values: vec![Value { sub_values: vec!["MD2".to_string()] }] });
+
+        table.dictionary.insert("PRICE".to_string(), price_dict);
+    }
+
+    // 2. Add a record with PRICE = 200 (internal format for 2.00)
+    {
+        let table = db.get_table_mut("PRODUCTS").unwrap();
+        let mut record = Record::new();
+        record.fields.push(Field { values: vec![Value { sub_values: vec!["200".to_string()] }] });
+        table.records.insert("P1".to_string(), record);
+    }
+
+    // 3. Query WITH PRICE = "2.00"
+    let query_str = vec!["WITH", "PRICE", "=", "2.00"];
+    let query = db.parse_query("PRODUCTS", &query_str).unwrap();
+    let results = db.query("PRODUCTS", false, &query, None);
+
+    assert_eq!(results.len(), 1, "Should have found P1 with PRICE = 2.00 (via conversion)");
+    assert_eq!(results[0].0, "P1");
+
+    // 4. Query WITH PRICE = "200"
+    let query_str2 = vec!["WITH", "PRICE", "=", "200"];
+    let query2 = db.parse_query("PRODUCTS", &query_str2).unwrap();
+    let results2 = db.query("PRODUCTS", false, &query2, None);
+
+    assert_eq!(results2.len(), 0, "Should NOT have found P1 with PRICE = 200 (200 converted with MD2 would be 20000)");
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
