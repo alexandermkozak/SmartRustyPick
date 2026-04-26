@@ -2,7 +2,9 @@
 
 ## Purpose
 
-The goal of this project is to provide a simple PICK-like multivalue database implementation useful for personal
+The goal of this project is to provide a
+simple [PICK-like multivalue](https://www.pickwiki.org/index.php/MultiValuedDatabases) database implementation useful
+for personal
 projects that is done entirely through vibe-coding.
 
 This is not only a personal project/tool, but a proof of concept and an exploration of the usefulness of AI agents as
