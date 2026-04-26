@@ -21,6 +21,14 @@ With its natural support for safety and embedded unit testing, Rust seemed like 
 For development I am using Jetbrains RustRover with their Junie agent. So far, the primary model used has been the
 default in Junie, Gemini 3 Flash.
 
+I am taking a deliberately naive approach to development, doing little to no research on exactly how data is managed or
+stored
+in general for a database, or within PICK systems. I am making no attempt to handle hashtable management, group size, or
+modulus
+until the time comes that it is necessary (as it was for QM, D3, etc.). I want to see how agentic AI can handle this,
+and
+what the cost of refactor/implementation will be through the discovery process.
+
 ## Introduction
 SmartRustyPick is a CLI tool for interacting with a MultiValue-inspired database. It supports hierarchical data
 organization through **Accounts**, data records with multiple fields, values and sub-values, dictionary definitions for
