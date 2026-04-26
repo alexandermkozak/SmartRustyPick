@@ -84,19 +84,15 @@ pub async fn start_server(config: Arc<Config>, db: Arc<Mutex<Database>>, overrid
             };
 
             // Check authorization
-            let client_info = {
-                let db_lock = db.lock().unwrap();
-                db_lock.authorized_clients.get(&thumbprint).cloned()
-            };
-
-            if client_info.is_none() {
-                let msg = format!("Unauthorized certificate {} from {}", thumbprint, peer_addr);
-                eprintln!("{}", msg);
+            {
                 let mut db_lock = db.lock().unwrap();
-                let _ = db_lock.log_error("SYSTEM", &msg);
-                return;
+                if !db_lock.authorized_clients.contains_key(&thumbprint) {
+                    let msg = format!("Unauthorized certificate {} from {}", thumbprint, peer_addr);
+                    eprintln!("{}", msg);
+                    let _ = db_lock.log_error("SYSTEM", &msg);
+                    return;
+                }
             }
-            let client_info = client_info.unwrap();
 
             let (reader, mut writer) = tokio::io::split(tls_stream);
             let mut reader = BufReader::new(reader);
@@ -118,9 +114,23 @@ pub async fn start_server(config: Arc<Config>, db: Arc<Mutex<Database>>, overrid
                             }
                         };
 
-                        let resp = handle_request(req, &db, &client_info);
-                        if let Ok(resp_json) = serde_json::to_string(&resp) {
-                            let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
+                        // Re-fetch client info to support dynamic permission updates
+                        let current_client_info = {
+                            let db_lock = db.lock().unwrap();
+                            db_lock.authorized_clients.get(&thumbprint).cloned()
+                        };
+
+                        if let Some(info) = current_client_info {
+                            let resp = handle_request(req, &db, &info);
+                            if let Ok(resp_json) = serde_json::to_string(&resp) {
+                                let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
+                            }
+                        } else {
+                            let resp = Response { status: "ERROR".to_string(), message: Some("Client deauthorized".to_string()), ..Default::default() };
+                            if let Ok(resp_json) = serde_json::to_string(&resp) {
+                                let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
+                            }
+                            break; // Terminate connection if client no longer exists
                         }
                     }
                     Err(e) => {

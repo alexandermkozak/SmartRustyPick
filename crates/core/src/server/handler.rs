@@ -26,15 +26,10 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
         }
     };
 
-    if let Some(ref acc) = target_account {
-        if db.current_account != *acc {
-            if let Err(e) = db.logto(acc) {
-                let msg = format!("Remote login error for account {}: {}", acc, e);
-                let _ = db.log_error("REMOTE", &msg);
-                return Response { status: "ERROR".to_string(), message: Some(format!("Failed to login to account: {}", e)), ..Default::default() };
-            }
-        }
-    }
+    let acc = match target_account {
+        Some(ref a) => a.as_str(),
+        None => "", // Some commands might not need an account, or will fail later
+    };
 
     match req.command.to_uppercase().as_str() {
         "READ" => {
@@ -53,7 +48,7 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
 
             let structured_opt = {
                 let (record_clone, table_name_clone) = {
-                    let table = match db.get_table_mut(&table_name) {
+                    let table = match db.get_table_mut_for_account(acc, &table_name) {
                         Ok(t) => t,
                         Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
                     };
@@ -65,7 +60,7 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
                 };
 
                 match record_clone {
-                    Some(r) => Some(db.serialize_record(&table_name_clone, &r)),
+                    Some(r) => Some(db.serialize_record_for_account(acc, &table_name_clone, &r)),
                     None => None,
                 }
             };
@@ -89,7 +84,7 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             };
 
             // Pre-load table to ensure dictionary is available for deserialization
-            if let Err(e) = db.get_table_mut(&table_name) {
+            if let Err(e) = db.get_table_mut_for_account(acc, &table_name) {
                 return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() };
             }
 
@@ -100,7 +95,7 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             let is_dict = req.is_dict.unwrap_or(false);
 
             let record = if let Some(structured) = req.structured_data {
-                match db.deserialize_record(&table_name, &structured) {
+                match db.deserialize_record_for_account(acc, &table_name, &structured) {
                     Some(r) => r,
                     None => return Response { status: "ERROR".to_string(), message: Some("Invalid structured data".to_string()), ..Default::default() },
                 }
@@ -108,7 +103,7 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
                 match data_val {
                     serde_json::Value::String(s) => Record::from_display_string(&s),
                     serde_json::Value::Object(_) => {
-                        match db.deserialize_record(&table_name, &data_val) {
+                        match db.deserialize_record_for_account(acc, &table_name, &data_val) {
                             Some(r) => r,
                             None => return Response { status: "ERROR".to_string(), message: Some("Invalid structured data in data field".to_string()), ..Default::default() },
                         }
@@ -119,7 +114,7 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
                 return Response { status: "ERROR".to_string(), message: Some("Data not specified".to_string()), ..Default::default() };
             };
 
-            let table = match db.get_table_mut(&table_name) {
+            let table = match db.get_table_mut_for_account(acc, &table_name) {
                 Ok(t) => t,
                 Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
             };
@@ -145,7 +140,7 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             };
             let is_dict = req.is_dict.unwrap_or(false);
 
-            let table = match db.get_table_mut(&table_name) {
+            let table = match db.get_table_mut_for_account(acc, &table_name) {
                 Ok(t) => t,
                 Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
             };
@@ -177,9 +172,9 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             };
 
             let results = if let Some(q) = query_node {
-                db.query(&table_name, is_dict, &q, None)
+                db.query_for_account(acc, &table_name, is_dict, &q, None)
             } else {
-                let table = match db.get_table_mut(&table_name) {
+                let table = match db.get_table_mut_for_account(acc, &table_name) {
                     Ok(t) => t,
                     Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
                 };
@@ -191,7 +186,7 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             };
 
             let results_processed: Vec<(String, serde_json::Value)> = results.into_iter()
-                .map(|(k, r)| (k, db.serialize_record(&table_name, &r)))
+                .map(|(k, r)| (k, db.serialize_record_for_account(acc, &table_name, &r)))
                 .collect();
 
             Response {
@@ -221,10 +216,10 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             };
 
             let keys = if let Some(q) = query_node {
-                let results = db.query(&table_name, is_dict, &q, None);
+                let results = db.query_for_account(acc, &table_name, is_dict, &q, None);
                 results.into_iter().map(|(k, _)| k).collect()
             } else {
-                let table = match db.get_table_mut(&table_name) {
+                let table = match db.get_table_mut_for_account(acc, &table_name) {
                     Ok(t) => t,
                     Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
                 };
@@ -267,7 +262,7 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
 
             let mut results = Vec::new();
             {
-                let table = match db.get_table_mut(&table_name) {
+                let table = match db.get_table_mut_for_account(acc, &table_name) {
                     Ok(t) => t,
                     Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
                 };
@@ -282,7 +277,7 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
 
             let results_len = results.len();
             let results_processed: Vec<(String, serde_json::Value)> = results.into_iter()
-                .map(|(k, r)| (k, db.serialize_record(&table_name, &r)))
+                .map(|(k, r)| (k, db.serialize_record_for_account(acc, &table_name, &r)))
                 .collect();
 
             Response {

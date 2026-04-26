@@ -91,7 +91,7 @@ mod tests {
             let mut db = Database::new(base_dir, None)?;
             // Check if $LOGS file exists in SYSTEM account
             db.logto("SYSTEM")?;
-            assert!(db.available_tables.contains("$LOGS"), "$LOGS table should be automatically created in SYSTEM account");
+            assert!(db.is_table_available("$LOGS"), "$LOGS table should be automatically created in SYSTEM account");
         }
 
         fs::remove_dir_all(base_dir)?;
@@ -144,7 +144,7 @@ mod tests {
 
             // Verify $CLIENTS exists and contains CLIENT1 and CLIENT2
             db.logto("SYSTEM")?;
-            assert!(db.available_tables.contains("$CLIENTS"), "$CLIENTS table should exist in SYSTEM account");
+            assert!(db.is_table_available("$CLIENTS"), "$CLIENTS table should exist in SYSTEM account");
 
             let clients_table = db.get_table("$CLIENTS").expect("$CLIENTS should be loadable");
             assert!(clients_table.records.contains_key("CLIENT1"), "$CLIENTS should contain CLIENT1");
@@ -217,7 +217,7 @@ mod tests {
 
             // Verify $ACCOUNTS exists and contains USER1 and USER2
             db.logto("SYSTEM")?;
-            assert!(db.available_tables.contains("$ACCOUNTS"), "$ACCOUNTS table should exist in SYSTEM account");
+            assert!(db.is_table_available("$ACCOUNTS"), "$ACCOUNTS table should exist in SYSTEM account");
 
             let accounts_table = db.get_table("$ACCOUNTS").expect("$ACCOUNTS should be loadable");
             assert!(accounts_table.records.contains_key("USER1"), "$ACCOUNTS should contain USER1");
@@ -300,7 +300,7 @@ mod tests {
         {
             let mut db = Database::new(base_dir, None)?;
             db.logto("SYSTEM")?;
-            assert!(db.available_tables.contains("DIR"), "DIR table should be automatically created in SYSTEM account");
+            assert!(db.is_table_available("DIR"), "DIR table should be automatically created in SYSTEM account");
 
             let dir_table = db.get_table("DIR").unwrap();
             assert!(dir_table.records.contains_key("$LOGS"));
@@ -315,7 +315,7 @@ mod tests {
             // Test create_test_account
             db.create_test_account("TEST_DIR")?;
             db.logto("TEST_DIR")?;
-            assert!(db.available_tables.contains("DIR"), "DIR table should be created in test account");
+            assert!(db.is_table_available("DIR"), "DIR table should be created in test account");
             let dir_table_test = db.get_table("DIR").unwrap();
             assert!(dir_table_test.records.contains_key("USERS"));
             assert!(dir_table_test.records.contains_key("PRODUCTS"));
