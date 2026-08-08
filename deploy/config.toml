@@ -1,0 +1,8 @@
+# Default configuration used when /data/config.toml does not exist yet.
+# Bind to all interfaces so the port can be published from the container.
+server_addr = "0.0.0.0"
+server_port = 8443
+cert_path = "server.crt"
+key_path = "server.key"
+ca_path = "ca.crt"
+editor = "nano"

@@ -56,6 +56,7 @@ For more information, see the following documentation:
 - [Administration Commands](docs/admin_commands.md) - System management and security.
 - [General Use Commands](docs/general_commands.md) - Data operations and queries.
 - [Remote Protocol](docs/protocol.md) - Details on the TCP/SSL remote protocol.
+- [Container Deployment](docs/deployment.md) - Running the server with podman or docker compose.
 - [MCP Server](mcp/README.md) - Usage instructions for the Model Context Protocol server.
 - [AI Agents](agents.md) - Documentation on the role and contributions of AI agents in this project.
 
