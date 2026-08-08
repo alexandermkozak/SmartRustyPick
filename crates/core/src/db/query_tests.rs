@@ -306,10 +306,14 @@ fn test_parse_sort_specs() {
     assert_eq!(rest, vec!["DESC", "PRICE"]);
     assert_eq!(specs, vec![SortSpec { field_name: "DESC".to_string(), descending: true }]);
 
-    // Dangling operator without a field is ignored
+    // Dangling operator without a field is not a sort; the token is kept in the clause
     let (rest, specs) = Database::parse_sort_specs(&["PRICE_COL", "BY"]);
-    assert_eq!(rest, vec!["PRICE_COL"]);
+    assert_eq!(rest, vec!["PRICE_COL", "BY"]);
     assert!(specs.is_empty());
+
+    let (rest, specs) = Database::parse_sort_specs(&["BY", "PRICE", "BY.DSND"]);
+    assert_eq!(rest, vec!["BY.DSND"]);
+    assert_eq!(specs, vec![SortSpec { field_name: "PRICE".to_string(), descending: false }]);
 }
 
 fn setup_sort_db(test_dir: &str) -> Database {

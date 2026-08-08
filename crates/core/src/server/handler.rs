@@ -234,7 +234,6 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
                         Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
                     };
                     let records = if is_dict { &table.dictionary } else { &table.records };
-                    // Optimization: Collect and sort keys directly to avoid cloning full records
                     records.keys().cloned().collect()
                 };
                 keys.sort();
