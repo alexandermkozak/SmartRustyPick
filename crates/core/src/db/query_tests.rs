@@ -267,3 +267,136 @@ fn test_query_with_wildcards() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+#[test]
+fn test_parse_sort_specs() {
+    // No sort clauses
+    let (rest, specs) = Database::parse_sort_specs(&["WITH", "DESC", "=", "[new]"]);
+    assert_eq!(rest, vec!["WITH", "DESC", "=", "[new]"]);
+    assert!(specs.is_empty());
+
+    // Ascending only
+    let (rest, specs) = Database::parse_sort_specs(&["PRICE_COL", "BY", "PRICE"]);
+    assert_eq!(rest, vec!["PRICE_COL"]);
+    assert_eq!(specs, vec![SortSpec { field_name: "PRICE".to_string(), descending: false }]);
+
+    // Descending only
+    let (rest, specs) = Database::parse_sort_specs(&["BY.DSND", "PRICE"]);
+    assert!(rest.is_empty());
+    assert_eq!(specs, vec![SortSpec { field_name: "PRICE".to_string(), descending: true }]);
+
+    // Multiple sorts keep left-to-right order
+    let (rest, specs) = Database::parse_sort_specs(&["WITH", "DESC", "=", "[new]", "BY", "PRICE", "BY.DSND", "CREATE.DATE"]);
+    assert_eq!(rest, vec!["WITH", "DESC", "=", "[new]"]);
+    assert_eq!(specs, vec![
+        SortSpec { field_name: "PRICE".to_string(), descending: false },
+        SortSpec { field_name: "CREATE.DATE".to_string(), descending: true },
+    ]);
+
+    // Case insensitive operators
+    let (_, specs) = Database::parse_sort_specs(&["by.dsnd", "PRICE"]);
+    assert_eq!(specs, vec![SortSpec { field_name: "PRICE".to_string(), descending: true }]);
+
+    // Sort and column specifiers are order-agnostic
+    let (rest, specs) = Database::parse_sort_specs(&["BY.DSND", "DESC", "DESC", "PRICE"]);
+    assert_eq!(rest, vec!["DESC", "PRICE"]);
+    assert_eq!(specs, vec![SortSpec { field_name: "DESC".to_string(), descending: true }]);
+
+    let (rest, specs) = Database::parse_sort_specs(&["DESC", "PRICE", "BY.DSND", "DESC"]);
+    assert_eq!(rest, vec!["DESC", "PRICE"]);
+    assert_eq!(specs, vec![SortSpec { field_name: "DESC".to_string(), descending: true }]);
+
+    // Dangling operator without a field is ignored
+    let (rest, specs) = Database::parse_sort_specs(&["PRICE_COL", "BY"]);
+    assert_eq!(rest, vec!["PRICE_COL"]);
+    assert!(specs.is_empty());
+}
+
+fn setup_sort_db(test_dir: &str) -> Database {
+    if Path::new(test_dir).exists() {
+        fs::remove_dir_all(test_dir).unwrap();
+    }
+    let mut db = Database::new(test_dir, None).unwrap();
+    db.create_account("ACC1", None).unwrap();
+    db.logto("ACC1").unwrap();
+    db.create_table("PRODUCTS").unwrap();
+    {
+        let table = db.get_table_mut("PRODUCTS").unwrap();
+        table.dictionary.insert("DESC".to_string(), Record::from_display_string("1^DESCRIPTION^L^20"));
+        table.dictionary.insert("PRICE".to_string(), Record::from_display_string("2^PRICE^R^10"));
+        table.dictionary.insert("CREATE.DATE".to_string(), Record::from_display_string("3^CREATED^L^10"));
+
+        table.records.insert("P1".to_string(), Record::from_display_string("new laptop^300^2024-01-01"));
+        table.records.insert("P2".to_string(), Record::from_display_string("new mouse^25^2024-03-01"));
+        table.records.insert("P3".to_string(), Record::from_display_string("old keyboard^100^2024-02-01"));
+        table.records.insert("P4".to_string(), Record::from_display_string("new cable^25^2024-05-01"));
+    }
+    db
+}
+
+#[test]
+fn test_sort_results_ascending_and_descending() {
+    let test_dir = "test_sort_asc_dsnd";
+    let mut db = setup_sort_db(test_dir);
+
+    let ids = |res: &Vec<(String, Record)>| res.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+
+    // BY PRICE - numeric ascending, not lexicographic ("25" before "100")
+    let (_, specs) = Database::parse_sort_specs(&["BY", "PRICE"]);
+    let mut res = db.query("PRODUCTS", false, &QueryNode::Condition(QueryCondition {
+        field_name: "ID".to_string(),
+        op: "!=".to_string(),
+        value: "".to_string(),
+    }), None);
+    db.sort_results("PRODUCTS", &mut res, &specs);
+    // P2 and P4 both 25, tie broken by ID
+    assert_eq!(ids(&res), vec!["P2", "P4", "P3", "P1"]);
+
+    // BY.DSND PRICE
+    let (_, specs) = Database::parse_sort_specs(&["BY.DSND", "PRICE"]);
+    db.sort_results("PRODUCTS", &mut res, &specs);
+    assert_eq!(ids(&res), vec!["P1", "P3", "P2", "P4"]);
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+#[test]
+fn test_sort_results_multiple_keys() {
+    let test_dir = "test_sort_multi";
+    let mut db = setup_sort_db(test_dir);
+
+    // BY PRICE BY.DSND CREATE.DATE
+    let (clause, specs) = Database::parse_sort_specs(&["WITH", "DESC", "=", "[new]", "BY", "PRICE", "BY.DSND", "CREATE.DATE"]);
+    let query = db.parse_query("PRODUCTS", &clause).unwrap();
+    let mut res = db.query("PRODUCTS", false, &query, None);
+    db.sort_results("PRODUCTS", &mut res, &specs);
+
+    let ids: Vec<String> = res.iter().map(|(k, _)| k.clone()).collect();
+    // Only the "new" products; P4/P2 share price 25 so the later date (P4) comes first.
+    assert_eq!(ids, vec!["P4", "P2", "P1"]);
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+#[test]
+fn test_sort_keys_and_unknown_field() {
+    let test_dir = "test_sort_keys";
+    let mut db = setup_sort_db(test_dir);
+
+    let (_, specs) = Database::parse_sort_specs(&["BY.DSND", "DESC"]);
+    let keys = vec!["P1".to_string(), "P2".to_string(), "P3".to_string(), "P4".to_string()];
+    let sorted = db.sort_keys("PRODUCTS", false, keys.clone(), &specs);
+    assert_eq!(sorted, vec!["P3", "P2", "P1", "P4"]);
+
+    // Unknown sort field falls back to ID order without panicking
+    let (_, specs) = Database::parse_sort_specs(&["BY", "NOPE"]);
+    let sorted = db.sort_keys("PRODUCTS", false, keys.clone(), &specs);
+    assert_eq!(sorted, vec!["P1", "P2", "P3", "P4"]);
+
+    // ID is sortable directly
+    let (_, specs) = Database::parse_sort_specs(&["BY.DSND", "ID"]);
+    let sorted = db.sort_keys("PRODUCTS", false, keys, &specs);
+    assert_eq!(sorted, vec!["P4", "P3", "P2", "P1"]);
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

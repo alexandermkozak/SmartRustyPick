@@ -85,6 +85,109 @@ impl Database {
         current_node
     }
 
+    /// Splits a clause list into the non-sort tokens and the parsed sort specs.
+    /// Sort operators are `BY` (ascending) and `BY.DSND` (descending), each followed by a field name.
+    /// Any number of them may be present, anywhere in the clause, and they are applied from left to
+    /// right. Tokens that are not part of a sort operator keep their relative order, so sort and
+    /// column specifiers may be freely interleaved.
+    pub fn parse_sort_specs<'a>(parts: &[&'a str]) -> (Vec<&'a str>, Vec<SortSpec>) {
+        let mut remaining = Vec::new();
+        let mut specs = Vec::new();
+        let mut i = 0;
+        while i < parts.len() {
+            let descending = match parts[i].to_uppercase().as_str() {
+                "BY" => false,
+                "BY.DSND" => true,
+                _ => {
+                    remaining.push(parts[i]);
+                    i += 1;
+                    continue;
+                }
+            };
+            if i + 1 >= parts.len() { break; }
+            specs.push(SortSpec {
+                field_name: parts[i + 1].to_string(),
+                descending,
+            });
+            i += 2;
+        }
+        (remaining, specs)
+    }
+
+    pub fn sort_results(&mut self, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
+        let account = self.current_account.clone();
+        self.sort_results_for_account(&account, table_name, results, specs);
+    }
+
+    pub fn sort_results_for_account(&mut self, account: &str, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
+        if specs.is_empty() { return; }
+
+        // Pre-resolve field indices so the comparator doesn't need to borrow self.
+        let mut resolved: Vec<(Option<usize>, bool)> = Vec::with_capacity(specs.len());
+        for spec in specs {
+            if spec.field_name == "ID" {
+                resolved.push((None, spec.descending));
+            } else {
+                let idx = self.get_field_index_for_account(account, table_name, &spec.field_name);
+                match idx {
+                    Some(i) => resolved.push((Some(i), spec.descending)),
+                    // Unknown field: keep the spec so ordering stays stable, but it compares equal.
+                    None => resolved.push((Some(usize::MAX), spec.descending)),
+                }
+            }
+        }
+
+        results.sort_by(|a, b| {
+            for (idx, descending) in &resolved {
+                let (left, right) = match idx {
+                    None => (a.0.clone(), b.0.clone()),
+                    Some(i) if *i == usize::MAX => continue,
+                    Some(i) => (a.1.get_field_display_string(*i), b.1.get_field_display_string(*i)),
+                };
+                let mut ord = Self::compare_sort_values(&left, &right);
+                if *descending {
+                    ord = ord.reverse();
+                }
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            a.0.cmp(&b.0)
+        });
+    }
+
+    pub fn sort_keys(&mut self, table_name: &str, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
+        let account = self.current_account.clone();
+        self.sort_keys_for_account(&account, table_name, is_dict, keys, specs)
+    }
+
+    pub fn sort_keys_for_account(&mut self, account: &str, table_name: &str, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
+        if specs.is_empty() { return keys; }
+
+        let mut results: Vec<(String, Record)> = {
+            let table = match self.get_table_mut_for_account(account, table_name) {
+                Ok(t) => t,
+                Err(_) => return keys,
+            };
+            let map = if is_dict { &table.dictionary } else { &table.records };
+            keys.iter()
+                .filter_map(|k| map.get(k).map(|r| (k.clone(), r.clone())))
+                .collect()
+        };
+
+        self.sort_results_for_account(account, table_name, &mut results, specs);
+        results.into_iter().map(|(k, _)| k).collect()
+    }
+
+    pub(crate) fn compare_sort_values(left: &str, right: &str) -> std::cmp::Ordering {
+        let l = left.trim();
+        let r = right.trim();
+        if let (Ok(lf), Ok(rf)) = (l.parse::<f64>(), r.parse::<f64>()) {
+            return lf.partial_cmp(&rf).unwrap_or(std::cmp::Ordering::Equal);
+        }
+        l.cmp(r)
+    }
+
     pub fn query(&mut self, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
         let account = self.current_account.clone();
         self.query_for_account(&account, table_name, use_dict_section, query, keys_to_filter)

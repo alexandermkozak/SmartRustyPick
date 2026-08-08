@@ -42,17 +42,41 @@ Remove a record from the database.
 
 List tables, keys, or records with formatted fields.
 
-- **Usage**: `LIST [DICT] [<table> [<fields>...]]`
+- **Usage**: `LIST [DICT] [<table> [<fields>...] [BY|BY.DSND <field> ...]]`
 - **Example**: `LIST USERS First.Name Last.Name`
+- **Example**: `LIST PRODUCTS BY PRICE`
+- **Example**: `LIST PRODUCTS BY.DSND PRICE`
+- **Sorting**: See [Sorting](#sorting) below.
 
 #### SELECT
 
 Create or refine an active select list based on field criteria.
 
-- **Usage**: `SELECT [DICT] <table> [WITH <field> <op> <value> [AND/OR <field> <op> <value> ...]]`
+- **Usage**:
+  `SELECT [DICT] <table> [WITH <field> <op> <value> [AND/OR <field> <op> <value> ...]] [BY|BY.DSND <field> ...]`
 - **Operators**: `=`, `#` (not equal), `<`, `>`, `<=`, `>=`, `[` (ends with), `]` (starts with), `[]` (contains)
 - **Logical Operators**: `AND`, `OR`
 - **Example**: `SELECT USERS WITH First.Name = "Ted" AND Last.Name = "Smith"`
+- **Sorting**: See [Sorting](#sorting) below.
+
+#### Sorting
+
+`LIST` and `SELECT` accept any number of sort operators. Sorts are applied from left to right, so the first operator is
+the primary sort key, the second breaks ties, and so on. Records that compare equal on every key fall back to record ID
+order. Sort operators and column names are order-agnostic and may be freely interleaved.
+
+- `BY <field>` - ascending sort
+- `BY.DSND <field>` - descending sort
+
+The special field name `ID` sorts on the record key. Values that are numeric on both sides are compared numerically,
+otherwise they are compared as text.
+
+- **Example**: `LIST PRODUCTS BY PRICE` - list products by ascending price
+- **Example**: `LIST PRODUCTS BY.DSND PRICE` - list products by descending price
+- **Example**: `SELECT PRODUCTS WITH DESC = "[new]" BY PRICE BY.DSND CREATE.DATE` - select products whose description
+  contains "new", ordered by ascending price, then by descending create date
+- **Example**: `LIST PRODUCTS BY.DSND DESC DESC PRICE` and `LIST PRODUCTS DESC PRICE BY.DSND DESC` are equivalent - both
+  show the `DESC` and `PRICE` columns sorted by descending `DESC`
 
 #### EDIT
 
