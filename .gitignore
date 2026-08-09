@@ -42,3 +42,5 @@
 /.edit_USERS_K1.tmp~
 __pycache__/
 *.pyc
+# Machine-specific performance metrics, produced by `make test-performance`.
+/performance_metrics.json

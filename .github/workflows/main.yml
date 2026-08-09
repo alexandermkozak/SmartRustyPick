@@ -17,6 +17,12 @@ env:
   SRP_PERF_RECORDS: 2000
   # Shared runners are slower and noisier than a workstation.
   SRP_STARTUP_TIMEOUT: 60
+  # Latency budgets are calibrated on a workstation; give the runners room so the
+  # absolute ceilings do not turn into flaky failures. The ratio-based checks, which
+  # are the real regression guards, are unaffected by how fast the host is.
+  SRP_PERF_BUDGET_SCALE: 4
+  # Runners have 2 cores; oversubscribing them only measures the scheduler.
+  SRP_CONC_CLIENTS: 4
 
 jobs:
   test:
@@ -54,6 +60,11 @@ jobs:
       - name: Run performance tests
         run: make test-performance
 
+      # One iteration of each Criterion benchmark. Not a timing gate - it keeps the
+      # benchmarks compiling and running, which is how benchmark suites usually rot.
+      - name: Smoke-run the engine benchmarks
+        run: make bench-smoke
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
@@ -62,4 +73,5 @@ jobs:
           path: |
             integration_results.md
             performance_results.md
+            performance_metrics.json
           if-no-files-found: warn

@@ -14,6 +14,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -24,6 +25,13 @@ CLI_BIN = os.path.join(TARGET_DIR, PROFILE, "smart-rusty-pick-cli")
 SERVER_BIN = os.path.join(TARGET_DIR, PROFILE, "smart-rusty-pick-server")
 
 STARTUP_TIMEOUT = float(os.environ.get("SRP_STARTUP_TIMEOUT", "30"))
+
+# Latency budgets are wall-clock and therefore host dependent. They are deliberately
+# generous so they only fire on real regressions, and every budget can be stretched
+# for slow or noisy machines (CI containers, emulated CPUs) with a single knob.
+BUDGET_SCALE = float(os.environ.get("SRP_PERF_BUDGET_SCALE", "1"))
+# Set SRP_PERF_ENFORCE=0 to downgrade budget violations to informational rows.
+ENFORCE_BUDGETS = os.environ.get("SRP_PERF_ENFORCE", "1") != "0"
 
 
 def require_binaries(*binaries):
@@ -43,6 +51,165 @@ def free_port():
 
 def _run(cmd):
     subprocess.run(cmd, shell=True, check=True, capture_output=True)
+
+
+def percentile(sorted_samples, fraction):
+    """Nearest-rank percentile over an already sorted sample list."""
+    if not sorted_samples:
+        return 0.0
+    index = int(round(fraction * (len(sorted_samples) - 1)))
+    return sorted_samples[index]
+
+
+class Stats:
+    """Latency distribution of a repeated operation, in milliseconds.
+
+    A single timing says very little on a shared machine: it is dominated by whatever
+    else the host was doing. Percentiles over many iterations are what make a
+    performance signal usable as a regression guard.
+    """
+
+    def __init__(self, samples_seconds):
+        self.samples = sorted(s * 1000.0 for s in samples_seconds)
+        self.count = len(self.samples)
+        self.total_ms = sum(self.samples)
+
+    @property
+    def mean(self):
+        return self.total_ms / self.count if self.count else 0.0
+
+    @property
+    def min(self):
+        return self.samples[0] if self.count else 0.0
+
+    @property
+    def max(self):
+        return self.samples[-1] if self.count else 0.0
+
+    @property
+    def p50(self):
+        return percentile(self.samples, 0.50)
+
+    @property
+    def p95(self):
+        return percentile(self.samples, 0.95)
+
+    @property
+    def p99(self):
+        return percentile(self.samples, 0.99)
+
+    @property
+    def ops_per_second(self):
+        return self.count / (self.total_ms / 1000.0) if self.total_ms else 0.0
+
+    def summary(self):
+        return (
+            f"n={self.count}, p50 {self.p50:.2f}ms, p95 {self.p95:.2f}ms, "
+            f"p99 {self.p99:.2f}ms, max {self.max:.2f}ms, {self.ops_per_second:.0f} ops/s"
+        )
+
+    def as_dict(self):
+        return {
+            "count": self.count,
+            "mean_ms": round(self.mean, 4),
+            "min_ms": round(self.min, 4),
+            "p50_ms": round(self.p50, 4),
+            "p95_ms": round(self.p95, 4),
+            "p99_ms": round(self.p99, 4),
+            "max_ms": round(self.max, 4),
+            "total_ms": round(self.total_ms, 4),
+            "ops_per_second": round(self.ops_per_second, 2),
+        }
+
+
+def benchmark(func, iterations, warmup=0):
+    """Time `func(i)` over `iterations` runs and return (Stats, last result).
+
+    Warmup iterations are executed but not measured, so first-call effects such as
+    lazily loading a table from disk do not distort the distribution.
+    """
+    for i in range(warmup):
+        func(i)
+    samples = []
+    result = None
+    for i in range(iterations):
+        start = time.perf_counter()
+        result = func(i)
+        samples.append(time.perf_counter() - start)
+    return Stats(samples), result
+
+
+class ResourceMonitor(threading.Thread):
+    """Samples a child process's memory and CPU usage while a suite runs.
+
+    Reads `/proc`, so it degrades gracefully (`available` is False) on platforms that
+    do not have it instead of failing the suite.
+    """
+
+    def __init__(self, pid, interval=0.1):
+        super().__init__(daemon=True)
+        self.pid = pid
+        self.interval = interval
+        self.available = os.path.exists(f"/proc/{pid}/status")
+        self.peak_rss_kb = 0
+        self.first_rss_kb = None
+        self.last_rss_kb = 0
+        self.cpu_seconds = 0.0
+        self.samples = 0
+        self._stop = threading.Event()
+        self._ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+    def _read_rss_kb(self):
+        with open(f"/proc/{self.pid}/status") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+        return 0
+
+    def _read_cpu_seconds(self):
+        with open(f"/proc/{self.pid}/stat") as handle:
+            fields = handle.read().rsplit(") ", 1)[1].split()
+        # utime and stime are fields 14 and 15 of /proc/pid/stat (1-based).
+        return (int(fields[11]) + int(fields[12])) / self._ticks
+
+    def run(self):
+        if not self.available:
+            return
+        while not self._stop.is_set():
+            try:
+                rss = self._read_rss_kb()
+                self.cpu_seconds = self._read_cpu_seconds()
+            except (OSError, IndexError, ValueError):
+                break  # the process exited
+            if self.first_rss_kb is None:
+                self.first_rss_kb = rss
+            self.last_rss_kb = rss
+            self.peak_rss_kb = max(self.peak_rss_kb, rss)
+            self.samples += 1
+            self._stop.wait(self.interval)
+
+    def stop(self):
+        self._stop.set()
+        self.join(timeout=5)
+        return self
+
+    def as_dict(self):
+        return {
+            "peak_rss_mb": round(self.peak_rss_kb / 1024.0, 2),
+            "final_rss_mb": round(self.last_rss_kb / 1024.0, 2),
+            "start_rss_mb": round((self.first_rss_kb or 0) / 1024.0, 2),
+            "cpu_seconds": round(self.cpu_seconds, 2),
+            "samples": self.samples,
+        }
+
+    def summary(self):
+        if not self.available:
+            return "resource monitoring unavailable on this platform"
+        return (
+            f"peak RSS {self.peak_rss_kb / 1024.0:.1f}MB, "
+            f"final RSS {self.last_rss_kb / 1024.0:.1f}MB, "
+            f"CPU {self.cpu_seconds:.2f}s over {self.samples} samples"
+        )
 
 
 class Certificates:
@@ -282,13 +449,22 @@ class Workspace:
 class Suite:
     """Collects results so a single failure does not hide the rest of the suite."""
 
-    def __init__(self, name, results_file, title="Integration Test Results", detail_header="Details"):
+    def __init__(
+        self,
+        name,
+        results_file,
+        title="Integration Test Results",
+        detail_header="Details",
+        metrics_file=None,
+    ):
         self.name = name
         self.results_file = os.path.join(REPO_ROOT, results_file)
         self.title = title
         self.detail_header = detail_header
+        self.metrics_file = os.path.join(REPO_ROOT, metrics_file) if metrics_file else None
         self.failures = 0
         self.checks = 0
+        self.metrics = {}
 
     def _log(self, test_name, status, detail):
         new_file = not os.path.exists(self.results_file)
@@ -314,13 +490,68 @@ class Suite:
         detail = "as expected" if passed else f"expected `{expected}`, got `{actual}`"
         return self.check(test_name, passed, detail)
 
+    def record(self, metric_name, payload):
+        """Store a machine-readable metric for trend tracking and baseline comparison."""
+        self.metrics[f"{self.name}: {metric_name}"] = payload
+
+    def measure(self, test_name, stats, budget_ms=None, extra="", passed=True):
+        """Report a latency distribution and, when a budget is given, guard p95 against it.
+
+        `passed` carries the correctness verdict of the measured operation, so a change
+        that is fast only because it stopped doing the work still fails.
+        """
+        detail = stats.summary()
+        if extra:
+            detail = f"{extra}; {detail}"
+        budget = None
+        if budget_ms is not None:
+            budget = budget_ms * BUDGET_SCALE
+            within = stats.p95 <= budget
+            detail += f"; budget p95 <= {budget:.2f}ms"
+            if not within:
+                detail += " (EXCEEDED)"
+            if ENFORCE_BUDGETS:
+                passed = passed and within
+        self.record(test_name, dict(stats.as_dict(), budget_p95_ms=budget))
+        return self.check(test_name, passed, detail)
+
+    def check_ratio(self, test_name, ratio, limit, detail=""):
+        """Guard a *relative* measurement, which stays meaningful on any host.
+
+        Absolute timings vary by an order of magnitude between machines; the shape of
+        the curve (how cost grows with data size or concurrency) does not, which makes
+        ratios the reliable way to catch complexity regressions.
+        """
+        message = f"{ratio:.2f}x (limit {limit:.2f}x)"
+        if detail:
+            message = f"{detail}; {message}"
+        self.record(test_name, {"ratio": round(ratio, 3), "limit": limit})
+        return self.check(test_name, ratio <= limit, message)
+
     def error(self, test_name, exc):
         self.checks += 1
         self.failures += 1
         print(f"  [Failure] {test_name}: {exc}")
         self._log(f"{self.name}: {test_name}", "Failure", str(exc).replace("|", "/").replace("\n", " "))
 
+    def _write_metrics(self):
+        if not self.metrics_file:
+            return
+        document = {"generated": time.strftime("%Y-%m-%dT%H:%M:%S"), "metrics": {}}
+        if os.path.exists(self.metrics_file):
+            try:
+                with open(self.metrics_file) as handle:
+                    document = json.load(handle)
+            except (OSError, ValueError):
+                pass
+        document.setdefault("metrics", {}).update(self.metrics)
+        document["generated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        with open(self.metrics_file, "w") as handle:
+            json.dump(document, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+
     def finish(self):
+        self._write_metrics()
         print(f"\n{self.name}: {self.checks - self.failures}/{self.checks} checks passed")
         if self.failures:
             print(f"{self.name} FAILED", file=sys.stderr)
