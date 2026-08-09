@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use std::time::SystemTime;
 
 pub struct Database {
     pub storage_dir: String,
@@ -10,6 +11,7 @@ pub struct Database {
     pub accounts_config: Record,
     pub loaded_tables: HashMap<(String, String), Table>,
     pub available_tables: HashMap<String, HashSet<String>>,
+    pub available_stamps: HashMap<String, Option<SystemTime>>,
     pub lru_order: VecDeque<(String, String)>,
     pub max_loaded: usize,
     pub active_select_list: Option<SelectList>,
@@ -17,6 +19,8 @@ pub struct Database {
     pub remote_select_cursors: HashMap<String, usize>,
     pub authorized_certs: HashSet<String>,
     pub authorized_clients: HashMap<String, ClientInfo>,
+    pub registry_stamp: Option<(Option<SystemTime>, u64)>,
+    pub clients_stamp: Option<TableStamp>,
     pub log_detail: String,
     pub max_log_records: usize,
 }
@@ -30,6 +34,7 @@ impl Database {
             accounts_config: Record::new(),
             loaded_tables: HashMap::new(),
             available_tables: HashMap::new(),
+            available_stamps: HashMap::new(),
             lru_order: VecDeque::new(),
             max_loaded: 10,
             active_select_list: None,
@@ -37,6 +42,8 @@ impl Database {
             remote_select_cursors: HashMap::new(),
             authorized_certs: HashSet::new(),
             authorized_clients: HashMap::new(),
+            registry_stamp: None,
+            clients_stamp: None,
             log_detail: config.log_detail.unwrap_or_else(|| "normal".to_string()),
             max_log_records: config.max_log_records.unwrap_or(100),
         };
@@ -62,6 +69,8 @@ impl Database {
 
     fn load_account_registry(&mut self) -> io::Result<()> {
         let registry_path = format!("{}/accounts.reg", self.storage_dir);
+        // Stamp before reading, so a write racing with our read is caught next time.
+        let stamp = Self::file_stamp(&registry_path);
         if Path::new(&registry_path).exists() {
             let mut map = HashMap::new();
             Self::load_section(&mut map, &registry_path)?;
@@ -69,7 +78,33 @@ impl Database {
                 self.accounts_config = reg_rec;
             }
         }
+        self.registry_stamp = Some(stamp);
         Ok(())
+    }
+
+    /// Re-reads `accounts.reg` when it was modified by another process, so accounts
+    /// created or deleted elsewhere are visible without restarting.
+    pub fn refresh_account_registry(&mut self) -> io::Result<()> {
+        let registry_path = format!("{}/accounts.reg", self.storage_dir);
+        let stamp = Self::file_stamp(&registry_path);
+        if self.registry_stamp == Some(stamp) {
+            return Ok(());
+        }
+        self.load_account_registry()
+    }
+
+    /// Reloads the client authorization map when `SYSTEM/$CLIENTS` changed on disk,
+    /// so authorizations and revocations made by another process take effect.
+    pub fn refresh_clients_if_stale(&mut self) -> io::Result<()> {
+        let _ = self.refresh_account_registry();
+        if self.get_account_dir("SYSTEM").is_none() {
+            return Ok(());
+        }
+        let stamp = self.disk_stamp("SYSTEM", "$CLIENTS");
+        if self.clients_stamp == Some(stamp) {
+            return Ok(());
+        }
+        self.run_in_system_account(|db| db.load_clients_from_table())
     }
 
     fn ensure_system_account(&mut self) -> io::Result<()> {
@@ -247,6 +282,8 @@ impl Database {
     }
 
     pub fn load_clients_from_table(&mut self) -> io::Result<()> {
+        // Stamp before reading, so a concurrent write is detected on the next check.
+        let stamp = self.disk_stamp("SYSTEM", "$CLIENTS");
         let table = self.get_table_mut("$CLIENTS")?;
         let mut clients = Vec::new();
         for record in table.records.values() {
@@ -274,6 +311,7 @@ impl Database {
                 });
             }
         }
+        self.clients_stamp = Some(stamp);
         self.authorized_clients.clear();
         self.authorized_certs.clear();
         for info in clients {
@@ -313,6 +351,9 @@ impl Database {
     }
 
     pub fn logto(&mut self, account_name: &str) -> io::Result<()> {
+        if self.get_account_dir(account_name).is_none() {
+            let _ = self.refresh_account_registry();
+        }
         let _account_dir = self.get_account_dir(account_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", account_name)))?;
 
@@ -325,12 +366,30 @@ impl Database {
     }
 
     fn ensure_available_tables(&mut self, account_name: &str) -> io::Result<()> {
-        if self.available_tables.contains_key(account_name) {
+        if self.get_account_dir(account_name).is_none() {
+            let _ = self.refresh_account_registry();
+        }
+        let account_dir = self.get_account_dir(account_name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", account_name)))?;
+
+        // Re-scan whenever the account directory changed on disk, so tables created
+        // by another process (e.g. the server while a local CLI is attached) are visible.
+        let dir_stamp = Self::dir_modified(&account_dir);
+        if self.available_tables.contains_key(account_name)
+            && self.available_stamps.get(account_name) == Some(&dir_stamp) {
             return Ok(());
         }
 
+        self.scan_available_tables(account_name)
+    }
+
+    /// Unconditionally re-reads the account directory. Used when the cached listing
+    /// does not contain a requested table, because directory mtime resolution is
+    /// coarse on some filesystems and may hide a freshly created table.
+    fn scan_available_tables(&mut self, account_name: &str) -> io::Result<()> {
         let account_dir = self.get_account_dir(account_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", account_name)))?;
+        let dir_stamp = Self::dir_modified(&account_dir);
 
         let mut tables = HashSet::new();
         if let Ok(entries) = fs::read_dir(&account_dir) {
@@ -343,10 +402,49 @@ impl Database {
             }
         }
         self.available_tables.insert(account_name.to_string(), tables);
+        self.available_stamps.insert(account_name.to_string(), dir_stamp);
         Ok(())
     }
 
+    fn dir_modified(path: &str) -> Option<SystemTime> {
+        fs::metadata(path).ok().and_then(|m| m.modified().ok())
+    }
+
+    fn file_stamp(path: &str) -> (Option<SystemTime>, u64) {
+        match fs::metadata(path) {
+            Ok(m) => (m.modified().ok(), m.len()),
+            Err(_) => (None, 0),
+        }
+    }
+
+    fn disk_stamp(&self, account: &str, name: &str) -> TableStamp {
+        let storage = self.account_storage_dir(account);
+        let (data_modified, data_len) = Self::file_stamp(&format!("{}/{}/data", storage, name));
+        let (dict_modified, dict_len) = Self::file_stamp(&format!("{}/{}/dict", storage, name));
+        TableStamp { data_modified, data_len, dict_modified, dict_len }
+    }
+
+    /// Drops a cached table whose backing files were modified by another process,
+    /// forcing a fresh read on the next access. Locally modified (dirty) tables are
+    /// kept untouched so that pending changes are never silently discarded.
+    fn invalidate_if_stale(&mut self, account: &str, name: &str) {
+        let key = (account.to_string(), name.to_string());
+        let stale = match self.loaded_tables.get(&key) {
+            Some(table) if !table.dirty => table.stamp != Some(self.disk_stamp(account, name)),
+            _ => false,
+        };
+        if stale {
+            self.loaded_tables.remove(&key);
+            if let Some(pos) = self.lru_order.iter().position(|x| x == &key) {
+                self.lru_order.remove(pos);
+            }
+        }
+    }
+
     pub fn create_account(&mut self, name: &str, directory: Option<&str>) -> io::Result<()> {
+        // Pick up accounts registered by another process, otherwise persisting our own
+        // snapshot of the registry would erase them.
+        let _ = self.refresh_account_registry();
         if self.get_account_dir(name).is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("Account '{}' already exists", name)));
         }
@@ -393,10 +491,13 @@ impl Database {
         Ok(())
     }
 
-    fn persist_account_registry(&self) -> io::Result<()> {
+    fn persist_account_registry(&mut self) -> io::Result<()> {
         let mut map = HashMap::new();
         map.insert("registry".to_string(), self.accounts_config.clone());
-        Self::save_section(&map, &format!("{}/accounts.reg", self.storage_dir))
+        let path = format!("{}/accounts.reg", self.storage_dir);
+        Self::save_section(&map, &path)?;
+        self.registry_stamp = Some(Self::file_stamp(&path));
+        Ok(())
     }
 
     pub fn delete_account(&mut self, name: &str) -> io::Result<()> {
@@ -404,6 +505,7 @@ impl Database {
             return Err(io::Error::new(io::ErrorKind::Other, "Cannot delete SYSTEM account"));
         }
 
+        let _ = self.refresh_account_registry();
         let dir = self.get_account_dir(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", name)))?;
 
@@ -443,6 +545,7 @@ impl Database {
             }
         }
         self.available_tables.remove(name);
+        self.available_stamps.remove(name);
 
         if self.current_account == name {
             self.current_account = String::new();
@@ -476,6 +579,12 @@ impl Database {
     }
 
     pub fn get_table_for_account(&mut self, account: &str, name: &str) -> Option<&Table> {
+        self.ensure_available_tables(account).ok()?;
+        if !self.available_tables.get(account).map(|s| s.contains(name)).unwrap_or(false) {
+            // Might have been created by another process since the last scan.
+            self.scan_available_tables(account).ok()?;
+        }
+
         // Strict validation: name must be in available_tables for this account
         let available = self.available_tables.get(account)?;
         if !available.contains(name) {
@@ -485,6 +594,8 @@ impl Database {
         // Use the validated name from available_tables
         let validated_name = available.get(name)?.clone();
         let name_str = validated_name;
+
+        self.invalidate_if_stale(account, &name_str);
 
         let key = (account.to_string(), name_str.clone());
         if !self.loaded_tables.contains_key(&key) {
@@ -518,6 +629,10 @@ impl Database {
 
     pub fn get_table_mut_for_account(&mut self, account: &str, name: &str) -> io::Result<&mut Table> {
         self.ensure_available_tables(account)?;
+        if !self.available_tables.get(account).map(|s| s.contains(name)).unwrap_or(false) {
+            // Might have been created by another process since the last scan.
+            self.scan_available_tables(account)?;
+        }
         let available = self.available_tables.get_mut(account).unwrap();
 
         // Strict validation: name must be in available_tables
@@ -528,6 +643,8 @@ impl Database {
         // Use the validated name from available_tables
         let validated_name = available.get(name).unwrap().clone();
         let name_str = validated_name;
+
+        self.invalidate_if_stale(account, &name_str);
 
         let key = (account.to_string(), name_str.clone());
         if !self.loaded_tables.contains_key(&key) {
@@ -568,6 +685,9 @@ impl Database {
     fn load_table_for_account(&self, account: &str, name: &str) -> io::Result<Table> {
         let storage = self.account_storage_dir(account);
         let mut table = Table::new();
+        // Take the stamp before reading: if the files change while we read them, the
+        // stamp will no longer match and the table is reloaded on the next access.
+        table.stamp = Some(self.disk_stamp(account, name));
         Self::load_section(&mut table.records, &format!("{}/{}/data", storage, name))?;
         Self::load_section(&mut table.dictionary, &format!("{}/{}/dict", storage, name))?;
         Ok(table)
@@ -593,16 +713,23 @@ impl Database {
         let keys: Vec<(String, String)> = self.loaded_tables.keys().cloned().collect();
         let mut clients_updated = false;
         for (account, name) in keys {
-            if account == "SYSTEM" && name == "$CLIENTS" {
-                if let Some(t) = self.loaded_tables.get(&(account.clone(), name.clone())) {
-                    if t.dirty {
-                        clients_updated = true;
-                    }
-                }
+            let was_dirty = self.loaded_tables.get(&(account.clone(), name.clone()))
+                .map(|t| t.dirty)
+                .unwrap_or(false);
+            if account == "SYSTEM" && name == "$CLIENTS" && was_dirty {
+                clients_updated = true;
+            }
+            if !was_dirty {
+                // Never refresh the stamp of a table we did not write: doing so would
+                // mark a snapshot that is already stale on disk as up to date and the
+                // freshness check would stop reloading it.
+                continue;
             }
             self.save_table_for_account(&account, &name)?;
+            let stamp = self.disk_stamp(&account, &name);
             if let Some(t) = self.loaded_tables.get_mut(&(account, name)) {
                 t.dirty = false;
+                t.stamp = Some(stamp);
             }
         }
         if clients_updated {
@@ -670,16 +797,20 @@ impl Database {
         Ok(())
     }
 
-    pub fn list_tables(&self) -> Vec<String> {
-        let mut tables: Vec<_> = self.available_tables.get(&self.current_account)
+    pub fn list_tables(&mut self) -> Vec<String> {
+        let account = self.current_account.clone();
+        let _ = self.ensure_available_tables(&account);
+        let mut tables: Vec<_> = self.available_tables.get(&account)
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default();
         tables.sort();
         tables
     }
 
-    pub fn is_table_available(&self, name: &str) -> bool {
-        self.available_tables.get(&self.current_account)
+    pub fn is_table_available(&mut self, name: &str) -> bool {
+        let account = self.current_account.clone();
+        let _ = self.ensure_available_tables(&account);
+        self.available_tables.get(&account)
             .map(|s| s.contains(name))
             .unwrap_or(false)
     }
