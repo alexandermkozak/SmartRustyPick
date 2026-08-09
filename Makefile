@@ -1,4 +1,7 @@
-.PHONY: test-unit test-integration test-performance test-all build run run-cli run-server
+.PHONY: test-unit test-integration test-performance test-all build run run-cli run-server container-build container-up container-down container-logs container-cli
+
+CONTAINER_ENGINE ?= podman
+IMAGE ?= localhost/smart-rusty-pick:latest
 
 build:
 	cargo build
@@ -37,3 +40,18 @@ mcp-setup:
 
 mcp-run:
 	python3 mcp/server.py
+
+container-build:
+	$(CONTAINER_ENGINE) build -f Containerfile -t $(IMAGE) .
+
+container-up:
+	$(CONTAINER_ENGINE) compose up -d
+
+container-down:
+	$(CONTAINER_ENGINE) compose down
+
+container-logs:
+	$(CONTAINER_ENGINE) compose logs -f
+
+container-cli:
+	$(CONTAINER_ENGINE) exec -it smart-rusty-pick smart-rusty-pick-cli

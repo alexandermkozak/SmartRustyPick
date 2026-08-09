@@ -1,0 +1,27 @@
+# Compose file for SmartRustyPick.
+#
+#   podman compose up -d   (or: podman-compose up -d)
+#   docker compose up -d
+#
+services:
+  smart-rusty-pick:
+    image: localhost/smart-rusty-pick:latest
+    build:
+      context: .
+      dockerfile: Containerfile
+    container_name: smart-rusty-pick
+    restart: unless-stopped
+    environment:
+      # Only used when seeding a brand new /data/config.toml.
+      SRP_SERVER_ADDR: "0.0.0.0"
+      SRP_SERVER_PORT: "8443"
+    ports:
+      - "8443:8443"
+    volumes:
+      # Holds config.toml, the generated certificates and db_storage/.
+      # To use a host directory instead, replace this with e.g.
+      #   - ./data:/data:z      (the :z suffix is required on SELinux hosts)
+      - srp-data:/data
+
+volumes:
+  srp-data:
