@@ -1,6 +1,7 @@
 target/
 db_storage/
 custom_path/
+.local/
 .git/
 .idea/
 .junie/
@@ -9,12 +10,4 @@ mcp/
 test/
 scripts/
 *.md
-*.crt
-*.key
-*.csr
-*.pfx
-*.srl
-*.ext
 config.toml
-check_logs.txt
-last_key.txt

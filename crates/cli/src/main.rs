@@ -252,7 +252,7 @@ fn main() -> io::Result<()> {
             "GENERATE.CERT" => {
                 let mut db_lock = db.lock().unwrap();
                 if db_lock.current_account == "SYSTEM" {
-                    handle_generate_cert(&mut db_lock, &parts);
+                    handle_generate_cert(&mut db_lock, &parts, &config);
                 } else {
                     println!("Unknown command: {}", command);
                 }
@@ -1222,7 +1222,7 @@ fn handle_list_conns(db: &mut Database) {
     });
 }
 
-fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
+fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
     if parts.len() < 2 {
         println!("Usage: GENERATE.CERT <common_name>");
         return;
@@ -1234,11 +1234,30 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
         println!("Error: Invalid common_name. Must not start with '-' or contain path separators.");
         return;
     }
-    let key_file = format!("{}.key", cn);
-    let csr_file = format!("{}.csr", cn);
-    let crt_file = format!("{}.crt", cn);
-    let pfx_file = format!("{}.pfx", cn);
-    let ext_file = format!("{}.ext", cn);
+
+    // Client certificates are written next to the CA that signs them, so they follow
+    // `ca_path` out of the working directory instead of littering it.
+    let ca_file = config.ca_path.clone().unwrap_or_else(|| "ca.crt".to_string());
+    let ca_key_file = {
+        let mut path = std::path::PathBuf::from(&ca_file);
+        path.set_extension("key");
+        path.to_string_lossy().into_owned()
+    };
+    let out_dir = std::path::Path::new(&ca_file)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        println!("Error creating certificate directory: {}", e);
+        return;
+    }
+    let out = |extension: &str| out_dir.join(format!("{}.{}", cn, extension)).to_string_lossy().into_owned();
+    let key_file = out("key");
+    let csr_file = out("csr");
+    let crt_file = out("crt");
+    let pfx_file = out("pfx");
+    let ext_file = out("ext");
 
     // 1. Generate RSA key
     let status = std::process::Command::new("openssl")
@@ -1272,14 +1291,13 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
         return;
     }
 
-    // 4. Sign CSR with system CA
-    // Assuming ca.crt and ca.key are in the root directory (as seen in the project root)
+    // 4. Sign CSR with the CA the server itself uses (`ca_path` in config.toml).
     let status = std::process::Command::new("openssl")
         .args(&[
             "x509", "-req",
             "-in", &csr_file,
-            "-CA", "ca.crt",
-            "-CAkey", "ca.key",
+            "-CA", &ca_file,
+            "-CAkey", &ca_key_file,
             "-CAcreateserial",
             "-out", &crt_file,
             "-days", "365",
@@ -1289,9 +1307,10 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str]) {
         .status();
 
     let _ = std::fs::remove_file(&ext_file);
+    let _ = std::fs::remove_file(&csr_file);
 
     if status.is_err() || !status.unwrap().success() {
-        println!("Error signing certificate. Ensure ca.crt and ca.key are in the project root.");
+        println!("Error signing certificate. Ensure {} and {} exist.", ca_file, ca_key_file);
         return;
     }
 

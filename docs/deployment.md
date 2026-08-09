@@ -3,11 +3,15 @@
 SmartRustyPick ships with a container definition that runs the headless server (`smart-rusty-pick-server`). It is
 written to the OCI/Dockerfile format, so the exact same build works with **podman** and **docker**.
 
+There is only one build definition. `Containerfile` holds it; `Dockerfile` and `.dockerignore` are symlinks to
+`Containerfile` and `.containerignore`, so docker finds them under the names it looks for and there is nothing to keep
+in sync by hand. Edit `Containerfile` and `.containerignore`.
+
 | File                                 | Purpose                                                                                   |
 |--------------------------------------|-------------------------------------------------------------------------------------------|
-| `Containerfile`                      | Multi-stage build (Rust builder + slim Debian runtime).                                   |
-| `Dockerfile`                         | Symlink to `Containerfile` for docker's default lookup.                                   |
-| `.containerignore` / `.dockerignore` | Keeps `target/`, local certificates and the local `db_storage/` out of the build context. |
+| `Containerfile`                      | Multi-stage build (Rust builder + slim Debian runtime). The single source of truth.       |
+| `Dockerfile`                         | Symlink to `Containerfile` for docker's default lookup. Never edit it directly.           |
+| `.containerignore` / `.dockerignore` | Same arrangement: `.dockerignore` is a symlink to `.containerignore`.                     |
 | `compose.yaml`                       | Single-service compose stack with a persistent data volume.                               |
 | `deploy/entrypoint.sh`               | Seeds `/data/config.toml` on first start, then runs the server.                           |
 | `deploy/config.toml`                 | Default config baked into the image (binds to `0.0.0.0:8443`).                            |

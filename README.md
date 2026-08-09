@@ -71,9 +71,10 @@ Currently supported settings:
 - `editor`: The command to launch for the `EDIT` command (default: `nano`).
 - `server_port`: The default port for the SSL server (default: 8443).
 - `server_addr`: The address the server should bind to (default: `127.0.0.1`).
-- `cert_path`: Path to the server SSL certificate.
-- `key_path`: Path to the server SSL private key.
-- `ca_path`: Path to the CA certificate for client authentication.
+- `cert_path`: Path to the server SSL certificate (default: `.local/certs/server.crt`).
+- `key_path`: Path to the server SSL private key (default: `.local/certs/server.key`).
+- `ca_path`: Path to the CA certificate for client authentication (default: `.local/certs/ca.crt`). The CA private key
+  is kept next to it as `ca.key`, and `GENERATE.CERT` writes new client certificates into the same directory.
 - `records_per_group`: Target records per hashfile group (default: 16).
 - `durable_writes`: Flush every write before acknowledging it (default: false). Individual files can opt in without this
   global switch: `CREATE.FILE <name> DURABLE` (see
@@ -82,7 +83,11 @@ Currently supported settings:
 - `flush_max_pending`: Flush once this many writes are pending (default: 256).
 
 If SSL certificate paths are provided in `config.toml`, the database service will automatically start in the background
-when the CLI is launched.
+when the CLI is launched. Missing certificates are generated on first start.
+
+Everything a local run produces stays out of the repository: `.local/` holds machine-local scratch (certificates and
+keys), `target/test-results/` holds generated test reports and metrics, and `db_storage/` holds the local database.
+All three are gitignored, so `make test-all` leaves `git status` clean.
 
 ## Quick Start
 

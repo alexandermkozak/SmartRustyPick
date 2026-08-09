@@ -3,6 +3,10 @@
 CONTAINER_ENGINE ?= podman
 IMAGE ?= localhost/smart-rusty-pick:latest
 PYTHON ?= python3
+# Every generated report lands here, never in the repository root. It sits inside the
+# already ignored `target/`, so a test run leaves the working copy clean.
+RESULTS_DIR ?= $(if $(SRP_RESULTS_DIR),$(SRP_RESULTS_DIR),target/test-results)
+export SRP_RESULTS_DIR := $(RESULTS_DIR)
 # Baseline file for `make perf-compare`, produced by an earlier `make test-performance`.
 BASE ?= baseline_metrics.json
 
@@ -24,7 +28,7 @@ test-unit:
 # working copy's db_storage/config.toml and can be run individually.
 test-integration: build
 	@echo "Running integration tests..."
-	@rm -f integration_results.md
+	@rm -f $(RESULTS_DIR)/integration_results.md
 	$(PYTHON) test/integration/test_server.py
 	$(PYTHON) test/integration/test_headless.py
 	$(PYTHON) test/integration/test_security.py
@@ -32,7 +36,7 @@ test-integration: build
 
 test-performance: build
 	@echo "Running performance tests..."
-	@rm -f performance_results.md performance_metrics.json
+	@rm -f $(RESULTS_DIR)/performance_results.md $(RESULTS_DIR)/performance_metrics.json
 	$(PYTHON) test/performance/test_load.py
 	$(PYTHON) test/performance/test_concurrency.py
 
@@ -51,13 +55,13 @@ bench-smoke:
 
 # Diff the metrics of two performance runs on the same machine.
 perf-compare:
-	$(PYTHON) scripts/compare_perf.py $(BASE) performance_metrics.json
+	$(PYTHON) scripts/compare_perf.py $(BASE) $(RESULTS_DIR)/performance_metrics.json
 
 profile:
 	./scripts/profile.sh $(FILTER)
 
 test-coverage:
-	cargo llvm-cov --workspace --lcov --output-path lcov.info
+	cargo llvm-cov --workspace --lcov --output-path $(RESULTS_DIR)/lcov.info
 
 test-coverage-html:
 	cargo llvm-cov --workspace --html

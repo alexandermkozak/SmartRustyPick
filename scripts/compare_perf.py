@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Compare two `performance_metrics.json` files and report regressions.
 
-The performance suites write every measurement to `performance_metrics.json`. Absolute
-numbers are only comparable within one machine, so the intended use is: run the suites
-on the base revision, keep the file, run them again on the change, and diff the two.
+The performance suites write every measurement to `target/test-results/performance_metrics.json`.
+Absolute numbers are only comparable within one machine, so the intended use is: run the
+suites on the base revision, keep the file, run them again on the change, and diff the two.
 
-    make test-performance && cp performance_metrics.json /tmp/base.json
+    make test-performance && cp target/test-results/performance_metrics.json /tmp/base.json
     git switch my-change && make test-performance
-    python3 scripts/compare_perf.py /tmp/base.json performance_metrics.json
+    python3 scripts/compare_perf.py /tmp/base.json target/test-results/performance_metrics.json
 
 Exits non-zero when any metric regressed by more than the tolerance, so it can be used
 as a gate in a pipeline that controls both runs.

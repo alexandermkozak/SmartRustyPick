@@ -33,8 +33,9 @@ The suites live in `test/` and share `test/harness.py`:
 - **Fixtures.** State is built by driving the actual CLI commands rather than by writing storage files by hand, so the
   suites do not depend on the on-disk byte layout.
 - **Reporting.** A failing check does not abort the suite; every check is recorded and the process exits non-zero at the
-  end. Results are written to `integration_results.md` and `performance_results.md` in the repository root, machine
-  readable measurements to `performance_metrics.json`, and all three are uploaded as CI artifacts.
+  end. Results are written to `target/test-results/`: `integration_results.md`, `performance_results.md` and the
+  machine readable `performance_metrics.json`. The whole directory is gitignored and uploaded as a CI artifact, so a
+  test run never dirties the working copy. Override the location with `SRP_RESULTS_DIR` (or `make RESULTS_DIR=...`).
 - **Measurement.** `harness.benchmark` times repeated operations into a `Stats` object (percentiles, throughput) and
   `harness.ResourceMonitor` samples the server's RSS and CPU time from `/proc` while a suite runs.
 
@@ -58,11 +59,12 @@ Each measurement is guarded in up to three ways, in increasing order of trustwor
 3. **Ratios.** How cost grows with data size or client count. These are host independent and are what actually catches
    an accidental O (n²), so they are the tightest checks in the suite.
 
-Every measurement is also written to `performance_metrics.json` (gitignored, uploaded as a CI artifact). To check a
-change for regressions, run the suite on both revisions on the same machine and diff the two files:
+Every measurement is also written to `target/test-results/performance_metrics.json` (gitignored, uploaded as a CI
+artifact). To check a change for regressions, run the suite on both revisions on the same machine and diff the two
+files:
 
 ```
-make test-performance && cp performance_metrics.json /tmp/base.json
+make test-performance && cp target/test-results/performance_metrics.json /tmp/base.json
 # ... apply your change ...
 make test-performance
 make perf-compare BASE=/tmp/base.json
