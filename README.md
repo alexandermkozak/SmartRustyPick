@@ -19,7 +19,8 @@ if the solutions implemented are necessarily correct or efficient down to the li
 With its natural support for safety and embedded unit testing, Rust seemed like the perfect choice for the project.
 
 For development I am using Jetbrains RustRover with their Junie agent. So far, the primary model used has been the
-default in Junie, Gemini 3 Flash.
+default in Junie, Gemini 3 Flash. **Note** as of 08/07/2026 - my primary model has been Claude Opus 5 (Got some free
+credits when Junie left beta). As expected, output has significantly improved compared to Gemini 3 Flash.
 
 I am taking a deliberately naive approach to development, doing little to no research on exactly how data is managed or
 stored
