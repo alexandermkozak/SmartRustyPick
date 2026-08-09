@@ -226,6 +226,15 @@ impl Database {
         if let (Ok(lf), Ok(rf)) = (l.parse::<f64>(), r.parse::<f64>()) {
             return lf.partial_cmp(&rf).unwrap_or(std::cmp::Ordering::Equal);
         }
+        // Text comparison is case-insensitive so that "Ztest" and "ztest" sort together instead of
+        // all uppercase values coming before all lowercase ones. Ties fall back to the raw byte
+        // comparison to keep the ordering deterministic.
+        let ci = l.chars()
+            .flat_map(char::to_lowercase)
+            .cmp(r.chars().flat_map(char::to_lowercase));
+        if ci != std::cmp::Ordering::Equal {
+            return ci;
+        }
         l.cmp(r)
     }
 

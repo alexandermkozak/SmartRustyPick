@@ -500,7 +500,10 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
                 selected_keys
             } else {
                 let mut k: Vec<_> = map.keys().cloned().collect();
-                k.sort();
+                // `sort_keys` falls back to the ID, so only sort here when it is not called.
+                if sort_specs.is_empty() {
+                    k.sort();
+                }
                 k
             };
             (keys, is_dict)

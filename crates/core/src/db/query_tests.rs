@@ -383,6 +383,29 @@ fn test_sort_results_multiple_keys() {
 }
 
 #[test]
+fn test_sort_text_is_case_insensitive() {
+    let test_dir = "test_sort_case";
+    let mut db = setup_sort_db(test_dir);
+    {
+        let table = db.get_table_mut("PRODUCTS").unwrap();
+        table.records.insert("P5".to_string(), Record::from_display_string("Ztest^2^2024-06-01"));
+        table.records.insert("P10".to_string(), Record::from_display_string("test!^2^2024-06-01"));
+    }
+
+    let (_, specs) = Database::parse_sort_specs(&["BY", "DESC"]);
+    let keys = vec!["P5".to_string(), "P10".to_string()];
+    let sorted = db.sort_keys("PRODUCTS", false, keys, &specs);
+    // "test!" sorts before "Ztest" once case is ignored.
+    assert_eq!(sorted, vec!["P10", "P5"]);
+
+    // Values differing only in case are adjacent and keep a deterministic order.
+    assert_eq!(Database::compare_sort_values("apple", "APPLE"), std::cmp::Ordering::Greater);
+    assert_eq!(Database::compare_sort_values("Banana", "apple"), std::cmp::Ordering::Greater);
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+#[test]
 fn test_sort_keys_and_unknown_field() {
     let test_dir = "test_sort_keys";
     let mut db = setup_sort_db(test_dir);
