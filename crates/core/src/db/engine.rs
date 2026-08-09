@@ -1,9 +1,10 @@
+use crate::db::hashfile::{self, SectionMeta};
 use crate::db::models::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 pub struct Database {
     pub storage_dir: String,
@@ -23,6 +24,21 @@ pub struct Database {
     pub clients_stamp: Option<TableStamp>,
     pub log_detail: String,
     pub max_log_records: usize,
+    /// Records each group aims to hold; drives the dynamic modulus.
+    pub records_per_group: usize,
+    /// When true every write is flushed immediately, trading throughput for
+    /// the guarantee that an acknowledged write survives a crash.
+    pub durable_writes: bool,
+    /// Longest a change may sit in memory before the next flush picks it up.
+    pub flush_interval: Duration,
+    /// Flush once this many writes have accumulated, so a burst is batched but
+    /// never grows without bound.
+    pub flush_max_pending: usize,
+    pending_writes: usize,
+    last_flush: Instant,
+    /// Per-file durability flags read from the DIR file, cached so the write
+    /// path does not touch the filesystem on every request.
+    durable_tables: HashMap<(String, String), bool>,
 }
 
 impl Database {
@@ -46,6 +62,15 @@ impl Database {
             clients_stamp: None,
             log_detail: config.log_detail.unwrap_or_else(|| "normal".to_string()),
             max_log_records: config.max_log_records.unwrap_or(100),
+            records_per_group: config.records_per_group
+                .filter(|n| *n > 0)
+                .unwrap_or(hashfile::DEFAULT_RECORDS_PER_GROUP),
+            durable_writes: config.durable_writes.unwrap_or(false),
+            flush_interval: Duration::from_millis(config.flush_interval_ms.unwrap_or(250)),
+            flush_max_pending: config.flush_max_pending.unwrap_or(256).max(1),
+            pending_writes: 0,
+            last_flush: Instant::now(),
+            durable_tables: HashMap::new(),
         };
 
         if !Path::new(&db.storage_dir).exists() {
@@ -158,7 +183,7 @@ impl Database {
             record.fields[SYS_ACCOUNTS_PATH_IDX].values.push(Value { sub_values: vec![dir] });
             accounts_table.records.insert(name, record);
         }
-        accounts_table.dirty = true;
+        accounts_table.touch_all();
         Ok(())
     }
 
@@ -188,8 +213,7 @@ impl Database {
                                     }
                                     rec.fields[SYS_CLIENTS_THUMBPRINT_IDX].values.push(Value { sub_values: vec![tp_lower] });
                                     rec.fields[SYS_CLIENTS_ADMIN_IDX].values.push(Value { sub_values: vec!["Y".to_string()] });
-                                    table.records.insert(format!("migrated_{}", &sv[..8]), rec);
-                                    table.dirty = true;
+                                    table.insert_record(&format!("migrated_{}", &sv[..8]), rec);
                                 }
                             }
                         }
@@ -272,11 +296,15 @@ impl Database {
                     table.dictionary.insert("TYPE".to_string(), Record::from_display_string("1^TYPE^L^1"));
                     updated = true;
                 }
+                if !table.dictionary.contains_key("DURABLE") {
+                    table.dictionary.insert("DURABLE".to_string(), Record::from_display_string("2^DURABLE^L^7"));
+                    updated = true;
+                }
             }
             _ => {}
         }
         if updated {
-            table.dirty = true;
+            table.mark_dict_dirty();
         }
         Ok(updated)
     }
@@ -419,7 +447,17 @@ impl Database {
 
     fn disk_stamp(&self, account: &str, name: &str) -> TableStamp {
         let storage = self.account_storage_dir(account);
-        let (data_modified, data_len) = Self::file_stamp(&format!("{}/{}/data", storage, name));
+        let data_path = format!("{}/{}/data", storage, name);
+        // A hashed section spreads its records over many files, so its identity
+        // is the meta file: its flush counter changes on every write, which is
+        // a stronger signal than a timestamp whose resolution may be coarse.
+        let (data_modified, data_len) = match hashfile::read_meta(&data_path) {
+            Some(meta) => (
+                Self::file_stamp(hashfile::section_dir(&data_path).join("meta").to_str().unwrap_or_default()).0,
+                meta.version,
+            ),
+            None => Self::file_stamp(&data_path),
+        };
         let (dict_modified, dict_len) = Self::file_stamp(&format!("{}/{}/dict", storage, name));
         TableStamp { data_modified, data_len, dict_modified, dict_len }
     }
@@ -430,7 +468,7 @@ impl Database {
     fn invalidate_if_stale(&mut self, account: &str, name: &str) {
         let key = (account.to_string(), name.to_string());
         let stale = match self.loaded_tables.get(&key) {
-            Some(table) if !table.dirty => table.stamp != Some(self.disk_stamp(account, name)),
+            Some(table) if !table.is_dirty() => table.stamp != Some(self.disk_stamp(account, name)),
             _ => false,
         };
         if stale {
@@ -476,8 +514,7 @@ impl Database {
                     record.fields.push(Field::default());
                 }
                 record.fields[SYS_ACCOUNTS_PATH_IDX].values.push(Value { sub_values: vec![dir] });
-                accounts_table.records.insert(name.to_string(), record);
-                accounts_table.dirty = true;
+                accounts_table.insert_record(name, record);
                 db.save()?;
             }
             Ok(())
@@ -525,8 +562,7 @@ impl Database {
         // Remove from $ACCOUNTS table
         self.run_in_system_account(|db| {
             let table = db.get_table_mut("$ACCOUNTS")?;
-            table.records.remove(name);
-            table.dirty = true;
+            table.remove_record(name);
             db.save()
         })?;
 
@@ -656,9 +692,10 @@ impl Database {
                     if !Path::new(&table_dir).exists() {
                         fs::create_dir_all(&table_dir)?;
                     }
-                    File::create(format!("{}/data", table_dir))?;
+                    let mut table = Table::new();
+                    table.data_meta = Self::init_data_section(&table_dir, self.records_per_group)?;
                     File::create(format!("{}/dict", table_dir))?;
-                    Table::new()
+                    table
                 }
                 Err(e) => return Err(e),
             };
@@ -684,37 +721,85 @@ impl Database {
 
     fn load_table_for_account(&self, account: &str, name: &str) -> io::Result<Table> {
         let storage = self.account_storage_dir(account);
+        let data_path = format!("{}/{}/data", storage, name);
         let mut table = Table::new();
         // Take the stamp before reading: if the files change while we read them, the
         // stamp will no longer match and the table is reloaded on the next access.
         table.stamp = Some(self.disk_stamp(account, name));
-        Self::load_section(&mut table.records, &format!("{}/{}/data", storage, name))?;
+        if hashfile::is_hashfile(&data_path) {
+            table.data_meta = hashfile::load(&data_path, &mut table.records)?;
+        } else {
+            // Pre-hashfile database: read the flat file and remember to convert
+            // it on the first flush, so upgrading needs no migration step.
+            Self::load_section(&mut table.records, &data_path)?;
+            table.legacy_data = !table.records.is_empty() || Path::new(&data_path).exists();
+        }
         Self::load_section(&mut table.dictionary, &format!("{}/{}/dict", storage, name))?;
         Ok(table)
     }
 
 
-    fn save_table_for_account(&self, account: &str, name: &str) -> io::Result<()> {
-        if let Some(table) = self.loaded_tables.get(&(account.to_string(), name.to_string())) {
-            if table.dirty {
-                let storage = self.account_storage_dir(account);
-                Self::save_section(&table.records, &format!("{}/{}/data", storage, name))?;
-                Self::save_section(&table.dictionary, &format!("{}/{}/dict", storage, name))?;
+    /// Writes the pending changes of one table and clears its dirty state.
+    ///
+    /// Only the groups holding changed keys are rewritten, unless the table was
+    /// edited in bulk, is still in the legacy flat format, or the modulus has
+    /// to change - all of which need a full rewrite anyway.
+    fn save_table_for_account(&mut self, account: &str, name: &str) -> io::Result<()> {
+        let key = (account.to_string(), name.to_string());
+        let storage = self.account_storage_dir(account);
+        let per_group = self.records_per_group;
+        let data_path = format!("{}/{}/data", storage, name);
+        let dict_path = format!("{}/{}/dict", storage, name);
+
+        let table = match self.loaded_tables.get_mut(&key) {
+            Some(table) if table.is_dirty() => table,
+            _ => return Ok(()),
+        };
+
+        if table.records_dirty() {
+            let incremental = if table.dirty_all || table.legacy_data {
+                None
+            } else {
+                Some(&table.dirty_keys)
+            };
+            table.data_meta = hashfile::save(&data_path, &table.records, table.data_meta, incremental, per_group)?;
+            if table.legacy_data {
+                let _ = fs::remove_file(&data_path);
+                table.legacy_data = false;
             }
         }
+        if table.dict_dirty {
+            Self::save_section(&table.dictionary, &dict_path)?;
+        }
+        table.clear_dirty();
         Ok(())
+    }
+
+    /// Creates an empty hashed record section for a brand new table. Existing
+    /// sections are left untouched, so re-creating a table cannot wipe it.
+    fn init_data_section(table_dir: &str, per_group: usize) -> io::Result<SectionMeta> {
+        let data_path = format!("{}/data", table_dir);
+        if let Some(meta) = hashfile::read_meta(&data_path) {
+            return Ok(meta);
+        }
+        if Path::new(&data_path).exists() {
+            // A legacy flat file: leave it for the migration on first flush.
+            return Ok(SectionMeta::empty());
+        }
+        hashfile::save(&data_path, &HashMap::new(), SectionMeta::empty(), None, per_group)
     }
 
     pub fn account_storage_dir(&self, account_name: &str) -> String {
         self.get_account_dir(account_name).unwrap_or_else(|| self.storage_dir.clone())
     }
 
+    /// Writes every pending change to disk immediately.
     pub fn save(&mut self) -> io::Result<()> {
         let keys: Vec<(String, String)> = self.loaded_tables.keys().cloned().collect();
         let mut clients_updated = false;
         for (account, name) in keys {
             let was_dirty = self.loaded_tables.get(&(account.clone(), name.clone()))
-                .map(|t| t.dirty)
+                .map(|t| t.is_dirty())
                 .unwrap_or(false);
             if account == "SYSTEM" && name == "$CLIENTS" && was_dirty {
                 clients_updated = true;
@@ -728,14 +813,70 @@ impl Database {
             self.save_table_for_account(&account, &name)?;
             let stamp = self.disk_stamp(&account, &name);
             if let Some(t) = self.loaded_tables.get_mut(&(account, name)) {
-                t.dirty = false;
                 t.stamp = Some(stamp);
             }
         }
+        self.pending_writes = 0;
+        self.last_flush = Instant::now();
         if clients_updated {
             self.load_clients_from_table()?;
         }
         Ok(())
+    }
+
+    /// True while changes are held in memory and not yet on disk.
+    pub fn has_pending_writes(&self) -> bool {
+        self.loaded_tables.values().any(|t| t.is_dirty())
+    }
+
+    pub fn pending_write_count(&self) -> usize {
+        self.pending_writes
+    }
+
+    /// Records that a write happened and flushes only when the batch is full
+    /// or the flush interval has elapsed.
+    ///
+    /// This is the write path used by the server. Saving on every request meant
+    /// one disk write per record even when a client streamed thousands of them;
+    /// batching turns that into one write per group per interval. The cost is a
+    /// bounded window (`flush_interval`) in which an acknowledged write is only
+    /// in memory - set `durable_writes` to trade the throughput back for it.
+    pub fn note_write(&mut self) -> io::Result<()> {
+        if self.durable_writes {
+            return self.save();
+        }
+        self.pending_writes += 1;
+        if self.pending_writes >= self.flush_max_pending
+            || self.last_flush.elapsed() >= self.flush_interval
+        {
+            return self.save();
+        }
+        Ok(())
+    }
+
+    /// Same as [`Database::note_write`], but honours the durability flag of the
+    /// file that was written: a file marked durable in its account's DIR entry
+    /// is flushed before the write is acknowledged, even when the rest of the
+    /// database is buffering. This lets mission critical files opt out of the
+    /// in-memory window without slowing everything else down.
+    pub fn note_write_for(&mut self, account: &str, name: &str) -> io::Result<()> {
+        if self.is_table_durable_for_account(account, name) {
+            return self.save();
+        }
+        self.note_write()
+    }
+
+    /// Flushes if the interval has elapsed. Intended for a background ticker,
+    /// so an idle server still persists the tail of a burst promptly.
+    pub fn flush_if_due(&mut self) -> io::Result<bool> {
+        if self.pending_writes == 0 && !self.has_pending_writes() {
+            return Ok(false);
+        }
+        if self.last_flush.elapsed() < self.flush_interval {
+            return Ok(false);
+        }
+        self.save()?;
+        Ok(true)
     }
 
     fn load_section(map: &mut HashMap<String, Record>, path: &str) -> io::Result<()> {
@@ -828,6 +969,24 @@ impl Database {
         self.create_table_for_account(&account, name)
     }
 
+    /// Creates a file and marks it durable, so every write to it is flushed
+    /// before being acknowledged regardless of the global buffering settings.
+    pub fn create_table_durable(&mut self, name: &str, durable: bool) -> io::Result<()> {
+        let account = self.current_account.clone();
+        self.create_table_for_account_durable(&account, name, durable)
+    }
+
+    pub fn create_table_for_account_durable(&mut self, account: &str, name: &str, durable: bool) -> io::Result<()> {
+        self.create_table_for_account(account, name)?;
+        if durable {
+            // The flag lives in DIR, so an account without one gets it now
+            // rather than silently losing the requested durability.
+            self.ensure_dir_file_for_account(account)?;
+            self.set_table_durable_for_account(account, name, true)?;
+        }
+        Ok(())
+    }
+
     pub fn create_table_for_account(&mut self, account: &str, name: &str) -> io::Result<()> {
         if account.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
@@ -839,7 +998,7 @@ impl Database {
         if !Path::new(&table_dir).exists() {
             fs::create_dir_all(&table_dir)?;
         }
-        File::create(format!("{}/data", table_dir))?;
+        Self::init_data_section(&table_dir, self.records_per_group)?;
         File::create(format!("{}/dict", table_dir))?;
 
         let available = self.available_tables.get_mut(account).unwrap();
@@ -856,6 +1015,12 @@ impl Database {
         // Set default dictionary for SYSTEM files
         if account == "SYSTEM" && (name.starts_with('$') || name == "DIR") {
             let _ = self.ensure_default_dictionaries(name);
+        } else if name == "DIR" {
+            // Every account's DIR describes the same two attributes, so name them
+            // here too rather than only for SYSTEM.
+            if let Ok(dir_table) = self.get_table_mut_for_account(account, "DIR") {
+                Self::ensure_dir_dictionary(dir_table);
+            }
         }
 
         Ok(())
@@ -877,6 +1042,7 @@ impl Database {
 
         let key = (account.to_string(), name.to_string());
         self.loaded_tables.remove(&key);
+        self.durable_tables.remove(&key);
         self.available_tables.get_mut(account).unwrap().remove(name);
         if let Some(pos) = self.lru_order.iter().position(|x| x == &key) {
             self.lru_order.remove(pos);
@@ -897,18 +1063,124 @@ impl Database {
     pub fn sync_dir_file_for_account(&mut self, account: &str) -> io::Result<()> {
         let tables = self.list_tables_for_account(account);
         let dir_table = self.get_table_mut_for_account(account, "DIR")?;
+        // The listing is rebuilt from scratch, but the durability flag is not
+        // derived from the filesystem, so it has to be carried over.
+        let durable: HashMap<String, bool> = dir_table.records.iter()
+            .map(|(k, r)| (k.clone(), Self::record_is_durable(r)))
+            .collect();
         dir_table.records.clear();
         for t in tables {
             if t != "DIR" {
-                let mut rec = Record::new();
-                rec.fields.push(Field {
-                    values: vec![Value { sub_values: vec!["F".to_string()] }]
-                });
-                dir_table.records.insert(t, rec);
+                let flag = durable.get(&t).copied().unwrap_or(false);
+                dir_table.records.insert(t, Self::dir_entry(flag));
             }
         }
-        dir_table.dirty = true;
+        // The listing is rebuilt from scratch, so every group has to be rewritten.
+        dir_table.touch_all();
         Ok(())
+    }
+
+    fn dir_entry(durable: bool) -> Record {
+        let mut rec = Record::new();
+        while rec.fields.len() <= DIR_DURABLE_IDX {
+            rec.fields.push(Field::default());
+        }
+        rec.fields[DIR_TYPE_IDX].values = vec![Value { sub_values: vec!["F".to_string()] }];
+        rec.fields[DIR_DURABLE_IDX].values = vec![Value {
+            sub_values: vec![if durable { "Y".to_string() } else { String::new() }],
+        }];
+        rec
+    }
+
+    fn ensure_dir_dictionary(dir_table: &mut Table) {
+        if !dir_table.dictionary.contains_key("TYPE") {
+            dir_table.dictionary.insert("TYPE".to_string(), Record::from_display_string("1^TYPE^L^1"));
+            dir_table.mark_dict_dirty();
+        }
+        if !dir_table.dictionary.contains_key("DURABLE") {
+            dir_table.dictionary.insert("DURABLE".to_string(), Record::from_display_string("2^DURABLE^L^7"));
+            dir_table.mark_dict_dirty();
+        }
+    }
+
+    fn record_is_durable(record: &Record) -> bool {
+        record.fields.get(DIR_DURABLE_IDX)
+            .and_then(|f| f.values.get(0))
+            .and_then(|v| v.sub_values.get(0))
+            .map(|s| matches!(s.trim().to_uppercase().as_str(), "Y" | "YES" | "1" | "TRUE" | "DURABLE"))
+            .unwrap_or(false)
+    }
+
+    pub fn set_table_durable(&mut self, name: &str, durable: bool) -> io::Result<()> {
+        let account = self.current_account.clone();
+        self.set_table_durable_for_account(&account, name, durable)
+    }
+
+    /// Records the per-file durability flag in the account's DIR file. The flag
+    /// itself is metadata for mission critical files, so it is flushed at once.
+    pub fn set_table_durable_for_account(&mut self, account: &str, name: &str, durable: bool) -> io::Result<()> {
+        if account.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
+        }
+        self.ensure_available_tables(account)?;
+        if !self.available_tables.get(account).map(|s| s.contains("DIR")).unwrap_or(false) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "DIR file not found for account"));
+        }
+        let dir_table = self.get_table_mut_for_account(account, "DIR")?;
+        let mut rec = dir_table.records.get(name).cloned().unwrap_or_else(|| Self::dir_entry(false));
+        while rec.fields.len() <= DIR_DURABLE_IDX {
+            rec.fields.push(Field::default());
+        }
+        if rec.fields[DIR_TYPE_IDX].values.is_empty() {
+            rec.fields[DIR_TYPE_IDX].values = vec![Value { sub_values: vec!["F".to_string()] }];
+        }
+        rec.fields[DIR_DURABLE_IDX].values = vec![Value {
+            sub_values: vec![if durable { "Y".to_string() } else { String::new() }],
+        }];
+        dir_table.insert_record(name, rec);
+        Self::ensure_dir_dictionary(dir_table);
+        self.durable_tables.insert((account.to_string(), name.to_string()), durable);
+        self.save()
+    }
+
+    pub fn is_table_durable(&mut self, name: &str) -> bool {
+        let account = self.current_account.clone();
+        self.is_table_durable_for_account(&account, name)
+    }
+
+    /// True when this file must be flushed on every write, either because the
+    /// whole database runs in durable mode or because its DIR entry says so.
+    pub fn is_table_durable_for_account(&mut self, account: &str, name: &str) -> bool {
+        if self.durable_writes {
+            return true;
+        }
+        let key = (account.to_string(), name.to_string());
+        if let Some(flag) = self.durable_tables.get(&key) {
+            return *flag;
+        }
+        let has_dir = name != "DIR"
+            && self.ensure_available_tables(account).is_ok()
+            && self.available_tables.get(account).map(|s| s.contains("DIR")).unwrap_or(false);
+        let flag = if has_dir {
+            match self.get_table_mut_for_account(account, "DIR") {
+                Ok(dir) => dir.records.get(name).map(Self::record_is_durable).unwrap_or(false),
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        self.durable_tables.insert(key, flag);
+        flag
+    }
+
+    /// Creates the account's DIR file if it does not have one yet.
+    pub fn ensure_dir_file_for_account(&mut self, account: &str) -> io::Result<()> {
+        self.ensure_available_tables(account)?;
+        if self.available_tables.get(account).map(|s| s.contains("DIR")).unwrap_or(false) {
+            return Ok(());
+        }
+        self.create_table_for_account(account, "DIR")?;
+        self.sync_dir_file_for_account(account)
     }
 
     pub fn ensure_dir_file(&mut self) -> io::Result<bool> {
@@ -1272,7 +1544,8 @@ impl Database {
             {
                 let table = db.get_table_mut("$LOGS")?;
                 table.records.insert(key, record);
-                table.dirty = true;
+                // Trimming below removes arbitrary keys, so this is a bulk change.
+                table.touch_all();
 
                 if table.records.len() > max_records {
                     let mut keys: Vec<_> = table.records.keys().cloned().collect();
@@ -1307,8 +1580,7 @@ impl Database {
                 // Field 2: Admin flag
                 record.fields[SYS_CLIENTS_ADMIN_IDX].values.push(Value { sub_values: vec![if is_admin { "Y".to_string() } else { "".to_string() }] });
 
-                table.records.insert(name.to_string(), record);
-                table.dirty = true;
+                table.insert_record(name, record);
             }
             db.save()?;
 
@@ -1336,7 +1608,7 @@ impl Database {
 
                     if !already_exists {
                         record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.push(Value { sub_values: vec![account.to_string()] });
-                        table.dirty = true;
+                        table.mark_dirty(name);
                         success = true;
                     }
                 }
@@ -1362,7 +1634,7 @@ impl Database {
                         record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.retain(|v| v.sub_values.get(0).map(|s| s != account).unwrap_or(true));
 
                         if record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len() < original_len {
-                            table.dirty = true;
+                            table.mark_dirty(name);
                             success = true;
                         }
                     }
@@ -1381,8 +1653,7 @@ impl Database {
         self.run_in_system_account(|db| {
             let found = {
                 let table = db.get_table_mut("$CLIENTS")?;
-                if table.records.remove(name).is_some() {
-                    table.dirty = true;
+                if table.remove_record(name).is_some() {
                     true
                 } else {
                     false
@@ -1423,7 +1694,8 @@ impl Database {
             table.dictionary.insert("EMAIL".to_string(), Record::from_display_string("2^EMAIL^L^20"));
             table.records.insert("1".to_string(), Record::from_display_string("John Doe^john@example.com"));
             table.records.insert("2".to_string(), Record::from_display_string("Jane Smith^jane@example.com"));
-            table.dirty = true;
+            table.touch_all();
+            table.mark_dict_dirty();
         }
         {
             let table = self.get_table_mut("PRODUCTS")?;
@@ -1431,7 +1703,8 @@ impl Database {
             table.dictionary.insert("PRICE".to_string(), Record::from_display_string("2^PRICE^R^10^^^^MD2"));
             table.records.insert("P1".to_string(), Record::from_display_string("Laptop^120000"));
             table.records.insert("P2".to_string(), Record::from_display_string("Mouse^2500"));
-            table.dirty = true;
+            table.touch_all();
+            table.mark_dict_dirty();
         }
         self.save()?;
         if !original_account.is_empty() {

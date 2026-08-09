@@ -137,6 +137,65 @@ fn test_create_and_delete_file_target_the_requested_account() {
 }
 
 #[test]
+fn test_create_file_durable_flag_is_honoured() {
+    // A file created with `durable` must be flushed on every write even though
+    // the database as a whole buffers.
+    let base_dir = "test_server_durable_file_dir";
+    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let mut db = Database::new(base_dir, None).unwrap();
+    db.create_account("DUR_TEST", None).unwrap();
+    db.current_account = String::new();
+    db.durable_writes = false;
+    db.flush_max_pending = 1_000;
+    db.flush_interval = std::time::Duration::from_secs(3_600);
+
+    let db_arc = Arc::new(Mutex::new(db));
+    let admin = ClientInfo {
+        thumbprint: "admin_tp".to_string(),
+        allowed_accounts: Vec::new(),
+        is_admin: true,
+    };
+
+    for (file, durable) in [("LEDGER", true), ("SCRATCH", false)] {
+        let resp = handle_request(
+            Request {
+                command: "CREATE.FILE".to_string(),
+                account: Some("DUR_TEST".to_string()),
+                file: Some(file.to_string()),
+                durable: Some(durable),
+                ..Default::default()
+            },
+            &db_arc,
+            &admin,
+        );
+        assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    }
+
+    let write = |file: &str| handle_request(
+        Request {
+            command: "WRITE".to_string(),
+            account: Some("DUR_TEST".to_string()),
+            file: Some(file.to_string()),
+            key: Some("K1".to_string()),
+            data: Some(serde_json::Value::String("V1".to_string())),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+
+    assert_eq!(write("SCRATCH").status, "OK");
+    assert!(db_arc.lock().unwrap().has_pending_writes(), "a normal file should be buffered");
+
+    assert_eq!(write("LEDGER").status, "OK");
+    assert!(!db_arc.lock().unwrap().has_pending_writes(), "a durable file must flush at once");
+    assert!(db_arc.lock().unwrap().is_table_durable_for_account("DUR_TEST", "LEDGER"));
+    assert!(!db_arc.lock().unwrap().is_table_durable_for_account("DUR_TEST", "SCRATCH"));
+
+    fs::remove_dir_all(base_dir).unwrap();
+}
+
+#[test]
 fn test_handle_request_query_select() {
     let base_dir = "test_server_query_dir";
     if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }

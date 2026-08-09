@@ -44,7 +44,7 @@ mod tests {
                 logs_mut.dictionary.remove("MESSAGE");
                 // Add an override
                 logs_mut.dictionary.insert("DETAIL".to_string(), Record::from_display_string("2^OVERRIDE_DETAIL^L^10"));
-                logs_mut.dirty = true;
+                logs_mut.touch_all();
             }
             db.save()?;
         }
@@ -264,7 +264,7 @@ mod tests {
             db.create_table("T1")?;
             let t1 = db.get_table_mut("T1").unwrap();
             t1.records.insert("K1".to_string(), Record::from_bytes(b"VAL1"));
-            t1.dirty = true;
+            t1.touch_all();
             db.save()?;
 
             // Log to ACC2 and create a table with same name but different content
@@ -272,7 +272,7 @@ mod tests {
             db.create_table("T1")?;
             let t1_acc2 = db.get_table_mut("T1").unwrap();
             t1_acc2.records.insert("K1".to_string(), Record::from_bytes(b"VAL2"));
-            t1_acc2.dirty = true;
+            t1_acc2.touch_all();
             db.save()?;
         }
 
@@ -416,7 +416,7 @@ mod tests {
                 table.dictionary.insert("LAST.NAME".to_string(), Record::from_display_string("2^Last Name^L^15"));
                 table.dictionary.insert("AGE".to_string(), Record::from_display_string("3^Age^R^3"));
                 table.records.insert("K1".to_string(), Record::from_display_string("John^Doe^30"));
-                table.dirty = true;
+                table.touch_all();
             }
             db.save()?;
 

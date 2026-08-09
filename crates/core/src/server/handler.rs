@@ -118,10 +118,13 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
                 Ok(t) => t,
                 Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
             };
-            let records = if is_dict { &mut table.dictionary } else { &mut table.records };
-            records.insert(key, record);
-            table.dirty = true;
-            match db.save() {
+            if is_dict {
+                table.dictionary.insert(key, record);
+                table.mark_dict_dirty();
+            } else {
+                table.insert_record(&key, record);
+            }
+            match db.note_write_for(acc, &table_name) {
                 Ok(_) => Response { status: "OK".to_string(), ..Default::default() },
                 Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Save error: {}", e)), ..Default::default() },
             }
@@ -144,10 +147,13 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
                 Ok(t) => t,
                 Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
             };
-            let records = if is_dict { &mut table.dictionary } else { &mut table.records };
-            records.remove(&key);
-            table.dirty = true;
-            match db.save() {
+            if is_dict {
+                table.dictionary.remove(&key);
+                table.mark_dict_dirty();
+            } else {
+                table.remove_record(&key);
+            }
+            match db.note_write_for(acc, &table_name) {
                 Ok(_) => Response { status: "OK".to_string(), ..Default::default() },
                 Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Save error: {}", e)), ..Default::default() },
             }
@@ -356,7 +362,8 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
                 Some(n) => n,
                 None => return Response { status: "ERROR".to_string(), message: Some("File name not specified".to_string()), ..Default::default() },
             };
-            match db.create_table_for_account(acc, &name) {
+            let durable = req.durable.unwrap_or(false);
+            match db.create_table_for_account_durable(acc, &name, durable) {
                 Ok(_) => Response { status: "OK".to_string(), ..Default::default() },
                 Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), ..Default::default() },
             }

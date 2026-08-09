@@ -20,6 +20,8 @@ pub struct Request {
     pub name: Option<String>,
     pub accounts_list: Option<Vec<String>>,
     pub is_admin: Option<bool>,
+    /// CREATE.FILE only: create the file with per-file durable writes enabled.
+    pub durable: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]

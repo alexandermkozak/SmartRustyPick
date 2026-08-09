@@ -3,12 +3,12 @@
 The project has four layers of tests, all runnable from the `Makefile` and all executed by the
 `Build and Test` GitHub workflow on every push to `main` and every pull request.
 
-| Layer       | Command                 | What it covers                                                                                          |
-|-------------|-------------------------|---------------------------------------------------------------------------------------------------------|
-| Unit        | `make test-unit`        | `cargo test --workspace` — the engine, query parser, dictionaries and the request handler.              |
-| Integration | `make test-integration` | The real binaries over the TLS protocol: CRUD, queries, select lists, headless mode and access control. |
-| Performance | `make test-performance` | End-to-end latency distributions, throughput, scaling ratios, concurrency and resource usage.           |
-| Benchmarks  | `make bench`            | Criterion micro-benchmarks of the engine: record codec, query execution, sorting, persistence.          |
+| Layer       | Command                 | What it covers                                                                                                               |
+|-------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------|
+| Unit        | `make test-unit`        | `cargo test --workspace` — the engine, query parser, dictionaries and the request handler.                                   |
+| Integration | `make test-integration` | The real binaries over the TLS protocol: CRUD, queries, select lists, headless mode, access control and per-file durability. |
+| Performance | `make test-performance` | End-to-end latency distributions, throughput, scaling ratios, concurrency and resource usage.                                |
+| Benchmarks  | `make bench`            | Criterion micro-benchmarks of the engine: record codec, query execution, sorting, persistence.                               |
 
 `make test-all` runs the first three. Everything below the unit layer requires `cargo build` first; the Make targets
 take care of it.
@@ -70,25 +70,33 @@ make perf-compare BASE=/tmp/base.json
 
 `perf-compare` exits non-zero if any metric worsened by more than 25% (`--tolerance` to change it).
 
-### Known cost: writes rewrite the whole file
+### Hashed Storage Performance
 
-The remote `WRITE` and `DELETE` handlers call `Database::save()`, which rewrites the entire table file. A single write
-is therefore O (file size) and a bulk load is O (n²): at 10 000 records the suite measures p50 1.4 ms per write over the
-first quarter of the file and 7.1 ms over the rest, and concurrent writers see a p99 of ~95 ms against a p50 of 5 ms.
-This is a design property, not a regression, so the suite pins it at *linear* — the check fails only if the per-write
-cost ever starts growing faster than the file does.
+The storage engine uses a hashed layout to ensure that write cost remains flat as the table grows. A single write only
+rewrites its corresponding hash group (averaging 16 records) rather than the entire table.
+
+The performance suite enforces this with two specific checks:
+
+- **Write cost growth**: Measures the ratio between the p50 write latency of the first 2,500 records and the remaining
+  7,500. This must stay below 2.0x (currently measured at ~0.99x).
+- **Write amplification**: Ensures that no single group file exceeds 5% of the total table size, verifying that records
+  are evenly distributed and the dynamic modulus is working correctly.
 
 ## Benchmarking and profiling
 
 `make bench` runs the Criterion micro-benchmarks in `crates/core/benches`. They measure the engine directly, without TLS
 or JSON in the way, and Criterion compares each run against the previous one stored in `target/criterion`:
 
-| Group          | What it measures                                                                               |
-|----------------|------------------------------------------------------------------------------------------------|
-| `record_codec` | `Record` encode/decode for a small (3 field) and a wide (~50 field, multi-valued) record.      |
-| `query`        | `parse_query` and `query_for_account` for unique-match, 10%-match and full-scan shapes.        |
-| `sort`         | `sort_results_for_account` over 10 000 records, single and compound sort specs.                |
-| `storage`      | Building and saving 5 000 records, loading them back from disk, and JSON record serialisation. |
+| Group          | What it measures                                                                                |
+|----------------|-------------------------------------------------------------------------------------------------|
+| `record_codec` | `Record` encode/decode for a small (3 field) and a wide (~50 field, multi-valued) record.       |
+| `query`        | `parse_query` and `query_for_account` for unique-match, 10%-match and full-scan shapes.         |
+| `sort`         | `sort_results_for_account` over 10 000 records, single and compound sort specs.                 |
+| `storage`      | Saving 5 000 records, loading them back from disk, JSON serialisation, and `incremental_write`. |
+
+`storage/incremental_write/{1000,10000}_records` is the sharpest guard on write amplification: it updates a single
+record and flushes, on a small and on a large table. The two figures must match - 63 us and 61 us when this was written.
+A gap between them means a write has started scaling with the size of the table again.
 
 `make bench-smoke` (also a CI step) runs one iteration of each. It is not a timing gate; it keeps the benchmarks
 compiling and running, which is how benchmark suites usually rot.
@@ -98,17 +106,19 @@ you what to install if neither is present. Narrow it down with `make profile FIL
 
 ## Useful environment variables
 
-| Variable                | Default  | Purpose                                                           |
-|-------------------------|----------|-------------------------------------------------------------------|
-| `SRP_PERF_RECORDS`      | `10000`  | Record count for the load suite. CI uses a smaller value.         |
-| `SRP_PERF_BUDGET_SCALE` | `1`      | Multiplies every latency budget. Raise it on slow or noisy hosts. |
-| `SRP_PERF_ENFORCE`      | `1`      | Set to `0` to report budget violations without failing the suite. |
-| `SRP_CONC_CLIENTS`      | `8`      | Parallel clients in the concurrency suite.                        |
-| `SRP_CONC_OPS`          | `200`    | Operations each concurrent client performs.                       |
-| `SRP_STARTUP_TIMEOUT`   | `30`     | Seconds to wait for a server to accept connections.               |
-| `SRP_PROFILE`           | `debug`  | Which `target/<profile>` directory to take the binaries from.     |
-| `CARGO_TARGET_DIR`      | `target` | Where to look for the built binaries.                             |
-| `SRP_KEEP_WORKSPACE`    | unset    | Keep the temporary directory after the run, for debugging.        |
+| Variable                 | Default  | Purpose                                                           |
+|--------------------------|----------|-------------------------------------------------------------------|
+| `SRP_PERF_RECORDS`       | `10000`  | Record count for the load suite. CI uses a smaller value.         |
+| `SRP_PERF_BUDGET_SCALE`  | `1`      | Multiplies every latency budget. Raise it on slow or noisy hosts. |
+| `SRP_PERF_ENFORCE`       | `1`      | Set to `0` to report budget violations without failing the suite. |
+| `SRP_CONC_CLIENTS`       | `8`      | Parallel clients in the concurrency suite.                        |
+| `SRP_CONC_OPS`           | `200`    | Operations each concurrent client performs.                       |
+| `SRP_STARTUP_TIMEOUT`    | `30`     | Seconds to wait for a server to accept connections.               |
+| `SRP_PROFILE`            | `debug`  | Which `target/<profile>` directory to take the binaries from.     |
+| `CARGO_TARGET_DIR`       | `target` | Where to look for the built binaries.                             |
+| `SRP_KEEP_WORKSPACE`     | unset    | Keep the temporary directory after the run, for debugging.        |
+| `SRP_LIMIT_WRITE_GROWTH` | `2.0`    | Max allowed growth ratio for write cost as the table grows.       |
+| `SRP_LIMIT_GROUP_SHARE`  | `0.05`   | Max allowed fraction of the table for a single hash group.        |
 
 Individual budgets and ratio limits have their own variables (`SRP_BUDGET_*`, `SRP_LIMIT_*`, `SRP_CONC_*`); they are
 listed at the top of each performance suite.

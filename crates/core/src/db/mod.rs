@@ -1,5 +1,6 @@
 pub mod models;
 pub mod engine;
+pub mod hashfile;
 pub mod query;
 #[cfg(test)]
 pub mod tests;
@@ -9,6 +10,10 @@ mod model_tests;
 mod query_tests;
 #[cfg(test)]
 mod engine_tests;
+#[cfg(test)]
+mod hashfile_tests;
+#[cfg(test)]
+mod durability_tests;
 
 pub use engine::Database;
 pub use models::*;

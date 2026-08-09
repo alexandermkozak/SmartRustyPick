@@ -22,7 +22,7 @@ fn test_lru_eviction() {
 
     // Load T1 and T2
     db.get_table_mut("T1").unwrap().records.insert("K1".to_string(), Record::from_display_string("V1"));
-    db.get_table_mut("T1").unwrap().dirty = true;
+    db.get_table_mut("T1").unwrap().touch_all();
     let _ = db.get_table_mut("T2");
 
     assert_eq!(db.loaded_tables.len(), 2);
@@ -144,7 +144,7 @@ fn test_sync_dir_file() {
     {
         let dir = db.get_table_mut("DIR").unwrap();
         dir.records.remove("T1");
-        dir.dirty = true;
+        dir.touch_all();
     }
     db.save().unwrap();
 
@@ -209,7 +209,7 @@ fn test_cache_reloads_when_another_process_writes() {
     {
         let t = writer.get_table_mut("ENTITIES").unwrap();
         t.records.insert("E1".to_string(), Record::from_display_string("FIRST"));
-        t.dirty = true;
+        t.touch_all();
     }
     writer.save().unwrap();
 
@@ -222,7 +222,7 @@ fn test_cache_reloads_when_another_process_writes() {
     {
         let t = writer.get_table_mut("ENTITIES").unwrap();
         t.records.insert("E2".to_string(), Record::from_display_string("SECOND"));
-        t.dirty = true;
+        t.touch_all();
     }
     writer.create_table("NEWFILE").unwrap();
     writer.save().unwrap();
@@ -247,7 +247,7 @@ fn test_listed_table_still_refreshes_after_save() {
     {
         let t = writer.get_table_mut("ENTITIES").unwrap();
         t.records.insert("E1".to_string(), Record::from_display_string("FIRST"));
-        t.dirty = true;
+        t.touch_all();
     }
     writer.save().unwrap();
 
@@ -261,7 +261,7 @@ fn test_listed_table_still_refreshes_after_save() {
     {
         let t = writer.get_table_mut("ENTITIES").unwrap();
         t.records.insert("E2".to_string(), Record::from_display_string("SECOND"));
-        t.dirty = true;
+        t.touch_all();
     }
     writer.save().unwrap();
 
@@ -291,14 +291,14 @@ fn test_local_changes_survive_staleness_check() {
     {
         let t = reader.get_table_mut("ENTITIES").unwrap();
         t.records.insert("LOCAL".to_string(), Record::from_display_string("PENDING"));
-        t.dirty = true;
+        t.touch_all();
     }
 
     // Another process writes to the same table while we hold unsaved changes.
     {
         let t = writer.get_table_mut("ENTITIES").unwrap();
         t.records.insert("REMOTE".to_string(), Record::from_display_string("COMMITTED"));
-        t.dirty = true;
+        t.touch_all();
     }
     writer.save().unwrap();
 

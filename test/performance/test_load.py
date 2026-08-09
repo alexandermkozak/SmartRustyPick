@@ -36,9 +36,11 @@ READ_SAMPLES = min(int(os.environ.get("SRP_PERF_READ_SAMPLES", "1000")), NUM_REC
 # repeated on the full file; the two sets of numbers give the growth ratios below.
 FIRST_SLICE = max(1, NUM_RECORDS // 4)
 GROWTH = NUM_RECORDS / FIRST_SLICE
-# A write costs O(file size), so the fair comparison between the two write phases is
-# the *average* file size during each phase, not the final one.
-WRITE_GROWTH = (NUM_RECORDS + FIRST_SLICE) / FIRST_SLICE
+# Records are stored in a hashfile whose modulus grows with the table, so a write
+# rewrites one group rather than the whole file: its cost must stay *constant* as
+# the table grows. This is the allowed drift between the two write phases, which
+# see the file at very different sizes.
+WRITE_GROWTH = float(os.environ.get("SRP_LIMIT_WRITE_GROWTH", "2.0"))
 
 MIDDLE_SEQ = NUM_RECORDS // 2
 BATCH_SIZE = max(1, min(500, NUM_RECORDS // 10))
@@ -46,8 +48,9 @@ BATCH_SIZE = max(1, min(500, NUM_RECORDS // 10))
 # Budgets are p95 milliseconds. Scan-bound operations are budgeted per 10k records so
 # the suite stays meaningful when SRP_PERF_RECORDS is overridden.
 SCAN_SCALE = max(NUM_RECORDS / 10000.0, 0.2)
-# A remote write rewrites the whole table file, so its budget scales with the file too.
-BUDGET_WRITE_MS = float(os.environ.get("SRP_BUDGET_WRITE_MS", "40")) * SCAN_SCALE
+# A write touches one hashfile group and is batched with its neighbours, so unlike the
+# scan-bound budgets below it does not scale with the size of the file.
+BUDGET_WRITE_MS = float(os.environ.get("SRP_BUDGET_WRITE_MS", "10"))
 BUDGET_READ_MS = float(os.environ.get("SRP_BUDGET_READ_MS", "25"))
 BUDGET_UNIQUE_MS = float(os.environ.get("SRP_BUDGET_UNIQUE_MS", "60")) * SCAN_SCALE
 BUDGET_ATTRIBUTE_MS = float(os.environ.get("SRP_BUDGET_ATTRIBUTE_MS", "120")) * SCAN_SCALE
@@ -73,6 +76,22 @@ SETUP_COMMANDS = [
 
 def record_data(i):
     return f"Val{i % 10}^Data{i % 100}^{i}"
+
+
+def find_section_dir(root, table):
+    '''Locate the hashed record section of `table` inside a workspace.'''
+    for path, dirs, _files in os.walk(root):
+        if os.path.basename(path) == table and 'data.hf' in dirs:
+            return os.path.join(path, 'data.hf')
+    return None
+
+
+def group_file_sizes(section_dir):
+    return sorted(
+        os.path.getsize(os.path.join(section_dir, name))
+        for name in os.listdir(section_dir)
+        if name.startswith('g') and not name.endswith('.tmp')
+    )
 
 
 def write_range(conn, start, end):
@@ -156,16 +175,17 @@ def main():
                     else f"{len(late_failures)} failed ({late_failures[0]})",
                 )
 
-                # Known design cost: the remote WRITE handler calls `Database::save()`,
-                # which rewrites the whole table file, so a single write is O(file size)
-                # and a bulk load is O(n^2). This guard pins that at *linear* - it fails
-                # if the per-write cost ever starts growing faster than the file does.
+                # The headline guarantee of the hashfile format. Before it, the WRITE
+                # handler rewrote the entire table on every request, so a write was
+                # O(file size) and a bulk load O(n^2). Now a write rewrites a single
+                # group, and this check fails if that ever regresses: the later phase
+                # sees the file 5x larger yet must cost the same.
                 suite.check_ratio(
-                    "Write cost grows no worse than the file size",
+                    "Write cost stays flat as the file grows",
                     late.p50 / early.p50 if early.p50 else 0.0,
-                    WRITE_GROWTH * float(os.environ.get("SRP_LIMIT_WRITE_SLACK", "1.5")),
-                    detail=f"p50 {early.p50:.2f}ms -> {late.p50:.2f}ms at "
-                    f"{WRITE_GROWTH:.1f}x the average file size",
+                    WRITE_GROWTH * float(os.environ.get("SRP_LIMIT_WRITE_SLACK", "1.0")),
+                    detail=f"p50 {early.p50:.2f}ms -> {late.p50:.2f}ms while the file "
+                    f"grew {GROWTH:.0f}x",
                 )
 
                 keys = [f"REC{i}" for i in range(NUM_RECORDS)]
@@ -275,6 +295,41 @@ def main():
                     extra=f"{batches * BATCH_SIZE} records drained"
                     if not short
                     else f"{len(short)} short batches",
+                )
+
+            # Write amplification, measured directly on disk rather than inferred from
+            # timings: a write rewrites one group, so the largest group is the real
+            # per-write I/O cost and must stay a small fraction of the whole table.
+            # Writes are batched, and the connection was only just closed, so give
+            # the server a moment to finish its final flush before reading the files.
+            time.sleep(0.5)
+            section_dir = find_section_dir(workspace.path, FILE)
+            if section_dir:
+                sizes = group_file_sizes(section_dir)
+                total = sum(sizes)
+                largest = sizes[-1] if sizes else 0
+                share = largest / total if total else 1.0
+                suite.record(
+                    'Hashfile layout',
+                    {
+                        'groups': len(sizes),
+                        'total_bytes': total,
+                        'largest_group_bytes': largest,
+                        'largest_group_share': round(share, 5),
+                        'records_per_group': round(NUM_RECORDS / len(sizes), 2) if sizes else 0,
+                    },
+                )
+                suite.check(
+                    'A write rewrites a small fraction of the file',
+                    share <= float(os.environ.get('SRP_LIMIT_GROUP_SHARE', '0.05')),
+                    f'{len(sizes)} groups, {NUM_RECORDS / max(len(sizes), 1):.1f} records each; '
+                    f'largest group {largest}B of {total}B ({share * 100:.2f}%)',
+                )
+            else:
+                suite.check(
+                    'A write rewrites a small fraction of the file',
+                    False,
+                    'no hashed section found on disk',
                 )
 
             elapsed = time.perf_counter() - started

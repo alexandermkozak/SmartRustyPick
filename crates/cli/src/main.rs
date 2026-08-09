@@ -307,10 +307,10 @@ fn handle_set(db: &mut Database, parts: &[&str]) {
     let record = Record::from_display_string(&data);
     if is_dict {
         table.dictionary.insert(key, record);
+        table.mark_dict_dirty();
     } else {
-        table.records.insert(key, record);
+        table.insert_record(&key, record);
     }
-    table.dirty = true;
     if table_name == "$CLIENTS" {
         let _ = db.save();
     }
@@ -410,15 +410,19 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
                     return;
                 }
             };
-            let map = if is_dict { &mut table.dictionary } else { &mut table.records };
             let mut count = 0;
             for key in keys_to_delete {
-                if map.remove(&key).is_some() {
+                let removed = if is_dict {
+                    table.dictionary.remove(&key).is_some()
+                } else {
+                    table.remove_record(&key).is_some()
+                };
+                if removed {
                     count += 1;
                 }
             }
             if count > 0 {
-                table.dirty = true;
+                if is_dict { table.mark_dict_dirty(); }
                 println!("[{}] records deleted", count);
             } else {
                 println!("NO RECORDS DELETED");
@@ -440,9 +444,14 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
             return;
         }
     };
-    let map = if is_dict { &mut table.dictionary } else { &mut table.records };
-    if map.remove(key).is_some() {
-        table.dirty = true;
+    let removed = if is_dict {
+        let removed = table.dictionary.remove(key).is_some();
+        if removed { table.mark_dict_dirty(); }
+        removed
+    } else {
+        table.remove_record(key).is_some()
+    };
+    if removed {
         if table_name == "$CLIENTS" {
             let _ = db.save();
         }
@@ -764,10 +773,10 @@ fn handle_edit(db: &mut Database, parts: &[&str], config: &Config) {
                     let key_str = key.to_string();
                     if is_dict {
                         table.dictionary.insert(key_str, record);
+                        table.mark_dict_dirty();
                     } else {
-                        table.records.insert(key_str, record);
+                        table.insert_record(&key_str, record);
                     }
-                    table.dirty = true;
                     if table_name == "$CLIENTS" {
                         let _ = db.save();
                     }
@@ -883,7 +892,8 @@ fn print_help(current_account: &str) {
     println!("  HELP                                  - Show this help.");
     println!("  SAVE-LIST <name>                      - Save active select list.");
     println!("  GET-LIST <name>                       - Restore a saved select list.");
-    println!("  CREATE.FILE <name>                    - Create a new file (data and dict) (SYSTEM only).");
+    println!("  CREATE.FILE <name> [DURABLE]          - Create a new file (data and dict) (SYSTEM only).");
+    println!("                                          DURABLE flushes every write to that file immediately.");
     println!("  DELETE.FILE <name>                    - Delete a file (data and dict) (SYSTEM only).");
     println!("  CREATE.ACCOUNT <name> [<dir>]         - Create a new account (SYSTEM only).");
     if current_account == "SYSTEM" {
@@ -932,8 +942,7 @@ fn handle_save_list(db: &mut Database, parts: &[&str]) {
 
     let record = Record::from_bytes(&data);
     let table = db.get_table_mut("$SAVEDLISTS").unwrap();
-    table.records.insert(list_name.to_string(), record);
-    table.dirty = true;
+    table.insert_record(list_name, record);
 
     db.active_select_list = None;
     println!("List '{}' saved", list_name);
@@ -977,12 +986,28 @@ fn handle_get_list(db: &mut Database, parts: &[&str]) {
 
 fn handle_create_file(db: &mut Database, parts: &[&str]) {
     if parts.len() < 2 {
-        println!("Usage: CREATE.FILE <file_name>");
+        println!("Usage: CREATE.FILE <file_name> [DURABLE]");
         return;
     }
     let file_name = parts[1];
-    match db.create_table(file_name) {
-        Ok(_) => println!("[{}] created (data and dict)", file_name),
+    let mut durable = false;
+    for flag in &parts[2..] {
+        match flag.to_uppercase().as_str() {
+            "DURABLE" | "-D" => durable = true,
+            other => {
+                println!("Unknown option '{}'. Usage: CREATE.FILE <file_name> [DURABLE]", other);
+                return;
+            }
+        }
+    }
+    match db.create_table_durable(file_name, durable) {
+        Ok(_) => {
+            if durable {
+                println!("[{}] created (data and dict, durable writes)", file_name);
+            } else {
+                println!("[{}] created (data and dict)", file_name);
+            }
+        }
         Err(e) => println!("Error: {}", e),
     }
 }

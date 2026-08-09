@@ -24,8 +24,45 @@ fn main() {
     println!("Starting headless database service on {}...", full_addr);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        if let Err(e) = smart_rusty_pick_core::server::start_server(Arc::new(config), db, None).await {
-            eprintln!("Server error: {}", e);
+        let serving = smart_rusty_pick_core::server::start_server(Arc::new(config), db.clone(), None);
+        tokio::select! {
+            result = serving => {
+                if let Err(e) = result {
+                    eprintln!("Server error: {}", e);
+                }
+            }
+            _ = shutdown_signal() => {
+                println!("Shutting down, flushing pending writes...");
+            }
+        }
+        // Writes are buffered in memory between flushes, so a shutdown must
+        // persist whatever has not been written out yet.
+        if let Ok(mut db_lock) = db.lock() {
+            if let Err(e) = db_lock.save() {
+                eprintln!("Failed to flush on shutdown: {}", e);
+            }
         }
     });
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

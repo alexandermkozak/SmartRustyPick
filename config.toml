@@ -5,3 +5,9 @@ key_path = "server.key"
 ca_path = "ca.crt"
 editor = "nano"
 
+# Storage engine settings (optional)
+# records_per_group = 16
+# durable_writes = false
+# flush_interval_ms = 250
+# flush_max_pending = 256
+

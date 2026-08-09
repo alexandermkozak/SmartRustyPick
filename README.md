@@ -52,6 +52,7 @@ field formatting, and complex select operations.
 For more information, see the following documentation:
 
 - [Data Structures](docs/data_structures.md) - Learn how records and dictionaries are structured.
+- [Storage Engine](docs/storage.md) - Details on the hashed storage layout and write buffering.
 - [Commands](docs/commands.md) - Learn about application modes and command categories.
 - [Administration Commands](docs/admin_commands.md) - System management and security.
 - [General Use Commands](docs/general_commands.md) - Data operations and queries.
@@ -72,6 +73,12 @@ Currently supported settings:
 - `cert_path`: Path to the server SSL certificate.
 - `key_path`: Path to the server SSL private key.
 - `ca_path`: Path to the CA certificate for client authentication.
+- `records_per_group`: Target records per hashfile group (default: 16).
+- `durable_writes`: Flush every write before acknowledging it (default: false). Individual files can opt in without this
+  global switch: `CREATE.FILE <name> DURABLE` (see
+  [Storage Engine](docs/storage.md)).
+- `flush_interval_ms`: Max milliseconds a change stays in memory (default: 250).
+- `flush_max_pending`: Flush once this many writes are pending (default: 256).
 
 If SSL certificate paths are provided in `config.toml`, the database service will automatically start in the background
 when the CLI is launched.

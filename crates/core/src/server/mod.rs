@@ -48,6 +48,8 @@ pub async fn start_server(config: Arc<Config>, db: Arc<Mutex<Database>>, overrid
 
     println!("Server listening on TLS {}", addr);
 
+    spawn_flusher(db.clone());
+
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let acceptor = acceptor.clone();
@@ -139,6 +141,45 @@ pub async fn start_server(config: Arc<Config>, db: Arc<Mutex<Database>>, overrid
                     }
                 }
             }
+
+            // A client that finished writing should not have to wait for the
+            // ticker before its changes reach disk.
+            if let Ok(mut db_lock) = db.lock() {
+                if db_lock.has_pending_writes() {
+                    let _ = db_lock.save();
+                }
+            }
         });
     }
+}
+
+/// Periodically writes out buffered changes.
+///
+/// Writes are batched in memory instead of hitting the disk one record at a
+/// time; without a ticker the last writes of a burst would linger until the
+/// next request arrived. The interval bounds how long that can be.
+fn spawn_flusher(db: Arc<Mutex<Database>>) {
+    let interval = {
+        let db_lock = db.lock().unwrap();
+        if db_lock.durable_writes {
+            return; // Every write is already flushed synchronously.
+        }
+        db_lock.flush_interval
+    };
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval.max(std::time::Duration::from_millis(10)));
+        loop {
+            ticker.tick().await;
+            let db = db.clone();
+            // Flushing touches the disk, so keep it off the async worker thread.
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(mut db_lock) = db.lock() {
+                    if let Err(e) = db_lock.flush_if_due() {
+                        eprintln!("Background flush error: {}", e);
+                    }
+                }
+            })
+                .await;
+        }
+    });
 }

@@ -28,6 +28,7 @@ test-integration: build
 	$(PYTHON) test/integration/test_server.py
 	$(PYTHON) test/integration/test_headless.py
 	$(PYTHON) test/integration/test_security.py
+	$(PYTHON) test/integration/test_durability.py
 
 test-performance: build
 	@echo "Running performance tests..."

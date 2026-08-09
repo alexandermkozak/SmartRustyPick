@@ -43,7 +43,7 @@ container puts all of them in a single directory: `/data`, exposed as the named 
 ├── config.toml     # seeded from the image on first start, then yours to edit
 ├── ca.crt, ca.key  # CA generated on first start
 ├── server.crt/.key # server certificate, signed by that CA
-└── db_storage/     # accounts, registers and records
+└── db_storage/     # accounts and tables (containing `dict` and `data.hf/`)
 ```
 
 To keep the data in a host directory instead of a named volume, replace the volume entry in `compose.yaml`:

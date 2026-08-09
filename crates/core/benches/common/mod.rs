@@ -49,6 +49,10 @@ pub fn bench_config() -> Config {
         server_addr: None,
         log_detail: Some("none".to_string()),
         max_log_records: Some(10),
+        records_per_group: None,
+        durable_writes: Some(true),
+        flush_interval_ms: None,
+        flush_max_pending: None,
     }
 }
 
@@ -93,5 +97,5 @@ pub fn build_table(db: &mut Database, table_name: &str, count: usize) {
     for i in 0..count {
         table.records.insert(format!("K{i:06}"), sample_record(i));
     }
-    table.dirty = true;
+    table.touch_all();
 }

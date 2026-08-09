@@ -43,7 +43,19 @@ SmartRustyPick supports automatic data conversion between internal storage forma
 - **ICONV (Input Conversion)**: Applied when writing structured data (e.g., `123.45` -> `12345`).
 
 #### Database Layout
-The database is stored in the `db_storage` directory:
-- `db_storage/<table_name>/data`: Contains data records.
-- `db_storage/<table_name>/dict`: Contains dictionary records.
+
+The database is stored in the `db_storage` directory, organized by account:
+
+- `db_storage/<account>/<table>/data.hf/`: A directory containing data records in a hashed layout.
+    - `meta`: Metadata file (version, modulus, record count).
+    - `g<hex>`: Group files containing hashed records.
+- `db_storage/<account>/<table>/dict`: A flat file containing dictionary records.
 - `$SAVEDLISTS`: A special table used to store named select lists.
+
+**Record Framing**: Both group files and the dictionary use the frame encoding:
+`[key_len u64 LE][key][data_len u64 LE][record bytes]`.
+
+**Automatic Migration**: Tables in the old flat `data` file format are automatically converted to the `data.hf/` layout
+on the first flush after being read.
+
+For more details on the storage engine, hashing, and write buffering, see [Storage Engine](storage.md).

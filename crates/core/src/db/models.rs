@@ -1,5 +1,6 @@
+use crate::db::hashfile::SectionMeta;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const FM: u8 = 254; // Field Mark
 pub const VM: u8 = 253; // Value Mark
@@ -12,6 +13,10 @@ pub const SYS_CLIENTS_ACCOUNTS_IDX: usize = 1;
 pub const SYS_CLIENTS_ADMIN_IDX: usize = 2;
 pub const SYS_LOGS_MESSAGE_IDX: usize = 0;
 pub const SYS_LOGS_DETAIL_IDX: usize = 1;
+// DIR entries describe the files of an account: field 1 is the entry type,
+// field 2 the per-file durability flag ("Y" = flush every write immediately).
+pub const DIR_TYPE_IDX: usize = 0;
+pub const DIR_DURABLE_IDX: usize = 1;
 
 // Dictionary record field indices
 pub const DICT_FIELD_IDX: usize = 0;
@@ -145,8 +150,20 @@ impl Record {
 pub struct Table {
     pub records: HashMap<String, Record>,
     pub dictionary: HashMap<String, Record>,
-    pub dirty: bool,
     pub stamp: Option<TableStamp>,
+    /// Layout and version of the record section on disk. Carried on the table
+    /// so a flush knows the current modulus without re-reading the meta file.
+    pub data_meta: SectionMeta,
+    /// Set when the records were read from the pre-hashfile flat file; the
+    /// next flush converts the table and removes the old file.
+    pub legacy_data: bool,
+    /// Keys changed since the last flush. Only the groups these hash into are
+    /// rewritten, which is what keeps a write independent of table size.
+    pub dirty_keys: HashSet<String>,
+    /// Set when a change cannot be attributed to individual keys (bulk edits,
+    /// migrations); forces a full rewrite of every group.
+    pub dirty_all: bool,
+    pub dict_dirty: bool,
 }
 
 impl Table {
@@ -154,15 +171,63 @@ impl Table {
         Table {
             records: HashMap::new(),
             dictionary: HashMap::new(),
-            dirty: false,
             stamp: None,
+            data_meta: SectionMeta::empty(),
+            legacy_data: false,
+            dirty_keys: HashSet::new(),
+            dirty_all: false,
+            dict_dirty: false,
         }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty_all || self.dict_dirty || !self.dirty_keys.is_empty()
+    }
+
+    pub fn records_dirty(&self) -> bool {
+        self.dirty_all || !self.dirty_keys.is_empty()
+    }
+
+    /// Marks a single record as changed. Preferred over [`Table::touch_all`]:
+    /// it lets the flush rewrite one group instead of the whole table.
+    pub fn mark_dirty(&mut self, key: &str) {
+        self.dirty_keys.insert(key.to_string());
+    }
+
+    /// Marks the whole table - records and dictionary - as changed. Only for
+    /// edits whose key set is not known, since it costs a full rewrite.
+    pub fn touch_all(&mut self) {
+        self.dirty_all = true;
+        self.dict_dirty = true;
+    }
+
+    pub fn mark_dict_dirty(&mut self) {
+        self.dict_dirty = true;
+    }
+
+    pub fn insert_record(&mut self, key: &str, record: Record) {
+        self.records.insert(key.to_string(), record);
+        self.mark_dirty(key);
+    }
+
+    pub fn remove_record(&mut self, key: &str) -> Option<Record> {
+        let previous = self.records.remove(key);
+        self.mark_dirty(key);
+        previous
+    }
+
+    pub fn clear_dirty(&mut self) {
+        self.dirty_keys.clear();
+        self.dirty_all = false;
+        self.dict_dirty = false;
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableStamp {
     pub data_modified: Option<std::time::SystemTime>,
+    /// Flush counter for a hashed section, byte length for a legacy flat file.
+    /// Either way it changes whenever another process rewrites the records.
     pub data_len: u64,
     pub dict_modified: Option<std::time::SystemTime>,
     pub dict_len: u64,

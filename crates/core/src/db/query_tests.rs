@@ -136,7 +136,7 @@ fn test_query_execution() {
         let users = db.get_table_mut("USERS").unwrap();
         let rec = Record::from_display_string("Skill]Rust]Go^rust@example.com");
         users.records.insert("3".to_string(), rec);
-        users.dirty = true;
+        users.touch_all();
         db.save().unwrap();
     }
 

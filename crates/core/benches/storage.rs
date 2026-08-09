@@ -42,6 +42,34 @@ fn bench_save(c: &mut Criterion) {
     group.finish();
 }
 
+/// The write path the remote server uses: change one record of an established
+/// table and flush. With the hashed layout this rewrites a single group, so the
+/// cost must not track the size of the table.
+fn bench_incremental_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("storage");
+    group.throughput(Throughput::Elements(1));
+
+    for records in [1_000usize, 10_000usize] {
+        let dir = common::TempDir::new(&format!("incr{records}"));
+        let mut db = common::new_db(dir.path());
+        common::build_table(&mut db, TABLE, records);
+        db.save().unwrap();
+
+        group.bench_function(format!("incremental_write/{records}_records"), |b| {
+            let mut counter = 0usize;
+            b.iter(|| {
+                counter += 1;
+                let table = db.get_table_mut_for_account(common::ACCOUNT, TABLE).unwrap();
+                table.insert_record(&format!("K{:06}", counter % records), common::sample_record(counter));
+                db.save().unwrap();
+                black_box(counter)
+            })
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_serialize(c: &mut Criterion) {
     let dir = common::TempDir::new("serialize");
     let mut db = common::new_db(dir.path());
@@ -62,5 +90,5 @@ fn bench_serialize(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_save, bench_serialize);
+criterion_group!(benches, bench_save, bench_incremental_write, bench_serialize);
 criterion_main!(benches);

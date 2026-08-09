@@ -50,6 +50,7 @@ a single line of JSON.
   )
   "list_name": "LIST_NAME", (optional, for QUERY, READNEXT, GETLIST)
   "batch_size": 10, (optional, for READNEXT)
+  "durable": true | false, (optional, for CREATE.FILE, default: false)
 }
 ```
 
@@ -108,6 +109,16 @@ Performs a search.
 - Optional fields: `is_dict`, `list_name`.
 - If `list_name` is provided, the result keys are stored in a named select list on the server, and only the `count` is
   returned.
+
+### CREATE.FILE
+
+Creates a table (data and dictionary sections) in the requested account. Requires an admin client.
+
+- Required fields: `account`, `file`.
+- Optional fields: `durable`.
+- With `durable: true` the file is marked mission critical in the account's `DIR`
+  entry, so every write to it is flushed to disk before it is acknowledged while the rest of the database keeps
+  buffering writes. See [Storage Engine](storage.md).
 
 ### READNEXT
 

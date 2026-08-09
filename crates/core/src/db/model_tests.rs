@@ -83,5 +83,5 @@ fn test_table_new() {
     let table = Table::new();
     assert_eq!(table.records.len(), 0);
     assert_eq!(table.dictionary.len(), 0);
-    assert!(!table.dirty);
+    assert!(!table.is_dirty());
 }

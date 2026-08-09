@@ -118,8 +118,14 @@ Retrieve a previously saved SELECT list.
 
 Create a new table (both data and dictionary sections).
 
-- **Usage**: `CREATE.FILE <name>`
+The optional `DURABLE` flag marks the file as mission critical: every write to it is flushed to disk before it is
+acknowledged, while the rest of the database keeps buffering writes. The flag is stored as the `DURABLE` attribute of
+the file's `DIR`
+entry - see [Storage Engine](storage.md).
+
+- **Usage**: `CREATE.FILE <name> [DURABLE]`
 - **Example**: `CREATE.FILE ORDERS`
+- **Example**: `CREATE.FILE LEDGER DURABLE`
 
 #### DELETE.FILE
 

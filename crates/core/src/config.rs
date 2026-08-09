@@ -12,6 +12,15 @@ pub struct Config {
     pub server_addr: Option<String>,
     pub log_detail: Option<String>,
     pub max_log_records: Option<usize>,
+    /// Target number of records per hashfile group. Lower means smaller, faster
+    /// group rewrites but more files; higher means the opposite.
+    pub records_per_group: Option<usize>,
+    /// Flush every write to disk before acknowledging it. Safest, slowest.
+    pub durable_writes: Option<bool>,
+    /// How long a change may stay in memory before being flushed.
+    pub flush_interval_ms: Option<u64>,
+    /// Flush once this many writes are pending, regardless of the interval.
+    pub flush_max_pending: Option<usize>,
 }
 
 impl Config {
@@ -34,6 +43,10 @@ impl Config {
             server_addr: Some("127.0.0.1".to_string()),
             log_detail: Some("normal".to_string()),
             max_log_records: Some(100),
+            records_per_group: None,
+            durable_writes: None,
+            flush_interval_ms: None,
+            flush_max_pending: None,
         }
     }
 }
