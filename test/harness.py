@@ -139,15 +139,19 @@ def benchmark(func, iterations, warmup=0):
     return Stats(samples), result
 
 
-class ResourceMonitor(threading.Thread):
+class ResourceMonitor:
     """Samples a child process's memory and CPU usage while a suite runs.
 
     Reads `/proc`, so it degrades gracefully (`available` is False) on platforms that
     do not have it instead of failing the suite.
+
+    The sampling thread is held rather than inherited from: subclassing
+    `threading.Thread` puts every attribute in the same namespace as the class's own
+    private members, and `self._stop` used to shadow `Thread._stop()`, which `join()`
+    calls on CPython 3.11 - breaking `stop()` with "'Event' object is not callable".
     """
 
     def __init__(self, pid, interval=0.1):
-        super().__init__(daemon=True)
         self.pid = pid
         self.interval = interval
         self.available = os.path.exists(f"/proc/{pid}/status")
@@ -156,7 +160,8 @@ class ResourceMonitor(threading.Thread):
         self.last_rss_kb = 0
         self.cpu_seconds = 0.0
         self.samples = 0
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
     def _read_rss_kb(self):
@@ -172,10 +177,14 @@ class ResourceMonitor(threading.Thread):
         # utime and stime are fields 14 and 15 of /proc/pid/stat (1-based).
         return (int(fields[11]) + int(fields[12])) / self._ticks
 
-    def run(self):
+    def start(self):
+        self._thread.start()
+        return self
+
+    def _sample_loop(self):
         if not self.available:
             return
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 rss = self._read_rss_kb()
                 self.cpu_seconds = self._read_cpu_seconds()
@@ -186,11 +195,13 @@ class ResourceMonitor(threading.Thread):
             self.last_rss_kb = rss
             self.peak_rss_kb = max(self.peak_rss_kb, rss)
             self.samples += 1
-            self._stop.wait(self.interval)
+            self._stop_event.wait(self.interval)
 
     def stop(self):
-        self._stop.set()
-        self.join(timeout=5)
+        """Idempotent, so a suite can stop the monitor and still stop it in `finally`."""
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)
         return self
 
     def as_dict(self):

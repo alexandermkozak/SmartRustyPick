@@ -343,7 +343,8 @@ def main():
                     bytes_per_record <= BUDGET_BYTES_PER_RECORD * harness.BUDGET_SCALE
                     or not harness.ENFORCE_BUDGETS,
                     f"{bytes_per_record:.0f} B/record over {NUM_RECORDS} records "
-                    f"(budget {BUDGET_BYTES_PER_RECORD:.0f}); {monitor.summary()}",
+                    f"(budget {BUDGET_BYTES_PER_RECORD * harness.BUDGET_SCALE:.0f}); "
+                    f"{monitor.summary()}",
                 )
                 suite.check(
                     "CPU time is accounted for",
