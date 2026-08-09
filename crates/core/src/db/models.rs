@@ -179,6 +179,12 @@ pub struct QueryCondition {
     pub value: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SortSpec {
+    pub field_name: String,
+    pub descending: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum LogicalOp {
     And,

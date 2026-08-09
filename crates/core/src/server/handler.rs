@@ -162,32 +162,54 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             };
             let is_dict = req.is_dict.unwrap_or(false);
 
+            let mut sort_specs = req.sort_specs.unwrap_or_default();
             let query_node = if let Some(node) = req.query_node {
                 Some(node)
-            } else if let Some(q_str) = req.query_string {
+            } else if let Some(q_str) = req.query_string.as_deref() {
                 let parts: Vec<&str> = q_str.split_whitespace().collect();
-                db.parse_query(&table_name, &parts)
+                let (clause_parts, parsed_sorts) = Database::parse_sort_specs(&parts);
+                if sort_specs.is_empty() { sort_specs = parsed_sorts; }
+                db.parse_query(&table_name, &clause_parts)
             } else {
                 None
             };
 
-            let results = if let Some(q) = query_node {
-                db.query_for_account(acc, &table_name, is_dict, &q, None)
+            let results_processed: Vec<(String, serde_json::Value)> = if let Some(q) = query_node {
+                let mut results = db.query_for_account(acc, &table_name, is_dict, &q, None);
+                db.sort_results_for_account(acc, &table_name, &mut results, &sort_specs);
+                results.into_iter()
+                    .map(|(k, r)| (k, db.serialize_record_for_account(acc, &table_name, &r)))
+                    .collect()
             } else {
-                let table = match db.get_table_mut_for_account(acc, &table_name) {
-                    Ok(t) => t,
-                    Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
+                // Full scan: sort the keys only, then serialize each record by reference so the
+                // whole table is never cloned into memory.
+                let mut keys: Vec<String> = {
+                    let table = match db.get_table_mut_for_account(acc, &table_name) {
+                        Ok(t) => t,
+                        Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
+                    };
+                    let records = if is_dict { &table.dictionary } else { &table.records };
+                    records.keys().cloned().collect()
+                };
+                if sort_specs.is_empty() {
+                    // `sort_keys_for_account` already falls back to the ID, so only sort here.
+                    keys.sort();
+                } else {
+                    keys = db.sort_keys_for_account(acc, &table_name, is_dict, keys, &sort_specs);
+                }
+
+                let table = match db.get_table_read_only_for_account(acc, &table_name) {
+                    Some(t) => t,
+                    None => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {} not loaded", table_name)), ..Default::default() },
                 };
                 let records = if is_dict { &table.dictionary } else { &table.records };
-                // Optimization: use iterator to avoid full map clone before sorting
-                let mut res: Vec<_> = records.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
-                res.sort_by(|a, b| a.0.cmp(&b.0));
-                res
+                keys.into_iter()
+                    .filter_map(|k| {
+                        let record = records.get(&k)?;
+                        Some((k, db.serialize_record_for_account(acc, &table_name, record)))
+                    })
+                    .collect()
             };
-
-            let results_processed: Vec<(String, serde_json::Value)> = results.into_iter()
-                .map(|(k, r)| (k, db.serialize_record_for_account(acc, &table_name, &r)))
-                .collect();
 
             Response {
                 status: "OK".to_string(),
@@ -206,28 +228,38 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             let is_dict = req.is_dict.unwrap_or(false);
             let list_name = req.list_name.unwrap_or_else(|| "DEFAULT".to_string());
 
+            let mut sort_specs = req.sort_specs.unwrap_or_default();
             let query_node = if let Some(node) = req.query_node {
                 Some(node)
-            } else if let Some(q_str) = req.query_string {
+            } else if let Some(q_str) = req.query_string.as_deref() {
                 let parts: Vec<&str> = q_str.split_whitespace().collect();
-                db.parse_query(&table_name, &parts)
+                let (clause_parts, parsed_sorts) = Database::parse_sort_specs(&parts);
+                if sort_specs.is_empty() { sort_specs = parsed_sorts; }
+                db.parse_query(&table_name, &clause_parts)
             } else {
                 None
             };
 
             let keys = if let Some(q) = query_node {
-                let results = db.query_for_account(acc, &table_name, is_dict, &q, None);
+                let mut results = db.query_for_account(acc, &table_name, is_dict, &q, None);
+                db.sort_results_for_account(acc, &table_name, &mut results, &sort_specs);
                 results.into_iter().map(|(k, _)| k).collect()
             } else {
-                let table = match db.get_table_mut_for_account(acc, &table_name) {
-                    Ok(t) => t,
-                    Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
+                let mut keys: Vec<String> = {
+                    let table = match db.get_table_mut_for_account(acc, &table_name) {
+                        Ok(t) => t,
+                        Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
+                    };
+                    let records = if is_dict { &table.dictionary } else { &table.records };
+                    records.keys().cloned().collect()
                 };
-                let records = if is_dict { &table.dictionary } else { &table.records };
-                // Optimization: Collect and sort keys directly to avoid cloning full records
-                let mut keys: Vec<String> = records.keys().cloned().collect();
-                keys.sort();
-                keys
+                if sort_specs.is_empty() {
+                    // `sort_keys_for_account` already falls back to the ID, so only sort here.
+                    keys.sort();
+                    keys
+                } else {
+                    db.sort_keys_for_account(acc, &table_name, is_dict, keys, &sort_specs)
+                }
             };
             let count = keys.len();
             db.remote_select_lists.insert(list_name.clone(), crate::db::SelectList { table_name, is_dict, keys });

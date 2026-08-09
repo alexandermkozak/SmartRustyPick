@@ -453,7 +453,7 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
 }
 
 fn handle_list(db: &mut Database, parts: &[&str]) {
-    // LIST [DICT] <table> [<fields>...]
+    // LIST [DICT] <table> [<fields>...] [BY|BY.DSND <field> ...]
     let mut offset = 1;
     let is_dict = if parts.len() > offset && parts[offset].to_uppercase() == "DICT" {
         offset += 1;
@@ -472,7 +472,9 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
     }
 
     let table_name = parts[offset];
-    let field_names = &parts[offset + 1..];
+    // Strip any BY / BY.DSND sort clauses; what remains are the fields to display.
+    let (field_names, sort_specs) = Database::parse_sort_specs(&parts[offset + 1..]);
+    let field_names = &field_names[..];
 
     let mut use_select_list = false;
     let mut selected_keys = Vec::new();
@@ -485,7 +487,7 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
 
     let table_exists = db.list_tables().contains(&table_name.to_string());
     if table_exists {
-        let (map_keys, is_dict_val) = {
+        let (mut map_keys, is_dict_val) = {
             let table = match db.get_table_mut(table_name) {
                 Ok(t) => t,
                 Err(e) => {
@@ -498,11 +500,18 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
                 selected_keys
             } else {
                 let mut k: Vec<_> = map.keys().cloned().collect();
-                k.sort();
+                // `sort_keys` falls back to the ID, so only sort here when it is not called.
+                if sort_specs.is_empty() {
+                    k.sort();
+                }
                 k
             };
             (keys, is_dict)
         };
+
+        if !sort_specs.is_empty() {
+            map_keys = db.sort_keys(table_name, is_dict_val, map_keys, &sort_specs);
+        }
 
         if field_names.is_empty() {
             for key in map_keys {
@@ -614,8 +623,9 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
 }
 
 fn handle_select(db: &mut Database, parts: &[&str]) {
-    // SELECT [DICT] <table> [WITH <field> <op> <value>]
+    // SELECT [DICT] <table> [WITH <field> <op> <value>] [BY|BY.DSND <field> ...]
     // e.g. SELECT USERS WITH First.Name = "Ted"
+    // e.g. SELECT PRODUCTS WITH DESC = "[new]" BY PRICE BY.DSND CREATE.DATE
     let mut offset = 1;
     let is_dict = if parts.len() > offset && parts[offset].to_uppercase() == "DICT" {
         offset += 1;
@@ -625,7 +635,7 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
     };
 
     if parts.len() < offset + 1 {
-        println!("Usage: SELECT [DICT] <table> [WITH <field> <op> <value>]");
+        println!("Usage: SELECT [DICT] <table> [WITH <field> <op> <value>] [BY|BY.DSND <field> ...]");
         return;
     }
 
@@ -642,14 +652,17 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
         None
     };
 
-    let results = if parts.len() >= offset + 2 && parts[offset + 1].to_uppercase() == "WITH" {
-        if let Some(query) = db.parse_query(table_name, &parts[offset + 1..]) {
+    // Strip any trailing BY / BY.DSND sort clauses before parsing the selection criteria.
+    let (clause_parts, sort_specs) = Database::parse_sort_specs(&parts[offset + 1..]);
+
+    let mut results = if !clause_parts.is_empty() && clause_parts[0].to_uppercase() == "WITH" {
+        if let Some(query) = db.parse_query(table_name, &clause_parts) {
             db.query(table_name, is_dict, &query, keys_to_filter.as_deref())
         } else {
             println!("INVALID QUERY FORMAT");
             return;
         }
-    } else if parts.len() == offset + 1 {
+    } else if clause_parts.is_empty() {
         if let Some(table) = db.get_table(table_name) {
             let map = if is_dict { &table.dictionary } else { &table.records };
             let mut res: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -660,9 +673,11 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
             return;
         }
     } else {
-        println!("Usage: SELECT [DICT] <table> [WITH <field> <op> <value>]");
+        println!("Usage: SELECT [DICT] <table> [WITH <field> <op> <value>] [BY|BY.DSND <field> ...]");
         return;
     };
+
+    db.sort_results(table_name, &mut results, &sort_specs);
 
     if results.is_empty() {
         println!("NO RECORDS FOUND");
@@ -858,6 +873,10 @@ fn print_help(current_account: &str) {
     println!("  SELECT [DICT] <table> [WITH <field> <op> <value>] - Create/refine active select list.");
     println!("    Operators: =, #, <>, <, >, <=, >=, EQ, NE, LT, GT, LE, GE");
     println!("    Wildcards (with = or #): [value (ends with), value] (starts with), [value] (contains)");
+    println!("    Sorting (LIST and SELECT): BY <field> (ascending), BY.DSND <field> (descending)");
+    println!("      Any number may be given; they are applied from left to right.");
+    println!("      Sort operators and column names may appear in any order.");
+    println!("      e.g. SELECT PRODUCTS WITH DESC = \"[new]\" BY PRICE BY.DSND CREATE.DATE");
     println!("  EDIT [DICT] <table> <key>             - Edit a record using external editor.");
     println!("  CT [DICT] <table> [<key>]             - Print record contents, field by field. Uses SELECT list if key omitted.");
     println!("  SAVE                                  - Save database to disk.");

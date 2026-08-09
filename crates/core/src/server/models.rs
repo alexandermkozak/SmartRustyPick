@@ -1,4 +1,4 @@
-use crate::db::QueryNode;
+use crate::db::{QueryNode, SortSpec};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -13,6 +13,7 @@ pub struct Request {
     pub is_dict: Option<bool>,
     pub query_node: Option<QueryNode>,
     pub query_string: Option<String>,
+    pub sort_specs: Option<Vec<SortSpec>>,
     pub list_name: Option<String>,
     pub batch_size: Option<usize>,
     pub thumbprint: Option<String>,
