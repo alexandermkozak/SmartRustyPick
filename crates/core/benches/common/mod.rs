@@ -39,6 +39,10 @@ impl Drop for TempDir {
 }
 
 /// Config that never touches the working directory's `config.toml`.
+///
+/// `fsync` defaults to `never` so the numbers stay comparable with the ones
+/// measured before group syncing existed; set `SRP_BENCH_FSYNC=always|meta` to
+/// measure what the durability guarantee costs.
 pub fn bench_config() -> Config {
     Config {
         editor: None,
@@ -51,6 +55,7 @@ pub fn bench_config() -> Config {
         max_log_records: Some(10),
         records_per_group: None,
         durable_writes: Some(true),
+        fsync: Some(std::env::var("SRP_BENCH_FSYNC").unwrap_or_else(|_| "never".to_string())),
         flush_interval_ms: None,
         flush_max_pending: None,
     }

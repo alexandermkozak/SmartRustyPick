@@ -17,6 +17,10 @@ pub struct Config {
     pub records_per_group: Option<usize>,
     /// Flush every write to disk before acknowledging it. Safest, slowest.
     pub durable_writes: Option<bool>,
+    /// How much of a flush is forced to the platter: `"always"`, `"meta"` or
+    /// `"never"` (default). Files marked durable use `"always"` unless this is
+    /// set explicitly.
+    pub fsync: Option<String>,
     /// How long a change may stay in memory before being flushed.
     pub flush_interval_ms: Option<u64>,
     /// Flush once this many writes are pending, regardless of the interval.
@@ -45,6 +49,7 @@ impl Config {
             max_log_records: Some(100),
             records_per_group: None,
             durable_writes: None,
+            fsync: None,
             flush_interval_ms: None,
             flush_max_pending: None,
         }
