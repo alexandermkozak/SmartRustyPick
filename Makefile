@@ -2,6 +2,7 @@
 
 CONTAINER_ENGINE ?= podman
 IMAGE ?= localhost/smart-rusty-pick:latest
+PYTHON ?= python3
 
 build:
 	cargo build
@@ -17,15 +18,19 @@ run-server: build
 test-unit:
 	cargo test --workspace
 
+# Each suite runs in its own temporary directory, so they never touch the
+# working copy's db_storage/config.toml and can be run individually.
 test-integration: build
 	@echo "Running integration tests..."
-	python3 test/integration/test_server.py
-	python3 test/integration/test_headless.py
-	python3 test/integration/test_security.py
+	@rm -f integration_results.md
+	$(PYTHON) test/integration/test_server.py
+	$(PYTHON) test/integration/test_headless.py
+	$(PYTHON) test/integration/test_security.py
 
 test-performance: build
 	@echo "Running performance tests..."
-	python3 test/performance/test_load.py
+	@rm -f performance_results.md
+	$(PYTHON) test/performance/test_load.py
 
 test-all: test-unit test-integration test-performance
 

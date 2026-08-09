@@ -1,10 +1,25 @@
 name: Build and Test
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the CI signal about correctness rather than raw throughput: a smaller
+  # volume still exercises every query shape on the shared runners.
+  SRP_PERF_RECORDS: 2000
+  # Shared runners are slower and noisier than a workstation.
+  SRP_STARTUP_TIMEOUT: 60
+
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
 
     steps:
@@ -13,14 +28,38 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build
-        run: cargo build
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
 
-      - name: Run Unit Tests
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Show tool versions
+        run: |
+          cargo --version
+          python3 --version
+          openssl version
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Run unit tests
         run: make test-unit
 
-      - name: Run Integration Tests
+      - name: Run integration tests
         run: make test-integration
 
-      - name: Run Performance Tests
+      - name: Run performance tests
         run: make test-performance
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            integration_results.md
+            performance_results.md
+          if-no-files-found: warn

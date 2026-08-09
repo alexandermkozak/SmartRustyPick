@@ -349,11 +349,14 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             if !client_info.is_admin {
                 return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), ..Default::default() };
             }
+            if target_account.is_none() {
+                return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), ..Default::default() };
+            }
             let name = match req.file {
                 Some(n) => n,
                 None => return Response { status: "ERROR".to_string(), message: Some("File name not specified".to_string()), ..Default::default() },
             };
-            match db.create_table(&name) {
+            match db.create_table_for_account(acc, &name) {
                 Ok(_) => Response { status: "OK".to_string(), ..Default::default() },
                 Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), ..Default::default() },
             }
@@ -362,11 +365,14 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             if !client_info.is_admin {
                 return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), ..Default::default() };
             }
+            if target_account.is_none() {
+                return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), ..Default::default() };
+            }
             let name = match req.file {
                 Some(n) => n,
                 None => return Response { status: "ERROR".to_string(), message: Some("File name not specified".to_string()), ..Default::default() },
             };
-            match db.delete_table(&name) {
+            match db.delete_table_for_account(acc, &name) {
                 Ok(_) => Response { status: "OK".to_string(), ..Default::default() },
                 Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), ..Default::default() },
             }

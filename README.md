@@ -57,6 +57,7 @@ For more information, see the following documentation:
 - [General Use Commands](docs/general_commands.md) - Data operations and queries.
 - [Remote Protocol](docs/protocol.md) - Details on the TCP/SSL remote protocol.
 - [Container Deployment](docs/deployment.md) - Running the server with podman or docker compose.
+- [Testing](docs/testing.md) - The unit, integration and performance suites and how to run them.
 - [MCP Server](mcp/README.md) - Usage instructions for the Model Context Protocol server.
 - [AI Agents](agents.md) - Documentation on the role and contributions of AI agents in this project.
 
@@ -78,7 +79,9 @@ when the CLI is launched.
 ## Quick Start
 
 1. Compile the workspace with `cargo build --release`.
-2. Run tests with `make test-unit` or `make test-all`.
+2. Run tests with `make test-unit` or `make test-all` (see [Testing](docs/testing.md)).
+    - The integration and performance suites need `python3` and `openssl`; they run against the built binaries in
+      isolated temporary directories, so they never touch your `db_storage/`.
 3. Run test coverage with `make test-coverage` (requires `cargo-llvm-cov`).
 4. Run the interactive "full stack" experience (CLI + background server): `make run` or
    `cargo run -p smart-rusty-pick-cli`.

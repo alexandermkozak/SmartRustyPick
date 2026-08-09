@@ -1,148 +1,168 @@
-import socket
-import ssl
-import json
-import time
-import subprocess
+"""Load profile for the remote protocol: bulk writes followed by representative queries.
+
+Timings are reported rather than asserted, because they depend heavily on the host.
+The correctness of each query (its result count) *is* asserted, so a performance
+regression that also breaks behaviour still fails the suite.
+"""
+
 import os
+import sys
+import time
 
-def generate_certs():
-    subprocess.run("openssl genrsa -out ca.key 2048", shell=True, check=True, capture_output=True)
-    subprocess.run("openssl req -x509 -new -nodes -key ca.key -sha256 -days 365 -out ca.crt -subj '/CN=Test CA' -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign,cRLSign'", shell=True, check=True, capture_output=True)
-    subprocess.run("openssl genrsa -out server.key 2048", shell=True, check=True, capture_output=True)
-    subprocess.run("openssl req -new -key server.key -out server.csr -subj '/CN=localhost'", shell=True, check=True, capture_output=True)
-    subprocess.run("openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -sha256", shell=True, check=True, capture_output=True)
-    subprocess.run("openssl genrsa -out client.key 2048", shell=True, check=True, capture_output=True)
-    subprocess.run("openssl req -new -key client.key -out client.csr -subj '/CN=Test Client'", shell=True, check=True, capture_output=True)
-    subprocess.run("openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 365 -sha256", shell=True, check=True, capture_output=True)
-    
-    thumbprint = subprocess.check_output("openssl x509 -in client.crt -fingerprint -noout -sha256", shell=True).decode().split('=')[1].replace(':', '').strip().lower()
-    return thumbprint
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
 
-def run_request(port, request, certfile, keyfile, cafile, existing_ssock=None):
-    if existing_ssock:
-        existing_ssock.sendall(json.dumps(request).encode() + b'\n')
-        
-        # Read until newline to handle large responses
-        data = b''
-        while not data.endswith(b'\n'):
-            chunk = existing_ssock.recv(4096)
-            if not chunk: break
-            data += chunk
-        
-        response = data.decode()
-        return json.loads(response)
+import harness
 
-    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=cafile)
-    context.load_cert_chain(certfile=certfile, keyfile=keyfile)
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_REQUIRED
+ACCOUNT = "PERF_ACC"
+FILE = "PERF"
+NUM_RECORDS = int(os.environ.get("SRP_PERF_RECORDS", "10000"))
+# Derived so the suite stays meaningful when the record count is overridden.
+MIDDLE_SEQ = NUM_RECORDS // 2
+BATCH_SIZE = max(1, min(500, NUM_RECORDS // 10))
 
-    with socket.create_connection(('127.0.0.1', port)) as sock:
-        with context.wrap_socket(sock, server_hostname='localhost') as ssock:
-            ssock.sendall(json.dumps(request).encode() + b'\n')
-            
-            # Read until newline to handle large responses
-            data = b''
-            while not data.endswith(b'\n'):
-                chunk = ssock.recv(4096)
-                if not chunk: break
-                data += chunk
-            
-            response = data.decode()
-            return json.loads(response)
+SETUP_COMMANDS = [
+    f"CREATE.ACCOUNT {ACCOUNT}",
+    f"LOGTO {ACCOUNT}",
+    "Y",  # answer the "DIR file missing. Create and populate?" prompt
+    f"CREATE.FILE {FILE}",
+    f"SET DICT {FILE} VAL1 1",
+    f"SET DICT {FILE} VAL2 2",
+    f"SET DICT {FILE} SEQ 3",
+    "SAVE",
+]
 
-def test_performance():
-    thumbprint = generate_certs()
-    
-    # Clean up
-    if os.path.exists("PERF_ACC"):
-        import shutil
-        shutil.rmtree("PERF_ACC")
-    if os.path.exists("accounts.reg"): os.remove("accounts.reg")
-    if os.path.exists("certs.reg"): os.remove("certs.reg")
 
-    port = 9999
-    num_records = 10000
+def timed(func):
+    start = time.perf_counter()
+    result = func()
+    return result, (time.perf_counter() - start)
 
-    # Start the application
-    proc = subprocess.Popen(["./target/debug/SmartRustyPick"], stdin=subprocess.PIPE, text=True)
-    
-    # Initialize SYSTEM and authorize client
-    proc.stdin.write("SYSTEM\n") # Log into SYSTEM
-    proc.stdin.write(f"AUTHORIZE.CONN {thumbprint} perf_client ADMIN\n")
-    proc.stdin.write("CREATE.ACCOUNT PERF_ACC\n")
-    proc.stdin.write("LOGTO PERF_ACC\n")
-    proc.stdin.write("Y\n") # Create DIR if prompted
-    proc.stdin.write(f"START.SERVER 127.0.0.1:{port} server.crt server.key ca.crt\n")
-    proc.stdin.flush()
 
-    time.sleep(5)
+def main():
+    suite = harness.Suite(
+        "Performance",
+        "performance_results.md",
+        title="Performance Test Results",
+        detail_header="Performance Data",
+    )
+    harness.require_binaries(harness.CLI_BIN)
 
-    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="ca.crt")
-    context.load_cert_chain(certfile="client.crt", keyfile="client.key")
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_REQUIRED
+    with harness.Workspace("performance") as workspace:
+        certs = harness.Certificates(workspace.path)
+        client_crt, client_key, thumbprint = certs.client("client")
+        port = harness.free_port()
+        harness.write_config(port, certs)
 
-    try:
-        with socket.create_connection(('127.0.0.1', port)) as sock:
-            with context.wrap_socket(sock, server_hostname='localhost') as ssock:
-                print(f"Loading {num_records} records...")
-                start_time = time.time()
-                for i in range(num_records):
-                    # Rotate Val1, Val2 to make queries more interesting
-                    val1 = f"Val{i % 10}"
-                    val2 = f"Data{i % 100}"
-                    req = {"command": "WRITE", "table": "PERF", "key": f"REC{i}", "data": f"{val1}^{val2}^{i}", "account": "PERF_ACC"}
-                    run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
-                end_time = time.time()
-                print(f"Time to write {num_records} records: {end_time - start_time:.2f}s")
-                write_time = end_time - start_time
+        cli = harness.start_cli(["--account", "SYSTEM"])
+        try:
+            cli.stdin.write(f"AUTHORIZE.CONN {thumbprint} perf_client ADMIN\n")
+            for command in SETUP_COMMANDS:
+                cli.stdin.write(command + "\n")
+            cli.stdin.flush()
 
-                print("Testing simple query performance (3 = 5000)...")
-                start_time = time.time()
-                req = {"command": "QUERY", "table": "PERF", "query_string": "WITH 3 = 5000", "account": "PERF_ACC"}
-                resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
-                end_time = time.time()
-                simple_query_time = (end_time - start_time) * 1000
-                print(f"Simple query time: {simple_query_time:.2f}ms. Keys found: {len(resp.get('results', []))}")
+            conn = harness.wait_for_client(port, client_crt, client_key, certs.ca_crt, process=cli)
+            with conn:
+                print(f"Writing {NUM_RECORDS} records...")
 
-                print("Testing attribute query performance (1 = Val5)...")
-                start_time = time.time()
-                req = {"command": "QUERY", "table": "PERF", "query_string": "WITH 1 = Val5", "account": "PERF_ACC"}
-                resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
-                end_time = time.time()
-                attr_query_time = (end_time - start_time) * 1000
-                print(f"Attribute query time: {attr_query_time:.2f}ms. Keys found: {len(resp.get('results', []))}")
+                def write_all():
+                    failed = 0
+                    for i in range(NUM_RECORDS):
+                        resp = conn.request(
+                            command="WRITE",
+                            file=FILE,
+                            key=f"REC{i}",
+                            data=f"Val{i % 10}^Data{i % 100}^{i}",
+                            account=ACCOUNT,
+                        )
+                        if resp["status"] != "OK":
+                            failed += 1
+                    return failed
 
-                print("Testing complex query performance (1 = Val5 AND 3 > 9000)...")
-                start_time = time.time()
-                req = {"command": "QUERY", "table": "PERF", "query_string": "WITH 1 = Val5 AND 3 > 9000", "account": "PERF_ACC"}
-                resp = run_request(port, req, "client.crt", "client.key", "ca.crt", existing_ssock=ssock)
-                end_time = time.time()
-                complex_query_time = (end_time - start_time) * 1000
-                print(f"Complex query time: {complex_query_time:.2f}ms. Keys found: {len(resp.get('results', []))}")
+                failed, write_time = timed(write_all)
+                suite.check(
+                    f"Write {NUM_RECORDS} records",
+                    failed == 0,
+                    f"{write_time:.2f}s total, {write_time / NUM_RECORDS * 1000:.2f}ms/record"
+                    if failed == 0
+                    else f"{failed} writes failed",
+                )
 
-                # Generate performance_results.md
-                with open("performance_results.md", "w") as f:
-                    f.write("# Performance Test Results\n\n")
-                    f.write(f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                    f.write("| Test Case | Status | Performance Data |\n")
-                    f.write("| --- | --- | --- |\n")
-                    f.write(f"| Write {num_records} records | Success | {write_time:.2f}s |\n")
-                    f.write(f"| Simple Query (1 result) | Success | {simple_query_time:.2f}ms |\n")
-                    f.write(f"| Attribute Query (1000 results) | Success | {attr_query_time:.2f}ms |\n")
-                    f.write(f"| Complex Query (100 results) | Success | {complex_query_time:.2f}ms |\n")
-                
-                try:
-                    ssock.unwrap()
-                except (ssl.SSLError, socket.error):
-                    pass
+                def query(query_string):
+                    return conn.request(
+                        command="QUERY", file=FILE, query_string=query_string, account=ACCOUNT
+                    )
 
-    finally:
-        proc.terminate()
-        proc.wait()
-        for f in ["ca.key", "ca.crt", "ca.srl", "server.key", "server.csr", "server.crt", "client.key", "client.csr", "client.crt"]:
-            if os.path.exists(f): os.remove(f)
+                resp, elapsed = timed(lambda: query(f"WITH SEQ = {MIDDLE_SEQ}"))
+                count = len(resp.get("results") or [])
+                suite.check(
+                    f"Unique-match query (WITH SEQ = {MIDDLE_SEQ})",
+                    count == 1,
+                    f"{elapsed * 1000:.2f}ms, {count} result(s)",
+                )
+
+                resp, elapsed = timed(lambda: query("WITH VAL1 = Val5"))
+                count = len(resp.get("results") or [])
+                suite.check(
+                    "Attribute query (WITH VAL1 = Val5)",
+                    count == NUM_RECORDS // 10,
+                    f"{elapsed * 1000:.2f}ms, {count} result(s)",
+                )
+
+                resp, elapsed = timed(lambda: query("WITH VAL1 = Val5 AND VAL2 = Data55"))
+                count = len(resp.get("results") or [])
+                suite.check(
+                    "Compound query (WITH VAL1 = Val5 AND VAL2 = Data55)",
+                    count == NUM_RECORDS // 100,
+                    f"{elapsed * 1000:.2f}ms, {count} result(s)",
+                )
+
+                resp, elapsed = timed(lambda: query(""))
+                count = len(resp.get("results") or [])
+                suite.check(
+                    "Full scan",
+                    count == NUM_RECORDS,
+                    f"{elapsed * 1000:.2f}ms, {count} result(s)",
+                )
+
+                resp, elapsed = timed(
+                    lambda: conn.request(
+                        command="SELECT",
+                        file=FILE,
+                        query_string="WITH VAL1 = Val5",
+                        list_name="PERFLIST",
+                        account=ACCOUNT,
+                    )
+                )
+                suite.check(
+                    "SELECT into a named list",
+                    resp.get("count") == NUM_RECORDS // 10,
+                    f"{elapsed * 1000:.2f}ms, {resp.get('count')} key(s)",
+                )
+
+                resp, elapsed = timed(
+                    lambda: conn.request(
+                        command="GET.NEXT",
+                        list_name="PERFLIST",
+                        batch_size=BATCH_SIZE,
+                        account=ACCOUNT,
+                    )
+                )
+                count = len(resp.get("results") or [])
+                suite.check(
+                    f"GET.NEXT batch of {BATCH_SIZE}",
+                    count == BATCH_SIZE,
+                    f"{elapsed * 1000:.2f}ms, {count} record(s)",
+                )
+        except Exception as exc:  # noqa: BLE001 - report instead of aborting the whole run
+            suite.error("Performance suite", exc)
+        finally:
+            output = harness.stop(cli)
+            if suite.failures:
+                print("--- CLI output ---")
+                print(output)
+
+    return suite.finish()
+
 
 if __name__ == "__main__":
-    test_performance()
+    sys.exit(main())

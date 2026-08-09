@@ -1,0 +1,329 @@
+"""Shared helpers for the SmartRustyPick integration and performance suites.
+
+Every suite runs inside its own temporary working directory. Both binaries resolve
+`config.toml` and the storage directory relative to the current working directory,
+so this is enough to keep a run fully isolated from the developer's real
+`db_storage/` and `config.toml`, and to let suites run in any order.
+"""
+
+import json
+import os
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+PROFILE = os.environ.get("SRP_PROFILE", "debug")
+TARGET_DIR = os.path.abspath(os.environ.get("CARGO_TARGET_DIR", os.path.join(REPO_ROOT, "target")))
+
+CLI_BIN = os.path.join(TARGET_DIR, PROFILE, "smart-rusty-pick-cli")
+SERVER_BIN = os.path.join(TARGET_DIR, PROFILE, "smart-rusty-pick-server")
+
+STARTUP_TIMEOUT = float(os.environ.get("SRP_STARTUP_TIMEOUT", "30"))
+
+
+def require_binaries(*binaries):
+    """Fail fast with an actionable message instead of a confusing FileNotFoundError."""
+    missing = [b for b in binaries if not os.path.exists(b)]
+    if missing:
+        names = ", ".join(os.path.basename(b) for b in missing)
+        raise SystemExit(f"Missing binaries ({names}). Run `cargo build` first.")
+
+
+def free_port():
+    """Reserve an ephemeral port from the OS so parallel/CI runs never collide."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _run(cmd):
+    subprocess.run(cmd, shell=True, check=True, capture_output=True)
+
+
+class Certificates:
+    """A throwaway CA plus a server certificate and any number of client certificates."""
+
+    def __init__(self, directory):
+        self.dir = directory
+        self.ca_crt = os.path.join(directory, "ca.crt")
+        self.ca_key = os.path.join(directory, "ca.key")
+        self.server_crt = os.path.join(directory, "server.crt")
+        self.server_key = os.path.join(directory, "server.key")
+        self._create_ca()
+        self._create_server()
+
+    def _path(self, *parts):
+        return os.path.join(self.dir, *parts)
+
+    def _write_ext(self, name, contents):
+        path = self._path(name)
+        with open(path, "w") as handle:
+            handle.write(contents)
+        return path
+
+    def _create_ca(self):
+        _run(f"openssl genrsa -out {self.ca_key} 2048")
+        _run(
+            f"openssl req -x509 -new -nodes -key {self.ca_key} -sha256 -days 365 -out {self.ca_crt} "
+            "-subj '/CN=SmartRustyPick Test CA' "
+            "-addext 'basicConstraints=critical,CA:TRUE' "
+            "-addext 'keyUsage=critical,keyCertSign,cRLSign'"
+        )
+
+    def _sign(self, name, common_name, ext_contents):
+        key = self._path(f"{name}.key")
+        csr = self._path(f"{name}.csr")
+        crt = self._path(f"{name}.crt")
+        ext = self._write_ext(f"{name}.ext", ext_contents)
+        _run(f"openssl genrsa -out {key} 2048")
+        _run(f"openssl req -new -key {key} -out {csr} -subj '/CN={common_name}'")
+        _run(
+            f"openssl x509 -req -in {csr} -CA {self.ca_crt} -CAkey {self.ca_key} -CAcreateserial "
+            f"-out {crt} -days 365 -sha256 -extfile {ext}"
+        )
+        os.remove(ext)
+        os.remove(csr)
+        return crt, key
+
+    def _create_server(self):
+        self._sign(
+            "server",
+            "localhost",
+            "basicConstraints=critical,CA:FALSE\n"
+            "keyUsage=critical,digitalSignature,keyEncipherment\n"
+            "extendedKeyUsage=serverAuth\n"
+            "subjectAltName=DNS:localhost,IP:127.0.0.1\n",
+        )
+
+    def client(self, name):
+        """Issue a client certificate and return a (crt, key, sha256 thumbprint) triple."""
+        crt, key = self._sign(
+            name,
+            f"SmartRustyPick {name}",
+            "basicConstraints=critical,CA:FALSE\n"
+            "keyUsage=critical,digitalSignature\n"
+            "extendedKeyUsage=clientAuth\n",
+        )
+        fingerprint = subprocess.check_output(
+            f"openssl x509 -in {crt} -fingerprint -noout -sha256", shell=True
+        ).decode()
+        thumbprint = fingerprint.split("=", 1)[1].replace(":", "").strip().lower()
+        return crt, key, thumbprint
+
+
+class Client:
+    """A mutual-TLS client speaking the newline-delimited JSON protocol."""
+
+    def __init__(self, port, certfile, keyfile, cafile):
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=cafile)
+        context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_REQUIRED
+
+        sock = socket.create_connection(("127.0.0.1", port), timeout=30)
+        self.sock = context.wrap_socket(sock, server_hostname="localhost")
+        self.sock.settimeout(60)
+        self._buffer = b""
+
+    def request(self, **payload):
+        """Send one request and read exactly one newline-terminated response."""
+        self.sock.sendall(json.dumps(payload).encode() + b"\n")
+        while b"\n" not in self._buffer:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("Server closed the connection before responding")
+            self._buffer += chunk
+        line, self._buffer = self._buffer.split(b"\n", 1)
+        return json.loads(line.decode())
+
+    def close(self):
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        finally:
+            self.sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+
+def wait_for_port(port, process=None, timeout=STARTUP_TIMEOUT):
+    """Poll until the server accepts TCP connections, failing early if it died."""
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(f"Process exited with code {process.returncode} before opening port {port}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.1)
+    raise TimeoutError(f"Port {port} did not open within {timeout}s (last error: {last_error})")
+
+
+def wait_for_client(port, certfile, keyfile, cafile, timeout=STARTUP_TIMEOUT, process=None):
+    """Wait for the port, then retry the TLS handshake until the acceptor is ready."""
+    wait_for_port(port, process=process, timeout=timeout)
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        try:
+            return Client(port, certfile, keyfile, cafile)
+        except (ssl.SSLError, OSError) as exc:
+            last_error = exc
+            time.sleep(0.2)
+    raise TimeoutError(f"Could not establish a TLS session on port {port} (last error: {last_error})")
+
+
+def write_config(port, certs=None, extra=""):
+    """Write a config.toml into the current working directory.
+
+    When `certs` is None no TLS paths are emitted, which keeps the CLI from
+    auto-starting its background server (useful when the suite starts one itself).
+    """
+    lines = [f'server_addr = "127.0.0.1"', f"server_port = {port}", 'editor = "true"']
+    if certs is not None:
+        lines += [
+            f'cert_path = "{certs.server_crt}"',
+            f'key_path = "{certs.server_key}"',
+            f'ca_path = "{certs.ca_crt}"',
+        ]
+    with open("config.toml", "w") as handle:
+        handle.write("\n".join(lines) + "\n" + extra)
+
+
+def start_server(cwd=None, env=None):
+    """Start the headless server binary."""
+    require_binaries(SERVER_BIN)
+    return subprocess.Popen(
+        [SERVER_BIN],
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def start_cli(args=(), cwd=None):
+    """Start the interactive CLI with its stdin/stdout attached to pipes."""
+    require_binaries(CLI_BIN)
+    return subprocess.Popen(
+        [CLI_BIN, *args],
+        cwd=cwd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def run_cli(commands, args=(), cwd=None, timeout=60):
+    """Run the CLI over a fixed command script and return its combined output."""
+    proc = start_cli(args, cwd=cwd)
+    script = "".join(f"{line}\n" for line in commands)
+    try:
+        output, _ = proc.communicate(script, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        output, _ = proc.communicate()
+        raise TimeoutError(f"CLI did not exit within {timeout}s. Output:\n{output}")
+    return output
+
+
+def stop(process, timeout=10):
+    """Terminate a child process and return whatever it printed."""
+    if process is None:
+        return ""
+    if process.poll() is None:
+        process.terminate()
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, _ = process.communicate()
+    return output or ""
+
+
+class Workspace:
+    """A temporary working directory that the suite runs inside."""
+
+    def __init__(self, name):
+        self.name = name
+        self.path = None
+        self._previous_cwd = None
+
+    def __enter__(self):
+        self._previous_cwd = os.getcwd()
+        self.path = tempfile.mkdtemp(prefix=f"srp-{self.name}-")
+        os.chdir(self.path)
+        return self
+
+    def __exit__(self, *_exc):
+        os.chdir(self._previous_cwd)
+        if os.environ.get("SRP_KEEP_WORKSPACE"):
+            print(f"Workspace kept at {self.path}")
+        else:
+            shutil.rmtree(self.path, ignore_errors=True)
+        return False
+
+
+class Suite:
+    """Collects results so a single failure does not hide the rest of the suite."""
+
+    def __init__(self, name, results_file, title="Integration Test Results", detail_header="Details"):
+        self.name = name
+        self.results_file = os.path.join(REPO_ROOT, results_file)
+        self.title = title
+        self.detail_header = detail_header
+        self.failures = 0
+        self.checks = 0
+
+    def _log(self, test_name, status, detail):
+        new_file = not os.path.exists(self.results_file)
+        with open(self.results_file, "a") as handle:
+            if new_file:
+                handle.write(f"# {self.title}\n\n")
+                handle.write(f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                handle.write(f"| Test Name | Status | {self.detail_header} |\n")
+                handle.write("| --- | --- | --- |\n")
+            handle.write(f"| {test_name} | {status} | {detail} |\n")
+
+    def check(self, test_name, passed, detail=""):
+        self.checks += 1
+        status = "Success" if passed else "Failure"
+        if not passed:
+            self.failures += 1
+        print(f"  [{status}] {test_name}{f': {detail}' if detail else ''}")
+        self._log(f"{self.name}: {test_name}", status, detail or "-")
+        return passed
+
+    def check_eq(self, test_name, actual, expected):
+        passed = actual == expected
+        detail = "as expected" if passed else f"expected `{expected}`, got `{actual}`"
+        return self.check(test_name, passed, detail)
+
+    def error(self, test_name, exc):
+        self.checks += 1
+        self.failures += 1
+        print(f"  [Failure] {test_name}: {exc}")
+        self._log(f"{self.name}: {test_name}", "Failure", str(exc).replace("|", "/").replace("\n", " "))
+
+    def finish(self):
+        print(f"\n{self.name}: {self.checks - self.failures}/{self.checks} checks passed")
+        if self.failures:
+            print(f"{self.name} FAILED", file=sys.stderr)
+            return 1
+        print(f"{self.name} PASSED")
+        return 0

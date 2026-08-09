@@ -63,6 +63,80 @@ fn test_handle_request_read_write() {
 }
 
 #[test]
+fn test_create_and_delete_file_target_the_requested_account() {
+    // A headless server is not logged into any account, so these commands must act on
+    // the account named in the request rather than on `current_account`.
+    let base_dir = "test_server_create_file_dir";
+    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let mut db = Database::new(base_dir, None).unwrap();
+    db.create_account("FILE_TEST", None).unwrap();
+    db.current_account = String::new();
+
+    let db_arc = Arc::new(Mutex::new(db));
+    let admin = ClientInfo {
+        thumbprint: "admin_tp".to_string(),
+        allowed_accounts: Vec::new(),
+        is_admin: true,
+    };
+
+    let resp = handle_request(
+        Request {
+            command: "CREATE.FILE".to_string(),
+            account: Some("FILE_TEST".to_string()),
+            file: Some("STOCK".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert!(Path::new(base_dir).join("FILE_TEST").join("STOCK").exists());
+
+    // The new file must be usable straight away through the same account.
+    let resp = handle_request(
+        Request {
+            command: "WRITE".to_string(),
+            account: Some("FILE_TEST".to_string()),
+            file: Some("STOCK".to_string()),
+            key: Some("ITEM1".to_string()),
+            data: Some(serde_json::Value::String("Widget".to_string())),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+
+    // Without an account there is nothing to act on, so the request must be rejected.
+    let resp = handle_request(
+        Request {
+            command: "CREATE.FILE".to_string(),
+            file: Some("ORPHAN".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.message.unwrap(), "Account not specified");
+
+    let resp = handle_request(
+        Request {
+            command: "DELETE.FILE".to_string(),
+            account: Some("FILE_TEST".to_string()),
+            file: Some("STOCK".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert!(!Path::new(base_dir).join("FILE_TEST").join("STOCK").exists());
+
+    fs::remove_dir_all(base_dir).unwrap();
+}
+
+#[test]
 fn test_handle_request_query_select() {
     let base_dir = "test_server_query_dir";
     if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }

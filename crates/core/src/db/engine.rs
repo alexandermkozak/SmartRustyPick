@@ -799,8 +799,12 @@ impl Database {
 
     pub fn list_tables(&mut self) -> Vec<String> {
         let account = self.current_account.clone();
-        let _ = self.ensure_available_tables(&account);
-        let mut tables: Vec<_> = self.available_tables.get(&account)
+        self.list_tables_for_account(&account)
+    }
+
+    pub fn list_tables_for_account(&mut self, account: &str) -> Vec<String> {
+        let _ = self.ensure_available_tables(account);
+        let mut tables: Vec<_> = self.available_tables.get(account)
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default();
         tables.sort();
@@ -821,12 +825,16 @@ impl Database {
 
     pub fn create_table(&mut self, name: &str) -> io::Result<()> {
         let account = self.current_account.clone();
+        self.create_table_for_account(&account, name)
+    }
+
+    pub fn create_table_for_account(&mut self, account: &str, name: &str) -> io::Result<()> {
         if account.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
         }
-        self.ensure_available_tables(&account)?;
+        self.ensure_available_tables(account)?;
 
-        let storage = self.account_storage_dir(&account);
+        let storage = self.account_storage_dir(account);
         let table_dir = format!("{}/{}", storage, name);
         if !Path::new(&table_dir).exists() {
             fs::create_dir_all(&table_dir)?;
@@ -834,7 +842,7 @@ impl Database {
         File::create(format!("{}/data", table_dir))?;
         File::create(format!("{}/dict", table_dir))?;
 
-        let available = self.available_tables.get_mut(&account).unwrap();
+        let available = self.available_tables.get_mut(account).unwrap();
         if available.contains(name) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("Table '{}' already exists", name)));
         }
@@ -842,7 +850,7 @@ impl Database {
 
         // Update DIR file if it exists and this is not the DIR file itself
         if name != "DIR" && available.contains("DIR") {
-            let _ = self.sync_dir_file();
+            let _ = self.sync_dir_file_for_account(account);
         }
 
         // Set default dictionary for SYSTEM files
@@ -855,22 +863,26 @@ impl Database {
 
     pub fn delete_table(&mut self, name: &str) -> io::Result<()> {
         let account = self.current_account.clone();
+        self.delete_table_for_account(&account, name)
+    }
+
+    pub fn delete_table_for_account(&mut self, account: &str, name: &str) -> io::Result<()> {
         if account.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
         }
-        self.ensure_available_tables(&account)?;
-        if !self.available_tables.get(&account).unwrap().contains(name) {
+        self.ensure_available_tables(account)?;
+        if !self.available_tables.get(account).unwrap().contains(name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' not found", name)));
         }
 
-        let key = (account.clone(), name.to_string());
+        let key = (account.to_string(), name.to_string());
         self.loaded_tables.remove(&key);
-        self.available_tables.get_mut(&account).unwrap().remove(name);
+        self.available_tables.get_mut(account).unwrap().remove(name);
         if let Some(pos) = self.lru_order.iter().position(|x| x == &key) {
             self.lru_order.remove(pos);
         }
 
-        let storage = self.account_storage_dir(&account);
+        let storage = self.account_storage_dir(account);
         let table_dir = format!("{}/{}", storage, name);
         let _ = fs::remove_dir_all(table_dir);
 
@@ -879,8 +891,12 @@ impl Database {
 
     pub fn sync_dir_file(&mut self) -> io::Result<()> {
         let account = self.current_account.clone();
-        let tables = self.list_tables();
-        let dir_table = self.get_table_mut_for_account(&account, "DIR")?;
+        self.sync_dir_file_for_account(&account)
+    }
+
+    pub fn sync_dir_file_for_account(&mut self, account: &str) -> io::Result<()> {
+        let tables = self.list_tables_for_account(account);
+        let dir_table = self.get_table_mut_for_account(account, "DIR")?;
         dir_table.records.clear();
         for t in tables {
             if t != "DIR" {
