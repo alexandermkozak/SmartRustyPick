@@ -1,4 +1,4 @@
-use crate::db::hashfile::{self, SectionMeta};
+use crate::db::hashfile::{self, FsyncPolicy, SectionMeta};
 use crate::db::models::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
@@ -29,6 +29,15 @@ pub struct Database {
     /// When true every write is flushed immediately, trading throughput for
     /// the guarantee that an acknowledged write survives a crash.
     pub durable_writes: bool,
+    /// How hard an ordinary buffered flush pushes: handing the bytes to the
+    /// page cache is not the same as having them on disk.
+    pub fsync: FsyncPolicy,
+    /// The policy used for a write that was promised to be durable. Defaults to
+    /// [`FsyncPolicy::Always`], because "flushed before the write is
+    /// acknowledged" is otherwise a promise about the page cache and not about
+    /// the disk. An explicit `fsync` setting overrides it, for the operator who
+    /// knowingly trades the guarantee for throughput.
+    pub durable_fsync: FsyncPolicy,
     /// Longest a change may sit in memory before the next flush picks it up.
     pub flush_interval: Duration,
     /// Flush once this many writes have accumulated, so a burst is batched but
@@ -66,6 +75,11 @@ impl Database {
                 .filter(|n| *n > 0)
                 .unwrap_or(hashfile::DEFAULT_RECORDS_PER_GROUP),
             durable_writes: config.durable_writes.unwrap_or(false),
+            fsync: FsyncPolicy::from_config(config.fsync.as_deref()),
+            durable_fsync: match config.fsync.as_deref() {
+                Some(value) => FsyncPolicy::from_config(Some(value)),
+                None => FsyncPolicy::Always,
+            },
             flush_interval: Duration::from_millis(config.flush_interval_ms.unwrap_or(250)),
             flush_max_pending: config.flush_max_pending.unwrap_or(256).max(1),
             pending_writes: 0,
@@ -751,6 +765,16 @@ impl Database {
         let data_path = format!("{}/{}/data", storage, name);
         let dict_path = format!("{}/{}/dict", storage, name);
 
+        // A file the caller marked durable is worth a real fsync: "flushed
+        // before the write is acknowledged" has to mean on disk, not merely in
+        // the page cache. Read from the cache rather than the DIR file so the
+        // flush path stays free of I/O.
+        let fsync = if self.durable_writes || self.durable_tables.get(&key).copied().unwrap_or(false) {
+            self.durable_fsync
+        } else {
+            self.fsync
+        };
+
         let table = match self.loaded_tables.get_mut(&key) {
             Some(table) if table.is_dirty() => table,
             _ => return Ok(()),
@@ -762,7 +786,14 @@ impl Database {
             } else {
                 Some(&table.dirty_keys)
             };
-            table.data_meta = hashfile::save(&data_path, &table.records, table.data_meta, incremental, per_group)?;
+            table.data_meta = hashfile::save_with_fsync(
+                &data_path,
+                &table.records,
+                table.data_meta,
+                incremental,
+                per_group,
+                fsync,
+            )?;
             if table.legacy_data {
                 let _ = fs::remove_file(&data_path);
                 table.legacy_data = false;
@@ -770,6 +801,9 @@ impl Database {
         }
         if table.dict_dirty {
             Self::save_section(&table.dictionary, &dict_path)?;
+            if fsync == FsyncPolicy::Always {
+                File::open(&dict_path)?.sync_all()?;
+            }
         }
         table.clear_dirty();
         Ok(())

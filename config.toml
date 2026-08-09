@@ -10,6 +10,9 @@ editor = "nano"
 # Storage engine settings (optional)
 # records_per_group = 16
 # durable_writes = false
+# How much of a flush is forced to the disk: "never" (default), "meta" or
+# "always". Files marked DURABLE use "always" unless this is set explicitly.
+# fsync = "never"
 # flush_interval_ms = 250
 # flush_max_pending = 256
 

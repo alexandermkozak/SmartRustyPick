@@ -270,6 +270,186 @@ fn test_durable_writes_flush_immediately() {
     fs::remove_dir_all(&base).unwrap();
 }
 
+/// Path of the first non-empty group of a section.
+fn a_group(section: &str) -> std::path::PathBuf {
+    let dir = hashfile::section_dir(section);
+    let mut groups: Vec<std::path::PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with('g'))
+        .collect();
+    groups.sort();
+    groups.into_iter().next().expect("the section should have at least one group")
+}
+
+fn truncate(path: &std::path::Path, drop_bytes: u64) {
+    let len = fs::metadata(path).unwrap().len();
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_len(len - drop_bytes).unwrap();
+}
+
+#[test]
+fn test_torn_group_is_detected_not_reported_as_missing_records() {
+    let dir = fresh_dir("test_hashfile_torn_group");
+    let section = format!("{}/data", dir);
+    let map = sample_map(200);
+    hashfile::save(&section, &map, hashfile::SectionMeta::empty(), None, 16).unwrap();
+
+    // A write that reached the filesystem only in part: the tail of the group,
+    // trailer included, never made it.
+    let group = a_group(&section);
+    let before = fs::metadata(&group).unwrap().len();
+    truncate(&group, before / 2);
+
+    let mut loaded = HashMap::new();
+    let err = hashfile::load(&section, &mut loaded).expect_err("a torn group must not load quietly");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("Corrupt group file"), "unhelpful error: {err}");
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_flipped_byte_in_a_group_is_detected_by_the_checksum() {
+    let dir = fresh_dir("test_hashfile_bitflip");
+    let section = format!("{}/data", dir);
+    let map = sample_map(200);
+    hashfile::save(&section, &map, hashfile::SectionMeta::empty(), None, 16).unwrap();
+
+    // Damage a record's payload while leaving every length intact, so only the
+    // checksum can tell that the group is no longer what was written.
+    let group = a_group(&section);
+    let mut bytes = fs::read(&group).unwrap();
+    let victim = bytes.len() / 2;
+    bytes[victim] ^= 0xFF;
+    fs::write(&group, &bytes).unwrap();
+
+    let mut loaded = HashMap::new();
+    let err = hashfile::load(&section, &mut loaded).expect_err("a damaged group must not load");
+    assert!(err.to_string().contains("checksum mismatch"), "unhelpful error: {err}");
+    assert!(loaded.is_empty(), "a rejected group must not leave records behind");
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_truncated_meta_is_detected() {
+    let dir = fresh_dir("test_hashfile_torn_meta");
+    let section = format!("{}/data", dir);
+    let map = sample_map(50);
+    hashfile::save(&section, &map, hashfile::SectionMeta::empty(), None, 16).unwrap();
+
+    // Half a `meta` is the dangerous case: a surviving but wrong modulus makes
+    // records hash into groups that do not hold them, which reads back as
+    // silent data loss rather than as an error.
+    let meta = hashfile::section_dir(&section).join("meta");
+    let len = fs::metadata(&meta).unwrap().len();
+    truncate(&meta, len / 2);
+
+    let mut loaded = HashMap::new();
+    let err = hashfile::load(&section, &mut loaded).expect_err("a torn meta must not load");
+    assert!(err.to_string().contains("Corrupt section metadata"), "unhelpful error: {err}");
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_stale_tmp_file_is_cleaned_up_and_never_read() {
+    let dir = fresh_dir("test_hashfile_stale_tmp");
+    let section = format!("{}/data", dir);
+    let mut map = sample_map(50);
+    let meta = hashfile::save(&section, &map, hashfile::SectionMeta::empty(), None, 16).unwrap();
+
+    // What a crash between `create` and `rename` leaves behind.
+    let section_dir = hashfile::section_dir(&section);
+    fs::write(section_dir.join("g00000000.tmp"), b"half a group").unwrap();
+    fs::write(section_dir.join("meta.tmp"), b"half a meta").unwrap();
+
+    let mut loaded = HashMap::new();
+    hashfile::load(&section, &mut loaded).unwrap();
+    assert_eq!(loaded.len(), 50, "a leftover temporary file is not part of the section");
+
+    map.insert("K00001".to_string(), record("CHANGED"));
+    let dirty: HashSet<String> = ["K00001".to_string()].into_iter().collect();
+    hashfile::save(&section, &map, meta, Some(&dirty), 16).unwrap();
+
+    let leftovers: Vec<String> = fs::read_dir(&section_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "stale temporary files should be swept: {:?}", leftovers);
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_meta_is_written_after_the_groups_it_describes() {
+    let dir = fresh_dir("test_hashfile_ordering");
+    let section = format!("{}/data", dir);
+    let map = sample_map(300);
+    let meta = hashfile::save_with_fsync(
+        &section,
+        &map,
+        hashfile::SectionMeta::empty(),
+        None,
+        16,
+        hashfile::FsyncPolicy::Always,
+    )
+        .unwrap();
+
+    // `meta` names the modulus the group files implement, so it must never be
+    // the older file of the two: a `meta` from the future describes data that
+    // may not be on disk yet.
+    let section_dir = hashfile::section_dir(&section);
+    let meta_time = fs::metadata(section_dir.join("meta")).unwrap().modified().unwrap();
+    for group in 0..meta.modulus {
+        let path = section_dir.join(format!("g{:08x}", group));
+        if let Ok(stat) = fs::metadata(&path) {
+            assert!(
+                stat.modified().unwrap() <= meta_time,
+                "{} was written after meta",
+                path.display()
+            );
+        }
+    }
+    assert!(meta.checksums, "a full rewrite puts a trailer on every group");
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_a_group_without_a_trailer_still_loads_before_the_first_full_rewrite() {
+    let dir = fresh_dir("test_hashfile_pre_checksum");
+    let section = format!("{}/data", dir);
+    let section_dir = hashfile::section_dir(&section);
+    fs::create_dir_all(&section_dir).unwrap();
+
+    // A section as an older version left it: no trailer, no `checksums` flag.
+    let mut frames = Vec::new();
+    for i in 0..3 {
+        let key = format!("OLD{i}");
+        frames.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        frames.extend_from_slice(key.as_bytes());
+        let data = record(&format!("V{i}")).to_bytes();
+        frames.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        frames.extend_from_slice(&data);
+    }
+    for group in 0..hashfile::MIN_MODULUS {
+        fs::write(section_dir.join(format!("g{:08x}", group)), if group == 0 { &frames[..] } else { &[][..] }).unwrap();
+    }
+    fs::write(section_dir.join("meta"), b"version=7\nmodulus=8\nrecords=3\n").unwrap();
+
+    let mut loaded = HashMap::new();
+    let meta = hashfile::load(&section, &mut loaded).unwrap();
+    assert!(!meta.checksums);
+    assert_eq!(loaded.len(), 3, "an upgrade must not declare an intact section corrupt");
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn test_another_process_sees_flushed_changes() {
     let base = fresh_dir("test_hashfile_visibility");

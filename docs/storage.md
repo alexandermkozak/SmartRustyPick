@@ -14,6 +14,8 @@ flat file format.
     - `version`: A counter that increments on every flush, used for cross-process freshness detection.
     - `modulus`: The number of groups currently in use.
     - `records`: The total number of records in the table.
+  - `checksums`: `1` once every group file carries a checksum trailer.
+  - `checksum`: A CRC32C of the other lines, written first so a truncation cannot remove it unnoticed.
 - `data.hf/g<8 hex digits>`: Group files containing the actual records. Each file corresponds to a hash group. Empty
   groups do not have a corresponding file.
 
@@ -21,6 +23,13 @@ flat file format.
 
 Both group files and the dictionary file (`dict`) use a simple frame encoding:
 `[key_len u64 LE][key][data_len u64 LE][record bytes]`
+
+A group file ends with a fixed 20-byte trailer:
+`[magic "SRPHFG01"][record_count u64 LE][crc32c u32 LE]`
+
+The checksum covers every byte before the trailer. Without it a torn tail is indistinguishable from a short group, and a
+partial write reads back as "these records simply do not exist". The `meta` file is checksummed the same way, on its
+first line, so that a truncation cannot take the checksum with it and leave a plausible-looking older file behind.
 
 ### Hashing and Dynamic Modulus
 
@@ -48,7 +57,29 @@ that cannot be attributed to individual keys), or during migration from the old 
 ### Atomic Writes
 
 When a group is flushed, it is written to a `.tmp` sibling file and then renamed to the final group filename, ensuring
-atomic updates.
+atomic updates. A `.tmp` left behind by a crash belongs to no group and is swept the next time the section is loaded.
+
+Renaming only makes the replacement *atomic*, not *durable*: the rename can be visible while the data blocks are not.
+See [Sync Policy](#sync-policy) for what closes that gap.
+
+### Write Ordering
+
+A flush writes every group first and only then rewrites `meta`. `meta.version` therefore never advertises data that is
+not yet on disk. The opposite order would let a surviving `meta` name a modulus the group files do not implement, so
+records would hash into groups that never received them - silent data loss on read rather than a load error.
+
+### Corruption Policy
+
+A damaged section is refused, not patched over:
+
+- A group whose checksum or record count does not match its trailer fails the load with an error naming the file.
+- A group with no trailer at all fails too, once `meta` records that the section is checksummed.
+- A truncated, unparsable or mis-checksummed `meta` fails the load.
+- Nothing is published into the in-memory table until the group it came from has been verified, so a rejected group
+  cannot leave a half-applied table behind.
+
+Sections written before checksums existed have no trailer and no `checksums` flag in `meta`; they are read leniently and
+gain their trailers on the first full rewrite, so an upgrade never declares an intact database corrupt.
 
 ### Automatic Migration
 
@@ -96,6 +127,20 @@ Set it when creating the file:
 The global `durable_writes = true` still wins: it makes every file durable regardless of its `DIR` entry. Reading the
 flag costs nothing on the write path — it is cached per file after the first lookup.
 
+### Sync Policy
+
+`fsync` decides how much of a flush is forced all the way to the disk:
+
+| Value             | Group files                  | Directory and `meta` | Survives power loss                   |
+|-------------------|------------------------------|----------------------|---------------------------------------|
+| `never` (default) | page cache                   | page cache           | No                                    |
+| `meta`            | page cache                   | `fsync`ed            | The namespace and `meta`, not records |
+| `always`          | `sync_all` before the rename | `fsync`ed            | Yes                                   |
+
+A file marked `DURABLE` (and a database running with `durable_writes = true`) uses `always`, because "flushed before the
+write is acknowledged" has to mean on disk and not merely in the page cache. Setting `fsync` explicitly overrides that
+too, for an operator who knowingly trades the guarantee for throughput.
+
 ## Configuration
 
 The following optional keys in `config.toml` control the storage engine:
@@ -103,6 +148,8 @@ The following optional keys in `config.toml` control the storage engine:
 - `records_per_group` (default 16): Target number of records per group. Lower values result in smaller group files and
   faster rewrites but more files.
 - `durable_writes` (default false): If true, every write is flushed to disk before being acknowledged.
+- `fsync` (default `never`): How much of a flush is forced to the disk — `never`, `meta` or `always`. Durable files use
+  `always` unless this is set explicitly.
 - `flush_interval_ms` (default 250): Maximum time a change stays in memory before being flushed.
 - `flush_max_pending` (default 256): Maximum number of pending writes before a flush is triggered.
 
@@ -123,6 +170,23 @@ measurements, not guarantees.
 Measured directly on the engine (`cargo bench -p smart-rusty-pick-core --bench storage -- incremental_write`), one
 record updated and flushed: 63 µs on a 1,000-record table and 61 µs on a 10,000-record one — the cost of a write does
 not depend on the size of the table.
+
+### The Cost of Syncing
+
+Same benchmark, one record updated and flushed, with `SRP_BENCH_FSYNC` selecting the policy. On a tmpfs (`/tmp`) an
+`fsync` is close to free, so these were taken on an ext4 volume on an NVMe SSD, which is what the guarantee actually
+costs:
+
+| `fsync`  | 1,000 records | 10,000 records |
+|----------|---------------|----------------|
+| `never`  | 0.15 ms       | 0.16 ms        |
+| `meta`   | 15.5 ms       | 15.2 ms        |
+| `always` | 23.6 ms       | 20.6 ms        |
+
+Two things to read out of this. First, durability costs about two orders of magnitude per flush — which is why `never`
+remains the default for the buffered path, where a flush covers a whole batch rather than a single write, and why
+syncing is reserved for files that asked for it. Second, the cost still does not depend on the size of the table: what
+is paid for is the sync itself, not the amount of data rewritten.
 
 ### Performance Constraints
 
