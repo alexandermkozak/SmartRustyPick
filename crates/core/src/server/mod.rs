@@ -13,9 +13,9 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio_rustls::rustls::server::WebPkiClientVerifier;
-use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::RootCertStore;
+use tokio_rustls::rustls::server::WebPkiClientVerifier;
 
 pub async fn start_server(config: Arc<Config>, db: Arc<Mutex<Database>>, override_addr: Option<String>) -> tokio::io::Result<()> {
     // Install default crypto provider for rustls

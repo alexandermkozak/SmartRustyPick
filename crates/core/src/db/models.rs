@@ -146,6 +146,7 @@ pub struct Table {
     pub records: HashMap<String, Record>,
     pub dictionary: HashMap<String, Record>,
     pub dirty: bool,
+    pub stamp: Option<TableStamp>,
 }
 
 impl Table {
@@ -154,8 +155,17 @@ impl Table {
             records: HashMap::new(),
             dictionary: HashMap::new(),
             dirty: false,
+            stamp: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableStamp {
+    pub data_modified: Option<std::time::SystemTime>,
+    pub data_len: u64,
+    pub dict_modified: Option<std::time::SystemTime>,
+    pub dict_len: u64,
 }
 
 #[derive(Clone, Debug)]
