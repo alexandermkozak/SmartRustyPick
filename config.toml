@@ -1,8 +1,10 @@
 server_addr = "127.0.0.1"
 server_port = 8443
-cert_path = "server.crt"
-key_path = "server.key"
-ca_path = "ca.crt"
+# Generated on first start if missing, together with the CA key next to `ca.crt`.
+# `.local/` is the single ignored directory for developer scratch.
+cert_path = ".local/certs/server.crt"
+key_path = ".local/certs/server.key"
+ca_path = ".local/certs/ca.crt"
 editor = "nano"
 
 # Storage engine settings (optional)

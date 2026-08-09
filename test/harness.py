@@ -24,6 +24,11 @@ TARGET_DIR = os.path.abspath(os.environ.get("CARGO_TARGET_DIR", os.path.join(REP
 CLI_BIN = os.path.join(TARGET_DIR, PROFILE, "smart-rusty-pick-cli")
 SERVER_BIN = os.path.join(TARGET_DIR, PROFILE, "smart-rusty-pick-server")
 
+# Every suite writes its report and its metrics here rather than into the repository
+# root, so a test run never dirties the working copy. `target/` is already ignored,
+# which means one rule covers all present and future result files.
+RESULTS_DIR = os.path.abspath(os.environ.get("SRP_RESULTS_DIR", os.path.join(TARGET_DIR, "test-results")))
+
 STARTUP_TIMEOUT = float(os.environ.get("SRP_STARTUP_TIMEOUT", "30"))
 
 # Latency budgets are wall-clock and therefore host dependent. They are deliberately
@@ -469,10 +474,11 @@ class Suite:
         metrics_file=None,
     ):
         self.name = name
-        self.results_file = os.path.join(REPO_ROOT, results_file)
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        self.results_file = os.path.join(RESULTS_DIR, results_file)
         self.title = title
         self.detail_header = detail_header
-        self.metrics_file = os.path.join(REPO_ROOT, metrics_file) if metrics_file else None
+        self.metrics_file = os.path.join(RESULTS_DIR, metrics_file) if metrics_file else None
         self.failures = 0
         self.checks = 0
         self.metrics = {}
