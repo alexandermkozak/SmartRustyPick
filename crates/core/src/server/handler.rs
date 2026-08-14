@@ -1,4 +1,4 @@
-use crate::db::{Database, Record};
+use crate::db::{Database, Record, Table};
 use crate::server::models::{Request, Response};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -42,10 +42,10 @@ pub fn handle_request(req: Request, db: &SharedDb, client_info: &crate::db::Clie
     if is_read_only(&command) {
         if let (Some(acc), Some(table_name)) = (allowed_account(&req, client_info), req.file.as_deref()) {
             let db = read_lock(db);
-            if db.table_ready_for_read(&acc, table_name) {
+            if let Some(table) = db.table_ready_for_read(&acc, table_name) {
                 return match command.as_str() {
-                    "READ" => read_command(&db, &acc, &req),
-                    _ => query_command(&db, &acc, &req),
+                    "READ" => read_command(&db, table, &acc, &req),
+                    _ => query_command(&db, table, &acc, &req),
                 };
             }
         }
@@ -71,8 +71,8 @@ fn allowed_account(req: &Request, client_info: &crate::db::ClientInfo) -> Option
     }
 }
 
-/// Reads a single record from a table that is already in memory.
-fn read_command(db: &Database, acc: &str, req: &Request) -> Response {
+/// Reads a single record from `table`, which the caller has already resolved.
+fn read_command(db: &Database, table: &Table, acc: &str, req: &Request) -> Response {
     let table_name = match req.file.as_deref() {
         Some(t) => t,
         None => return error("File not specified"),
@@ -83,10 +83,6 @@ fn read_command(db: &Database, acc: &str, req: &Request) -> Response {
     };
     let is_dict = req.is_dict.unwrap_or(false);
 
-    let table = match db.get_table_read_only_for_account(acc, table_name) {
-        Some(t) => t,
-        None => return error(format!("Table error: {} not loaded", table_name)),
-    };
     let records = if is_dict { &table.dictionary } else { &table.records };
     match records.get(key) {
         Some(record) => Response {
@@ -98,8 +94,8 @@ fn read_command(db: &Database, acc: &str, req: &Request) -> Response {
     }
 }
 
-/// Runs a QUERY against a table that is already in memory.
-fn query_command(db: &Database, acc: &str, req: &Request) -> Response {
+/// Runs a QUERY against `table`, which the caller has already resolved.
+fn query_command(db: &Database, table: &Table, acc: &str, req: &Request) -> Response {
     let table_name = match req.file.as_deref() {
         Some(t) => t,
         None => return error("File not specified"),
@@ -119,25 +115,21 @@ fn query_command(db: &Database, acc: &str, req: &Request) -> Response {
     };
 
     let results_processed: Vec<(String, serde_json::Value)> = if let Some(q) = query_node {
-        let mut results = db.query_read_only_for_account(acc, table_name, is_dict, &q, None);
-        db.sort_results_read_only_for_account(acc, table_name, &mut results, &sort_specs);
+        let mut results = Database::query_in(table, is_dict, &q, None);
+        Database::sort_results_in(table, &mut results, &sort_specs);
         results.into_iter()
             .map(|(k, r)| (k, db.serialize_record_for_account(acc, table_name, &r)))
             .collect()
     } else {
         // Full scan: sort the keys only, then serialize each record by reference so the
         // whole table is never cloned into memory.
-        let table = match db.get_table_read_only_for_account(acc, table_name) {
-            Some(t) => t,
-            None => return error(format!("Table error: {} not loaded", table_name)),
-        };
         let records = if is_dict { &table.dictionary } else { &table.records };
         let mut keys: Vec<String> = records.keys().cloned().collect();
         if sort_specs.is_empty() {
-            // `sort_keys_read_only_for_account` already falls back to the ID, so only sort here.
+            // `sort_keys_in` already falls back to the ID, so only sort here.
             keys.sort();
         } else {
-            keys = db.sort_keys_read_only_for_account(acc, table_name, is_dict, keys, &sort_specs);
+            keys = Database::sort_keys_in(table, is_dict, keys, &sort_specs);
         }
 
         keys.into_iter()
@@ -198,7 +190,11 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             if let Err(e) = db.get_table_mut_for_account(acc, &table_name) {
                 return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() };
             }
-            read_command(db, acc, &req)
+            let table = match db.get_table_read_only_for_account(acc, &table_name) {
+                Some(t) => t,
+                None => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {} not loaded", table_name)), ..Default::default() },
+            };
+            read_command(db, table, acc, &req)
         }
         "WRITE" => {
             if target_account.is_none() {
@@ -296,7 +292,11 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             if let Err(e) = db.get_table_mut_for_account(acc, &table_name) {
                 return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() };
             }
-            query_command(db, acc, &req)
+            let table = match db.get_table_read_only_for_account(acc, &table_name) {
+                Some(t) => t,
+                None => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {} not loaded", table_name)), ..Default::default() },
+            };
+            query_command(db, table, acc, &req)
         }
         "SELECT" => {
             if target_account.is_none() {

@@ -50,6 +50,30 @@ pub struct Database {
     durable_tables: HashMap<(String, String), bool>,
 }
 
+impl Table {
+    /// The 0-based index of a dictionary field, or `None` when the field is
+    /// unknown. Reading it off the table directly spares the caller a lookup in
+    /// `loaded_tables`, which costs two string allocations per call.
+    pub fn field_index(&self, field_name: &str) -> Option<usize> {
+        if field_name == "ID" { return Some(0); }
+        let rec = self.dictionary.get(field_name)?;
+        let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.get(0)?.sub_values.get(0)?;
+        match idx_str.parse::<usize>() {
+            // Pick attribute 1 is 0-indexed 0 in our internal fields vector
+            Ok(idx) if idx > 0 => Some(idx - 1),
+            _ => None,
+        }
+    }
+
+    /// The Pick MDn conversion code of a dictionary field, if it has one.
+    pub fn conversion_code(&self, field_name: &str) -> Option<String> {
+        let rec = self.dictionary.get(field_name)?;
+        // Pick MDn conversion is in Field 8
+        let code = rec.fields.get(DICT_CONV_IDX)?.values.get(0)?.sub_values.get(0)?;
+        if code.is_empty() { None } else { Some(code.clone()) }
+    }
+}
+
 impl Database {
     pub fn new(base_storage_dir: &str, config: Option<crate::config::Config>) -> io::Result<Self> {
         let config = config.unwrap_or_else(crate::config::Config::load);
@@ -476,15 +500,18 @@ impl Database {
         TableStamp { data_modified, data_len, dict_modified, dict_len }
     }
 
-    /// True when a table can be read through a shared reference alone: it is
+    /// The table, when it can be read through a shared reference alone: it is
     /// already in memory and either holds unflushed changes of ours or still
     /// matches the files on disk. Callers that only hold `&self` cannot load or
     /// invalidate a table, so they use this to decide whether they have to fall
-    /// back to an exclusive borrow.
-    pub fn table_ready_for_read(&self, account: &str, name: &str) -> bool {
-        match self.get_table_read_only_for_account(account, name) {
-            Some(table) => table.is_dirty() || table.stamp == Some(self.disk_stamp(account, name)),
-            None => false,
+    /// back to an exclusive borrow. Returning the table itself saves them a
+    /// second lookup.
+    pub fn table_ready_for_read(&self, account: &str, name: &str) -> Option<&Table> {
+        let table = self.get_table_read_only_for_account(account, name)?;
+        if table.is_dirty() || table.stamp == Some(self.disk_stamp(account, name)) {
+            Some(table)
+        } else {
+            None
         }
     }
 
@@ -1262,19 +1289,7 @@ impl Database {
     }
 
     pub fn get_conversion_code_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> Option<String> {
-        let table = self.get_table_read_only_for_account(account, table_name)?;
-        if let Some(rec) = table.dictionary.get(field_name) {
-            // Pick MDn conversion is in Field 8
-            if let Some(f8) = rec.fields.get(DICT_CONV_IDX) {
-                if let Some(v) = f8.values.get(0) {
-                    let code: &String = v.sub_values.get(0)?;
-                    if !code.is_empty() {
-                        return Some(code.clone());
-                    }
-                }
-            }
-        }
-        None
+        self.get_table_read_only_for_account(account, table_name)?.conversion_code(field_name)
     }
 
     pub fn get_conversion_code(&mut self, table_name: &str, field_name: &str) -> Option<String> {
@@ -1432,21 +1447,7 @@ impl Database {
 
     pub fn get_field_index_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> Option<usize> {
         if field_name == "ID" { return Some(0); }
-        let table = self.get_table_read_only_for_account(account, table_name)?;
-        if let Some(rec) = table.dictionary.get(field_name) {
-            if let Some(f1) = rec.fields.get(DICT_FIELD_IDX) {
-                if let Some(v1) = f1.values.get(0) {
-                    let idx_str: &String = v1.sub_values.get(0)?;
-                    if let Ok(idx) = idx_str.parse::<usize>() {
-                        // Pick attribute 1 is 0-indexed 0 in our internal fields vector
-                        if idx > 0 {
-                            return Some(idx - 1);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        self.get_table_read_only_for_account(account, table_name)?.field_index(field_name)
     }
 
     pub fn get_field_index(&mut self, table_name: &str, field_name: &str) -> Option<usize> {

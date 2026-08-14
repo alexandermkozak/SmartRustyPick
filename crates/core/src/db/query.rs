@@ -133,16 +133,20 @@ impl Database {
     pub fn sort_results_for_account(&mut self, account: &str, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
         if specs.is_empty() { return; }
         let _ = self.get_table_mut_for_account(account, table_name);
-        self.sort_results_read_only_for_account(account, table_name, results, specs);
+        let table = match self.get_table_read_only_for_account(account, table_name) {
+            Some(t) => t,
+            None => return,
+        };
+        Self::sort_results_in(table, results, specs);
     }
 
-    /// Same as [`sort_results_for_account`], but for a caller holding a shared
-    /// reference. The table must already be loaded; unknown fields compare
-    /// equal, so an unloaded table simply leaves the order untouched.
-    pub fn sort_results_read_only_for_account(&self, account: &str, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
+    /// Same as [`sort_results_for_account`], but for a caller that has already
+    /// resolved the table, so no lookup is repeated here. Unknown fields compare
+    /// equal, so they simply leave the order untouched.
+    pub fn sort_results_in(table: &Table, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
         if specs.is_empty() { return; }
 
-        let resolved = self.resolve_sort_fields(account, table_name, specs);
+        let resolved = Self::resolve_sort_fields(table, specs);
 
         // Pre-calculate the sort values once per record instead of on every comparison.
         let sort_keys: Vec<Vec<String>> = results
@@ -158,13 +162,13 @@ impl Database {
 
     /// Resolves each sort spec to a field index. `None` means the record ID, `Some(usize::MAX)`
     /// marks an unknown field, which compares equal so the ordering stays stable.
-    fn resolve_sort_fields(&self, account: &str, table_name: &str, specs: &[SortSpec]) -> Vec<(Option<usize>, bool)> {
+    fn resolve_sort_fields(table: &Table, specs: &[SortSpec]) -> Vec<(Option<usize>, bool)> {
         let mut resolved: Vec<(Option<usize>, bool)> = Vec::with_capacity(specs.len());
         for spec in specs {
             if spec.field_name == "ID" {
                 resolved.push((None, spec.descending));
             } else {
-                match self.get_field_index_read_only_for_account(account, table_name, &spec.field_name) {
+                match table.field_index(&spec.field_name) {
                     Some(i) => resolved.push((Some(i), spec.descending)),
                     None => resolved.push((Some(usize::MAX), spec.descending)),
                 }
@@ -212,22 +216,21 @@ impl Database {
     pub fn sort_keys_for_account(&mut self, account: &str, table_name: &str, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
         if specs.is_empty() { return keys; }
         if self.get_table_mut_for_account(account, table_name).is_err() { return keys; }
-        self.sort_keys_read_only_for_account(account, table_name, is_dict, keys, specs)
+        match self.get_table_read_only_for_account(account, table_name) {
+            Some(table) => Self::sort_keys_in(table, is_dict, keys, specs),
+            None => keys,
+        }
     }
 
-    /// Same as [`sort_keys_for_account`], but for a caller holding a shared
-    /// reference; the table must already be loaded.
-    pub fn sort_keys_read_only_for_account(&self, account: &str, table_name: &str, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
+    /// Same as [`sort_keys_for_account`], but for a caller that has already
+    /// resolved the table.
+    pub fn sort_keys_in(table: &Table, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
         if specs.is_empty() { return keys; }
 
-        let resolved = self.resolve_sort_fields(account, table_name, specs);
+        let resolved = Self::resolve_sort_fields(table, specs);
 
         // Look the records up by reference and pre-calculate their sort values; no record is cloned.
         let sort_keys: Vec<Vec<String>> = {
-            let table = match self.get_table_read_only_for_account(account, table_name) {
-                Some(t) => t,
-                None => return keys,
-            };
             let map = if is_dict { &table.dictionary } else { &table.records };
             keys.iter()
                 .map(|k| match map.get(k) {
@@ -270,67 +273,63 @@ impl Database {
         if self.get_table_mut_for_account(account, table_name).is_err() {
             return Vec::new(); // Return empty results if table not found
         }
-        self.query_read_only_for_account(account, table_name, use_dict_section, query, keys_to_filter)
+        match self.get_table_read_only_for_account(account, table_name) {
+            Some(table) => Self::query_in(table, use_dict_section, query, keys_to_filter),
+            None => Vec::new(),
+        }
     }
 
-    /// Same as [`query_for_account`], but for a caller holding a shared
-    /// reference; the table must already be loaded.
-    pub fn query_read_only_for_account(&self, account: &str, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
+    /// Same as [`query_for_account`], but for a caller that has already resolved
+    /// the table.
+    pub fn query_in(table: &Table, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
         // Pre-calculate field indices and conversions to avoid repeated lookups per record
         let mut field_map = HashMap::new();
-        self.collect_field_indices_for_account(account, table_name, query, &mut field_map);
+        Self::collect_field_indices(table, query, &mut field_map);
 
         let mut results = Vec::new();
 
-        // Use a block to limit the borrow of `table`
-        {
-            let table = match self.get_table_read_only_for_account(account, table_name) {
-                Some(t) => t,
-                None => return results, // Return empty results if table not found
-            };
-            let source_map = if use_dict_section {
-                &table.dictionary
-            } else {
-                &table.records
-            };
+        let source_map = if use_dict_section {
+            &table.dictionary
+        } else {
+            &table.records
+        };
 
-            if let Some(filter_keys) = keys_to_filter {
-                for key in filter_keys {
-                    if let Some(record) = source_map.get(key) {
-                        if Self::evaluate_node_static_with_id(key, record, query, &field_map) {
-                            results.push((key.clone(), record.clone()));
-                        }
+        if let Some(filter_keys) = keys_to_filter {
+            for key in filter_keys {
+                if let Some(record) = source_map.get(key) {
+                    if Self::evaluate_node_static_with_id(key, record, query, &field_map) {
+                        results.push((key.clone(), record.clone()));
                     }
                 }
-            } else {
-                // Optimize: Filter before sorting.
-                // Avoid cloning the entire table by using an iterator.
-                results = source_map.iter()
-                    .filter(|(key, record)| Self::evaluate_node_static_with_id(key, record, query, &field_map))
-                    .map(|(key, record)| (key.clone(), record.clone()))
-                    .collect();
-                results.sort_by(|a, b| a.0.cmp(&b.0));
             }
+        } else {
+            // Optimize: Filter before sorting.
+            // Avoid cloning the entire table by using an iterator.
+            results = source_map.iter()
+                .filter(|(key, record)| Self::evaluate_node_static_with_id(key, record, query, &field_map))
+                .map(|(key, record)| (key.clone(), record.clone()))
+                .collect();
+            results.sort_by(|a, b| a.0.cmp(&b.0));
         }
 
         results
     }
 
 
-    pub(crate) fn collect_field_indices_for_account(&self, account: &str, table_name: &str, node: &QueryNode, map: &mut HashMap<String, FieldQueryInfo>) {
+    pub(crate) fn collect_field_indices(table: &Table, node: &QueryNode, map: &mut HashMap<String, FieldQueryInfo>) {
         match node {
             QueryNode::Condition(cond) => {
                 if cond.field_name == "ID" { return; }
                 if !map.contains_key(&cond.field_name) {
-                    if let Some(idx) = self.get_field_index_read_only_for_account(account, table_name, &cond.field_name) {
-                        let conversion = self.get_conversion_code_read_only_for_account(account, table_name, &cond.field_name);
+                    if let Some(idx) = table.field_index(&cond.field_name) {
+                        let conversion = table.conversion_code(&cond.field_name);
                         map.insert(cond.field_name.clone(), FieldQueryInfo { index: idx, conversion });
                     }
                 }
             }
             QueryNode::Logical { left, right, .. } => {
-                self.collect_field_indices_for_account(account, table_name, left, map);
-                self.collect_field_indices_for_account(account, table_name, right, map);
+                Self::collect_field_indices(table, left, map);
+                Self::collect_field_indices(table, right, map);
             }
         }
     }

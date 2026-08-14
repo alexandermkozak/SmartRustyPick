@@ -52,7 +52,7 @@ fn main() -> io::Result<()> {
 
     // Auto-login based on current directory
     let auto_account = {
-        let db_lock = db.write().unwrap();
+        let db_lock = db.read().unwrap();
         let current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         db_lock.get_account_for_dir(current_dir.to_str().unwrap_or("."))
     };
