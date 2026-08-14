@@ -9,7 +9,13 @@ pub struct FieldQueryInfo {
 }
 
 impl Database {
-    pub fn parse_query(&mut self, _table_name: &str, parts: &[&str]) -> Option<QueryNode> {
+    pub fn parse_query(&mut self, table_name: &str, parts: &[&str]) -> Option<QueryNode> {
+        self.parse_query_read_only(table_name, parts)
+    }
+
+    /// Parsing needs nothing from the database; this variant exists so a caller
+    /// holding only a shared reference can build a query too.
+    pub fn parse_query_read_only(&self, _table_name: &str, parts: &[&str]) -> Option<QueryNode> {
         // Simple parser for WITH <field> <op> <value> [AND/OR <field> <op> <value> ...]
         if parts.is_empty() { return None; }
         let mut start_idx = 0;
@@ -126,6 +132,15 @@ impl Database {
 
     pub fn sort_results_for_account(&mut self, account: &str, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
         if specs.is_empty() { return; }
+        let _ = self.get_table_mut_for_account(account, table_name);
+        self.sort_results_read_only_for_account(account, table_name, results, specs);
+    }
+
+    /// Same as [`sort_results_for_account`], but for a caller holding a shared
+    /// reference. The table must already be loaded; unknown fields compare
+    /// equal, so an unloaded table simply leaves the order untouched.
+    pub fn sort_results_read_only_for_account(&self, account: &str, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
+        if specs.is_empty() { return; }
 
         let resolved = self.resolve_sort_fields(account, table_name, specs);
 
@@ -143,13 +158,13 @@ impl Database {
 
     /// Resolves each sort spec to a field index. `None` means the record ID, `Some(usize::MAX)`
     /// marks an unknown field, which compares equal so the ordering stays stable.
-    fn resolve_sort_fields(&mut self, account: &str, table_name: &str, specs: &[SortSpec]) -> Vec<(Option<usize>, bool)> {
+    fn resolve_sort_fields(&self, account: &str, table_name: &str, specs: &[SortSpec]) -> Vec<(Option<usize>, bool)> {
         let mut resolved: Vec<(Option<usize>, bool)> = Vec::with_capacity(specs.len());
         for spec in specs {
             if spec.field_name == "ID" {
                 resolved.push((None, spec.descending));
             } else {
-                match self.get_field_index_for_account(account, table_name, &spec.field_name) {
+                match self.get_field_index_read_only_for_account(account, table_name, &spec.field_name) {
                     Some(i) => resolved.push((Some(i), spec.descending)),
                     None => resolved.push((Some(usize::MAX), spec.descending)),
                 }
@@ -196,14 +211,22 @@ impl Database {
 
     pub fn sort_keys_for_account(&mut self, account: &str, table_name: &str, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
         if specs.is_empty() { return keys; }
+        if self.get_table_mut_for_account(account, table_name).is_err() { return keys; }
+        self.sort_keys_read_only_for_account(account, table_name, is_dict, keys, specs)
+    }
+
+    /// Same as [`sort_keys_for_account`], but for a caller holding a shared
+    /// reference; the table must already be loaded.
+    pub fn sort_keys_read_only_for_account(&self, account: &str, table_name: &str, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
+        if specs.is_empty() { return keys; }
 
         let resolved = self.resolve_sort_fields(account, table_name, specs);
 
         // Look the records up by reference and pre-calculate their sort values; no record is cloned.
         let sort_keys: Vec<Vec<String>> = {
-            let table = match self.get_table_mut_for_account(account, table_name) {
-                Ok(t) => t,
-                Err(_) => return keys,
+            let table = match self.get_table_read_only_for_account(account, table_name) {
+                Some(t) => t,
+                None => return keys,
             };
             let map = if is_dict { &table.dictionary } else { &table.records };
             keys.iter()
@@ -244,7 +267,16 @@ impl Database {
     }
 
     pub fn query_for_account(&mut self, account: &str, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
-        // Pre-calculate field indices and conversions to avoid repeated mutable borrows of self
+        if self.get_table_mut_for_account(account, table_name).is_err() {
+            return Vec::new(); // Return empty results if table not found
+        }
+        self.query_read_only_for_account(account, table_name, use_dict_section, query, keys_to_filter)
+    }
+
+    /// Same as [`query_for_account`], but for a caller holding a shared
+    /// reference; the table must already be loaded.
+    pub fn query_read_only_for_account(&self, account: &str, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
+        // Pre-calculate field indices and conversions to avoid repeated lookups per record
         let mut field_map = HashMap::new();
         self.collect_field_indices_for_account(account, table_name, query, &mut field_map);
 
@@ -252,9 +284,9 @@ impl Database {
 
         // Use a block to limit the borrow of `table`
         {
-            let table = match self.get_table_mut_for_account(account, table_name) {
-                Ok(t) => t,
-                Err(_) => return results, // Return empty results if table not found
+            let table = match self.get_table_read_only_for_account(account, table_name) {
+                Some(t) => t,
+                None => return results, // Return empty results if table not found
             };
             let source_map = if use_dict_section {
                 &table.dictionary
@@ -285,12 +317,12 @@ impl Database {
     }
 
 
-    pub(crate) fn collect_field_indices_for_account(&mut self, account: &str, table_name: &str, node: &QueryNode, map: &mut HashMap<String, FieldQueryInfo>) {
+    pub(crate) fn collect_field_indices_for_account(&self, account: &str, table_name: &str, node: &QueryNode, map: &mut HashMap<String, FieldQueryInfo>) {
         match node {
             QueryNode::Condition(cond) => {
                 if cond.field_name == "ID" { return; }
                 if !map.contains_key(&cond.field_name) {
-                    if let Some(idx) = self.get_field_index_for_account(account, table_name, &cond.field_name) {
+                    if let Some(idx) = self.get_field_index_read_only_for_account(account, table_name, &cond.field_name) {
                         let conversion = self.get_conversion_code_read_only_for_account(account, table_name, &cond.field_name);
                         map.insert(cond.field_name.clone(), FieldQueryInfo { index: idx, conversion });
                     }

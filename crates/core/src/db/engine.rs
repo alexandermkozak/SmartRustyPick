@@ -476,6 +476,18 @@ impl Database {
         TableStamp { data_modified, data_len, dict_modified, dict_len }
     }
 
+    /// True when a table can be read through a shared reference alone: it is
+    /// already in memory and either holds unflushed changes of ours or still
+    /// matches the files on disk. Callers that only hold `&self` cannot load or
+    /// invalidate a table, so they use this to decide whether they have to fall
+    /// back to an exclusive borrow.
+    pub fn table_ready_for_read(&self, account: &str, name: &str) -> bool {
+        match self.get_table_read_only_for_account(account, name) {
+            Some(table) => table.is_dirty() || table.stamp == Some(self.disk_stamp(account, name)),
+            None => false,
+        }
+    }
+
     /// Drops a cached table whose backing files were modified by another process,
     /// forcing a fresh read on the next access. Locally modified (dirty) tables are
     /// kept untouched so that pending changes are never silently discarded.

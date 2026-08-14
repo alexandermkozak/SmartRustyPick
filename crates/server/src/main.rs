@@ -1,7 +1,7 @@
 use smart_rusty_pick_core::config::Config;
 use smart_rusty_pick_core::db::Database;
 use smart_rusty_pick_core::server;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 fn main() {
     let config = Config::load();
@@ -15,7 +15,7 @@ fn main() {
     }
 
     // We use a directory "db_storage" to hold our tables
-    let db = Arc::new(Mutex::new(Database::new("db_storage", Some(config.clone())).expect("Failed to initialize database")));
+    let db = Arc::new(RwLock::new(Database::new("db_storage", Some(config.clone())).expect("Failed to initialize database")));
 
     let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
     let port = config.server_port.unwrap_or(8443);
@@ -37,7 +37,7 @@ fn main() {
         }
         // Writes are buffered in memory between flushes, so a shutdown must
         // persist whatever has not been written out yet.
-        if let Ok(mut db_lock) = db.lock() {
+        if let Ok(mut db_lock) = db.write() {
             if let Err(e) = db_lock.save() {
                 eprintln!("Failed to flush on shutdown: {}", e);
             }
