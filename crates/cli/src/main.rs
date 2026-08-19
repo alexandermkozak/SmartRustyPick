@@ -116,7 +116,7 @@ fn main() -> io::Result<()> {
 
     loop {
         let prompt = {
-            let db_lock = db.write().unwrap();
+            let db_lock = db.read().unwrap();
             let acc = db_lock.current_account.clone();
             if acc.is_empty() {
                 "PICK> ".to_string()
@@ -265,7 +265,7 @@ fn main() -> io::Result<()> {
                 println!("OK");
             }
             "HELP" => {
-                let db_lock = db.write().unwrap();
+                let db_lock = db.read().unwrap();
                 print_help(&db_lock.current_account);
             }
             "EXIT" | "QUIT" => break,

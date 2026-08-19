@@ -1466,11 +1466,17 @@ impl Database {
     }
 
     pub fn serialize_record_for_account(&self, account: &str, table_name: &str, record: &Record) -> serde_json::Value {
+        match self.get_table_read_only_for_account(account, table_name) {
+            Some(table) => self.serialize_record_in(table, record),
+            None => serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    /// Serializes `record` using `table`, which the caller has already
+    /// resolved. Spares the caller a second table lookup per record, which
+    /// matters when serializing an entire result set.
+    pub fn serialize_record_in(&self, table: &Table, record: &Record) -> serde_json::Value {
         let mut map = serde_json::Map::new();
-        let table = match self.get_table_read_only_for_account(account, table_name) {
-            Some(t) => t,
-            None => return serde_json::Value::Object(map),
-        };
 
         for (dict_key, dict_rec) in &table.dictionary {
             if let Some(f1) = dict_rec.fields.get(DICT_FIELD_IDX) {
@@ -1478,8 +1484,12 @@ impl Database {
                     if let Some(idx_str) = v1.sub_values.get(0) {
                         if let Ok(idx) = idx_str.parse::<usize>() {
                             if idx > 0 {
-                                let _field_idx = idx - 1;
-                                let value = self.format_record_field_for_account(account, table_name, record, dict_key);
+                                let field_idx = idx - 1;
+                                let raw_val = record.get_field_display_string(field_idx);
+                                let value = match table.conversion_code(dict_key) {
+                                    Some(code) => Self::apply_conversion(&raw_val, &code),
+                                    None => raw_val,
+                                };
                                 let camel_key = self.to_camel_case(dict_key);
                                 map.insert(camel_key, serde_json::Value::String(value));
                             }

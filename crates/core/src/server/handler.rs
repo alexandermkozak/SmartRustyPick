@@ -44,8 +44,8 @@ pub fn handle_request(req: Request, db: &SharedDb, client_info: &crate::db::Clie
             let db = read_lock(db);
             if let Some(table) = db.table_ready_for_read(&acc, table_name) {
                 return match command.as_str() {
-                    "READ" => read_command(&db, table, &acc, &req),
-                    _ => query_command(&db, table, &acc, &req),
+                    "READ" => read_command(&db, table, &req),
+                    _ => query_command(&db, table, &req),
                 };
             }
         }
@@ -72,11 +72,10 @@ fn allowed_account(req: &Request, client_info: &crate::db::ClientInfo) -> Option
 }
 
 /// Reads a single record from `table`, which the caller has already resolved.
-fn read_command(db: &Database, table: &Table, acc: &str, req: &Request) -> Response {
-    let table_name = match req.file.as_deref() {
-        Some(t) => t,
-        None => return error("File not specified"),
-    };
+fn read_command(db: &Database, table: &Table, req: &Request) -> Response {
+    if req.file.is_none() {
+        return error("File not specified");
+    }
     let key = match req.key.as_deref() {
         Some(k) => k,
         None => return error("Key not specified"),
@@ -87,7 +86,7 @@ fn read_command(db: &Database, table: &Table, acc: &str, req: &Request) -> Respo
     match records.get(key) {
         Some(record) => Response {
             status: "OK".to_string(),
-            record: Some(db.serialize_record_for_account(acc, table_name, record)),
+            record: Some(db.serialize_record_in(table, record)),
             ..Default::default()
         },
         None => error("Record not found"),
@@ -95,7 +94,7 @@ fn read_command(db: &Database, table: &Table, acc: &str, req: &Request) -> Respo
 }
 
 /// Runs a QUERY against `table`, which the caller has already resolved.
-fn query_command(db: &Database, table: &Table, acc: &str, req: &Request) -> Response {
+fn query_command(db: &Database, table: &Table, req: &Request) -> Response {
     let table_name = match req.file.as_deref() {
         Some(t) => t,
         None => return error("File not specified"),
@@ -118,7 +117,7 @@ fn query_command(db: &Database, table: &Table, acc: &str, req: &Request) -> Resp
         let mut results = Database::query_in(table, is_dict, &q, None);
         Database::sort_results_in(table, &mut results, &sort_specs);
         results.into_iter()
-            .map(|(k, r)| (k, db.serialize_record_for_account(acc, table_name, &r)))
+            .map(|(k, r)| (k, db.serialize_record_in(table, &r)))
             .collect()
     } else {
         // Full scan: sort the keys only, then serialize each record by reference so the
@@ -135,7 +134,7 @@ fn query_command(db: &Database, table: &Table, acc: &str, req: &Request) -> Resp
         keys.into_iter()
             .filter_map(|k| {
                 let record = records.get(&k)?;
-                Some((k, db.serialize_record_for_account(acc, table_name, record)))
+                Some((k, db.serialize_record_in(table, record)))
             })
             .collect()
     };
@@ -194,7 +193,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 Some(t) => t,
                 None => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {} not loaded", table_name)), ..Default::default() },
             };
-            read_command(db, table, acc, &req)
+            read_command(db, table, &req)
         }
         "WRITE" => {
             if target_account.is_none() {
@@ -296,7 +295,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 Some(t) => t,
                 None => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {} not loaded", table_name)), ..Default::default() },
             };
-            query_command(db, table, acc, &req)
+            query_command(db, table, &req)
         }
         "SELECT" => {
             if target_account.is_none() {
