@@ -117,7 +117,7 @@ fn query_command(db: &Database, table: &Table, req: &Request) -> Response {
         let mut results = Database::query_in(table, is_dict, &q, None);
         Database::sort_results_in(table, &mut results, &sort_specs);
         results.into_iter()
-            .map(|(k, r)| (k, db.serialize_record_in(table, &r)))
+            .map(|(k, r)| (k, db.serialize_record_in(table, r)))
             .collect()
     } else {
         // Full scan: sort the keys only, then serialize each record by reference so the

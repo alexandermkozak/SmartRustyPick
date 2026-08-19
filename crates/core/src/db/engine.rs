@@ -68,9 +68,29 @@ impl Table {
     /// The Pick MDn conversion code of a dictionary field, if it has one.
     pub fn conversion_code(&self, field_name: &str) -> Option<String> {
         let rec = self.dictionary.get(field_name)?;
+        Self::conversion_code_from_dict_record(rec)
+    }
+
+    /// Same as [`conversion_code`], but for a caller that already has the
+    /// dictionary record in hand, sparing a second lookup in `dictionary`.
+    pub(crate) fn conversion_code_from_dict_record(dict_rec: &Record) -> Option<String> {
         // Pick MDn conversion is in Field 8
-        let code = rec.fields.get(DICT_CONV_IDX)?.values.get(0)?.sub_values.get(0)?;
+        let code = dict_rec.fields.get(DICT_CONV_IDX)?.values.get(0)?.sub_values.get(0)?;
         if code.is_empty() { None } else { Some(code.clone()) }
+    }
+
+    /// The 0-based index and conversion code of a dictionary field in a single
+    /// dictionary lookup, instead of one lookup per property.
+    pub fn field_index_and_conversion(&self, field_name: &str) -> Option<(usize, Option<String>)> {
+        if field_name == "ID" { return Some((0, None)); }
+        let rec = self.dictionary.get(field_name)?;
+        let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.get(0)?.sub_values.get(0)?;
+        let idx = match idx_str.parse::<usize>() {
+            // Pick attribute 1 is 0-indexed 0 in our internal fields vector
+            Ok(idx) if idx > 0 => idx - 1,
+            _ => return None,
+        };
+        Some((idx, Self::conversion_code_from_dict_record(rec)))
     }
 }
 
@@ -1486,7 +1506,7 @@ impl Database {
                             if idx > 0 {
                                 let field_idx = idx - 1;
                                 let raw_val = record.get_field_display_string(field_idx);
-                                let value = match table.conversion_code(dict_key) {
+                                let value = match Table::conversion_code_from_dict_record(dict_rec) {
                                     Some(code) => Self::apply_conversion(&raw_val, &code),
                                     None => raw_val,
                                 };

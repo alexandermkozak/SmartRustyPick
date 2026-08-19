@@ -143,7 +143,11 @@ impl Database {
     /// Same as [`sort_results_for_account`], but for a caller that has already
     /// resolved the table, so no lookup is repeated here. Unknown fields compare
     /// equal, so they simply leave the order untouched.
-    pub fn sort_results_in(table: &Table, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
+    ///
+    /// Generic over `T: Borrow<Record>` so it works both for owned results and
+    /// for the borrowed records returned by [`query_in`](Self::query_in),
+    /// without cloning.
+    pub fn sort_results_in<T: std::borrow::Borrow<Record>>(table: &Table, results: &mut Vec<(String, T)>, specs: &[SortSpec]) {
         if specs.is_empty() { return; }
 
         let resolved = Self::resolve_sort_fields(table, specs);
@@ -151,12 +155,12 @@ impl Database {
         // Pre-calculate the sort values once per record instead of on every comparison.
         let sort_keys: Vec<Vec<String>> = results
             .iter()
-            .map(|(id, record)| Self::sort_key_for(id, record, &resolved))
+            .map(|(id, record)| Self::sort_key_for(id, record.borrow(), &resolved))
             .collect();
 
         let order = Self::sorted_order(&sort_keys, &resolved, |i| results[i].0.as_str());
 
-        let mut taken: Vec<Option<(String, Record)>> = results.drain(..).map(Some).collect();
+        let mut taken: Vec<Option<(String, T)>> = results.drain(..).map(Some).collect();
         results.extend(order.into_iter().map(|i| taken[i].take().unwrap()));
     }
 
@@ -274,14 +278,19 @@ impl Database {
             return Vec::new(); // Return empty results if table not found
         }
         match self.get_table_read_only_for_account(account, table_name) {
-            Some(table) => Self::query_in(table, use_dict_section, query, keys_to_filter),
+            Some(table) => Self::query_in(table, use_dict_section, query, keys_to_filter)
+                .into_iter()
+                .map(|(key, record)| (key, record.clone()))
+                .collect(),
             None => Vec::new(),
         }
     }
 
     /// Same as [`query_for_account`], but for a caller that has already resolved
-    /// the table.
-    pub fn query_in(table: &Table, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
+    /// the table. Returns borrowed records, so a caller that already holds the
+    /// database lock (e.g. serializing results immediately) does not pay for a
+    /// clone of every matching record.
+    pub fn query_in<'a>(table: &'a Table, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, &'a Record)> {
         // Pre-calculate field indices and conversions to avoid repeated lookups per record
         let mut field_map = HashMap::new();
         Self::collect_field_indices(table, query, &mut field_map);
@@ -298,7 +307,7 @@ impl Database {
             for key in filter_keys {
                 if let Some(record) = source_map.get(key) {
                     if Self::evaluate_node_static_with_id(key, record, query, &field_map) {
-                        results.push((key.clone(), record.clone()));
+                        results.push((key.clone(), record));
                     }
                 }
             }
@@ -307,7 +316,7 @@ impl Database {
             // Avoid cloning the entire table by using an iterator.
             results = source_map.iter()
                 .filter(|(key, record)| Self::evaluate_node_static_with_id(key, record, query, &field_map))
-                .map(|(key, record)| (key.clone(), record.clone()))
+                .map(|(key, record)| (key.clone(), record))
                 .collect();
             results.sort_by(|a, b| a.0.cmp(&b.0));
         }
@@ -321,8 +330,7 @@ impl Database {
             QueryNode::Condition(cond) => {
                 if cond.field_name == "ID" { return; }
                 if !map.contains_key(&cond.field_name) {
-                    if let Some(idx) = table.field_index(&cond.field_name) {
-                        let conversion = table.conversion_code(&cond.field_name);
+                    if let Some((idx, conversion)) = table.field_index_and_conversion(&cond.field_name) {
                         map.insert(cond.field_name.clone(), FieldQueryInfo { index: idx, conversion });
                     }
                 }
