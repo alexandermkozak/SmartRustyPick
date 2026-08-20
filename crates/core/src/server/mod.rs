@@ -5,19 +5,18 @@ pub mod handler;
 mod handler_tests;
 
 use crate::config::Config;
-use crate::db::Database;
 pub use certs::{ensure_certificates, load_certs, load_key};
-pub use handler::handle_request;
+pub use handler::{SharedDb, handle_request, handle_request_locked, read_lock, write_lock};
 pub use models::{Request, Response};
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 
-pub async fn start_server(config: Arc<Config>, db: Arc<Mutex<Database>>, override_addr: Option<String>) -> tokio::io::Result<()> {
+pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Option<String>) -> tokio::io::Result<()> {
     // Install default crypto provider for rustls
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 
@@ -79,19 +78,36 @@ pub async fn start_server(config: Arc<Config>, db: Arc<Mutex<Database>>, overrid
                 None => {
                     let msg = format!("No client certificate provided from {}", peer_addr);
                     eprintln!("{}", msg);
-                    let mut db_lock = db.lock().unwrap();
-                    let _ = db_lock.log_error("SYSTEM", &msg);
+                    let db = db.clone();
+                    // Logging writes to disk, so keep it off the async worker thread.
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = write_lock(&db).log_error("SYSTEM", &msg);
+                    })
+                        .await;
                     return;
                 }
             };
 
             // Check authorization
             {
-                let mut db_lock = db.lock().unwrap();
-                if !db_lock.authorized_clients.contains_key(&thumbprint) {
+                // Even taking the lock has to happen off the async worker: while a
+                // flush holds it, waiting here would block every other connection
+                // scheduled on this thread.
+                let db_for_task = db.clone();
+                let tp = thumbprint.clone();
+                let authorized = tokio::task::spawn_blocking(move || {
+                    read_lock(&db_for_task).authorized_clients.contains_key(&tp)
+                })
+                    .await
+                    .unwrap_or(false);
+                if !authorized {
                     let msg = format!("Unauthorized certificate {} from {}", thumbprint, peer_addr);
                     eprintln!("{}", msg);
-                    let _ = db_lock.log_error("SYSTEM", &msg);
+                    let db = db.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = write_lock(&db).log_error("SYSTEM", &msg);
+                    })
+                        .await;
                     return;
                 }
             }
@@ -116,23 +132,39 @@ pub async fn start_server(config: Arc<Config>, db: Arc<Mutex<Database>>, overrid
                             }
                         };
 
-                        // Re-fetch client info to support dynamic permission updates
-                        let current_client_info = {
-                            let db_lock = db.lock().unwrap();
-                            db_lock.authorized_clients.get(&thumbprint).cloned()
-                        };
+                        // The engine is synchronous and file backed: running it on
+                        // the async worker would stall every other task on that
+                        // thread, handshakes of unrelated connections included. The
+                        // client info is re-fetched inside the same task, both to
+                        // support dynamic permission updates and to keep the lock off
+                        // this thread entirely.
+                        let db_for_task = db.clone();
+                        let tp = thumbprint.clone();
+                        let handled = tokio::task::spawn_blocking(move || {
+                            let info = read_lock(&db_for_task).authorized_clients.get(&tp).cloned();
+                            info.map(|info| handle_request(req, &db_for_task, &info))
+                        })
+                            .await;
 
-                        if let Some(info) = current_client_info {
-                            let resp = handle_request(req, &db, &info);
-                            if let Ok(resp_json) = serde_json::to_string(&resp) {
-                                let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
+                        match handled {
+                            Ok(Some(resp)) => {
+                                if let Ok(resp_json) = serde_json::to_string(&resp) {
+                                    let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
+                                }
                             }
-                        } else {
-                            let resp = Response { status: "ERROR".to_string(), message: Some("Client deauthorized".to_string()), ..Default::default() };
-                            if let Ok(resp_json) = serde_json::to_string(&resp) {
-                                let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
+                            Err(e) => {
+                                let resp = Response { status: "ERROR".to_string(), message: Some(format!("Request failed: {}", e)), ..Default::default() };
+                                if let Ok(resp_json) = serde_json::to_string(&resp) {
+                                    let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
+                                }
                             }
-                            break; // Terminate connection if client no longer exists
+                            Ok(None) => {
+                                let resp = Response { status: "ERROR".to_string(), message: Some("Client deauthorized".to_string()), ..Default::default() };
+                                if let Ok(resp_json) = serde_json::to_string(&resp) {
+                                    let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
+                                }
+                                break; // Terminate connection if client no longer exists
+                            }
                         }
                     }
                     Err(e) => {
@@ -144,11 +176,12 @@ pub async fn start_server(config: Arc<Config>, db: Arc<Mutex<Database>>, overrid
 
             // A client that finished writing should not have to wait for the
             // ticker before its changes reach disk.
-            if let Ok(mut db_lock) = db.lock() {
-                if db_lock.has_pending_writes() {
-                    let _ = db_lock.save();
+            let _ = tokio::task::spawn_blocking(move || {
+                if read_lock(&db).has_pending_writes() {
+                    let _ = write_lock(&db).save();
                 }
-            }
+            })
+                .await;
         });
     }
 }
@@ -158,9 +191,9 @@ pub async fn start_server(config: Arc<Config>, db: Arc<Mutex<Database>>, overrid
 /// Writes are batched in memory instead of hitting the disk one record at a
 /// time; without a ticker the last writes of a burst would linger until the
 /// next request arrived. The interval bounds how long that can be.
-fn spawn_flusher(db: Arc<Mutex<Database>>) {
+fn spawn_flusher(db: SharedDb) {
     let interval = {
-        let db_lock = db.lock().unwrap();
+        let db_lock = read_lock(&db);
         if db_lock.durable_writes {
             return; // Every write is already flushed synchronously.
         }
@@ -173,10 +206,8 @@ fn spawn_flusher(db: Arc<Mutex<Database>>) {
             let db = db.clone();
             // Flushing touches the disk, so keep it off the async worker thread.
             let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(mut db_lock) = db.lock() {
-                    if let Err(e) = db_lock.flush_if_due() {
-                        eprintln!("Background flush error: {}", e);
-                    }
+                if let Err(e) = write_lock(&db).flush_if_due() {
+                    eprintln!("Background flush error: {}", e);
                 }
             })
                 .await;

@@ -1,11 +1,156 @@
-use crate::db::{Database, Record};
+use crate::db::{Database, Record, Table};
 use crate::server::models::{Request, Response};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &crate::db::ClientInfo) -> Response {
-    let mut db = db.lock().unwrap();
+/// The database handle shared by every connection.
+///
+/// A read/write lock rather than a mutex: the commands that only look at the
+/// data are the common case and have no reason to exclude each other.
+pub type SharedDb = Arc<RwLock<Database>>;
 
-    let target_account = if let Some(acc) = req.account {
+/// Takes the shared lock, ignoring poisoning.
+///
+/// A panic in one handler leaves the database no less readable than it was, so
+/// refusing every later request would turn a single failed command into a dead
+/// server.
+pub fn read_lock(db: &SharedDb) -> RwLockReadGuard<'_, Database> {
+    db.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Takes the exclusive lock, ignoring poisoning. See [`read_lock`].
+pub fn write_lock(db: &SharedDb) -> RwLockWriteGuard<'_, Database> {
+    db.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn error(message: impl Into<String>) -> Response {
+    Response { status: "ERROR".to_string(), message: Some(message.into()), ..Default::default() }
+}
+
+/// The commands that never modify the database and can therefore run under the
+/// shared lock, in parallel with each other.
+fn is_read_only(command: &str) -> bool {
+    matches!(command, "READ" | "QUERY")
+}
+
+pub fn handle_request(req: Request, db: &SharedDb, client_info: &crate::db::ClientInfo) -> Response {
+    let command = req.command.to_uppercase();
+
+    // Fast path: a read of an already loaded, still current table needs nothing
+    // exclusive. Anything else - a table that has to be loaded or reloaded, a
+    // denied request that wants to be logged - falls through to the slow path,
+    // which is also where the response is produced, so behaviour is identical.
+    if is_read_only(&command) {
+        if let (Some(acc), Some(table_name)) = (allowed_account(&req, client_info), req.file.as_deref()) {
+            let db = read_lock(db);
+            if let Some(table) = db.table_ready_for_read(&acc, table_name) {
+                return match command.as_str() {
+                    "READ" => read_command(&db, table, &req),
+                    _ => query_command(&db, table, &req),
+                };
+            }
+        }
+    }
+
+    let mut db = write_lock(db);
+    handle_request_locked(req, &mut db, client_info)
+}
+
+/// The account a request targets, or `None` when resolving it needs the slow
+/// path (unspecified, or denied and therefore worth an error log entry).
+fn allowed_account(req: &Request, client_info: &crate::db::ClientInfo) -> Option<String> {
+    match req.account.as_deref() {
+        Some(acc) => {
+            if client_info.is_admin || client_info.allowed_accounts.iter().any(|a| a == acc) {
+                Some(acc.to_string())
+            } else {
+                None
+            }
+        }
+        None if client_info.allowed_accounts.len() == 1 => Some(client_info.allowed_accounts[0].clone()),
+        None => None,
+    }
+}
+
+/// Reads a single record from `table`, which the caller has already resolved.
+fn read_command(db: &Database, table: &Table, req: &Request) -> Response {
+    if req.file.is_none() {
+        return error("File not specified");
+    }
+    let key = match req.key.as_deref() {
+        Some(k) => k,
+        None => return error("Key not specified"),
+    };
+    let is_dict = req.is_dict.unwrap_or(false);
+
+    let records = if is_dict { &table.dictionary } else { &table.records };
+    match records.get(key) {
+        Some(record) => Response {
+            status: "OK".to_string(),
+            record: Some(db.serialize_record_in(table, record)),
+            ..Default::default()
+        },
+        None => error("Record not found"),
+    }
+}
+
+/// Runs a QUERY against `table`, which the caller has already resolved.
+fn query_command(db: &Database, table: &Table, req: &Request) -> Response {
+    let table_name = match req.file.as_deref() {
+        Some(t) => t,
+        None => return error("File not specified"),
+    };
+    let is_dict = req.is_dict.unwrap_or(false);
+
+    let mut sort_specs = req.sort_specs.clone().unwrap_or_default();
+    let query_node = if let Some(node) = req.query_node.clone() {
+        Some(node)
+    } else if let Some(q_str) = req.query_string.as_deref() {
+        let parts: Vec<&str> = q_str.split_whitespace().collect();
+        let (clause_parts, parsed_sorts) = Database::parse_sort_specs(&parts);
+        if sort_specs.is_empty() { sort_specs = parsed_sorts; }
+        db.parse_query_read_only(table_name, &clause_parts)
+    } else {
+        None
+    };
+
+    let results_processed: Vec<(String, serde_json::Value)> = if let Some(q) = query_node {
+        let mut results = Database::query_in(table, is_dict, &q, None);
+        Database::sort_results_in(table, &mut results, &sort_specs);
+        results.into_iter()
+            .map(|(k, r)| (k, db.serialize_record_in(table, r)))
+            .collect()
+    } else {
+        // Full scan: sort the keys only, then serialize each record by reference so the
+        // whole table is never cloned into memory.
+        let records = if is_dict { &table.dictionary } else { &table.records };
+        let mut keys: Vec<String> = records.keys().cloned().collect();
+        if sort_specs.is_empty() {
+            // `sort_keys_in` already falls back to the ID, so only sort here.
+            keys.sort();
+        } else {
+            keys = Database::sort_keys_in(table, is_dict, keys, &sort_specs);
+        }
+
+        keys.into_iter()
+            .filter_map(|k| {
+                let record = records.get(&k)?;
+                Some((k, db.serialize_record_in(table, record)))
+            })
+            .collect()
+    };
+
+    Response {
+        status: "OK".to_string(),
+        results: Some(results_processed),
+        ..Default::default()
+    }
+}
+
+/// Handles a request against an exclusively borrowed database. Commands that
+/// only read still go through here whenever the shared path could not serve
+/// them, for instance because the table had to be loaded first.
+pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crate::db::ClientInfo) -> Response {
+    let target_account = if let Some(acc) = req.account.clone() {
         // Client specified an account
         if !client_info.is_admin && !client_info.allowed_accounts.contains(&acc) {
             let msg = format!("Access denied for account {}: Not in allowed list", acc);
@@ -36,43 +181,19 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             if target_account.is_none() {
                 return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), ..Default::default() };
             }
-            let table_name = match req.file {
-                Some(t) => t,
+            let table_name = match req.file.as_deref() {
+                Some(t) => t.to_string(),
                 None => return Response { status: "ERROR".to_string(), message: Some("File not specified".to_string()), ..Default::default() },
             };
-            let key = match req.key {
-                Some(k) => k,
-                None => return Response { status: "ERROR".to_string(), message: Some("Key not specified".to_string()), ..Default::default() },
-            };
-            let is_dict = req.is_dict.unwrap_or(false);
-
-            let structured_opt = {
-                let (record_clone, table_name_clone) = {
-                    let table = match db.get_table_mut_for_account(acc, &table_name) {
-                        Ok(t) => t,
-                        Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
-                    };
-                    let records = if is_dict { &table.dictionary } else { &table.records };
-                    match records.get(&key) {
-                        Some(r) => (Some(r.clone()), table_name.clone()),
-                        None => (None, table_name.clone()),
-                    }
-                };
-
-                match record_clone {
-                    Some(r) => Some(db.serialize_record_for_account(acc, &table_name_clone, &r)),
-                    None => None,
-                }
-            };
-
-            match structured_opt {
-                Some(structured) => Response {
-                    status: "OK".to_string(),
-                    record: Some(structured),
-                    ..Default::default()
-                },
-                None => Response { status: "ERROR".to_string(), message: Some("Record not found".to_string()), ..Default::default() },
+            // Load the table, then serve the request exactly as the shared path would.
+            if let Err(e) = db.get_table_mut_for_account(acc, &table_name) {
+                return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() };
             }
+            let table = match db.get_table_read_only_for_account(acc, &table_name) {
+                Some(t) => t,
+                None => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {} not loaded", table_name)), ..Default::default() },
+            };
+            read_command(db, table, &req)
         }
         "WRITE" => {
             if target_account.is_none() {
@@ -162,66 +283,19 @@ pub fn handle_request(req: Request, db: &Arc<Mutex<Database>>, client_info: &cra
             if target_account.is_none() {
                 return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), ..Default::default() };
             }
-            let table_name = match req.file {
-                Some(t) => t,
+            let table_name = match req.file.as_deref() {
+                Some(t) => t.to_string(),
                 None => return Response { status: "ERROR".to_string(), message: Some("File not specified".to_string()), ..Default::default() },
             };
-            let is_dict = req.is_dict.unwrap_or(false);
-
-            let mut sort_specs = req.sort_specs.unwrap_or_default();
-            let query_node = if let Some(node) = req.query_node {
-                Some(node)
-            } else if let Some(q_str) = req.query_string.as_deref() {
-                let parts: Vec<&str> = q_str.split_whitespace().collect();
-                let (clause_parts, parsed_sorts) = Database::parse_sort_specs(&parts);
-                if sort_specs.is_empty() { sort_specs = parsed_sorts; }
-                db.parse_query(&table_name, &clause_parts)
-            } else {
-                None
-            };
-
-            let results_processed: Vec<(String, serde_json::Value)> = if let Some(q) = query_node {
-                let mut results = db.query_for_account(acc, &table_name, is_dict, &q, None);
-                db.sort_results_for_account(acc, &table_name, &mut results, &sort_specs);
-                results.into_iter()
-                    .map(|(k, r)| (k, db.serialize_record_for_account(acc, &table_name, &r)))
-                    .collect()
-            } else {
-                // Full scan: sort the keys only, then serialize each record by reference so the
-                // whole table is never cloned into memory.
-                let mut keys: Vec<String> = {
-                    let table = match db.get_table_mut_for_account(acc, &table_name) {
-                        Ok(t) => t,
-                        Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
-                    };
-                    let records = if is_dict { &table.dictionary } else { &table.records };
-                    records.keys().cloned().collect()
-                };
-                if sort_specs.is_empty() {
-                    // `sort_keys_for_account` already falls back to the ID, so only sort here.
-                    keys.sort();
-                } else {
-                    keys = db.sort_keys_for_account(acc, &table_name, is_dict, keys, &sort_specs);
-                }
-
-                let table = match db.get_table_read_only_for_account(acc, &table_name) {
-                    Some(t) => t,
-                    None => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {} not loaded", table_name)), ..Default::default() },
-                };
-                let records = if is_dict { &table.dictionary } else { &table.records };
-                keys.into_iter()
-                    .filter_map(|k| {
-                        let record = records.get(&k)?;
-                        Some((k, db.serialize_record_for_account(acc, &table_name, record)))
-                    })
-                    .collect()
-            };
-
-            Response {
-                status: "OK".to_string(),
-                results: Some(results_processed),
-                ..Default::default()
+            // Load the table, then serve the request exactly as the shared path would.
+            if let Err(e) = db.get_table_mut_for_account(acc, &table_name) {
+                return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() };
             }
+            let table = match db.get_table_read_only_for_account(acc, &table_name) {
+                Some(t) => t,
+                None => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {} not loaded", table_name)), ..Default::default() },
+            };
+            query_command(db, table, &req)
         }
         "SELECT" => {
             if target_account.is_none() {
