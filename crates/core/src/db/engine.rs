@@ -73,10 +73,10 @@ impl Table {
 
     /// Same as [`conversion_code`], but for a caller that already has the
     /// dictionary record in hand, sparing a second lookup in `dictionary`.
-    pub(crate) fn conversion_code_from_dict_record(dict_rec: &Record) -> Option<String> {
+    pub(crate) fn conversion_code_from_dict_record(dict_rec: &Record) -> Option<&str> {
         // Pick MDn conversion is in Field 8
         let code = dict_rec.fields.get(DICT_CONV_IDX)?.values.get(0)?.sub_values.get(0)?;
-        if code.is_empty() { None } else { Some(code.clone()) }
+        if code.is_empty() { None } else { Some(code.as_str()) }
     }
 
     /// The 0-based index and conversion code of a dictionary field in a single
