@@ -183,6 +183,11 @@ fn cert_output_dir(ca_path: &str) -> PathBuf {
 /// deliberately short-lived one. `write_pfx` adds the PKCS#12 bundle the CLI
 /// hands to GUI clients; its failure is not fatal, since the PEM pair is what
 /// the protocol actually needs.
+///
+/// The bundle carries the CA as well as the leaf and the key. A leaf-only PKCS#12
+/// still parses, but a client that picks its certificate by building a chain -
+/// Windows' Schannel does - will not offer one it cannot chain to the CA the
+/// server asked for, and the connection is then dropped as unauthenticated.
 pub fn generate_client_cert(config: &Config, common_name: &str, days: u32, write_pfx: bool) -> io::Result<GeneratedCert> {
     if let Err(message) = validate_common_name(common_name) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
@@ -255,7 +260,7 @@ pub fn generate_client_cert(config: &Config, common_name: &str, days: u32, write
 
     let pfx_path = if write_pfx
         && ran(std::process::Command::new("openssl")
-        .args(["pkcs12", "-export", "-out", &pfx_file, "-inkey", &key_file, "-in", &crt_file, "-passout", "pass:"])
+        .args(["pkcs12", "-export", "-out", &pfx_file, "-inkey", &key_file, "-in", &crt_file, "-certfile", &ca_file, "-passout", "pass:"])
         .status())
     {
         Some(pfx_file)

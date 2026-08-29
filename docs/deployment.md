@@ -107,6 +107,15 @@ openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
     -out client.crt -days 365 -sha256
 ```
 
+Clients that want a PKCS#12 bundle rather than a PEM pair - .NET, and most GUI clients - need the CA in the bundle too,
+which is what `-certfile` does. Without it such a client cannot build a chain for its own certificate, so it never
+offers one and the server drops the connection as unauthenticated:
+
+```sh
+openssl pkcs12 -export -out client.pfx -inkey client.key -in client.crt \
+    -certfile ca.crt -passout pass:
+```
+
 Register the client thumbprint with the server as described in
 [Administration Commands](admin_commands.md), then connect as documented in the
 [Remote Protocol](protocol.md).

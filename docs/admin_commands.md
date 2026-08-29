@@ -79,7 +79,8 @@ command is restricted to the `SYSTEM` account and runs interactively.
 - **Example**: `GENERATE.CERT myclient`
 - **Note**: Admin clients can issue certificates the same way over the [remote protocol](protocol.md); the
   [web dashboard](web_dashboard.md) uses that to generate and download certificates from a browser.
-- **Output**: Creates `myclient.crt`, `myclient.csr`, `myclient.key`, and `myclient.pfx` in the current directory.
+- **Output**: Creates `myclient.crt`, `myclient.key` and `myclient.pfx` in the current directory. The CSR is an input to
+  the signing step and is removed once the certificate is signed.
 - **Workflow**:
   1. Generates files for the specified `<common_name>`.
   2. Prompts for an **Authorization Name** (defaults to `<common_name>`).
@@ -87,7 +88,10 @@ command is restricted to the `SYSTEM` account and runs interactively.
   4. If not Admin, prompts for a comma-separated list of **Allowed Accounts**.
   5. Automatically performs the `AUTHORIZE.CONN` step.
 - **Note**:
-  - The `.pfx` file is generated with an empty password.
+  - The `.pfx` file is generated with an empty password. It bundles the private key, the client certificate and the CA
+    that signed it. The CA belongs in there: a client that selects its certificate by building a chain - Windows'
+    Schannel, and so .NET's `SslStream` - will not offer a certificate it cannot chain to the CA the server asked for,
+    and the server then drops the connection as unauthenticated.
   - If authorization is skipped (e.g., non-admin with no accounts), you can still use `AUTHORIZE.CONN` manually later.
 
 #### START.SERVER
