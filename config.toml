@@ -16,3 +16,10 @@ editor = "nano"
 # flush_interval_ms = 250
 # flush_max_pending = 256
 
+# Web management dashboard (optional). On by default, on the loopback interface.
+# The access token is generated on every boot and printed with the URL unless one
+# is set here. See docs/web_dashboard.md.
+# web_enabled = true
+# web_addr = "127.0.0.1"
+# web_port = 8080
+# web_token = ""

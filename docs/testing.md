@@ -1,16 +1,18 @@
 # Testing
 
-The project has four layers of tests, all runnable from the `Makefile` and all executed by the
+The project has five layers of tests, all runnable from the `Makefile` and all executed by the
 `Build and Test` GitHub workflow on every push to `main` and every pull request.
 
-| Layer       | Command                 | What it covers                                                                                                               |
-|-------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------|
-| Unit        | `make test-unit`        | `cargo test --workspace` — the engine, query parser, dictionaries and the request handler.                                   |
-| Integration | `make test-integration` | The real binaries over the TLS protocol: CRUD, queries, select lists, headless mode, access control and per-file durability. |
-| Performance | `make test-performance` | End-to-end latency distributions, throughput, scaling ratios, concurrency and resource usage.                                |
-| Benchmarks  | `make bench`            | Criterion micro-benchmarks of the engine: record codec, query execution, sorting, persistence.                               |
+| Layer       | Command                 | What it covers                                                                                                                                  |
+|-------------|-------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| Unit        | `make test-unit`        | `cargo test --workspace` — the engine, query parser, dictionaries and the request handler.                                                      |
+| Integration | `make test-integration` | The real binaries over the TLS protocol: CRUD, queries, select lists, headless mode, access control, per-file durability and the web dashboard. |
+| Performance | `make test-performance` | End-to-end latency distributions, throughput, scaling ratios, concurrency and resource usage.                                                   |
+| Benchmarks  | `make bench`            | Criterion micro-benchmarks of the engine: record codec, query execution, sorting, persistence.                                                  |
+| Front end   | `make ui-test`          | The dashboard's Vue slices under jsdom, plus the architecture test that keeps features from importing each other.                               |
 
-`make test-all` runs the first three. Everything below the unit layer requires `cargo build` first; the Make targets
+`make test-all` runs the first three; `make ui-test` covers the dashboard's front end and needs node. Everything below
+the unit layer requires `cargo build` first; the Make targets
 take care of it.
 
 ## Requirements
@@ -18,6 +20,8 @@ take care of it.
 - A Rust toolchain (for `cargo build` / `cargo test`).
 - `python3` (standard library only — no packages to install).
 - `openssl` on the `PATH`, used to mint throwaway certificates.
+- Node 22+ **only** for the dashboard front end (`make ui-test`, `make ui-build`). The built bundle is committed, so
+  building and testing the database itself never needs it.
 
 ## How the Python suites work
 
@@ -27,7 +31,8 @@ The suites live in `test/` and share `test/harness.py`:
   `config.toml` and the storage directory relative to the working directory, this keeps a run from ever touching your
   real `db_storage/` or `config.toml`. Nothing is left behind in the repository.
 - **Ports.** Every suite asks the OS for a free port instead of hardcoding one, so runs never collide with each other or
-  with a database you already have running.
+  with a database you already have running. The web dashboard binds a fixed port by default, so `harness.write_config`
+  disables it unless a suite asks for it with a free port of its own.
 - **Certificates.** A fresh CA, server certificate and client certificates are generated per run. The client thumbprints
   are authorised through the real `AUTHORIZE.CONN` command.
 - **Fixtures.** State is built by driving the actual CLI commands rather than by writing storage files by hand, so the

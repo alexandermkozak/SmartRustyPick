@@ -1,0 +1,29 @@
+{
+  "name": "smart-rusty-pick-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Vue front end for the SmartRustyPick web management dashboard.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "check": "vue-tsc --noEmit",
+    "test": "vitest run",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "@vitejs/plugin-vue": "^6.0.1",
+    "@vue/test-utils": "^2.5.0",
+    "jsdom": "^30.0.1",
+    "prettier": "^3.9.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.12",
+    "vitest": "^4.1.11",
+    "vue-tsc": "^3.1.1"
+  }
+}

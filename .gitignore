@@ -21,3 +21,8 @@
 /.env
 __pycache__/
 *.pyc
+
+# Front-end dependencies. The built bundle in
+# crates/core/src/web/assets/dist is deliberately committed so `cargo build`
+# needs no node toolchain.
+node_modules/

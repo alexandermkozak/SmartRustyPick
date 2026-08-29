@@ -1,4 +1,4 @@
-.PHONY: test-unit test-integration test-performance test-all bench bench-smoke perf-compare profile build run run-cli run-server container-build container-up container-down container-logs container-cli
+.PHONY: test-unit test-integration test-performance test-all bench bench-smoke perf-compare profile build run run-cli run-server container-build container-up container-down container-logs container-cli ui-install ui-dev ui-build ui-check ui-test ui-format install-hooks
 
 CONTAINER_ENGINE ?= podman
 IMAGE ?= localhost/smart-rusty-pick:latest
@@ -12,6 +12,46 @@ BASE ?= baseline_metrics.json
 
 build:
 	cargo build
+
+# Points git at the tracked hooks in .githooks. One command, once per clone.
+# The pre-commit hook runs the dashboard's formatting and bundle-freshness
+# checks, which are the two CI failures a formatter-on-save tends to cause.
+install-hooks:
+	git config core.hooksPath .githooks
+	@echo "Hooks installed. Skip one with 'git commit --no-verify'."
+
+# --- Web dashboard front end -------------------------------------------------
+# The Vue sources live in crates/core/src/web/ui and are compiled into
+# crates/core/src/web/assets/dist, which is committed: `cargo build` embeds that
+# bundle, so node is needed only to change the interface, never to build the
+# database. Run `make ui-build` and commit the result after touching ui/.
+UI_DIR := crates/core/src/web/ui
+
+ui-install:
+	cd $(UI_DIR) && npm ci
+
+ui-build:
+	cd $(UI_DIR) && npm ci --silent && npm run build
+
+# Type-checks the front end without writing a bundle.
+ui-check:
+	cd $(UI_DIR) && npm ci --silent && npm run check
+
+# Component tests for the dashboard: it mounts, polls, renders and degrades,
+# plus the architecture test that keeps the feature slices from tangling.
+ui-test:
+	cd $(UI_DIR) && npm ci --silent && npm test
+
+# Formats the front end with Prettier. Indentation and line endings for the rest
+# of the repository come from .editorconfig, which editors apply on their own.
+ui-format:
+	cd $(UI_DIR) && npm ci --silent && npm run format
+
+# Vite dev server with hot reload on :5173, proxying the API to a database
+# server already running on :8080. Open the printed dashboard URL with its
+# ?token=... against :5173 rather than :8080.
+ui-dev:
+	cd $(UI_DIR) && npm install --silent && npm run dev
 
 run: run-cli
 
@@ -33,6 +73,7 @@ test-integration: build
 	$(PYTHON) test/integration/test_headless.py
 	$(PYTHON) test/integration/test_security.py
 	$(PYTHON) test/integration/test_durability.py
+	$(PYTHON) test/integration/test_web.py
 
 test-performance: build
 	@echo "Running performance tests..."

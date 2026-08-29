@@ -1,0 +1,234 @@
+# Web Management Dashboard
+
+A browser interface for running the database: who may connect, what certificates they hold, what the server is doing
+right now, and what the accounts and files look like. It starts with the database server, so there is nothing extra to
+run.
+
+It is a *management* interface, not a data browser. It reports how many records a file holds and how they are laid out;
+it never returns one.
+
+## Starting it
+
+The dashboard comes up with the protocol server, whichever way that server is started —
+`make run-server`, the CLI's background service, or `START.SERVER`. On startup it prints the address to open:
+
+```
+Server listening on TLS 127.0.0.1:8443
+Web dashboard on http://127.0.0.1:8080/?token=6f1c…
+  authorized as WEB.DASHBOARD (thumbprint 5bfc…), reissued on every start
+```
+
+Open that URL. The token in it is stored in a `HttpOnly`, `SameSite=Strict` cookie, so the page's own requests carry it
+without any script being able to read it.
+
+### Configuration
+
+| Setting       | Default     | Description                                                           |
+|---------------|-------------|-----------------------------------------------------------------------|
+| `web_enabled` | `true`      | Set `false` for a server that should expose nothing but the protocol. |
+| `web_addr`    | `127.0.0.1` | Interface to bind. May carry its own port (`"0.0.0.0:9000"`).         |
+| `web_port`    | `8080`      | Port to listen on.                                                    |
+| `web_token`   | *generated* | A fixed access token. Unset, a new one is generated on every boot.    |
+
+A failure to start the dashboard — a port already in use, a missing CA — is reported and does not stop the database from
+serving.
+
+## How it talks to the database
+
+The dashboard holds a client certificate and speaks the ordinary
+[remote protocol](protocol.md) over the same TLS listener as every other client. It has no private path into the engine,
+so it can do exactly what its authorization allows and nothing more, and its work shows up in `LIST.CONNS` and
+`SERVER.STATS` like anyone else's.
+
+```
+browser ──HTTP(localhost)──▶ dashboard ──TLS + client cert──▶ protocol server ──▶ engine
+```
+
+Its certificate is **issued fresh on every boot** and authorized under the fixed name
+`WEB.DASHBOARD`, which replaces the previous entry. Two things follow:
+
+- A dashboard certificate from an earlier run stops working the moment the server restarts. It is valid for a day at
+  most in any case.
+- `DEAUTHORIZE.CONN WEB.DASHBOARD` locks the dashboard out until the next restart, the same way it would lock out any
+  other client.
+
+The certificate and its key are written next to the CA (`.local/certs/web-dashboard.crt`
+by default), so they follow `ca_path` rather than littering the working directory.
+
+## What it shows
+
+| Tab            | Contents                                                                                                                         |
+|----------------|----------------------------------------------------------------------------------------------------------------------------------|
+| Overview       | Uptime, listener, connection and request totals, pending writes, tables in memory, and every connection open right now.          |
+| Authorizations | Every authorized client: name, thumbprint, allowed accounts, admin flag. Authorize a thumbprint, add or remove accounts, revoke. |
+| Certificates   | Issue a certificate signed by the server's CA, authorized in the same step, with its key downloadable once.                      |
+| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics.       |
+
+File statistics cover the record and dictionary counts, the hash modulus and group distribution, bytes on disk, the
+durability flag and whether the file is currently held in the server's cache. Record counts come from each file's
+section metadata, so opening the view does not load the file.
+
+## Security
+
+The dashboard can authorize clients and hand out private keys, so treat reaching it as equivalent to holding an admin
+certificate.
+
+- It **binds to `127.0.0.1` by default**. Point `web_addr` elsewhere only behind a reverse proxy that terminates TLS;
+  the dashboard itself serves plain HTTP and says so at startup when it is bound to a non-loopback address.
+- Every request needs the token, in the session cookie, an `Authorization: Bearer` header or a `?token=` parameter. The
+  only exception is `/health`, which returns nothing but liveness. Tokens are compared in constant time.
+- The page is served under `Content-Security-Policy: default-src 'none'` with only same-origin scripts and styles:
+  nothing is fetched from anywhere else, and there is no inline script to smuggle anything into.
+- Values from the database are written into the page as text, never as markup.
+
+## HTTP API
+
+Each endpoint is one protocol command. Responses are the protocol's own JSON; failures are
+`{"error": "..."}` with a status code — `401` without a token, `403` when the protocol refused for lack of privileges,
+`404` for something that is not there, `502` when the database itself cannot be reached.
+
+| Method   | Path                                   | Command                                                           |
+|----------|----------------------------------------|-------------------------------------------------------------------|
+| `GET`    | `/health`                              | none (liveness, no token required)                                |
+| `GET`    | `/api/stats`                           | `SERVER.STATS`                                                    |
+| `GET`    | `/api/clients`                         | `LIST.CONNS`                                                      |
+| `POST`   | `/api/clients`                         | `AUTHORIZE.CONN`                                                  |
+| `DELETE` | `/api/clients/{name}`                  | `DEAUTHORIZE.CONN`                                                |
+| `POST`   | `/api/clients/{name}/accounts`         | `ADD.CLIENT.ACCOUNT` / `REMOVE.CLIENT.ACCOUNT` (`"remove": true`) |
+| `POST`   | `/api/certificates`                    | `GENERATE.CERT`                                                   |
+| `GET`    | `/api/accounts`                        | `LIST.ACCOUNTS`                                                   |
+| `GET`    | `/api/accounts/{account}/files`        | `LIST.FILES`                                                      |
+| `GET`    | `/api/accounts/{account}/files/{file}` | `FILE.STATS`                                                      |
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/stats
+curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"common_name":"reporting-bot","accounts":["SALES"]}' \
+     http://127.0.0.1:8080/api/certificates
+```
+
+## Implementation
+
+The server side lives in `crates/core/src/web/`:
+
+| File           | Role                                                                           |
+|----------------|--------------------------------------------------------------------------------|
+| `mod.rs`       | Boot: issue and authorize the certificate, mint the token, accept connections. |
+| `http.rs`      | The HTTP/1.1 subset the dashboard needs, with every read bounded.              |
+| `client.rs`    | The pooled TLS connection to the protocol server.                              |
+| `api.rs`       | Routes: one HTTP shape in, one protocol command out.                           |
+| `assets/dist/` | The built front end, embedded in the binary at compile time.                   |
+
+There is no HTTP framework: the protocol server was written the same way, and a dependency
+tree larger than the database itself is a poor trade for a handful of routes.
+
+### Front end
+
+The page is a Vue 3 application using the Composition API, written as single-file components and built by Vite. It is
+organised in **vertical slices**: each feature owns its views, its components, its composables, its API calls and its
+types, in one directory.
+
+```
+crates/core/src/web/ui/src/
+├── App.vue                  the shell: header, tabs, alert banner
+├── features/
+│   ├── index.ts             the registry - the one module that knows every slice
+│   ├── types.ts             FeatureTab: all the shell knows about a feature
+│   ├── overview/            ┐
+│   │   ├── index.ts         │ public surface: the tab, plus the two header widgets
+│   │   ├── api.ts           │ SERVER.STATS
+│   │   ├── types.ts         │ ServerSnapshot, ConnectionSnapshot
+│   │   ├── OverviewView.vue │
+│   │   ├── components/      │ ServerLine, ServerControls, StatGrid, ConnectionsTable
+│   │   └── composables/     ┘ useServerStats
+│   ├── authorizations/      same shape: LIST.CONNS, AUTHORIZE.CONN, useClients, …
+│   ├── certificates/        GENERATE.CERT, useCertificateIssuing, …
+│   └── accounts/            LIST.ACCOUNTS, LIST.FILES, FILE.STATS, useAccountBrowser, …
+└── shared/                  the kernel every slice may use
+    ├── api/client.ts        the transport: ApiError, call, record, pairs, keys
+    ├── api/protocol.ts      the response envelope
+    ├── composables/         usePolling, useAlerts
+    ├── components/          StatCard, RolePill, PanelState, StatList
+    ├── format.ts            durations, byte counts, thumbprints
+    └── style.css
+```
+
+Adding a feature is a new directory plus one line in `features/index.ts`. Removing one is deleting a directory and that
+line — nothing else in the tree refers to it.
+
+**The rules**, asserted by `shared/architecture.test.ts` rather than left to good intentions:
+
+1. A feature imports its own files and `@shared/...`. It never imports another feature; that is what a slice's
+   `index.ts` is for, and only the registry may use it.
+2. `shared/` never imports a feature. The kernel cannot depend on what is built on it.
+3. Every slice has an `index.ts` and appears in the registry, so a feature cannot be half-wired and silently absent.
+
+The test names the offending file and specifier when a rule is broken. Two path aliases,
+`@shared/*` and `@features/*`, mean moving a file inside its own slice never rewrites a path outside it.
+
+`shared/composables/usePolling.ts` is where the live-monitoring behaviour lives, and new watched views should be built
+on it rather than on their own timers:
+
+- Requests never overlap; the next tick is scheduled when the previous response lands, so a slow server slows the
+  refresh rate instead of queueing requests.
+- Polling stops while the browser tab is hidden, and refreshes immediately when it returns.
+- A failed refresh keeps the last good data on screen, dimmed, with the reason beside it.
+- A `401` stops the poll rather than retrying into a log full of refusals.
+
+The overview slice's `useServerStats` shows the intended pattern for data more than one component needs: one
+module-scope poller, shared, with consumers reference counted so it starts when the first component that wants it mounts
+and stops when the last goes away. The shell never has to start a poll on behalf of a feature it otherwise knows nothing
+about.
+
+### Building it
+
+The built bundle in `assets/dist/` is **committed**, so `cargo build` alone produces a working server and neither CI nor
+the container image needs a node toolchain. Node is required only to change the interface:
+
+```sh
+make ui-build     # rebuild assets/dist - commit the result
+make ui-test      # component and architecture tests (vitest + jsdom)
+make ui-check     # type-check only
+make ui-format    # Prettier
+make ui-dev       # Vite dev server on :5173 with hot reload
+```
+
+Formatting is Prettier's (`ui/.prettierrc.json`), and CI fails on unformatted files. Indentation and line endings for
+the rest of the repository come from `.editorconfig` at the root, which editors apply on their own.
+
+**In a JetBrains IDE, two settings are worth a minute:**
+
+1. Turn Prettier on for this project — *Settings → Languages & Frameworks → JavaScript → Prettier*, set the
+   configuration to automatic and tick *Run on save*. Without it the IDE's own formatter and Prettier disagree on four
+   details — brace spacing, the space in `<Component />`, continuation indent and attribute indent — and undo each other
+   on every save until CI's `format:check` fails. Only the first is expressible in `.prettierrc.json`, so configuration
+   alone cannot settle it.
+2. Mark `crates/core/src/web/assets/dist` as *Excluded* (right-click → *Mark Directory as*). It is Vite output;
+   reformatting it by hand makes a rebuild produce something different and fails the freshness check.
+
+After `make ui-build`, rebuild the Rust binary too: the bundle is embedded at compile time, so a server built earlier
+keeps serving the older copy.
+
+For `make ui-dev`, start a database server first and open the dashboard URL it prints with the port changed to 5173 —
+`http://127.0.0.1:5173/?token=...`. Vite proxies `/api` and
+`/health` to `127.0.0.1:8080`, and in a dev build only, the page replays that token as a bearer header because the
+production `HttpOnly` cookie belongs to a different origin. The production bundle contains no path that puts the token
+anywhere script-readable.
+
+Vite is configured to emit fixed filenames (`app.js`, `app.css`) rather than content-hashed ones, because `include_str!`
+needs paths known at compile time. Nothing is lost: responses carry `Cache-Control: no-store`, so there is no cache to
+bust.
+
+### What keeps the bundle honest
+
+A committed build artefact is only safe if it cannot silently drift from its sources:
+
+- `.github/workflows/main.yml` has a `dashboard-bundle` job that runs the component tests, rebuilds the bundle and fails
+  if `git diff` shows the committed copy differs.
+- `cargo test` checks that the embedded page references exactly the assets the server serves, and that the bundle is a
+  production build rather than a dev one — a dev build would need `unsafe-eval`, which the page's own policy refuses.
+- `test/integration/test_web.py` fetches every `/dist/...` path the served page references and checks each returns 200
+  with a usable content type.
+
+`test/integration/test_web.py` also drives the real binaries end to end: the bootstrap, the token checks, every
+endpoint, certificate issuing and revocation, and the certificate rotation across a restart.

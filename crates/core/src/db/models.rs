@@ -240,11 +240,59 @@ pub struct SelectList {
     pub keys: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ClientInfo {
+    /// The `$CLIENTS` record key: the name the client was authorized under.
+    pub name: String,
     pub thumbprint: String,
     pub allowed_accounts: Vec<String>,
     pub is_admin: bool,
+}
+
+/// What a management view needs to know about one account, gathered without
+/// loading any of its records.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct AccountStats {
+    pub name: String,
+    pub directory: String,
+    /// Files in the account, including system and `DIR` files.
+    pub file_count: usize,
+    /// Records across every file, read from each file's section metadata.
+    pub record_count: u64,
+    /// Bytes on disk under the account directory.
+    pub disk_bytes: u64,
+}
+
+/// Statistics for a single data file. Deliberately record free: the dashboard
+/// navigates files, it does not browse their contents.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct FileStats {
+    pub account: String,
+    pub name: String,
+    /// Records in the data section, from its metadata rather than a load.
+    pub record_count: u64,
+    /// Entries in the dictionary section.
+    pub dict_count: usize,
+    /// Hash modulus: how many groups the records are spread over.
+    pub modulus: u64,
+    /// Flush counter of the data section; increments on every write out.
+    pub version: u64,
+    /// Group files present on disk, and how their bytes are distributed.
+    pub group_count: usize,
+    pub smallest_group_bytes: u64,
+    pub largest_group_bytes: u64,
+    pub disk_bytes: u64,
+    /// True once the section carries per-group checksums.
+    pub checksums: bool,
+    /// Still in the pre-hashfile flat format, converted on the next flush.
+    pub legacy: bool,
+    /// Every write to this file is flushed before it is acknowledged.
+    pub durable: bool,
+    /// Currently held in the server's table cache.
+    pub loaded: bool,
+    /// Seconds since the data section was last modified, when the filesystem
+    /// reports a usable timestamp.
+    pub modified_seconds_ago: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -14,6 +14,7 @@ fn test_handle_request_read_write() {
 
     let db_arc = Arc::new(RwLock::new(db));
     let client_info = ClientInfo {
+        name: "test_client".to_string(),
         thumbprint: "test_tp".to_string(),
         allowed_accounts: vec!["SERVER_TEST".to_string()],
         is_admin: false,
@@ -74,6 +75,7 @@ fn test_create_and_delete_file_target_the_requested_account() {
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
+        name: "test_admin".to_string(),
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
         is_admin: true,
@@ -151,6 +153,7 @@ fn test_create_file_durable_flag_is_honoured() {
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
+        name: "test_admin".to_string(),
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
         is_admin: true,
@@ -205,6 +208,7 @@ fn test_handle_request_query_select() {
 
     let db_arc = Arc::new(RwLock::new(db));
     let client_info = ClientInfo {
+        name: "test_client".to_string(),
         thumbprint: "test_tp".to_string(),
         allowed_accounts: vec!["QUERY_TEST".to_string()],
         is_admin: true, // Admin to access SYSTEM if needed, but we use QUERY_TEST
@@ -250,6 +254,161 @@ fn test_handle_request_query_select() {
     let next_results = resp_next.results.unwrap();
     assert_eq!(next_results.len(), 1);
     assert!(next_results[0].1.is_object());
+
+    fs::remove_dir_all(base_dir).unwrap();
+}
+
+#[test]
+fn test_management_commands_report_accounts_files_and_statistics() {
+    // The dashboard navigates the database through these three commands, so
+    // between them they have to describe an account without ever handing back a
+    // record.
+    let base_dir = "test_server_management_dir";
+    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let mut db = Database::new(base_dir, None).unwrap();
+    db.create_test_account("MGMT_TEST").unwrap();
+    db.current_account = String::new();
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "test_admin".to_string(),
+        thumbprint: "admin_tp".to_string(),
+        allowed_accounts: Vec::new(),
+        is_admin: true,
+    };
+
+    let resp = handle_request(Request { command: "LIST.ACCOUNTS".to_string(), ..Default::default() }, &db_arc, &admin);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let accounts = resp.results.unwrap();
+    let account = accounts.iter().find(|(name, _)| name == "MGMT_TEST").expect("the created account is listed");
+    assert!(account.1["file_count"].as_u64().unwrap() > 0);
+    assert!(account.1["directory"].as_str().unwrap().contains("MGMT_TEST"));
+
+    let resp = handle_request(
+        Request { command: "LIST.FILES".to_string(), account: Some("MGMT_TEST".to_string()), ..Default::default() },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let files = resp.keys.unwrap();
+    assert!(files.contains(&"USERS".to_string()), "USERS missing from {:?}", files);
+    assert_eq!(resp.count, Some(files.len()));
+
+    let resp = handle_request(
+        Request {
+            command: "FILE.STATS".to_string(),
+            account: Some("MGMT_TEST".to_string()),
+            file: Some("USERS".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let stats = resp.record.unwrap();
+    assert_eq!(stats["account"].as_str().unwrap(), "MGMT_TEST");
+    assert_eq!(stats["name"].as_str().unwrap(), "USERS");
+    assert_eq!(stats["record_count"].as_u64().unwrap(), 2);
+    assert!(stats["dict_count"].as_u64().unwrap() > 0);
+    assert!(stats["modulus"].as_u64().unwrap() > 0);
+    assert!(stats.get("records").is_none(), "statistics must not carry record contents");
+
+    // A file that does not exist is a not-found error, not an empty answer.
+    let resp = handle_request(
+        Request {
+            command: "FILE.STATS".to_string(),
+            account: Some("MGMT_TEST".to_string()),
+            file: Some("NOPE".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "ERROR");
+    assert!(resp.message.unwrap().contains("not found"));
+
+    fs::remove_dir_all(base_dir).unwrap();
+}
+
+#[test]
+fn test_management_commands_respect_the_clients_permissions() {
+    let base_dir = "test_server_management_perm_dir";
+    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let mut db = Database::new(base_dir, None).unwrap();
+    db.create_test_account("VISIBLE").unwrap();
+    db.create_test_account("HIDDEN").unwrap();
+    db.current_account = String::new();
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let client_info = ClientInfo {
+        name: "test_client".to_string(),
+        thumbprint: "test_tp".to_string(),
+        allowed_accounts: vec!["VISIBLE".to_string()],
+        is_admin: false,
+    };
+
+    // An account the client cannot reach must not even be named to it.
+    let resp = handle_request(Request { command: "LIST.ACCOUNTS".to_string(), ..Default::default() }, &db_arc, &client_info);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let names: Vec<String> = resp.results.unwrap().into_iter().map(|(name, _)| name).collect();
+    assert_eq!(names, vec!["VISIBLE".to_string()]);
+
+    let resp = handle_request(
+        Request { command: "LIST.FILES".to_string(), account: Some("HIDDEN".to_string()), ..Default::default() },
+        &db_arc,
+        &client_info,
+    );
+    assert_eq!(resp.status, "ERROR");
+    assert!(resp.message.unwrap().contains("Access denied"));
+
+    // The management views of the server itself are administrative.
+    for command in ["SERVER.STATS", "LIST.CONNS", "GENERATE.CERT"] {
+        let resp = handle_request(
+            Request { command: command.to_string(), name: Some("intruder".to_string()), ..Default::default() },
+            &db_arc,
+            &client_info,
+        );
+        assert_eq!(resp.status, "ERROR", "{} must be refused", command);
+        assert_eq!(resp.message.unwrap(), "Admin privileges required");
+    }
+
+    fs::remove_dir_all(base_dir).unwrap();
+}
+
+#[test]
+fn test_list_conns_and_server_stats_describe_the_running_server() {
+    let base_dir = "test_server_stats_dir";
+    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let mut db = Database::new(base_dir, None).unwrap();
+    db.add_authorized_client("reporting-bot", "AB12CD", vec!["SALES".to_string()], false).unwrap();
+    db.current_account = String::new();
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "test_admin".to_string(),
+        thumbprint: "admin_tp".to_string(),
+        allowed_accounts: Vec::new(),
+        is_admin: true,
+    };
+
+    let resp = handle_request(Request { command: "LIST.CONNS".to_string(), ..Default::default() }, &db_arc, &admin);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let clients = resp.results.unwrap();
+    let (name, info) = clients.iter().find(|(name, _)| name == "reporting-bot").expect("the authorized client is listed");
+    assert_eq!(name, "reporting-bot");
+    // Thumbprints are stored lowercase, whatever case they were given in.
+    assert_eq!(info["thumbprint"].as_str().unwrap(), "ab12cd");
+    assert_eq!(info["accounts"][0].as_str().unwrap(), "SALES");
+    assert_eq!(info["is_admin"].as_bool().unwrap(), false);
+
+    let resp = handle_request(Request { command: "SERVER.STATS".to_string(), ..Default::default() }, &db_arc, &admin);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let stats = resp.record.unwrap();
+    assert!(stats["active_connections"].is_array());
+    assert!(stats["total_requests"].is_number());
+    // The engine-side numbers are merged into the same object.
+    assert_eq!(stats["authorized_clients"].as_u64().unwrap(), 1);
+    assert!(stats["pending_writes"].is_number());
 
     fs::remove_dir_all(base_dir).unwrap();
 }

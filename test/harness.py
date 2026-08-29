@@ -369,11 +369,16 @@ def wait_for_client(port, certfile, keyfile, cafile, timeout=STARTUP_TIMEOUT, pr
     raise TimeoutError(f"Could not establish a TLS session on port {port} (last error: {last_error})")
 
 
-def write_config(port, certs=None, extra=""):
+def write_config(port, certs=None, extra="", web_port=None, web_token=None):
     """Write a config.toml into the current working directory.
 
     When `certs` is None no TLS paths are emitted, which keeps the CLI from
     auto-starting its background server (useful when the suite starts one itself).
+
+    The web dashboard is off unless a suite asks for it: it defaults to a fixed
+    port, which two suites - or a suite and the developer's own server - would
+    otherwise fight over. A suite that wants it passes a `free_port()` and a
+    token, so it knows the token without having to scrape the server's output.
     """
     lines = [f'server_addr = "127.0.0.1"', f"server_port = {port}", 'editor = "true"']
     if certs is not None:
@@ -382,8 +387,81 @@ def write_config(port, certs=None, extra=""):
             f'key_path = "{certs.server_key}"',
             f'ca_path = "{certs.ca_crt}"',
         ]
+    if web_port is None:
+        lines.append("web_enabled = false")
+    else:
+        lines += ['web_addr = "127.0.0.1"', f"web_port = {web_port}"]
+        if web_token is not None:
+            lines.append(f'web_token = "{web_token}"')
     with open("config.toml", "w") as handle:
         handle.write("\n".join(lines) + "\n" + extra)
+
+
+class _Unset:
+    """Distinguishes "use the stored token" from "send no token at all"."""
+
+
+_UNSET = _Unset()
+
+
+class Dashboard:
+    """HTTP client for the web management dashboard.
+
+    Returns `(status, payload)` rather than raising on 4xx: the suites check
+    refusals as often as they check successes, and an exception for "401 as
+    intended" would read backwards.
+    """
+
+    def __init__(self, port, token=None):
+        self.base = f"http://127.0.0.1:{port}"
+        self.token = token
+
+    def call(self, path, method="GET", payload=None, token=_UNSET, headers=None):
+        import urllib.error
+        import urllib.request
+
+        body = json.dumps(payload).encode() if payload is not None else None
+        request = urllib.request.Request(f"{self.base}{path}", data=body, method=method)
+        if body is not None:
+            request.add_header("Content-Type", "application/json")
+        bearer = self.token if token is _UNSET else token
+        if bearer:
+            request.add_header("Authorization", f"Bearer {bearer}")
+        for name, value in (headers or {}).items():
+            request.add_header(name, value)
+
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.status, _decode(response.read()), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, _decode(error.read()), dict(error.headers)
+
+
+def _decode(raw):
+    text = raw.decode("utf-8", "replace")
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def wait_for_dashboard(port, process=None, timeout=STARTUP_TIMEOUT):
+    """Poll the dashboard's unauthenticated health endpoint until it answers."""
+    import urllib.error
+    import urllib.request
+
+    wait_for_port(port, process=process, timeout=timeout)
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as response:
+                if response.status == 200:
+                    return
+        except (urllib.error.URLError, OSError) as exc:
+            last_error = exc
+        time.sleep(0.2)
+    raise TimeoutError(f"Dashboard on port {port} never became healthy (last error: {last_error})")
 
 
 def start_server(cwd=None, env=None):

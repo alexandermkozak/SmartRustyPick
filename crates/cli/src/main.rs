@@ -4,6 +4,9 @@ use smart_rusty_pick_core::server;
 use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
 
+/// Lifetime of a certificate issued by `GENERATE.CERT`, matching the server's.
+const CLIENT_CERT_DAYS: u32 = 365;
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut initial_account = None;
@@ -1228,168 +1231,68 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
         return;
     }
 
+    // Issuing is shared with the server's `GENERATE.CERT` command, so a
+    // certificate made here and one made from the dashboard are the same
+    // certificate, signed the same way and named the same way.
     let cn = parts[1];
-    // Sanitize common_name to prevent option injection or directory traversal
-    if cn.starts_with('-') || cn.contains('/') || cn.contains('\\') || cn.contains("..") {
-        println!("Error: Invalid common_name. Must not start with '-' or contain path separators.");
-        return;
-    }
-
-    // Client certificates are written next to the CA that signs them, so they follow
-    // `ca_path` out of the working directory instead of littering it.
-    let ca_file = config.ca_path.clone().unwrap_or_else(|| "ca.crt".to_string());
-    let ca_key_file = {
-        let mut path = std::path::PathBuf::from(&ca_file);
-        path.set_extension("key");
-        path.to_string_lossy().into_owned()
+    let generated = match server::certs::generate_client_cert(config, cn, CLIENT_CERT_DAYS, true) {
+        Ok(generated) => generated,
+        Err(e) => {
+            println!("Error generating certificate: {}", e);
+            return;
+        }
     };
-    let out_dir = std::path::Path::new(&ca_file)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    if let Err(e) = std::fs::create_dir_all(&out_dir) {
-        println!("Error creating certificate directory: {}", e);
-        return;
+
+    println!("Certificate generated: {}", generated.cert_path);
+    println!("Private key: {}", generated.key_path);
+    match &generated.pfx_path {
+        Some(path) => println!("PFX file: {}", path),
+        None => println!("PFX file: not generated"),
     }
-    let out = |extension: &str| out_dir.join(format!("{}.{}", cn, extension)).to_string_lossy().into_owned();
-    let key_file = out("key");
-    let csr_file = out("csr");
-    let crt_file = out("crt");
-    let pfx_file = out("pfx");
-    let ext_file = out("ext");
+    println!("SHA-256 Thumbprint: {}", generated.thumbprint);
 
-    // 1. Generate RSA key
-    let status = std::process::Command::new("openssl")
-        .args(&["genrsa", "-out", &key_file, "2048"])
-        .status();
+    // Interactive authorization
+    println!("\n--- Connection Authorization ---");
+    print!("Enter authorization name [{}]: ", cn);
+    io::stdout().flush().unwrap();
+    let mut auth_name = String::new();
+    io::stdin().read_line(&mut auth_name).unwrap();
+    let auth_name = if auth_name.trim().is_empty() { cn.to_string() } else { auth_name.trim().to_string() };
 
-    if status.is_err() || !status.unwrap().success() {
-        println!("Error generating RSA key");
-        return;
-    }
+    print!("Is this an ADMIN connection? (Y/N) [N]: ");
+    io::stdout().flush().unwrap();
+    let mut is_admin_input = String::new();
+    io::stdin().read_line(&mut is_admin_input).unwrap();
+    let is_admin = is_admin_input.trim().to_uppercase() == "Y";
 
-    // 2. Generate CSR
-    let subj = format!("/CN={}", cn);
-    let status = std::process::Command::new("openssl")
-        .args(&["req", "-new", "-key", &key_file, "-out", &csr_file, "-subj", &subj])
-        .status();
+    let accounts = if is_admin {
+        Vec::new()
+    } else {
+        print!("Enter comma-separated list of allowed accounts: ");
+        io::stdout().flush().unwrap();
+        let mut accs_input = String::new();
+        io::stdin().read_line(&mut accs_input).unwrap();
+        accs_input.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
 
-    if status.is_err() || !status.unwrap().success() {
-        println!("Error generating CSR");
-        return;
-    }
-
-    // 3. Create extension file for SAN if needed
-    let mut san = "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nsubjectAltName = DNS:".to_string();
-    san.push_str(cn);
-    if cn == "localhost" {
-        san.push_str(", IP:127.0.0.1");
-    }
-    if let Err(e) = std::fs::write(&ext_file, san) {
-        println!("Error creating extension file: {}", e);
+    if !is_admin && accounts.is_empty() {
+        println!("Error: Non-admin connections must have at least one allowed account.");
+        println!("Authorization skipped. Use AUTHORIZE.CONN to authorize manually.");
         return;
     }
 
-    // 4. Sign CSR with the CA the server itself uses (`ca_path` in config.toml).
-    let status = std::process::Command::new("openssl")
-        .args(&[
-            "x509", "-req",
-            "-in", &csr_file,
-            "-CA", &ca_file,
-            "-CAkey", &ca_key_file,
-            "-CAcreateserial",
-            "-out", &crt_file,
-            "-days", "365",
-            "-sha256",
-            "-extfile", &ext_file
-        ])
-        .status();
-
-    let _ = std::fs::remove_file(&ext_file);
-    let _ = std::fs::remove_file(&csr_file);
-
-    if status.is_err() || !status.unwrap().success() {
-        println!("Error signing certificate. Ensure {} and {} exist.", ca_file, ca_key_file);
-        return;
-    }
-
-    // 5. Create PFX file
-    let status = std::process::Command::new("openssl")
-        .args(&[
-            "pkcs12", "-export",
-            "-out", &pfx_file,
-            "-inkey", &key_file,
-            "-in", &crt_file,
-            "-passout", "pass:"
-        ])
-        .status();
-
-    if status.is_err() || !status.unwrap().success() {
-        println!("Error generating PFX file.");
-    }
-
-    // 5. Calculate thumbprint for convenience
-    let output = std::process::Command::new("openssl")
-        .args(&["x509", "-in", &crt_file, "-fingerprint", "-noout", "-sha256"])
-        .output();
-
-    if let Ok(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        if let Some(thumbprint) = text.split('=').nth(1) {
-            let thumbprint = thumbprint.replace(':', "").trim().to_lowercase();
-            println!("Certificate generated: {}", crt_file);
-            println!("Private key: {}", key_file);
-            println!("PFX file: {}", pfx_file);
-            println!("SHA-256 Thumbprint: {}", thumbprint);
-
-            // Interactive authorization
-            println!("\n--- Connection Authorization ---");
-            print!("Enter authorization name [{}]: ", cn);
-            io::stdout().flush().unwrap();
-            let mut auth_name = String::new();
-            io::stdin().read_line(&mut auth_name).unwrap();
-            let auth_name = if auth_name.trim().is_empty() { cn.to_string() } else { auth_name.trim().to_string() };
-
-            print!("Is this an ADMIN connection? (Y/N) [N]: ");
-            io::stdout().flush().unwrap();
-            let mut is_admin_input = String::new();
-            io::stdin().read_line(&mut is_admin_input).unwrap();
-            let is_admin = is_admin_input.trim().to_uppercase() == "Y";
-
-            let accounts = if is_admin {
-                Vec::new()
+    match db.add_authorized_client(&auth_name, &generated.thumbprint, accounts, is_admin) {
+        Ok(_) => {
+            if is_admin {
+                println!("Successfully authorized: {} as {} (ADMIN)", generated.thumbprint, auth_name);
             } else {
-                print!("Enter comma-separated list of allowed accounts: ");
-                io::stdout().flush().unwrap();
-                let mut accs_input = String::new();
-                io::stdin().read_line(&mut accs_input).unwrap();
-                accs_input.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
-
-            if !is_admin && accounts.is_empty() {
-                println!("Error: Non-admin connections must have at least one allowed account.");
-                println!("Authorization skipped. Use AUTHORIZE.CONN to authorize manually.");
-            } else {
-                match db.add_authorized_client(&auth_name, &thumbprint, accounts, is_admin) {
-                    Ok(_) => {
-                        if is_admin {
-                            println!("Successfully authorized: {} as {} (ADMIN)", thumbprint, auth_name);
-                        } else {
-                            println!("Successfully authorized: {} as {}", thumbprint, auth_name);
-                        }
-                    }
-                    Err(e) => println!("Error authorizing: {}", e),
-                }
+                println!("Successfully authorized: {} as {}", generated.thumbprint, auth_name);
             }
         }
-    } else {
-        println!("Certificate generated: {}", crt_file);
-        println!("Private key: {}", key_file);
-        println!("PFX file: {}", pfx_file);
+        Err(e) => println!("Error authorizing: {}", e),
     }
 }
 

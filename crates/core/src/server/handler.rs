@@ -22,6 +22,11 @@ pub fn write_lock(db: &SharedDb) -> RwLockWriteGuard<'_, Database> {
     db.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Lifetime of a certificate issued through `GENERATE.CERT`. A year matches
+/// what the CLI has always handed out; the dashboard's own certificate is far
+/// shorter lived and is issued separately.
+const CLIENT_CERT_DAYS: u32 = 365;
+
 fn error(message: impl Into<String>) -> Response {
     Response { status: "ERROR".to_string(), message: Some(message.into()), ..Default::default() }
 }
@@ -524,6 +529,114 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 }
             }
             Response { status: "OK".to_string(), ..Default::default() }
+        }
+        "LIST.CONNS" => {
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), ..Default::default() };
+            }
+            // Re-read first: another process (a CLI beside this server) may have
+            // authorized or revoked a client since the last request.
+            let _ = db.refresh_clients_if_stale();
+            let mut clients: Vec<&crate::db::ClientInfo> = db.authorized_clients.values().collect();
+            clients.sort_by(|a, b| a.name.cmp(&b.name));
+            let results = clients.into_iter()
+                .map(|info| {
+                    (info.name.clone(), serde_json::json!({
+                        "thumbprint": info.thumbprint,
+                        "accounts": info.allowed_accounts,
+                        "is_admin": info.is_admin,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            let count = results.len();
+            Response { status: "OK".to_string(), results: Some(results), count: Some(count), ..Default::default() }
+        }
+        "LIST.ACCOUNTS" => {
+            // A client sees the accounts it may reach; an admin sees them all.
+            let stats: Vec<crate::db::AccountStats> = db.account_statistics()
+                .into_iter()
+                .filter(|account| client_info.is_admin || client_info.allowed_accounts.contains(&account.name))
+                .collect();
+            let results = stats.into_iter()
+                .map(|account| {
+                    let name = account.name.clone();
+                    (name, serde_json::to_value(account).unwrap_or(serde_json::Value::Null))
+                })
+                .collect::<Vec<_>>();
+            let count = results.len();
+            Response { status: "OK".to_string(), results: Some(results), count: Some(count), ..Default::default() }
+        }
+        "LIST.FILES" => {
+            if target_account.is_none() {
+                return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), ..Default::default() };
+            }
+            let files = db.list_tables_for_account(acc);
+            let count = files.len();
+            Response { status: "OK".to_string(), keys: Some(files), count: Some(count), ..Default::default() }
+        }
+        "FILE.STATS" => {
+            if target_account.is_none() {
+                return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), ..Default::default() };
+            }
+            let name = match req.file {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("File not specified".to_string()), ..Default::default() },
+            };
+            match db.file_statistics(acc, &name) {
+                Ok(stats) => Response {
+                    status: "OK".to_string(),
+                    record: Some(serde_json::to_value(stats).unwrap_or(serde_json::Value::Null)),
+                    ..Default::default()
+                },
+                Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), ..Default::default() },
+            }
+        }
+        "SERVER.STATS" => {
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), ..Default::default() };
+            }
+            let mut snapshot = serde_json::to_value(crate::server::stats::snapshot()).unwrap_or(serde_json::Value::Null);
+            // The engine side of "how busy is it": what is still only in memory.
+            if let Some(object) = snapshot.as_object_mut() {
+                object.insert("pending_writes".to_string(), serde_json::json!(db.pending_write_count()));
+                object.insert("loaded_tables".to_string(), serde_json::json!(db.loaded_tables.len()));
+                object.insert("authorized_clients".to_string(), serde_json::json!(db.authorized_clients.len()));
+            }
+            Response { status: "OK".to_string(), record: Some(snapshot), ..Default::default() }
+        }
+        "GENERATE.CERT" => {
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), ..Default::default() };
+            }
+            let common_name = match req.name {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("Name not specified".to_string()), ..Default::default() },
+            };
+            let config = match crate::server::active_config() {
+                Some(config) => config,
+                None => return Response { status: "ERROR".to_string(), message: Some("Certificate generation is unavailable: no server configuration".to_string()), ..Default::default() },
+            };
+            // A generated certificate is useless until it is authorized, and a
+            // caller that has to send a second command can leave orphaned keys
+            // behind. Both happen here, or neither does.
+            match crate::server::certs::generate_client_cert(&config, &common_name, CLIENT_CERT_DAYS, true) {
+                Ok(generated) => {
+                    let accounts = req.accounts_list.unwrap_or_default();
+                    let is_admin = req.is_admin.unwrap_or(false);
+                    if !is_admin && accounts.is_empty() {
+                        return Response { status: "ERROR".to_string(), message: Some("A non-admin certificate needs at least one allowed account".to_string()), ..Default::default() };
+                    }
+                    if let Err(e) = db.add_authorized_client(&common_name, &generated.thumbprint, accounts, is_admin) {
+                        return Response { status: "ERROR".to_string(), message: Some(format!("Certificate generated but authorization failed: {}", e)), ..Default::default() };
+                    }
+                    Response {
+                        status: "OK".to_string(),
+                        record: Some(serde_json::to_value(&generated).unwrap_or(serde_json::Value::Null)),
+                        ..Default::default()
+                    }
+                }
+                Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), ..Default::default() },
+            }
         }
         _ => Response { status: "ERROR".to_string(), message: Some("Unknown command".to_string()), ..Default::default() },
     }
