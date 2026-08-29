@@ -3,3 +3,12 @@ node_modules/
 # The build output lives outside this directory and is written by Vite, never
 # by hand.
 ../assets/dist/
+
+# The IDE's own HTML/CSS formatter owns these two, and it disagrees with
+# Prettier in ways neither side can be configured out of: Prettier always
+# indents <head>/<body> inside <html> and always breaks a multi-value `font:`
+# shorthand across lines. Neither file changes often enough to be worth losing
+# a CI run to, so Prettier leaves them alone. Everything else here - and that
+# is every .vue and .ts file, the ones that actually churn - is still checked.
+/index.html
+src/shared/style.css
