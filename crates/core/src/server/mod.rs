@@ -3,6 +3,8 @@ pub mod certs;
 pub mod handler;
 #[cfg(test)]
 mod handler_tests;
+#[cfg(test)]
+mod protocol_doc_tests;
 
 use crate::config::Config;
 pub use certs::{ensure_certificates, load_certs, load_key};
