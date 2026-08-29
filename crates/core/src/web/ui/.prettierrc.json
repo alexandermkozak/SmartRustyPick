@@ -1,0 +1,23 @@
+{
+  "printWidth": 100,
+  "semi": false,
+  "singleQuote": true,
+  "trailingComma": "all",
+  "bracketSpacing": false,
+  "arrowParens": "always",
+  "vueIndentScriptAndStyle": false,
+  "overrides": [
+    {
+      "files": ["*.ts", "*.mts", "*.cts", "*.js"],
+      "options": {
+        "tabWidth": 4
+      }
+    },
+    {
+      "files": ["*.vue", "*.css", "*.html", "*.json"],
+      "options": {
+        "tabWidth": 2
+      }
+    }
+  ]
+}

@@ -44,20 +44,16 @@ impl Drop for TempDir {
 /// measured before group syncing existed; set `SRP_BENCH_FSYNC=always|meta` to
 /// measure what the durability guarantee costs.
 pub fn bench_config() -> Config {
+    // Only the settings a benchmark cares about are named; the rest come from
+    // `Config::default()`, so a new setting cannot break this file.
     Config {
-        editor: None,
-        server_port: None,
-        cert_path: None,
-        key_path: None,
-        ca_path: None,
-        server_addr: None,
         log_detail: Some("none".to_string()),
         max_log_records: Some(10),
-        records_per_group: None,
         durable_writes: Some(true),
         fsync: Some(std::env::var("SRP_BENCH_FSYNC").unwrap_or_else(|_| "never".to_string())),
-        flush_interval_ms: None,
-        flush_max_pending: None,
+        // A benchmark measures the engine, so it starts no listeners.
+        web_enabled: Some(false),
+        ..Config::default()
     }
 }
 

@@ -1,4 +1,4 @@
-.PHONY: test-unit test-integration test-performance test-all bench bench-smoke perf-compare profile build run run-cli run-server container-build container-up container-down container-logs container-cli ui-install ui-dev ui-build ui-check ui-test
+.PHONY: test-unit test-integration test-performance test-all bench bench-smoke perf-compare profile build run run-cli run-server container-build container-up container-down container-logs container-cli ui-install ui-dev ui-build ui-check ui-test ui-format
 
 CONTAINER_ENGINE ?= podman
 IMAGE ?= localhost/smart-rusty-pick:latest
@@ -30,9 +30,15 @@ ui-build:
 ui-check:
 	cd $(UI_DIR) && npm ci --silent && npm run check
 
-# Component tests for the dashboard: it mounts, polls, renders and degrades.
+# Component tests for the dashboard: it mounts, polls, renders and degrades,
+# plus the architecture test that keeps the feature slices from tangling.
 ui-test:
 	cd $(UI_DIR) && npm ci --silent && npm test
+
+# Formats the front end with Prettier. Indentation and line endings for the rest
+# of the repository come from .editorconfig, which editors apply on their own.
+ui-format:
+	cd $(UI_DIR) && npm ci --silent && npm run format
 
 # Vite dev server with hot reload on :5173, proxying the API to a database
 # server already running on :8080. Open the printed dashboard URL with its

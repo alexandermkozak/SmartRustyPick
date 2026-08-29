@@ -9,7 +9,7 @@ The project has five layers of tests, all runnable from the `Makefile` and all e
 | Integration | `make test-integration` | The real binaries over the TLS protocol: CRUD, queries, select lists, headless mode, access control, per-file durability and the web dashboard. |
 | Performance | `make test-performance` | End-to-end latency distributions, throughput, scaling ratios, concurrency and resource usage.                                                   |
 | Benchmarks  | `make bench`            | Criterion micro-benchmarks of the engine: record codec, query execution, sorting, persistence.                                                  |
-| Front end   | `make ui-test`          | The dashboard's Vue components under jsdom: it mounts, polls, renders live figures and degrades when the API refuses.                           |
+| Front end   | `make ui-test`          | The dashboard's Vue slices under jsdom, plus the architecture test that keeps features from importing each other.                               |
 
 `make test-all` runs the first three; `make ui-test` covers the dashboard's front end and needs node. Everything below
 the unit layer requires `cargo build` first; the Make targets

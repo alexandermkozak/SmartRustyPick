@@ -1,4 +1,5 @@
 /// <reference types="vitest/config" />
+import {fileURLToPath, URL} from 'node:url'
 import {defineConfig} from 'vite'
 import vue from '@vitejs/plugin-vue'
 
@@ -8,6 +9,14 @@ import vue from '@vitejs/plugin-vue'
 // no-store`, so there is no cache to bust.
 export default defineConfig(({command}) => ({
     plugins: [vue()],
+    // Slices reach the shared kernel by alias and each other not at all, so a
+    // file moving inside its own slice never rewrites a path outside it.
+    resolve: {
+        alias: {
+            '@shared': fileURLToPath(new URL('./src/shared', import.meta.url)),
+            '@features': fileURLToPath(new URL('./src/features', import.meta.url)),
+        },
+    },
     // Built assets are served from /dist/; the dev server serves from the root.
     base: command === 'build' ? '/dist/' : '/',
     build: {

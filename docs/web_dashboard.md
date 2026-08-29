@@ -124,27 +124,61 @@ tree larger than the database itself is a poor trade for a handful of routes.
 
 ### Front end
 
-The page is a Vue 3 application using the Composition API, written as single-file components and built by Vite. Sources
-live in `crates/core/src/web/ui/`:
+The page is a Vue 3 application using the Composition API, written as single-file components and built by Vite. It is
+organised in **vertical slices**: each feature owns its views, its components, its composables, its API calls and its
+types, in one directory.
 
-| Path                                | Role                                                            |
-|-------------------------------------|-----------------------------------------------------------------|
-| `src/App.vue`                       | The shell: header, tabs, alert banner, live toggle.             |
-| `src/views/`                        | One component per tab.                                          |
-| `src/components/`                   | Small shared pieces: stat cards, role pills, panel states.      |
-| `src/composables/usePolling.ts`     | Interval refresh with the behaviour live views need.            |
-| `src/composables/useServerStats.ts` | One shared server poll for the header and the overview.         |
-| `src/composables/useAlerts.ts`      | The banner any view can raise an error into.                    |
-| `src/api.ts`, `src/types.ts`        | The HTTP client, and the wire types mirroring the Rust structs. |
+```
+crates/core/src/web/ui/src/
+├── App.vue                  the shell: header, tabs, alert banner
+├── features/
+│   ├── index.ts             the registry - the one module that knows every slice
+│   ├── types.ts             FeatureTab: all the shell knows about a feature
+│   ├── overview/            ┐
+│   │   ├── index.ts         │ public surface: the tab, plus the two header widgets
+│   │   ├── api.ts           │ SERVER.STATS
+│   │   ├── types.ts         │ ServerSnapshot, ConnectionSnapshot
+│   │   ├── OverviewView.vue │
+│   │   ├── components/      │ ServerLine, ServerControls, StatGrid, ConnectionsTable
+│   │   └── composables/     ┘ useServerStats
+│   ├── authorizations/      same shape: LIST.CONNS, AUTHORIZE.CONN, useClients, …
+│   ├── certificates/        GENERATE.CERT, useCertificateIssuing, …
+│   └── accounts/            LIST.ACCOUNTS, LIST.FILES, FILE.STATS, useAccountBrowser, …
+└── shared/                  the kernel every slice may use
+    ├── api/client.ts        the transport: ApiError, call, record, pairs, keys
+    ├── api/protocol.ts      the response envelope
+    ├── composables/         usePolling, useAlerts
+    ├── components/          StatCard, RolePill, PanelState, StatList
+    ├── format.ts            durations, byte counts, thumbprints
+    └── style.css
+```
 
-`usePolling` is where the live-monitoring behaviour lives, and new watched views should be built on it rather than on
-their own timers:
+Adding a feature is a new directory plus one line in `features/index.ts`. Removing one is deleting a directory and that
+line — nothing else in the tree refers to it.
+
+**The rules**, asserted by `shared/architecture.test.ts` rather than left to good intentions:
+
+1. A feature imports its own files and `@shared/...`. It never imports another feature; that is what a slice's
+   `index.ts` is for, and only the registry may use it.
+2. `shared/` never imports a feature. The kernel cannot depend on what is built on it.
+3. Every slice has an `index.ts` and appears in the registry, so a feature cannot be half-wired and silently absent.
+
+The test names the offending file and specifier when a rule is broken. Two path aliases,
+`@shared/*` and `@features/*`, mean moving a file inside its own slice never rewrites a path outside it.
+
+`shared/composables/usePolling.ts` is where the live-monitoring behaviour lives, and new watched views should be built
+on it rather than on their own timers:
 
 - Requests never overlap; the next tick is scheduled when the previous response lands, so a slow server slows the
   refresh rate instead of queueing requests.
 - Polling stops while the browser tab is hidden, and refreshes immediately when it returns.
 - A failed refresh keeps the last good data on screen, dimmed, with the reason beside it.
 - A `401` stops the poll rather than retrying into a log full of refusals.
+
+The overview slice's `useServerStats` shows the intended pattern for data more than one component needs: one
+module-scope poller, shared, with consumers reference counted so it starts when the first component that wants it mounts
+and stops when the last goes away. The shell never has to start a poll on behalf of a feature it otherwise knows nothing
+about.
 
 ### Building it
 
@@ -153,10 +187,27 @@ the container image needs a node toolchain. Node is required only to change the 
 
 ```sh
 make ui-build     # rebuild assets/dist - commit the result
-make ui-test      # component tests (vitest + jsdom)
+make ui-test      # component and architecture tests (vitest + jsdom)
 make ui-check     # type-check only
+make ui-format    # Prettier
 make ui-dev       # Vite dev server on :5173 with hot reload
 ```
+
+Formatting is Prettier's (`ui/.prettierrc.json`), and CI fails on unformatted files. Indentation and line endings for
+the rest of the repository come from `.editorconfig` at the root, which editors apply on their own.
+
+**In a JetBrains IDE, two settings are worth a minute:**
+
+1. Turn Prettier on for this project — *Settings → Languages & Frameworks → JavaScript → Prettier*, set the
+   configuration to automatic and tick *Run on save*. Without it the IDE's own formatter and Prettier disagree on four
+   details — brace spacing, the space in `<Component />`, continuation indent and attribute indent — and undo each other
+   on every save until CI's `format:check` fails. Only the first is expressible in `.prettierrc.json`, so configuration
+   alone cannot settle it.
+2. Mark `crates/core/src/web/assets/dist` as *Excluded* (right-click → *Mark Directory as*). It is Vite output;
+   reformatting it by hand makes a rebuild produce something different and fails the freshness check.
+
+After `make ui-build`, rebuild the Rust binary too: the bundle is embedded at compile time, so a server built earlier
+keeps serving the older copy.
 
 For `make ui-dev`, start a database server first and open the dashboard URL it prints with the port changed to 5173 —
 `http://127.0.0.1:5173/?token=...`. Vite proxies `/api` and

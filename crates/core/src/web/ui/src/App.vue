@@ -1,48 +1,28 @@
 <script lang="ts" setup>
-import {computed, onMounted, onUnmounted, shallowRef} from 'vue'
-import OverviewView from './views/OverviewView.vue'
-import ClientsView from './views/ClientsView.vue'
-import CertificatesView from './views/CertificatesView.vue'
-import AccountsView from './views/AccountsView.vue'
-import {useAlerts} from './composables/useAlerts'
-import {useServerStats} from './composables/useServerStats'
-import {duration} from './format'
+/**
+ * The shell: a header, a tab per feature, and the banner errors surface in.
+ *
+ * It composes slices and owns none of their behaviour. The only things it
+ * imports from a feature are the tab descriptors in the registry and the two
+ * header widgets the overview slice publishes - so a new feature is a new
+ * directory plus one line in `features/index.ts`.
+ */
+import {computed, shallowRef} from 'vue'
+import {featureTabs} from './features'
+import {ServerControls, ServerLine} from './features/overview'
+import {useAlerts} from '@shared/composables/useAlerts'
 
-const tabs = [
-  {id: 'overview', label: 'Overview', component: OverviewView},
-  {id: 'clients', label: 'Authorizations', component: ClientsView},
-  {id: 'certificates', label: 'Certificates', component: CertificatesView},
-  {id: 'accounts', label: 'Accounts', component: AccountsView},
-] as const
-
-type TabId = (typeof tabs)[number]['id']
-
-const current = shallowRef<TabId>('overview')
+const current = shallowRef(featureTabs[0].id)
 const alerts = useAlerts()
-const stats = useServerStats()
 
-const view = computed(() => tabs.find((tab) => tab.id === current.value)!.component)
+const view = computed(
+  () => (featureTabs.find((tab) => tab.id === current.value) ?? featureTabs[0]).component,
+)
 
-const serverLine = computed(() => {
-  const snapshot = stats.data.value
-  if (!snapshot) return stats.error.value ? 'not responding' : 'connecting…'
-  return `${snapshot.listen_addr} · up ${duration(snapshot.uptime_seconds)}`
-})
-
-const health = computed(() => {
-  if (stats.error.value) return {text: stats.live.value ? 'error' : 'disconnected', tone: 'down'}
-  if (!stats.loaded.value) return {text: '…', tone: ''}
-  return {text: 'connected', tone: 'up'}
-})
-
-function select(tab: TabId): void {
-  current.value = tab
+function select(id: string): void {
+  current.value = id
   alerts.clear()
 }
-
-// The shared poller outlives every view, so the shell owns its lifetime.
-onMounted(() => stats.start())
-onUnmounted(() => stats.stop())
 </script>
 
 <template>
@@ -51,33 +31,22 @@ onUnmounted(() => stats.stop())
       <span class="mark">SRP</span>
       <div>
         <h1>SmartRustyPick</h1>
-        <p class="sub">{{ serverLine }}</p>
+        <ServerLine />
       </div>
     </div>
     <div class="bar-right">
-      <span :class="health.tone" class="pill">{{ health.text }}</span>
-      <label class="check live-toggle">
-        <input
-            :checked="stats.live.value"
-            type="checkbox"
-            @change="stats.live.value ? stats.stop() : stats.start()"
-        />
-        Live
-      </label>
-      <button :disabled="stats.loading.value" class="ghost" type="button" @click="stats.refresh()">
-        Refresh
-      </button>
+      <ServerControls />
     </div>
   </header>
 
   <nav class="tabs">
     <button
-        v-for="tab in tabs"
-        :key="tab.id"
-        :aria-current="current === tab.id"
-        class="tab"
-        type="button"
-        @click="select(tab.id)"
+      v-for="tab in featureTabs"
+      :key="tab.id"
+      :aria-current="current === tab.id"
+      class="tab"
+      type="button"
+      @click="select(tab.id)"
     >
       {{ tab.label }}
     </button>
@@ -89,7 +58,7 @@ onUnmounted(() => stats.stop())
     <!-- Kept alive so switching tabs does not throw away a loaded file list or
          a certificate that has only just been shown. -->
     <KeepAlive>
-      <component :is="view"/>
+      <component :is="view" />
     </KeepAlive>
   </main>
 </template>

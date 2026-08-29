@@ -90,6 +90,9 @@ jobs:
           cache: npm
           cache-dependency-path: crates/core/src/web/ui/package-lock.json
 
+      - name: Check the dashboard front end's formatting
+        run: cd crates/core/src/web/ui && npm ci && npm run format:check
+
       - name: Test the dashboard front end
         run: make ui-test
 

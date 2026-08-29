@@ -61,17 +61,15 @@ impl Config {
     }
 }
 
-impl Config {
-    pub fn load() -> Self {
-        let config_path = Path::new("config.toml");
-        if config_path.exists() {
-            if let Ok(content) = fs::read_to_string(config_path) {
-                if let Ok(config) = toml::from_str::<Config>(&content) {
-                    return config;
-                }
-            }
-        }
-        // Return default if file doesn't exist or is invalid
+/// The settings a fresh installation runs with.
+///
+/// Written once, here, so that every other place needing a configuration -
+/// `load`'s fallback, the benchmarks, a test that wants one setting changed -
+/// says `..Config::default()` instead of listing every field. Adding a setting
+/// is then a single line in the struct above, rather than a compile error in
+/// each copy of the list.
+impl Default for Config {
+    fn default() -> Self {
         Config {
             editor: Some("nano".to_string()),
             server_port: Some(8443),
@@ -94,16 +92,40 @@ impl Config {
     }
 }
 
+impl Config {
+    pub fn load() -> Self {
+        let config_path = Path::new("config.toml");
+        if config_path.exists() {
+            if let Ok(content) = fs::read_to_string(config_path) {
+                if let Ok(config) = toml::from_str::<Config>(&content) {
+                    return config;
+                }
+            }
+        }
+        // No file, or one that does not parse: run on the defaults rather than
+        // refusing to start.
+        Config::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A configuration with nothing set, whatever the working directory's
+    /// `config.toml` happens to say.
     fn empty() -> Config {
-        let mut config = Config::load();
-        config.web_enabled = None;
-        config.web_addr = None;
-        config.web_port = None;
-        config
+        Config::default()
+    }
+
+    #[test]
+    fn every_setting_is_optional() {
+        // `Config::default()` is what a missing or unparsable file falls back
+        // to, and what the benchmarks build on: it has to be usable as it is.
+        let config = Config::default();
+        assert_eq!(config.server_port, Some(8443));
+        assert_eq!(config.server_addr.as_deref(), Some("127.0.0.1"));
+        assert!(config.cert_path.is_none(), "TLS is opt in");
     }
 
     #[test]

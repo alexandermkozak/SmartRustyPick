@@ -11,7 +11,7 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {flushPromises, mount} from '@vue/test-utils'
 import type {Component} from 'vue'
-import type {ServerSnapshot} from './types'
+import type {ServerSnapshot} from '@features/overview/types'
 
 const snapshot: ServerSnapshot = {
     uptime_seconds: 3661,
@@ -103,7 +103,9 @@ describe('the dashboard shell', () => {
 
         const cards = wrapper.findAll('.stat').map((card) => card.text())
         expect(cards.some((text) => text.includes('340') && text.includes('Requests'))).toBe(true)
-        expect(cards.some((text) => text.includes('Active connections') && text.includes('1'))).toBe(true)
+        expect(
+            cards.some((text) => text.includes('Active connections') && text.includes('1')),
+        ).toBe(true)
 
         // The open session is listed with the name it was authorized under.
         expect(wrapper.text()).toContain('WEB.DASHBOARD')
@@ -141,7 +143,10 @@ describe('the dashboard shell', () => {
 
     it('stops polling once the session is refused, rather than retrying forever', async () => {
         const fetchStub = vi.fn(
-            async () => new Response(JSON.stringify({error: 'A valid dashboard token is required'}), {status: 401}),
+            async () =>
+                new Response(JSON.stringify({error: 'A valid dashboard token is required'}), {
+                    status: 401,
+                }),
         )
         vi.stubGlobal('fetch', fetchStub)
         vi.useFakeTimers()

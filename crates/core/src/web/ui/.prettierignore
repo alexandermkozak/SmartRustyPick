@@ -1,0 +1,5 @@
+node_modules/
+
+# The build output lives outside this directory and is written by Vite, never
+# by hand.
+../assets/dist/

@@ -1,0 +1,10 @@
+# The dashboard bundle is written by Vite (`make ui-build`), never by hand. It
+# is committed so that `cargo build` needs no node toolchain, but it is build
+# output: GitHub collapses it in reviews, and reformatting it by hand breaks the
+# freshness check in the `dashboard-bundle` CI job.
+crates/core/src/web/assets/dist/** linguist-generated=true
+crates/core/src/web/assets/dist/** -diff
+
+# Lockfiles are generated too, and no one reviews them line by line.
+crates/core/src/web/ui/package-lock.json linguist-generated=true
+Cargo.lock linguist-generated=true
