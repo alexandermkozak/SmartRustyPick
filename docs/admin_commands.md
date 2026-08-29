@@ -101,4 +101,10 @@ Start the SSL TCP server for remote access. If the address/port is omitted, it d
 
 - **Usage**: `START.SERVER [<addr:port>] <cert_path> <key_path> <ca_path>`
 - **Example**: `START.SERVER 0.0.0.0:8443 server.crt server.key ca.crt` or `START.SERVER server.crt server.key ca.crt`
-- **Note**: This starts the server in a background thread.
+- **Note**:
+  - This starts the server in a background thread.
+  - The supplied certificate, key and CA paths are used as given, overriding `cert_path`, `key_path` and `ca_path`
+    from `config.toml` for this server instance. Every other setting (port defaults aside, ports, durability, the
+    dashboard, ...) still comes from `config.toml`.
+  - All three paths must already exist; a missing file is reported as an error before the listener is bound, rather
+    than silently generating new certificates at the mistyped path.

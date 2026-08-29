@@ -38,7 +38,29 @@ pub struct Config {
     /// Fixed dashboard access token. Left unset, a new one is generated on every
     /// boot and printed with the dashboard URL.
     pub web_token: Option<String>,
+    /// Maximum size, in bytes, of a single request line. A client that streams
+    /// bytes without a newline is cut off once it crosses this, instead of
+    /// growing the read buffer without bound.
+    pub max_request_bytes: Option<usize>,
+    /// Maximum time allowed to complete the TLS handshake before the connection
+    /// is dropped.
+    pub handshake_timeout_ms: Option<u64>,
+    /// Maximum time a connection may sit idle, with no request in flight,
+    /// before it is closed. `0` disables the idle timeout.
+    pub idle_timeout_ms: Option<u64>,
+    /// Maximum number of connections the server holds open at once. Additional
+    /// connections are rejected until one of the existing ones closes.
+    pub max_connections: Option<usize>,
 }
+
+/// A single misbehaving (or compromised) authorised client should not be able to
+/// take the server down for everyone; these are the connection-level defaults
+/// that contain that damage. See `docs/admin_commands.md`'s server section and
+/// the README's configuration table for what each one guards against.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024; // 1 MiB
+pub const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 0; // disabled
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
 /// Dashboard defaults, applied wherever the config leaves them unset.
 pub const DEFAULT_WEB_ADDR: &str = "127.0.0.1";
@@ -58,6 +80,26 @@ impl Config {
         } else {
             format!("{}:{}", addr, self.web_port.unwrap_or(DEFAULT_WEB_PORT))
         }
+    }
+
+    pub fn max_request_bytes(&self) -> usize {
+        self.max_request_bytes.unwrap_or(DEFAULT_MAX_REQUEST_BYTES)
+    }
+
+    pub fn handshake_timeout_ms(&self) -> u64 {
+        self.handshake_timeout_ms.unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS)
+    }
+
+    /// `None` means disabled (config value `0`).
+    pub fn idle_timeout(&self) -> Option<std::time::Duration> {
+        match self.idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS) {
+            0 => None,
+            ms => Some(std::time::Duration::from_millis(ms)),
+        }
+    }
+
+    pub fn max_connections(&self) -> usize {
+        self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS)
     }
 }
 
@@ -88,6 +130,10 @@ impl Default for Config {
             web_addr: None,
             web_port: None,
             web_token: None,
+            max_request_bytes: None,
+            handshake_timeout_ms: None,
+            idle_timeout_ms: None,
+            max_connections: None,
         }
     }
 }
@@ -148,5 +194,24 @@ mod tests {
         let mut config = empty();
         config.web_enabled = Some(false);
         assert!(!config.web_enabled());
+    }
+
+    #[test]
+    fn connection_limits_have_sane_defaults() {
+        let config = empty();
+        assert_eq!(config.max_request_bytes(), 1024 * 1024);
+        assert_eq!(config.handshake_timeout_ms(), 10_000);
+        assert_eq!(config.idle_timeout(), None, "disabled unless configured");
+        assert_eq!(config.max_connections(), 1024);
+    }
+
+    #[test]
+    fn idle_timeout_zero_means_disabled() {
+        let mut config = empty();
+        config.idle_timeout_ms = Some(0);
+        assert_eq!(config.idle_timeout(), None);
+
+        config.idle_timeout_ms = Some(500);
+        assert_eq!(config.idle_timeout(), Some(std::time::Duration::from_millis(500)));
     }
 }

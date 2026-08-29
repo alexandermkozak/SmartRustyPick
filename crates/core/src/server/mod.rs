@@ -13,8 +13,9 @@ pub use handler::{SharedDb, handle_request, handle_request_locked, read_lock, wr
 pub use models::{Request, Response};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
@@ -73,16 +74,54 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
     spawn_flusher(db.clone());
     crate::web::spawn_dashboard(config.clone(), db.clone(), &addr);
 
+    // Bounds how many connections are held open at once: an authorised client
+    // is trusted to issue requests, not to open unlimited sockets. Beyond the
+    // limit, new connections are rejected outright rather than queued, so a
+    // flood cannot build up unbounded backlog of its own.
+    let max_connections = config.max_connections();
+    let connection_slots = Arc::new(Semaphore::new(max_connections));
+
     loop {
         let (stream, peer_addr) = listener.accept().await?;
+
+        let permit = match connection_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let msg = format!("Connection limit ({}) reached; rejecting {}", max_connections, peer_addr);
+                eprintln!("{}", msg);
+                stats::note_rejected();
+                let db = db.clone();
+                // The rejected socket is dropped as soon as this task returns, which
+                // is enough to close it; logging still goes through spawn_blocking so
+                // a slow disk never stalls the accept loop.
+                tokio::spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = write_lock(&db).log_error("SYSTEM", &msg);
+                    })
+                        .await;
+                });
+                continue;
+            }
+        };
+
         let acceptor = acceptor.clone();
         let db = db.clone();
+        let config = config.clone();
 
         tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
+            // Held for the lifetime of this task; dropping it (on any return path)
+            // frees the slot for the next connection.
+            let _permit = permit;
+
+            let handshake_timeout = std::time::Duration::from_millis(config.handshake_timeout_ms());
+            let tls_stream = match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
                     eprintln!("TLS accept error from {}: {}", peer_addr, e);
+                    return;
+                }
+                Err(_) => {
+                    eprintln!("TLS handshake from {} did not complete within {:?}", peer_addr, handshake_timeout);
                     return;
                 }
             };
@@ -150,10 +189,46 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
 
+            let max_request_bytes = config.max_request_bytes() as u64;
+            let idle_timeout = config.idle_timeout();
+
             loop {
                 line.clear();
-                match reader.read_line(&mut line).await {
+                // A fresh `Take` every iteration, so the byte allowance is per
+                // request rather than shared across the whole connection.
+                let mut bounded = (&mut reader).take(max_request_bytes);
+                let read = bounded.read_line(&mut line);
+                let read_result = match idle_timeout {
+                    Some(timeout) => match tokio::time::timeout(timeout, read).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            eprintln!("Connection from {} idle for more than {:?}; closing", peer_addr, timeout);
+                            break;
+                        }
+                    },
+                    None => read.await,
+                };
+
+                match read_result {
                     Ok(0) => break, // EOF
+                    Ok(n) if n as u64 >= max_request_bytes && !line.ends_with('\n') => {
+                        // The line reader hit the byte cap without finding a
+                        // terminator: either a genuine oversized request or a
+                        // client streaming bytes with no newline at all. Either
+                        // way, unread bytes may still be sitting on the socket,
+                        // so the only safe response is to close the connection
+                        // rather than try to resynchronise on the next line.
+                        eprintln!("Request from {} exceeded max_request_bytes ({} bytes); closing connection", peer_addr, max_request_bytes);
+                        let resp = Response {
+                            status: "ERROR".to_string(),
+                            message: Some(format!("Request too large (max {} bytes)", max_request_bytes)),
+                            ..Default::default()
+                        };
+                        if let Ok(resp_json) = serde_json::to_string(&resp) {
+                            let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
+                        }
+                        break;
+                    }
                     Ok(_) => {
                         let req: Request = match serde_json::from_str(&line) {
                             Ok(r) => r,

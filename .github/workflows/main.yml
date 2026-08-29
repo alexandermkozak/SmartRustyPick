@@ -60,6 +60,18 @@ jobs:
       - name: Run unit tests
         run: make test-unit
 
+      # Unit tests build their fixtures under the OS temp dir now (see
+      # crates/core/src/test_support.rs), not inside the working copy. This
+      # makes that invariant permanent instead of a habit: a test that regresses
+      # to a CWD-relative fixture directory fails the build here.
+      - name: Verify unit tests left the working copy clean
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::cargo test left files in the working copy:"
+            git status --porcelain
+            exit 1
+          fi
+
       - name: Run integration tests
         run: make test-integration
 

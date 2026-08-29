@@ -44,6 +44,20 @@ The suites live in `test/` and share `test/harness.py`:
 - **Measurement.** `harness.benchmark` times repeated operations into a `Stats` object (percentiles, throughput) and
   `harness.ResourceMonitor` samples the server's RSS and CPU time from `/proc` while a suite runs.
 
+## How the Rust unit tests work
+
+`cargo test --workspace` uses `smart_rusty_pick_core::test_support` (promoted from the Criterion benches' own helper)
+for the same isolation the Python suites get from `harness.py`:
+
+- **Isolation.** `test_support::TempDir` creates a uniquely named directory under the OS temp dir and removes it (and
+  everything under it) on `Drop`, so a test never writes into the working copy and a panic never leaves a directory
+  behind. Every unit test that needs storage opens one instead of a fixed, working-directory-relative path.
+- **Config.** `test_support::isolated_config()` returns a `Config` passed explicitly to `Database::new(..., Some(...))`,
+  so no test depends on the repository's `config.toml` or behaves differently depending on where `cargo test` is
+  invoked from.
+- **Enforced in CI.** The `Build and Test` workflow runs `git status --porcelain` after `make test-unit` and fails the
+  build if it is non-empty, so a test that regresses to a CWD-relative fixture directory is caught immediately.
+
 ## Performance testing
 
 `make test-performance` runs two suites. Neither reports a single stopwatch reading: every operation is repeated and

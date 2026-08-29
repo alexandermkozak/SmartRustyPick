@@ -1,42 +1,14 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 use smart_rusty_pick_core::config::Config;
 use smart_rusty_pick_core::db::engine::Database;
 use smart_rusty_pick_core::db::models::{Field, Record, Value};
-use std::fs;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const ACCOUNT: &str = "BENCH";
 
-/// A temporary storage directory that removes itself when dropped, so benches never
-/// write into the repository working copy.
-pub struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    pub fn new(tag: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let mut path = std::env::temp_dir();
-        path.push(format!("srp_bench_{}_{}_{}", tag, std::process::id(), nanos));
-        fs::create_dir_all(&path).unwrap();
-        TempDir { path }
-    }
-
-    pub fn path(&self) -> &str {
-        self.path.to_str().unwrap()
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
+/// Self-cleaning temporary storage directory, shared with the crate's unit
+/// tests so both get the same isolation guarantees from one implementation.
+pub use smart_rusty_pick_core::test_support::TempDir;
 
 /// Config that never touches the working directory's `config.toml`.
 ///

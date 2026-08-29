@@ -1,6 +1,5 @@
 target/
 db_storage/
-custom_path/
 .local/
 .git/
 .idea/

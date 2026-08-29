@@ -1,8 +1,7 @@
 use crate::db::engine::Database;
 use crate::db::models::*;
 use crate::db::query::SortValue;
-use std::fs;
-use std::path::Path;
+use crate::test_support::{isolated_config, TempDir};
 
 /// Orders one pair the way a sort would. The sort itself resolves each value
 /// once up front; this spells that out for a test that only has two.
@@ -48,22 +47,19 @@ fn test_compare_values() {
 
 #[test]
 fn test_parse_query_trim() {
-    let base_dir = "test_parse_query_trim_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("parse_query_trim");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
 
     let q = db.parse_query("T1", &["WITH", "NAME", "=", "  John  "]).unwrap();
     if let QueryNode::Condition(c) = q {
         assert_eq!(c.value, "John");
     }
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_parse_query() {
-    let base_dir = "test_parse_query_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("parse_query");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
 
     // Simple WITH
     let q1 = db.parse_query("T1", &["WITH", "NAME", "=", "John"]);
@@ -96,15 +92,12 @@ fn test_parse_query() {
     // Invalid
     assert!(db.parse_query("T1", &[]).is_none());
     assert!(db.parse_query("T1", &["NAME", "="]).is_none()); // Missing value
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_query_execution() {
-    let base_dir = "test_query_exec_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("query_exec");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("QUERY_TEST").unwrap();
     db.logto("QUERY_TEST").unwrap();
 
@@ -151,18 +144,12 @@ fn test_query_execution() {
     let results5 = db.query("USERS", false, &q5, None);
     assert_eq!(results5.len(), 1);
     assert_eq!(results5[0].0, "3");
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_query_with_conversion() {
-    let test_dir = "test_query_conv";
-    if Path::new(test_dir).exists() {
-        fs::remove_dir_all(test_dir).unwrap();
-    }
-
-    let mut db = Database::new(test_dir, None).unwrap();
+    let dir = TempDir::new("query_conv");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("ACC1", None).unwrap();
     db.logto("ACC1").unwrap();
 
@@ -207,18 +194,12 @@ fn test_query_with_conversion() {
     let results2 = db.query("PRODUCTS", false, &query2, None);
 
     assert_eq!(results2.len(), 0, "Should NOT have found P1 with PRICE = 200 (200 converted with MD2 would be 20000)");
-
-    fs::remove_dir_all(test_dir).unwrap();
 }
 
 #[test]
 fn test_query_with_wildcards() {
-    let test_dir = "test_query_wildcards";
-    if Path::new(test_dir).exists() {
-        fs::remove_dir_all(test_dir).unwrap();
-    }
-
-    let mut db = Database::new(test_dir, None).unwrap();
+    let dir = TempDir::new("query_wildcards");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("ACC1", None).unwrap();
     db.logto("ACC1").unwrap();
 
@@ -271,8 +252,6 @@ fn test_query_with_wildcards() {
     assert!(res3.iter().any(|(id, _)| id == "1"), "Should find 'brand new item'");
     assert!(res3.iter().any(|(id, _)| id == "2"), "Should find 'old item'");
     assert!(!res3.iter().any(|(id, _)| id == "3"), "Should NOT find 'newest thing'");
-
-    fs::remove_dir_all(test_dir).unwrap();
 }
 
 #[test]
@@ -323,11 +302,12 @@ fn test_parse_sort_specs() {
     assert_eq!(specs, vec![SortSpec { field_name: "PRICE".to_string(), descending: false }]);
 }
 
-fn setup_sort_db(test_dir: &str) -> Database {
-    if Path::new(test_dir).exists() {
-        fs::remove_dir_all(test_dir).unwrap();
-    }
-    let mut db = Database::new(test_dir, None).unwrap();
+/// A `TempDir` rooted database with the `PRODUCTS` fixture used by the sort
+/// tests below. The guard is returned alongside the database so callers keep
+/// the directory alive for as long as they use it.
+fn setup_sort_db(label: &str) -> (TempDir, Database) {
+    let dir = TempDir::new(label);
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("ACC1", None).unwrap();
     db.logto("ACC1").unwrap();
     db.create_table("PRODUCTS").unwrap();
@@ -342,13 +322,12 @@ fn setup_sort_db(test_dir: &str) -> Database {
         table.records.insert("P3".to_string(), Record::from_display_string("old keyboard^100^2024-02-01"));
         table.records.insert("P4".to_string(), Record::from_display_string("new cable^25^2024-05-01"));
     }
-    db
+    (dir, db)
 }
 
 #[test]
 fn test_sort_results_ascending_and_descending() {
-    let test_dir = "test_sort_asc_dsnd";
-    let mut db = setup_sort_db(test_dir);
+    let (_dir, mut db) = setup_sort_db("sort_asc_dsnd");
 
     let ids = |res: &Vec<(String, Record)>| res.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
 
@@ -367,14 +346,11 @@ fn test_sort_results_ascending_and_descending() {
     let (_, specs) = Database::parse_sort_specs(&["BY.DSND", "PRICE"]);
     db.sort_results("PRODUCTS", &mut res, &specs);
     assert_eq!(ids(&res), vec!["P1", "P3", "P2", "P4"]);
-
-    fs::remove_dir_all(test_dir).unwrap();
 }
 
 #[test]
 fn test_sort_results_multiple_keys() {
-    let test_dir = "test_sort_multi";
-    let mut db = setup_sort_db(test_dir);
+    let (_dir, mut db) = setup_sort_db("sort_multi");
 
     // BY PRICE BY.DSND CREATE.DATE
     let (clause, specs) = Database::parse_sort_specs(&["WITH", "DESC", "=", "[new]", "BY", "PRICE", "BY.DSND", "CREATE.DATE"]);
@@ -385,14 +361,11 @@ fn test_sort_results_multiple_keys() {
     let ids: Vec<String> = res.iter().map(|(k, _)| k.clone()).collect();
     // Only the "new" products; P4/P2 share price 25 so the later date (P4) comes first.
     assert_eq!(ids, vec!["P4", "P2", "P1"]);
-
-    fs::remove_dir_all(test_dir).unwrap();
 }
 
 #[test]
 fn test_sort_text_is_case_insensitive() {
-    let test_dir = "test_sort_case";
-    let mut db = setup_sort_db(test_dir);
+    let (_dir, mut db) = setup_sort_db("sort_case");
     {
         let table = db.get_table_mut("PRODUCTS").unwrap();
         table.records.insert("P5".to_string(), Record::from_display_string("Ztest^2^2024-06-01"));
@@ -408,14 +381,11 @@ fn test_sort_text_is_case_insensitive() {
     // Values differing only in case are adjacent and keep a deterministic order.
     assert_eq!(sort_cmp("apple", "APPLE"), std::cmp::Ordering::Greater);
     assert_eq!(sort_cmp("Banana", "apple"), std::cmp::Ordering::Greater);
-
-    fs::remove_dir_all(test_dir).unwrap();
 }
 
 #[test]
 fn test_sort_keys_and_unknown_field() {
-    let test_dir = "test_sort_keys";
-    let mut db = setup_sort_db(test_dir);
+    let (_dir, mut db) = setup_sort_db("sort_keys");
 
     let (_, specs) = Database::parse_sort_specs(&["BY.DSND", "DESC"]);
     let keys = vec!["P1".to_string(), "P2".to_string(), "P3".to_string(), "P4".to_string()];
@@ -431,8 +401,6 @@ fn test_sort_keys_and_unknown_field() {
     let (_, specs) = Database::parse_sort_specs(&["BY.DSND", "ID"]);
     let sorted = db.sort_keys("PRODUCTS", false, keys, &specs);
     assert_eq!(sorted, vec!["P4", "P3", "P2", "P1"]);
-
-    fs::remove_dir_all(test_dir).unwrap();
 }
 
 /// The sort resolves each value once instead of parsing inside the comparator.

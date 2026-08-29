@@ -1322,15 +1322,33 @@ fn handle_start_server(db: Arc<RwLock<Database>>, parts: &[&str], config: Arc<Co
         return;
     }
 
-    let _ = parts[offset].to_string();
-    let _ = parts[offset + 1].to_string();
-    let _ = parts[offset + 2].to_string();
+    let cert_path = parts[offset].to_string();
+    let key_path = parts[offset + 1].to_string();
+    let ca_path = parts[offset + 2].to_string();
+
+    // Explicit paths are trusted to be exact: silently falling back to generating
+    // fresh material at a mistyped path would hide the typo instead of failing on it.
+    for (label, path) in [("Certificate", &cert_path), ("Key", &key_path), ("CA certificate", &ca_path)] {
+        if !std::path::Path::new(path).exists() {
+            println!("Error: {} file '{}' does not exist.", label, path);
+            return;
+        }
+    }
+
+    // Every other setting (ports, durability, dashboard, ...) still comes from
+    // config.toml; only the TLS material is overridden by what was typed.
+    let server_config = Arc::new(Config {
+        cert_path: Some(cert_path),
+        key_path: Some(key_path),
+        ca_path: Some(ca_path),
+        ..(*config).clone()
+    });
 
     let addr_clone = addr.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let _ = server::start_server(config, db, Some(addr_clone)).await;
+            let _ = server::start_server(server_config, db, Some(addr_clone)).await;
         });
     });
     println!("Server start initiated on {}.", addr);

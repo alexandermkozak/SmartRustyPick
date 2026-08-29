@@ -1,15 +1,14 @@
 use crate::db::{ClientInfo, Database};
 use crate::server::handler::handle_request;
 use crate::server::models::Request;
-use std::fs;
+use crate::test_support::{isolated_config, TempDir};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 #[test]
 fn test_handle_request_read_write() {
-    let base_dir = "test_server_handler_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("handler");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("SERVER_TEST").unwrap();
 
     let db_arc = Arc::new(RwLock::new(db));
@@ -59,17 +58,15 @@ fn test_handle_request_read_write() {
     let resp_denied = handle_request(req_denied, &db_arc, &client_info);
     assert_eq!(resp_denied.status, "ERROR");
     assert!(resp_denied.message.unwrap().contains("Access denied"));
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_create_and_delete_file_target_the_requested_account() {
     // A headless server is not logged into any account, so these commands must act on
     // the account named in the request rather than on `current_account`.
-    let base_dir = "test_server_create_file_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("server_create_file");
+    let base_dir = dir.path();
+    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
     db.create_account("FILE_TEST", None).unwrap();
     db.current_account = String::new();
 
@@ -134,17 +131,14 @@ fn test_create_and_delete_file_target_the_requested_account() {
     );
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
     assert!(!Path::new(base_dir).join("FILE_TEST").join("STOCK").exists());
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_create_file_durable_flag_is_honoured() {
     // A file created with `durable` must be flushed on every write even though
     // the database as a whole buffers.
-    let base_dir = "test_server_durable_file_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("server_durable_file");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("DUR_TEST", None).unwrap();
     db.current_account = String::new();
     db.durable_writes = false;
@@ -194,15 +188,12 @@ fn test_create_file_durable_flag_is_honoured() {
     assert!(!db_arc.read().unwrap().has_pending_writes(), "a durable file must flush at once");
     assert!(db_arc.write().unwrap().is_table_durable_for_account("DUR_TEST", "LEDGER"));
     assert!(!db_arc.write().unwrap().is_table_durable_for_account("DUR_TEST", "SCRATCH"));
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_handle_request_query_select() {
-    let base_dir = "test_server_query_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("server_query");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("QUERY_TEST").unwrap();
     db.logto("QUERY_TEST").unwrap();
 
@@ -254,8 +245,6 @@ fn test_handle_request_query_select() {
     let next_results = resp_next.results.unwrap();
     assert_eq!(next_results.len(), 1);
     assert!(next_results[0].1.is_object());
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
@@ -263,9 +252,8 @@ fn test_management_commands_report_accounts_files_and_statistics() {
     // The dashboard navigates the database through these three commands, so
     // between them they have to describe an account without ever handing back a
     // record.
-    let base_dir = "test_server_management_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("server_management");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("MGMT_TEST").unwrap();
     db.current_account = String::new();
 
@@ -326,15 +314,12 @@ fn test_management_commands_report_accounts_files_and_statistics() {
     );
     assert_eq!(resp.status, "ERROR");
     assert!(resp.message.unwrap().contains("not found"));
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_management_commands_respect_the_clients_permissions() {
-    let base_dir = "test_server_management_perm_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("server_management_perm");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("VISIBLE").unwrap();
     db.create_test_account("HIDDEN").unwrap();
     db.current_account = String::new();
@@ -371,15 +356,12 @@ fn test_management_commands_respect_the_clients_permissions() {
         assert_eq!(resp.status, "ERROR", "{} must be refused", command);
         assert_eq!(resp.message.unwrap(), "Admin privileges required");
     }
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_list_conns_and_server_stats_describe_the_running_server() {
-    let base_dir = "test_server_stats_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("server_stats");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.add_authorized_client("reporting-bot", "AB12CD", vec!["SALES".to_string()], false).unwrap();
     db.current_account = String::new();
 
@@ -409,6 +391,4 @@ fn test_list_conns_and_server_stats_describe_the_running_server() {
     // The engine-side numbers are merged into the same object.
     assert_eq!(stats["authorized_clients"].as_u64().unwrap(), 1);
     assert!(stats["pending_writes"].is_number());
-
-    fs::remove_dir_all(base_dir).unwrap();
 }

@@ -8,12 +8,7 @@
 
 # Runtime state of a locally started CLI or server.
 /db_storage/
-/custom_path/
 .edit_*.tmp*
-
-# Fixture directories the engine tests write into.
-/crates/core/test_load_clients_dir/
-/crates/core/test_repro_dir/
 
 # Tooling.
 /.junie/
