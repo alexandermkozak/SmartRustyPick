@@ -1,4 +1,4 @@
-.PHONY: test-unit test-integration test-performance test-all bench bench-smoke perf-compare profile build run run-cli run-server container-build container-up container-down container-logs container-cli ui-install ui-dev ui-build ui-check ui-test ui-format
+.PHONY: test-unit test-integration test-performance test-all bench bench-smoke perf-compare profile build run run-cli run-server container-build container-up container-down container-logs container-cli ui-install ui-dev ui-build ui-check ui-test ui-format install-hooks
 
 CONTAINER_ENGINE ?= podman
 IMAGE ?= localhost/smart-rusty-pick:latest
@@ -12,6 +12,13 @@ BASE ?= baseline_metrics.json
 
 build:
 	cargo build
+
+# Points git at the tracked hooks in .githooks. One command, once per clone.
+# The pre-commit hook runs the dashboard's formatting and bundle-freshness
+# checks, which are the two CI failures a formatter-on-save tends to cause.
+install-hooks:
+	git config core.hooksPath .githooks
+	@echo "Hooks installed. Skip one with 'git commit --no-verify'."
 
 # --- Web dashboard front end -------------------------------------------------
 # The Vue sources live in crates/core/src/web/ui and are compiled into

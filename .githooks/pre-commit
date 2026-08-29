@@ -1,0 +1,52 @@
+#!/bin/sh
+# Catches the two dashboard checks that CI runs and that a formatter-on-save can
+# quietly undo between "I ran the checks" and "I committed".
+#
+# Both are cheap and only run when something under the front end is staged, so a
+# commit that does not touch it pays nothing. Install with `make install-hooks`;
+# skip once with `git commit --no-verify`.
+set -e
+
+UI_DIR="crates/core/src/web/ui"
+DIST_DIR="crates/core/src/web/assets/dist"
+
+staged=$(git diff --cached --name-only)
+case "$staged" in
+    *"$UI_DIR"*|*"$DIST_DIR"*) ;;
+    *) exit 0 ;;
+esac
+
+if [ ! -d "$UI_DIR/node_modules" ]; then
+    echo "pre-commit: $UI_DIR/node_modules is missing, skipping the dashboard checks."
+    echo "            Run 'make ui-install' to have them run here instead of in CI."
+    exit 0
+fi
+
+echo "pre-commit: checking the dashboard front end..."
+
+if ! (cd "$UI_DIR" && npx prettier --check . >/dev/null 2>&1); then
+    echo
+    echo "  ✗ Unformatted files. CI's format:check will fail."
+    (cd "$UI_DIR" && npx prettier --list-different . | sed 's/^/      /')
+    echo
+    echo "    Fix: make ui-format   (then stage the result)"
+    echo "    In a JetBrains IDE, turning Prettier on for the project stops this recurring:"
+    echo "    Settings -> Languages & Frameworks -> JavaScript -> Prettier -> Run on save."
+    exit 1
+fi
+
+# The committed bundle has to be what the sources build. Rebuilding is the only
+# honest way to know, and it takes well under a second.
+before=$(find "$DIST_DIR" -type f -exec sha256sum {} \; | sort | sha256sum)
+(cd "$UI_DIR" && npm run build >/dev/null 2>&1)
+after=$(find "$DIST_DIR" -type f -exec sha256sum {} \; | sort | sha256sum)
+
+if [ "$before" != "$after" ]; then
+    echo
+    echo "  ✗ The committed bundle does not match its sources; CI's freshness check will fail."
+    echo "    It has been rebuilt for you - stage $DIST_DIR and commit again."
+    echo "    Nothing but 'make ui-build' should ever write to that directory."
+    exit 1
+fi
+
+echo "pre-commit: dashboard front end OK."
