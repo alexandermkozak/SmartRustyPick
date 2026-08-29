@@ -79,6 +79,14 @@ make perf-compare BASE=/tmp/base.json
 
 `perf-compare` exits non-zero if any metric worsened by more than 25% (`--tolerance` to change it).
 
+The same file renders as a Markdown report with `make perf-report`, which is how the numbers reach a pull request
+without anyone opening the workflow run. CI writes that report to the run summary and to a single comment on the
+pull request, rewritten in place on every push, so the latency table, the budget verdicts and the ratio checks are
+visible on the pull request itself. The report shows one run rather than a comparison: absolute timings are not
+comparable between hosts, so read the budget and ratio verdicts for pass/fail, and use `perf-compare` on one machine
+when you need a real before-and-after. The report is written even when the suite failed, since a run that blew a
+budget is the one worth reading.
+
 ### Sorting
 
 `LIST` and `SELECT` sort by resolving each value once, in front of the sort, rather than deriving it inside the

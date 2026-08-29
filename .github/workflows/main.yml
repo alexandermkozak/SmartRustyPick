@@ -28,6 +28,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    # Needed only by the step that publishes the performance report onto the
+    # pull request; everything else in this job reads.
+    permissions:
+      contents: read
+      pull-requests: write
+
     steps:
       - uses: actions/checkout@v4
 
@@ -59,6 +65,61 @@ jobs:
 
       - name: Run performance tests
         run: make test-performance
+
+      # The suites already record every measurement to performance_metrics.json.
+      # These two steps put that file where it can be read without opening the run:
+      # the run summary, and a single comment on the pull request that is rewritten
+      # on each push. They run even when the suite failed, because a run that blew a
+      # budget is exactly the run whose numbers are worth reading.
+      - name: Render the performance report
+        if: always() && hashFiles('target/test-results/performance_metrics.json') != ''
+        run: |
+          python3 scripts/report_perf.py \
+            --footer "[Full workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) - performance suite: ${{ job.status }}" \
+            --output target/test-results/perf-report.md
+          cat target/test-results/perf-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment the performance report on the pull request
+        # Skipped for pull requests from forks: their token is read-only, so the
+        # comment would fail the job for a contributor who cannot fix it. The report
+        # is still in the run summary and the uploaded artifact.
+        if: >-
+          always() && github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
+          && hashFiles('target/test-results/perf-report.md') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # Identifies the comment this workflow owns, so each push rewrites it in
+          # place instead of burying the pull request under one comment per run.
+          marker='<!-- smart-rusty-pick: performance report -->'
+          { echo "$marker"; cat target/test-results/perf-report.md; } > "$RUNNER_TEMP/comment.md"
+          jq -Rs '{body: .}' "$RUNNER_TEMP/comment.md" > "$RUNNER_TEMP/payload.json"
+
+          # Listed into a file and checked on its own line: a failed assignment from a
+          # command substitution does not trip `set -e`, and treating an API error as
+          # "no comment yet" would post a duplicate on every push instead of failing.
+          if ! gh api --paginate "repos/$REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+               > "$RUNNER_TEMP/comments.json"; then
+            echo "::error::Could not list the pull request's comments."
+            exit 1
+          fi
+          # `--paginate` concatenates one array per page, so slurp and merge before
+          # searching: on a busy pull request the comment can be past the first page.
+          comment_id=$(jq -r -s --arg marker "$marker" \
+            'add | map(select(.body | startswith($marker))) | .[0].id // empty' \
+            "$RUNNER_TEMP/comments.json")
+
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/$REPOSITORY/issues/comments/$comment_id" --input "$RUNNER_TEMP/payload.json" --silent
+            echo "Updated comment $comment_id."
+          else
+            gh api -X POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" --input "$RUNNER_TEMP/payload.json" --silent
+            echo "Created a new performance comment."
+          fi
 
       # One iteration of each Criterion benchmark. Not a timing gate - it keeps the
       # benchmarks compiling and running, which is how benchmark suites usually rot.

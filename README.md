@@ -104,8 +104,9 @@ All three are gitignored, so `make test-all` leaves `git status` clean.
     - The integration and performance suites need `python3` and `openssl`; they run against the built binaries in
       isolated temporary directories, so they never touch your `db_storage/`.
 3. Run test coverage with `make test-coverage` (requires `cargo-llvm-cov`).
-   - `make bench` runs the engine micro-benchmarks, `make profile` produces a flamegraph, and `make perf-compare`
-     diffs the metrics of two performance runs.
+   - `make bench` runs the engine micro-benchmarks, `make profile` produces a flamegraph, `make perf-compare`
+     diffs the metrics of two performance runs, and `make perf-report` renders the last run as Markdown - the same
+     report CI posts to each pull request.
 4. Run the interactive "full stack" experience (CLI + background server): `make run` or
    `cargo run -p smart-rusty-pick-cli`.
    - The CLI will automatically log into an account if the current directory is associated with one.

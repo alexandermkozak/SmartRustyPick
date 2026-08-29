@@ -1,4 +1,4 @@
-.PHONY: test-unit test-integration test-performance test-all bench bench-smoke perf-compare profile build run run-cli run-server container-build container-up container-down container-logs container-cli ui-install ui-dev ui-build ui-check ui-test ui-format install-hooks
+.PHONY: test-unit test-integration test-performance test-all bench bench-smoke perf-compare perf-report profile build run run-cli run-server container-build container-up container-down container-logs container-cli ui-install ui-dev ui-build ui-check ui-test ui-format install-hooks
 
 CONTAINER_ENGINE ?= podman
 IMAGE ?= localhost/smart-rusty-pick:latest
@@ -93,6 +93,11 @@ bench:
 # stops compiling or panics - the usual way benchmarks silently rot.
 bench-smoke:
 	cargo bench -p smart-rusty-pick-core -- --test
+
+# Render the last performance run as Markdown: the same numbers the suites print,
+# in the shape that belongs in a CI job summary or a pull request comment.
+perf-report:
+	$(PYTHON) scripts/report_perf.py $(RESULTS_DIR)/performance_metrics.json
 
 # Diff the metrics of two performance runs on the same machine.
 perf-compare:
