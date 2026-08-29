@@ -1,7 +1,14 @@
 use crate::db::engine::Database;
 use crate::db::models::*;
+use crate::db::query::SortValue;
 use std::fs;
 use std::path::Path;
+
+/// Orders one pair the way a sort would. The sort itself resolves each value
+/// once up front; this spells that out for a test that only has two.
+fn sort_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    SortValue::new(left).compare(&SortValue::new(right))
+}
 
 #[test]
 fn test_compare_values() {
@@ -399,8 +406,8 @@ fn test_sort_text_is_case_insensitive() {
     assert_eq!(sorted, vec!["P10", "P5"]);
 
     // Values differing only in case are adjacent and keep a deterministic order.
-    assert_eq!(Database::compare_sort_values("apple", "APPLE"), std::cmp::Ordering::Greater);
-    assert_eq!(Database::compare_sort_values("Banana", "apple"), std::cmp::Ordering::Greater);
+    assert_eq!(sort_cmp("apple", "APPLE"), std::cmp::Ordering::Greater);
+    assert_eq!(sort_cmp("Banana", "apple"), std::cmp::Ordering::Greater);
 
     fs::remove_dir_all(test_dir).unwrap();
 }
@@ -426,4 +433,63 @@ fn test_sort_keys_and_unknown_field() {
     assert_eq!(sorted, vec!["P4", "P3", "P2", "P1"]);
 
     fs::remove_dir_all(test_dir).unwrap();
+}
+
+/// The sort resolves each value once instead of parsing inside the comparator.
+/// These pin the behaviour that refactoring must not change.
+#[test]
+fn test_sort_value_ordering_rules() {
+    use std::cmp::Ordering;
+
+    // Both numeric: compared as numbers, not as text ("9" < "10").
+    assert_eq!(sort_cmp("9", "10"), Ordering::Less);
+    assert_eq!(sort_cmp("10", "9"), Ordering::Greater);
+    assert_eq!(sort_cmp("2.50", "2.5"), Ordering::Equal);
+    assert_eq!(sort_cmp("-3", "2"), Ordering::Less);
+
+    // Surrounding whitespace is not part of the value.
+    assert_eq!(sort_cmp("  42  ", "42"), Ordering::Equal);
+    assert_eq!(sort_cmp(" apple ", "apple"), Ordering::Equal);
+
+    // Only one side numeric: falls back to text, so "10" precedes "apple".
+    assert_eq!(sort_cmp("10", "apple"), Ordering::Less);
+    assert_eq!(sort_cmp("apple", "10"), Ordering::Greater);
+
+    // Neither numeric: case-insensitive, with the raw text breaking the tie.
+    assert_eq!(sort_cmp("Ztest", "test!"), Ordering::Greater);
+    assert_eq!(sort_cmp("apple", "apple"), Ordering::Equal);
+
+    // A value that is not a number must not be coerced into one.
+    assert_eq!(sort_cmp("1abc", "2abc"), Ordering::Less);
+    assert_eq!(sort_cmp("", "0"), Ordering::Less);
+}
+
+/// Lowercasing is precomputed rather than folded during each comparison. It has
+/// to agree with folding lazily, including where one character lowercases to
+/// several and where a titlecase character is not classified as uppercase.
+#[test]
+fn test_sort_value_case_folding_matches_lazy_folding() {
+    let cases = [
+        ("apple", "APPLE"),
+        ("Ztest", "test!"),
+        // U+0130 lowercases to two code points.
+        ("\u{0130}stanbul", "istanbul"),
+        // U+01C5 is titlecase: not uppercase, but not its own lowercase either.
+        ("\u{01C5}ex", "\u{01C6}ex"),
+        ("Stra\u{00DF}e", "STRASSE"),
+        ("\u{00E9}clair", "\u{00C9}CLAIR"),
+    ];
+    for (left, right) in cases {
+        let lazy = left
+            .trim()
+            .chars()
+            .flat_map(char::to_lowercase)
+            .cmp(right.trim().chars().flat_map(char::to_lowercase));
+        let resolved = SortValue::new(left).compare(&SortValue::new(right));
+        // The resolved comparison breaks a case-fold tie with the raw text, so
+        // only a decided lazy ordering has to match exactly.
+        if lazy != std::cmp::Ordering::Equal {
+            assert_eq!(resolved, lazy, "{left:?} vs {right:?}");
+        }
+    }
 }
