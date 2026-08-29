@@ -33,7 +33,8 @@ ENV SRP_DATA_DIR=/data
 WORKDIR /data
 VOLUME ["/data"]
 
-EXPOSE 8443
+# 8443 is the remote protocol; 8080 is the web management dashboard.
+EXPOSE 8443 8080
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["smart-rusty-pick-server"]

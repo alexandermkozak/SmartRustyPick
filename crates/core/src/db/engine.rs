@@ -389,7 +389,7 @@ impl Database {
         let stamp = self.disk_stamp("SYSTEM", "$CLIENTS");
         let table = self.get_table_mut("$CLIENTS")?;
         let mut clients = Vec::new();
-        for record in table.records.values() {
+        for (name, record) in table.records.iter() {
             if let Some(tp) = record.fields.get(SYS_CLIENTS_THUMBPRINT_IDX).and_then(|f| f.values.get(0)).and_then(|v| v.sub_values.get(0)) {
                 let tp_lower = tp.to_lowercase();
                 let mut allowed_accounts = Vec::new();
@@ -408,6 +408,7 @@ impl Database {
                     .map(|s| s == "Y")
                     .unwrap_or(false);
                 clients.push(ClientInfo {
+                    name: name.clone(),
                     thumbprint: tp_lower,
                     allowed_accounts,
                     is_admin,
@@ -1060,6 +1061,146 @@ impl Database {
             .unwrap_or_default();
         tables.sort();
         tables
+    }
+
+    /// Every account in the registry, sorted, picking up accounts created by
+    /// another process since the last look.
+    pub fn list_accounts(&mut self) -> Vec<String> {
+        let _ = self.refresh_account_registry();
+        let mut names: Vec<String> = self.accounts_config.fields.get(0)
+            .map(|f| f.values.iter().filter_map(|v| v.sub_values.get(0).cloned()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Summarises every account for a management view.
+    ///
+    /// Record counts come from each file's section metadata, so a large account
+    /// is described without any of it being read into memory.
+    pub fn account_statistics(&mut self) -> Vec<AccountStats> {
+        self.list_accounts()
+            .into_iter()
+            .map(|name| {
+                let directory = self.account_storage_dir(&name);
+                let files = self.list_tables_for_account(&name);
+                let record_count = files.iter()
+                    .map(|file| self.file_record_count(&directory, &name, file))
+                    .sum();
+                let (disk_bytes, _) = Self::tree_stats(Path::new(&directory));
+                AccountStats { name, directory, file_count: files.len(), record_count, disk_bytes }
+            })
+            .collect()
+    }
+
+    /// Records in one file, preferring the in-memory table when it is loaded so
+    /// that writes not yet flushed are still counted.
+    fn file_record_count(&self, directory: &str, account: &str, file: &str) -> u64 {
+        if let Some(table) = self.loaded_tables.get(&(account.to_string(), file.to_string())) {
+            return table.records.len() as u64;
+        }
+        let data_path = format!("{}/{}/data", directory, file);
+        match hashfile::read_meta(&data_path) {
+            Some(meta) => meta.records,
+            // Pre-hashfile flat file: the count is only in the file itself.
+            None => {
+                let mut map = HashMap::new();
+                let _ = Self::load_section(&mut map, &data_path);
+                map.len() as u64
+            }
+        }
+    }
+
+    /// Total bytes under `path` and the most recent modification time found
+    /// there. Returns zeroes for a path that does not exist.
+    fn tree_stats(path: &Path) -> (u64, Option<SystemTime>) {
+        let mut bytes = 0;
+        let mut newest = None;
+        let mut stack = vec![path.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+                if metadata.is_dir() {
+                    stack.push(entry.path());
+                    continue;
+                }
+                bytes += metadata.len();
+                if let Ok(modified) = metadata.modified() {
+                    newest = Some(match newest {
+                        Some(current) if current > modified => current,
+                        _ => modified,
+                    });
+                }
+            }
+        }
+        (bytes, newest)
+    }
+
+    /// Describes one file: how many records it holds, how they are spread over
+    /// the hash groups and what it costs on disk. No record is returned, and
+    /// none is loaded to answer this unless the file is in the legacy format.
+    pub fn file_statistics(&mut self, account: &str, name: &str) -> io::Result<FileStats> {
+        let _ = self.ensure_available_tables(account);
+        if !self.available_tables.get(account).map(|s| s.contains(name)).unwrap_or(false) {
+            self.scan_available_tables(account)?;
+        }
+        if !self.available_tables.get(account).map(|s| s.contains(name)).unwrap_or(false) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Table '{}' not found in account '{}'", name, account),
+            ));
+        }
+
+        let durable = self.is_table_durable_for_account(account, name);
+        let directory = self.account_storage_dir(account);
+        let file_dir = format!("{}/{}", directory, name);
+        let data_path = format!("{}/data", file_dir);
+        let meta = hashfile::read_meta(&data_path);
+        let group_sizes = hashfile::group_sizes(&data_path);
+        let (disk_bytes, modified) = Self::tree_stats(Path::new(&file_dir));
+
+        let loaded_table = self.loaded_tables.get(&(account.to_string(), name.to_string()));
+        let loaded = loaded_table.is_some();
+        let record_count = match loaded_table {
+            Some(table) => table.records.len() as u64,
+            None => self.file_record_count(&directory, account, name),
+        };
+        let dict_count = match loaded_table {
+            Some(table) => table.dictionary.len(),
+            None => {
+                let mut dictionary = HashMap::new();
+                let _ = Self::load_section(&mut dictionary, &format!("{}/dict", file_dir));
+                dictionary.len()
+            }
+        };
+
+        Ok(FileStats {
+            account: account.to_string(),
+            name: name.to_string(),
+            record_count,
+            dict_count,
+            modulus: meta.map(|m| m.modulus).unwrap_or(0),
+            version: meta.map(|m| m.version).unwrap_or(0),
+            group_count: group_sizes.len(),
+            smallest_group_bytes: group_sizes.first().copied().unwrap_or(0),
+            largest_group_bytes: group_sizes.last().copied().unwrap_or(0),
+            disk_bytes,
+            checksums: meta.map(|m| m.checksums).unwrap_or(false),
+            legacy: meta.is_none(),
+            durable,
+            loaded,
+            modified_seconds_ago: modified
+                .and_then(|time| SystemTime::now().duration_since(time).ok())
+                .map(|elapsed| elapsed.as_secs()),
+        })
     }
 
     pub fn is_table_available(&mut self, name: &str) -> bool {

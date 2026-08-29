@@ -15,8 +15,15 @@ services:
       # Only used when seeding a brand new /data/config.toml.
       SRP_SERVER_ADDR: "0.0.0.0"
       SRP_SERVER_PORT: "8443"
+      SRP_WEB_PORT: "8080"
+      # Set a fixed dashboard token here to keep one across restarts; otherwise
+      # the URL with this boot's token is printed in the container log.
+      # SRP_WEB_TOKEN: "change-me"
     ports:
       - "8443:8443"
+      # The dashboard manages authorizations and issues certificates, and speaks
+      # plain HTTP: publish it to the host's loopback interface only.
+      - "127.0.0.1:8080:8080"
     volumes:
       # Holds config.toml, the generated certificates and db_storage/.
       # To use a host directory instead, replace this with e.g.

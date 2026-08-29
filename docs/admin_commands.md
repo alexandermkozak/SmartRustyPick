@@ -67,6 +67,8 @@ Deauthorize a client certificate by its assigned name. This command is restricte
 List all authorized certificate names and their thumbprints. This command is restricted to the `SYSTEM` account.
 
 - **Usage**: `LIST.CONNS`
+- **Note**: The same listing is available to admin clients over the [remote protocol](protocol.md) and in the
+  [web dashboard](web_dashboard.md), which is how the dashboard manages authorizations.
 
 #### GENERATE.CERT
 
@@ -75,6 +77,8 @@ command is restricted to the `SYSTEM` account and runs interactively.
 
 - **Usage**: `GENERATE.CERT <common_name>`
 - **Example**: `GENERATE.CERT myclient`
+- **Note**: Admin clients can issue certificates the same way over the [remote protocol](protocol.md); the
+  [web dashboard](web_dashboard.md) uses that to generate and download certificates from a browser.
 - **Output**: Creates `myclient.crt`, `myclient.csr`, `myclient.key`, and `myclient.pfx` in the current directory.
 - **Workflow**:
   1. Generates files for the specified `<common_name>`.

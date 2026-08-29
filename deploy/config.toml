@@ -6,3 +6,8 @@ cert_path = "server.crt"
 key_path = "server.key"
 ca_path = "ca.crt"
 editor = "nano"
+
+# Web management dashboard. Bound to all interfaces so the published port
+# reaches it; the access token is printed in the container log on every start.
+web_addr = "0.0.0.0"
+web_port = 8080

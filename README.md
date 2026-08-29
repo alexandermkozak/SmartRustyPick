@@ -43,6 +43,8 @@ field formatting, and complex select operations.
   formatting/conversions (Dates, Numbers).
 - **Active Select Lists**: Perform queries and refine them through sequential `SELECT` commands.
 - **Remote Access**: TCP SSL server with certificate authentication and CRUD protocol.
+- **Web Dashboard**: Browser-based management of connections, certificates, accounts and live server activity, started
+  automatically with the server.
 - **Persistent Configuration**: Customize your environment (e.g., preferred editor, SSL certificates, server address).
 - **Headless Mode**: Run the database as a background service without a CLI.
 - **Smart Login**: Automatic CLI account login based on the current working directory.
@@ -58,6 +60,7 @@ For more information, see the following documentation:
 - [Administration Commands](docs/admin_commands.md) - System management and security.
 - [General Use Commands](docs/general_commands.md) - Data operations and queries.
 - [Remote Protocol](docs/protocol.md) - Details on the TCP/SSL remote protocol.
+- [Web Dashboard](docs/web_dashboard.md) - The browser-based management interface.
 - [Container Deployment](docs/deployment.md) - Running the server with podman or docker compose.
 - [Testing](docs/testing.md) - The unit, integration and performance suites and how to run them.
 - [MCP Server](mcp/README.md) - Usage instructions for the Model Context Protocol server.
@@ -81,6 +84,11 @@ Currently supported settings:
   [Storage Engine](docs/storage.md)).
 - `flush_interval_ms`: Max milliseconds a change stays in memory (default: 250).
 - `flush_max_pending`: Flush once this many writes are pending (default: 256).
+- `web_enabled`: Start the [web management dashboard](docs/web_dashboard.md) with the server (default: true).
+- `web_addr`: Address the dashboard binds to (default: `127.0.0.1`).
+- `web_port`: Port the dashboard listens on (default: 8080).
+- `web_token`: Fixed dashboard access token. Unset, a new one is generated on every boot and printed with the
+  dashboard's URL.
 
 If SSL certificate paths are provided in `config.toml`, the database service will automatically start in the background
 when the CLI is launched. Missing certificates are generated on first start.
@@ -104,6 +112,8 @@ All three are gitignored, so `make test-all` leaves `git status` clean.
    - The database server will start in the background if SSL certificates are configured in `config.toml`.
 5. Run specifically as a headless database service: `make run-server`.
    - Requires SSL settings in `config.toml`.
+   - Either way, the web dashboard starts alongside the server; open the `http://127.0.0.1:8080/?token=...` link it
+     prints (see [Web Dashboard](docs/web_dashboard.md)).
 6. Type `HELP` in the CLI to see all commands.
 
 ## Workspace Structure

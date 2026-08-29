@@ -1,6 +1,7 @@
 pub mod models;
 pub mod certs;
 pub mod handler;
+pub mod stats;
 #[cfg(test)]
 mod handler_tests;
 #[cfg(test)]
@@ -11,12 +12,30 @@ pub use certs::{ensure_certificates, load_certs, load_key};
 pub use handler::{SharedDb, handle_request, handle_request_locked, read_lock, write_lock};
 pub use models::{Request, Response};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
+
+static ACTIVE_CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
+
+/// The configuration the running server was started with.
+///
+/// Commands that reach outside the database - issuing a certificate needs the
+/// CA paths - have no other way to find it: the handler is given a database and
+/// a client, and threading a config through every call site would touch every
+/// command to serve one.
+pub fn active_config() -> Option<Arc<Config>> {
+    ACTIVE_CONFIG.get().cloned()
+}
+
+/// Publishes the configuration for [`active_config`]. The first server to start
+/// in a process wins; a second one would be sharing the same database anyway.
+pub fn set_active_config(config: Arc<Config>) {
+    let _ = ACTIVE_CONFIG.set(config);
+}
 
 pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Option<String>) -> tokio::io::Result<()> {
     // Install default crypto provider for rustls
@@ -25,6 +44,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
     let addr = override_addr.unwrap_or_else(|| format!("{}:{}", config.server_addr.as_ref().unwrap_or(&"0.0.0.0".to_string()), config.server_port.unwrap_or(8443)));
 
     ensure_certificates(&config)?;
+    set_active_config(config.clone());
 
     let certs = load_certs(config.cert_path.as_ref().unwrap())?;
     let key = load_key(config.key_path.as_ref().unwrap())?;
@@ -48,8 +68,10 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
     let listener = TcpListener::bind(&addr).await?;
 
     println!("Server listening on TLS {}", addr);
+    stats::set_listen_addr(&addr);
 
     spawn_flusher(db.clone());
+    crate::web::spawn_dashboard(config.clone(), db.clone(), &addr);
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
@@ -80,6 +102,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                 None => {
                     let msg = format!("No client certificate provided from {}", peer_addr);
                     eprintln!("{}", msg);
+                    stats::note_rejected();
                     let db = db.clone();
                     // Logging writes to disk, so keep it off the async worker thread.
                     let _ = tokio::task::spawn_blocking(move || {
@@ -91,28 +114,37 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
             };
 
             // Check authorization
-            {
+            let client = {
                 // Even taking the lock has to happen off the async worker: while a
                 // flush holds it, waiting here would block every other connection
                 // scheduled on this thread.
                 let db_for_task = db.clone();
                 let tp = thumbprint.clone();
-                let authorized = tokio::task::spawn_blocking(move || {
-                    read_lock(&db_for_task).authorized_clients.contains_key(&tp)
+                let client = tokio::task::spawn_blocking(move || {
+                    read_lock(&db_for_task).authorized_clients.get(&tp).cloned()
                 })
                     .await
-                    .unwrap_or(false);
-                if !authorized {
-                    let msg = format!("Unauthorized certificate {} from {}", thumbprint, peer_addr);
-                    eprintln!("{}", msg);
-                    let db = db.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = write_lock(&db).log_error("SYSTEM", &msg);
-                    })
-                        .await;
-                    return;
+                    .ok()
+                    .flatten();
+                match client {
+                    Some(client) => client,
+                    None => {
+                        let msg = format!("Unauthorized certificate {} from {}", thumbprint, peer_addr);
+                        eprintln!("{}", msg);
+                        stats::note_rejected();
+                        let db = db.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = write_lock(&db).log_error("SYSTEM", &msg);
+                        })
+                            .await;
+                        return;
+                    }
                 }
-            }
+            };
+
+            // From here the session is real, so it belongs in the live view a
+            // management client can ask for.
+            let connection_id = stats::open(&peer_addr.to_string(), &client.name, &thumbprint, client.is_admin);
 
             let (reader, mut writer) = tokio::io::split(tls_stream);
             let mut reader = BufReader::new(reader);
@@ -142,6 +174,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                         // this thread entirely.
                         let db_for_task = db.clone();
                         let tp = thumbprint.clone();
+                        let command = req.command.to_uppercase();
                         let handled = tokio::task::spawn_blocking(move || {
                             let info = read_lock(&db_for_task).authorized_clients.get(&tp).cloned();
                             info.map(|info| handle_request(req, &db_for_task, &info))
@@ -150,17 +183,20 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
 
                         match handled {
                             Ok(Some(resp)) => {
+                                stats::note_request(connection_id, &command, resp.status != "OK");
                                 if let Ok(resp_json) = serde_json::to_string(&resp) {
                                     let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
                                 }
                             }
                             Err(e) => {
+                                stats::note_request(connection_id, &command, true);
                                 let resp = Response { status: "ERROR".to_string(), message: Some(format!("Request failed: {}", e)), ..Default::default() };
                                 if let Ok(resp_json) = serde_json::to_string(&resp) {
                                     let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
                                 }
                             }
                             Ok(None) => {
+                                stats::note_request(connection_id, &command, true);
                                 let resp = Response { status: "ERROR".to_string(), message: Some("Client deauthorized".to_string()), ..Default::default() };
                                 if let Ok(resp_json) = serde_json::to_string(&resp) {
                                     let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
@@ -175,6 +211,8 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                     }
                 }
             }
+
+            stats::close(connection_id);
 
             // A client that finished writing should not have to wait for the
             // ticker before its changes reach disk.

@@ -55,6 +55,12 @@ const COMMANDS: &[&str] = &[
     "DEAUTHORIZE.CONN",
     "ADD.CLIENT.ACCOUNT",
     "REMOVE.CLIENT.ACCOUNT",
+    "GENERATE.CERT",
+    "LIST.CONNS",
+    "LIST.ACCOUNTS",
+    "LIST.FILES",
+    "FILE.STATS",
+    "SERVER.STATS",
 ];
 
 fn json_keys<T: serde::Serialize>(value: &T) -> Vec<String> {

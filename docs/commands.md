@@ -18,6 +18,14 @@ When run with the `--headless` flag, the application starts the database service
 - **Usage**: `./SmartRustyPick --headless`
 - **Requirement**: Requires `cert_path`, `key_path`, and `ca_path` to be configured in `config.toml`.
 
+#### Web Dashboard
+
+Whichever mode starts the database service also starts the browser-based management dashboard, which prints its address
+and this boot's access token on startup.
+
+- **Usage**: open the printed `http://127.0.0.1:8080/?token=...` link.
+- **Documentation**: See [Web Dashboard](web_dashboard.md).
+
 #### MCP Mode
 
 SmartRustyPick also includes a Model Context Protocol (MCP) server for integration with AI agents.

@@ -32,14 +32,24 @@ AI agents have been responsible for several critical improvements and fixes in t
 - **Graceful Shutdowns:** Fixed "Read error" and "peer closed connection" warnings by implementing proper TLS
   `close_notify` sequences in test clients.
 
-### 2. Testing and Automation
+### 2. Management Interfaces
+
+- **Web Dashboard:** Built the browser-based management interface that starts with the database server, covering
+  connection authorization, certificate issuing and download, live connection and usage monitoring, and navigation of
+  accounts and their files. It connects to the database as an ordinary remote client, with a certificate reissued and
+  re-authorized on every boot, so it can do nothing the documented protocol does not already allow.
+- **Protocol Extensions:** Added the management commands the dashboard needed - `LIST.CONNS`, `LIST.ACCOUNTS`,
+  `LIST.FILES`, `FILE.STATS`, `SERVER.STATS` and `GENERATE.CERT` - to the remote protocol rather than giving the
+  interface a private path into the engine.
+
+### 3. Testing and Automation
 
 - **Integration Tests:** Developed a Python-based integration suite covering the full CRUD protocol (WRITE, READ, QUERY,
   SELECT LIST, READNEXT, DELETE).
 - **Performance Testing:** Created load tests to verify database performance under concurrent-like sequential pressure.
 - **Git Hooks:** Automated quality control by setting up a `pre-push` hook that runs `cargo test` to prevent regression.
 
-### 3. Database Core
+### 4. Database Core
 
 - **MultiValue Logic:** Implementation of hierarchical data structures (FM, VM, SVM).
 - **Dictionary Support:** Logic for field formatting and conversions (Dates, Numbers).
