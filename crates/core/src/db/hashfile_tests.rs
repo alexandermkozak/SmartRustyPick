@@ -1,16 +1,13 @@
 use crate::db::engine::Database;
 use crate::db::hashfile;
 use crate::db::models::*;
+use crate::test_support::{isolated_config, TempDir};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-fn fresh_dir(name: &str) -> String {
-    if Path::new(name).exists() {
-        fs::remove_dir_all(name).unwrap();
-    }
-    fs::create_dir_all(name).unwrap();
-    name.to_string()
+fn fresh_dir(label: &str) -> TempDir {
+    TempDir::new(label)
 }
 
 fn record(value: &str) -> Record {
@@ -59,7 +56,8 @@ fn test_keys_spread_evenly_over_groups() {
 
 #[test]
 fn test_round_trip_and_incremental_write() {
-    let dir = fresh_dir("test_hashfile_roundtrip");
+    let guard = fresh_dir("hashfile_roundtrip");
+    let dir = guard.path();
     let section = format!("{}/data", dir);
 
     let mut map = sample_map(500);
@@ -86,13 +84,12 @@ fn test_round_trip_and_incremental_write() {
     assert_eq!(reloaded.len(), 500);
     assert_eq!(reloaded["K00042"], record("CHANGED"));
     assert_eq!(reloaded["K00001"], record("VALUE1"));
-
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn test_incremental_write_touches_one_group_only() {
-    let dir = fresh_dir("test_hashfile_one_group");
+    let guard = fresh_dir("hashfile_one_group");
+    let dir = guard.path();
     let section = format!("{}/data", dir);
 
     let mut map = sample_map(1_000);
@@ -123,13 +120,12 @@ fn test_incremental_write_touches_one_group_only() {
     // This is the whole point of the format: a write costs one group, not the
     // entire table, no matter how large the table has grown.
     assert_eq!(changed, vec![expected]);
-
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn test_rehash_preserves_every_record() {
-    let dir = fresh_dir("test_hashfile_rehash");
+    let guard = fresh_dir("hashfile_rehash");
+    let dir = guard.path();
     let section = format!("{}/data", dir);
 
     let mut map = HashMap::new();
@@ -157,13 +153,12 @@ fn test_rehash_preserves_every_record() {
     let mut loaded = HashMap::new();
     hashfile::load(&section, &mut loaded).unwrap();
     assert_eq!(loaded.len(), 10);
-
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn test_legacy_flat_file_is_migrated_on_first_write() {
-    let base = fresh_dir("test_hashfile_migration");
+    let guard = fresh_dir("hashfile_migration");
+    let base = guard.path();
     let table_dir = format!("{}/LEGACY", base);
     fs::create_dir_all(&table_dir).unwrap();
 
@@ -180,8 +175,8 @@ fn test_legacy_flat_file_is_migrated_on_first_write() {
     fs::write(format!("{}/data", table_dir), &flat).unwrap();
     fs::write(format!("{}/dict", table_dir), b"").unwrap();
 
-    let mut db = Database::new(&base, None).unwrap();
-    db.create_account("LEG", Some(&base)).unwrap();
+    let mut db = Database::new(base, Some(isolated_config())).unwrap();
+    db.create_account("LEG", Some(base)).unwrap();
     db.logto("LEG").unwrap();
 
     {
@@ -204,16 +199,14 @@ fn test_legacy_flat_file_is_migrated_on_first_write() {
     assert_eq!(table.records["OLD7"], record("LEGACY7"));
     assert_eq!(table.records["NEW"], record("FRESH"));
     assert!(!table.legacy_data);
-
-    drop(db);
-    fs::remove_dir_all(&base).unwrap();
 }
 
 #[test]
 fn test_deferred_flush_batches_writes() {
-    let base = fresh_dir("test_hashfile_deferred");
-    let mut db = Database::new(&base, None).unwrap();
-    db.create_account("BUF", Some(&base)).unwrap();
+    let guard = fresh_dir("hashfile_deferred");
+    let base = guard.path();
+    let mut db = Database::new(base, Some(isolated_config())).unwrap();
+    db.create_account("BUF", Some(base)).unwrap();
     db.logto("BUF").unwrap();
     db.create_table("T").unwrap();
 
@@ -244,16 +237,14 @@ fn test_deferred_flush_batches_writes() {
     let mut on_disk = HashMap::new();
     hashfile::load(&section, &mut on_disk).unwrap();
     assert_eq!(on_disk.len(), 11);
-
-    drop(db);
-    fs::remove_dir_all(&base).unwrap();
 }
 
 #[test]
 fn test_durable_writes_flush_immediately() {
-    let base = fresh_dir("test_hashfile_durable");
-    let mut db = Database::new(&base, None).unwrap();
-    db.create_account("DUR", Some(&base)).unwrap();
+    let guard = fresh_dir("hashfile_durable");
+    let base = guard.path();
+    let mut db = Database::new(base, Some(isolated_config())).unwrap();
+    db.create_account("DUR", Some(base)).unwrap();
     db.logto("DUR").unwrap();
     db.create_table("T").unwrap();
     db.durable_writes = true;
@@ -265,9 +256,6 @@ fn test_durable_writes_flush_immediately() {
     let mut on_disk = HashMap::new();
     hashfile::load(&format!("{}/T/data", base), &mut on_disk).unwrap();
     assert_eq!(on_disk.len(), 1);
-
-    drop(db);
-    fs::remove_dir_all(&base).unwrap();
 }
 
 /// Path of the first non-empty group of a section.
@@ -291,7 +279,8 @@ fn truncate(path: &std::path::Path, drop_bytes: u64) {
 
 #[test]
 fn test_torn_group_is_detected_not_reported_as_missing_records() {
-    let dir = fresh_dir("test_hashfile_torn_group");
+    let guard = fresh_dir("hashfile_torn_group");
+    let dir = guard.path();
     let section = format!("{}/data", dir);
     let map = sample_map(200);
     hashfile::save(&section, &map, hashfile::SectionMeta::empty(), None, 16).unwrap();
@@ -306,13 +295,12 @@ fn test_torn_group_is_detected_not_reported_as_missing_records() {
     let err = hashfile::load(&section, &mut loaded).expect_err("a torn group must not load quietly");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert!(err.to_string().contains("Corrupt group file"), "unhelpful error: {err}");
-
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn test_flipped_byte_in_a_group_is_detected_by_the_checksum() {
-    let dir = fresh_dir("test_hashfile_bitflip");
+    let guard = fresh_dir("hashfile_bitflip");
+    let dir = guard.path();
     let section = format!("{}/data", dir);
     let map = sample_map(200);
     hashfile::save(&section, &map, hashfile::SectionMeta::empty(), None, 16).unwrap();
@@ -329,13 +317,12 @@ fn test_flipped_byte_in_a_group_is_detected_by_the_checksum() {
     let err = hashfile::load(&section, &mut loaded).expect_err("a damaged group must not load");
     assert!(err.to_string().contains("checksum mismatch"), "unhelpful error: {err}");
     assert!(loaded.is_empty(), "a rejected group must not leave records behind");
-
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn test_truncated_meta_is_detected() {
-    let dir = fresh_dir("test_hashfile_torn_meta");
+    let guard = fresh_dir("hashfile_torn_meta");
+    let dir = guard.path();
     let section = format!("{}/data", dir);
     let map = sample_map(50);
     hashfile::save(&section, &map, hashfile::SectionMeta::empty(), None, 16).unwrap();
@@ -350,13 +337,12 @@ fn test_truncated_meta_is_detected() {
     let mut loaded = HashMap::new();
     let err = hashfile::load(&section, &mut loaded).expect_err("a torn meta must not load");
     assert!(err.to_string().contains("Corrupt section metadata"), "unhelpful error: {err}");
-
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn test_stale_tmp_file_is_cleaned_up_and_never_read() {
-    let dir = fresh_dir("test_hashfile_stale_tmp");
+    let guard = fresh_dir("hashfile_stale_tmp");
+    let dir = guard.path();
     let section = format!("{}/data", dir);
     let mut map = sample_map(50);
     let meta = hashfile::save(&section, &map, hashfile::SectionMeta::empty(), None, 16).unwrap();
@@ -381,13 +367,12 @@ fn test_stale_tmp_file_is_cleaned_up_and_never_read() {
         .filter(|n| n.ends_with(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "stale temporary files should be swept: {:?}", leftovers);
-
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn test_meta_is_written_after_the_groups_it_describes() {
-    let dir = fresh_dir("test_hashfile_ordering");
+    let guard = fresh_dir("hashfile_ordering");
+    let dir = guard.path();
     let section = format!("{}/data", dir);
     let map = sample_map(300);
     let meta = hashfile::save_with_fsync(
@@ -416,13 +401,12 @@ fn test_meta_is_written_after_the_groups_it_describes() {
         }
     }
     assert!(meta.checksums, "a full rewrite puts a trailer on every group");
-
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn test_a_group_without_a_trailer_still_loads_before_the_first_full_rewrite() {
-    let dir = fresh_dir("test_hashfile_pre_checksum");
+    let guard = fresh_dir("hashfile_pre_checksum");
+    let dir = guard.path();
     let section = format!("{}/data", dir);
     let section_dir = hashfile::section_dir(&section);
     fs::create_dir_all(&section_dir).unwrap();
@@ -446,21 +430,20 @@ fn test_a_group_without_a_trailer_still_loads_before_the_first_full_rewrite() {
     let meta = hashfile::load(&section, &mut loaded).unwrap();
     assert!(!meta.checksums);
     assert_eq!(loaded.len(), 3, "an upgrade must not declare an intact section corrupt");
-
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn test_another_process_sees_flushed_changes() {
-    let base = fresh_dir("test_hashfile_visibility");
-    let mut writer = Database::new(&base, None).unwrap();
-    writer.create_account("VIS", Some(&base)).unwrap();
+    let guard = fresh_dir("hashfile_visibility");
+    let base = guard.path();
+    let mut writer = Database::new(base, Some(isolated_config())).unwrap();
+    writer.create_account("VIS", Some(base)).unwrap();
     writer.logto("VIS").unwrap();
     writer.create_table("T").unwrap();
     writer.get_table_mut("T").unwrap().insert_record("K1", record("FIRST"));
     writer.save().unwrap();
 
-    let mut reader = Database::new(&base, None).unwrap();
+    let mut reader = Database::new(base, Some(isolated_config())).unwrap();
     reader.logto("VIS").unwrap();
     assert_eq!(reader.get_table_mut("T").unwrap().records.len(), 1);
 
@@ -473,8 +456,4 @@ fn test_another_process_sees_flushed_changes() {
     let table = reader.get_table_mut("T").unwrap();
     assert_eq!(table.records.len(), 2);
     assert_eq!(table.records["K2"], record("SECOND"));
-
-    drop(writer);
-    drop(reader);
-    fs::remove_dir_all(&base).unwrap();
 }

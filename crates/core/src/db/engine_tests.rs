@@ -1,13 +1,13 @@
 use crate::db::engine::Database;
 use crate::db::models::*;
-use std::fs;
+use crate::test_support::{isolated_config, TempDir};
 use std::path::Path;
 
 #[test]
 fn test_lru_eviction() {
-    let base_dir = "test_lru_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("lru");
+    let base_dir = dir.path();
+    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
     db.logto("SYSTEM").unwrap();
     db.loaded_tables.clear();
     db.lru_order.clear();
@@ -44,15 +44,13 @@ fn test_lru_eviction() {
     assert!(!db.is_table_loaded("T3"));
     assert!(db.is_table_loaded("T2"));
     assert!(db.is_table_loaded("T1"));
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_delete_table_and_account() {
-    let base_dir = "test_delete_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("delete");
+    let base_dir = dir.path();
+    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
 
     db.create_account("DEL_ACC", None).unwrap();
     db.logto("DEL_ACC").unwrap();
@@ -65,17 +63,15 @@ fn test_delete_table_and_account() {
     db.logto("SYSTEM").unwrap();
     db.delete_account("DEL_ACC").unwrap();
     assert!(db.get_account_dir("DEL_ACC").is_none());
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_account_registry_reloads_when_another_process_writes() {
-    let base_dir = "test_stale_registry_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let dir = TempDir::new("stale_registry");
+    let base_dir = dir.path();
 
-    let mut writer = Database::new(base_dir, None).unwrap();
-    let mut reader = Database::new(base_dir, None).unwrap();
+    let mut writer = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let mut reader = Database::new(base_dir, Some(isolated_config())).unwrap();
 
     // The other process registers a brand new account.
     writer.create_account("NEWACC", None).unwrap();
@@ -86,21 +82,19 @@ fn test_account_registry_reloads_when_another_process_writes() {
 
     // The reader creating its own account must not erase the other one.
     reader.create_account("OWNACC", None).unwrap();
-    let mut third = Database::new(base_dir, None).unwrap();
+    let mut third = Database::new(base_dir, Some(isolated_config())).unwrap();
     assert!(third.get_account_dir("NEWACC").is_some(), "registry lost an account on write");
     assert!(third.get_account_dir("OWNACC").is_some());
     let _ = third.logto("SYSTEM");
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_authorized_clients_refresh_across_processes() {
-    let base_dir = "test_stale_clients_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let dir = TempDir::new("stale_clients");
+    let base_dir = dir.path();
 
-    let mut writer = Database::new(base_dir, None).unwrap();
-    let mut reader = Database::new(base_dir, None).unwrap();
+    let mut writer = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let mut reader = Database::new(base_dir, Some(isolated_config())).unwrap();
 
     let tp = "aabbccdd";
     writer.add_authorized_client("CLIENT1", tp, vec!["SYSTEM".to_string()], false).unwrap();
@@ -112,8 +106,6 @@ fn test_authorized_clients_refresh_across_processes() {
     assert!(writer.remove_authorized_client("CLIENT1").unwrap());
     reader.refresh_clients_if_stale().unwrap();
     assert!(!reader.authorized_clients.contains_key(tp), "deauthorized client still authorized");
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
@@ -130,9 +122,9 @@ fn test_apply_conversion() {
 
 #[test]
 fn test_sync_dir_file() {
-    let base_dir = "test_sync_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("sync");
+    let base_dir = dir.path();
+    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
     db.create_account("SYNC_ACC", None).unwrap();
     db.logto("SYNC_ACC").unwrap();
 
@@ -154,15 +146,13 @@ fn test_sync_dir_file() {
         assert!(dir.records.contains_key("T1"));
         assert!(dir.records.contains_key("T2"));
     }
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_directory_traversal_vulnerability() {
-    let base_dir = "test_traversal_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("traversal");
+    let base_dir = dir.path();
+    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
 
     // Create a "secret" account
     db.create_account("SECRET", None).unwrap();
@@ -192,17 +182,15 @@ fn test_directory_traversal_vulnerability() {
 
     // Verify that "INVALID_TABLE_NAME" is NOT created in loaded_tables
     assert!(!db.is_table_loaded("INVALID_TABLE_NAME"));
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_cache_reloads_when_another_process_writes() {
-    let base_dir = "test_stale_cache_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let dir = TempDir::new("stale_cache");
+    let base_dir = dir.path();
 
     // "Server" instance creates the table and one record.
-    let mut writer = Database::new(base_dir, None).unwrap();
+    let mut writer = Database::new(base_dir, Some(isolated_config())).unwrap();
     writer.create_account("SHARED", None).unwrap();
     writer.logto("SHARED").unwrap();
     writer.create_table("ENTITIES").unwrap();
@@ -214,7 +202,7 @@ fn test_cache_reloads_when_another_process_writes() {
     writer.save().unwrap();
 
     // "Local CLI" instance reads it, populating its own cache.
-    let mut reader = Database::new(base_dir, None).unwrap();
+    let mut reader = Database::new(base_dir, Some(isolated_config())).unwrap();
     reader.logto("SHARED").unwrap();
     assert!(reader.get_table("ENTITIES").unwrap().records.contains_key("E1"));
 
@@ -231,16 +219,14 @@ fn test_cache_reloads_when_another_process_writes() {
     let table = reader.get_table("ENTITIES").expect("ENTITIES should be readable");
     assert!(table.records.contains_key("E2"), "cached table was not refreshed from disk");
     assert!(reader.get_table("NEWFILE").is_some(), "new table created by another process is not visible");
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_listed_table_still_refreshes_after_save() {
-    let base_dir = "test_stale_after_save_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let dir = TempDir::new("stale_after_save");
+    let base_dir = dir.path();
 
-    let mut writer = Database::new(base_dir, None).unwrap();
+    let mut writer = Database::new(base_dir, Some(isolated_config())).unwrap();
     writer.create_account("SHARED3", None).unwrap();
     writer.logto("SHARED3").unwrap();
     writer.create_table("ENTITIES").unwrap();
@@ -252,7 +238,7 @@ fn test_listed_table_still_refreshes_after_save() {
     writer.save().unwrap();
 
     // Local CLI lists the file, caching a clean snapshot.
-    let mut reader = Database::new(base_dir, None).unwrap();
+    let mut reader = Database::new(base_dir, Some(isolated_config())).unwrap();
     reader.logto("SHARED3").unwrap();
     assert!(reader.list_tables().contains(&"ENTITIES".to_string()));
     assert!(reader.get_table("ENTITIES").unwrap().records.contains_key("E1"));
@@ -271,22 +257,20 @@ fn test_listed_table_still_refreshes_after_save() {
 
     let table = reader.get_table("ENTITIES").unwrap();
     assert!(table.records.contains_key("E2"), "stale snapshot was frozen by an unrelated save");
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_local_changes_survive_staleness_check() {
-    let base_dir = "test_stale_dirty_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
+    let dir = TempDir::new("stale_dirty");
+    let base_dir = dir.path();
 
-    let mut writer = Database::new(base_dir, None).unwrap();
+    let mut writer = Database::new(base_dir, Some(isolated_config())).unwrap();
     writer.create_account("SHARED2", None).unwrap();
     writer.logto("SHARED2").unwrap();
     writer.create_table("ENTITIES").unwrap();
     writer.save().unwrap();
 
-    let mut reader = Database::new(base_dir, None).unwrap();
+    let mut reader = Database::new(base_dir, Some(isolated_config())).unwrap();
     reader.logto("SHARED2").unwrap();
     {
         let t = reader.get_table_mut("ENTITIES").unwrap();
@@ -305,15 +289,13 @@ fn test_local_changes_survive_staleness_check() {
     // Pending local changes must not be silently discarded.
     let table = reader.get_table("ENTITIES").unwrap();
     assert!(table.records.contains_key("LOCAL"));
-
-    fs::remove_dir_all(base_dir).unwrap();
 }
 
 #[test]
 fn test_all_dict_fields() {
-    let base_dir = "test_dict_fields_dir";
-    if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir).unwrap(); }
-    let mut db = Database::new(base_dir, None).unwrap();
+    let dir = TempDir::new("dict_fields");
+    let base_dir = dir.path();
+    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
     db.logto("SYSTEM").unwrap();
 
     db.create_table("USERS").unwrap();
@@ -337,6 +319,4 @@ fn test_all_dict_fields() {
     assert_eq!(fields[0], "EMAIL");
     assert_eq!(fields[1], "ALT_NAME");
     assert_eq!(fields[2], "ZIP");
-
-    fs::remove_dir_all(base_dir).unwrap();
 }

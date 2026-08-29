@@ -1,16 +1,12 @@
 use crate::db::engine::Database;
 use crate::db::hashfile;
 use crate::db::models::*;
+use crate::test_support::{isolated_config, TempDir};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
 
-fn fresh_dir(name: &str) -> String {
-    if Path::new(name).exists() {
-        fs::remove_dir_all(name).unwrap();
-    }
-    fs::create_dir_all(name).unwrap();
-    name.to_string()
+fn fresh_dir(label: &str) -> TempDir {
+    TempDir::new(label)
 }
 
 fn record(value: &str) -> Record {
@@ -18,7 +14,7 @@ fn record(value: &str) -> Record {
 }
 
 fn open_account(base: &str, account: &str) -> Database {
-    let mut db = Database::new(base, None).unwrap();
+    let mut db = Database::new(base, Some(isolated_config())).unwrap();
     db.create_account(account, Some(base)).unwrap();
     db.logto(account).unwrap();
     db.create_dir_file().unwrap();
@@ -38,8 +34,9 @@ fn on_disk_count(base: &str, table: &str) -> usize {
 
 #[test]
 fn test_create_file_records_durable_flag_in_dir() {
-    let base = fresh_dir("test_durability_flag");
-    let mut db = open_account(&base, "DUR1");
+    let guard = fresh_dir("durability_flag");
+    let base = guard.path();
+    let mut db = open_account(base, "DUR1");
     db.create_table("NORMAL").unwrap();
     db.create_table_durable("CRITICAL", true).unwrap();
 
@@ -49,15 +46,13 @@ fn test_create_file_records_durable_flag_in_dir() {
     assert!(!db.is_table_durable("NORMAL"));
     // The flag is described in the DIR dictionary, so it shows up in listings.
     assert!(db.get_table_mut("DIR").unwrap().dictionary.contains_key("DURABLE"));
-
-    drop(db);
-    fs::remove_dir_all(&base).unwrap();
 }
 
 #[test]
 fn test_dir_sync_preserves_durable_flag() {
-    let base = fresh_dir("test_durability_sync");
-    let mut db = open_account(&base, "DUR2");
+    let guard = fresh_dir("durability_sync");
+    let base = guard.path();
+    let mut db = open_account(base, "DUR2");
     db.create_table_durable("CRITICAL", true).unwrap();
 
     // Creating another file rebuilds the whole listing; the flag is not derived
@@ -66,34 +61,29 @@ fn test_dir_sync_preserves_durable_flag() {
     db.sync_dir_file().unwrap();
     assert_eq!(dir_flag(&mut db, "CRITICAL"), "Y");
     assert!(db.is_table_durable("CRITICAL"));
-
-    drop(db);
-    fs::remove_dir_all(&base).unwrap();
 }
 
 #[test]
 fn test_durable_flag_survives_reopen_and_can_be_cleared() {
-    let base = fresh_dir("test_durability_reopen");
+    let guard = fresh_dir("durability_reopen");
+    let base = guard.path();
     {
-        let mut db = open_account(&base, "DUR3");
+        let mut db = open_account(base, "DUR3");
         db.create_table_durable("CRITICAL", true).unwrap();
         db.save().unwrap();
     }
 
-    let mut db = Database::new(&base, None).unwrap();
+    let mut db = Database::new(base, Some(isolated_config())).unwrap();
     db.logto("DUR3").unwrap();
     assert!(db.is_table_durable("CRITICAL"), "flag must be read back from DIR");
 
     db.set_table_durable("CRITICAL", false).unwrap();
     assert!(!db.is_table_durable("CRITICAL"));
     assert_eq!(dir_flag(&mut db, "CRITICAL"), "");
-
-    drop(db);
-    fs::remove_dir_all(&base).unwrap();
 }
 
 fn config_with_fsync(fsync: Option<&str>) -> crate::config::Config {
-    let mut config = crate::config::Config::load();
+    let mut config = isolated_config();
     config.log_detail = Some("none".to_string());
     config.fsync = fsync.map(|v| v.to_string());
     config
@@ -101,28 +91,26 @@ fn config_with_fsync(fsync: Option<&str>) -> crate::config::Config {
 
 #[test]
 fn test_durable_writes_are_fsynced_unless_the_operator_says_otherwise() {
-    let base = fresh_dir("test_durability_policy");
+    let guard = fresh_dir("durability_policy");
+    let base = guard.path();
 
     // Out of the box a durable file is really synced, while an ordinary
     // buffered flush keeps the throughput it always had.
-    let db = Database::new(&base, Some(config_with_fsync(None))).unwrap();
+    let db = Database::new(base, Some(config_with_fsync(None))).unwrap();
     assert_eq!(db.durable_fsync, hashfile::FsyncPolicy::Always);
     assert_eq!(db.fsync, hashfile::FsyncPolicy::Never);
     drop(db);
 
     // An explicit setting wins, including for durable files: that is the knob
     // for someone who knowingly trades the guarantee for speed.
-    let db = Database::new(&base, Some(config_with_fsync(Some("meta")))).unwrap();
+    let db = Database::new(base, Some(config_with_fsync(Some("meta")))).unwrap();
     assert_eq!(db.durable_fsync, hashfile::FsyncPolicy::Meta);
     assert_eq!(db.fsync, hashfile::FsyncPolicy::Meta);
     drop(db);
 
     // Nonsense falls back to the default rather than refusing to open.
-    let db = Database::new(&base, Some(config_with_fsync(Some("sometimes")))).unwrap();
+    let db = Database::new(base, Some(config_with_fsync(Some("sometimes")))).unwrap();
     assert_eq!(db.fsync, hashfile::FsyncPolicy::Never);
-
-    drop(db);
-    fs::remove_dir_all(&base).unwrap();
 }
 
 /// Set on the re-executed test binary to make it play the victim: write one
@@ -134,7 +122,7 @@ const KILL_CHILD_DIR: &str = "SRP_KILL9_CHILD_DIR";
 /// and no further flush can happen. Whatever is on disk afterwards is exactly
 /// what the acknowledged write left there.
 fn write_then_die(base: &str) -> ! {
-    let mut db = Database::new(base, None).unwrap();
+    let mut db = Database::new(base, Some(isolated_config())).unwrap();
     db.create_account("KILL", Some(base)).unwrap();
     db.logto("KILL").unwrap();
     db.create_dir_file().unwrap();
@@ -162,10 +150,11 @@ fn test_durable_write_survives_sigkill() {
         write_then_die(&base);
     }
 
-    let base = fresh_dir("test_durability_kill9");
+    let guard = fresh_dir("durability_kill9");
+    let base = guard.path();
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "db::durability_tests::test_durable_write_survives_sigkill", "--nocapture"])
-        .env(KILL_CHILD_DIR, &base)
+        .env(KILL_CHILD_DIR, base)
         .status()
         .unwrap();
     assert!(status.code().is_none(), "the child should have died from a signal, not exited: {:?}", status);
@@ -180,20 +169,18 @@ fn test_durable_write_survives_sigkill() {
         .collect();
     assert!(leftovers.is_empty(), "a crash left a temporary file behind: {:?}", leftovers);
 
-    let mut db = Database::new(&base, None).unwrap();
+    let mut db = Database::new(base, Some(isolated_config())).unwrap();
     db.logto("KILL").unwrap();
     let table = db.get_table_mut("LEDGER").unwrap();
     assert_eq!(table.records.len(), 1, "the acknowledged write did not survive the kill");
     assert_eq!(table.records["K1"], record("ACKED"));
-
-    drop(db);
-    fs::remove_dir_all(&base).unwrap();
 }
 
 #[test]
 fn test_durable_file_flushes_while_others_stay_buffered() {
-    let base = fresh_dir("test_durability_flush");
-    let mut db = open_account(&base, "DUR4");
+    let guard = fresh_dir("durability_flush");
+    let base = guard.path();
+    let mut db = open_account(base, "DUR4");
     db.create_table("NORMAL").unwrap();
     db.create_table_durable("CRITICAL", true).unwrap();
 
@@ -206,13 +193,10 @@ fn test_durable_file_flushes_while_others_stay_buffered() {
     db.get_table_mut("NORMAL").unwrap().insert_record("K1", record("V1"));
     db.note_write_for("DUR4", "NORMAL").unwrap();
     assert!(db.has_pending_writes(), "a normal file should still be buffered");
-    assert_eq!(on_disk_count(&base, "NORMAL"), 0);
+    assert_eq!(on_disk_count(base, "NORMAL"), 0);
 
     db.get_table_mut("CRITICAL").unwrap().insert_record("K1", record("V1"));
     db.note_write_for("DUR4", "CRITICAL").unwrap();
     assert!(!db.has_pending_writes(), "a durable file must flush before acknowledging");
-    assert_eq!(on_disk_count(&base, "CRITICAL"), 1);
-
-    drop(db);
-    fs::remove_dir_all(&base).unwrap();
+    assert_eq!(on_disk_count(base, "CRITICAL"), 1);
 }

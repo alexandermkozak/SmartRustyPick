@@ -89,6 +89,14 @@ Currently supported settings:
 - `web_port`: Port the dashboard listens on (default: 8080).
 - `web_token`: Fixed dashboard access token. Unset, a new one is generated on every boot and printed with the
   dashboard's URL.
+- `max_request_bytes`: Maximum size, in bytes, of a single request line before the connection is closed with an error
+  (default: 1048576, i.e. 1 MiB).
+- `handshake_timeout_ms`: Maximum time allowed to complete the TLS handshake before the connection is dropped
+  (default: 10000).
+- `idle_timeout_ms`: Maximum time a connection may sit idle, with no request in flight, before it is closed
+  (default: 0, disabled).
+- `max_connections`: Maximum number of connections the server holds open at once; further connections are rejected
+  until one closes (default: 1024).
 
 If SSL certificate paths are provided in `config.toml`, the database service will automatically start in the background
 when the CLI is launched. Missing certificates are generated on first start.

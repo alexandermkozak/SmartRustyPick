@@ -1,17 +1,16 @@
 #[cfg(test)]
 mod tests {
     use crate::db::*;
-    use std::fs;
+    use crate::test_support::{isolated_config, TempDir};
     use std::io;
-    use std::path::Path;
 
     #[test]
     fn test_system_dictionary_auto_creation() -> io::Result<()> {
-        let base_dir = "test_system_dict_dir";
-        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let dir = TempDir::new("system_dict");
+        let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, None)?;
+            let mut db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
 
             // Verify $LOGS dictionary
@@ -51,7 +50,7 @@ mod tests {
 
         // Restart and check for self-healing
         {
-            let mut db = Database::new(base_dir, None)?;
+            let mut db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
 
             let logs = db.get_table("$LOGS").unwrap();
@@ -63,48 +62,45 @@ mod tests {
             assert!(detail_val.contains("OVERRIDE_DETAIL"), "Existing dictionary entry should NOT be overwritten (got '{}')", detail_val);
         }
 
-        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 
     #[test]
     fn test_system_account_auto_creation() -> io::Result<()> {
-        let base_dir = "test_system_account_dir";
-        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let dir = TempDir::new("system_account");
+        let base_dir = dir.path();
 
         {
-            let db = Database::new(base_dir, None)?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             // Check if SYSTEM account exists
             assert!(db.get_account_dir("SYSTEM").is_some(), "SYSTEM account should be automatically created");
         }
 
-        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 
     #[test]
     fn test_system_logs_auto_creation() -> io::Result<()> {
-        let base_dir = "test_system_logs_dir";
-        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let dir = TempDir::new("system_logs");
+        let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, None)?;
+            let mut db = Database::new(base_dir, Some(isolated_config()))?;
             // Check if $LOGS file exists in SYSTEM account
             db.logto("SYSTEM")?;
             assert!(db.is_table_available("$LOGS"), "$LOGS table should be automatically created in SYSTEM account");
         }
 
-        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 
     #[test]
     fn test_error_logging() -> io::Result<()> {
-        let base_dir = "test_error_logging_dir";
-        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let dir = TempDir::new("error_logging");
+        let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, None)?;
+            let mut db = Database::new(base_dir, Some(isolated_config()))?;
             db.log_detail = "detailed".to_string();
             db.max_log_records = 2;
 
@@ -128,17 +124,16 @@ mod tests {
             assert_eq!(rec3.fields[0].values[0].sub_values[0], "Third error");
         }
 
-        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 
     #[test]
     fn test_system_clients_file() -> io::Result<()> {
-        let base_dir = "test_system_clients_file_dir";
-        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let dir = TempDir::new("system_clients_file");
+        let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, None)?;
+            let mut db = Database::new(base_dir, Some(isolated_config()))?;
             db.add_authorized_client("CLIENT1", "aabbccdd", vec!["ACC1".to_string()], false)?;
             db.add_authorized_client("CLIENT2", "11223344", vec![], true)?; // ADMIN
 
@@ -195,25 +190,24 @@ mod tests {
 
         // Test auto-population on restart
         {
-            let db = Database::new(base_dir, None)?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             assert!(db.authorized_clients.contains_key("11223344"), "Should load CLIENT2 from $CLIENTS on restart");
             assert!(db.authorized_clients.get("11223344").unwrap().is_admin);
         }
 
-        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 
     #[test]
     fn test_system_accounts_file() -> io::Result<()> {
-        let base_dir = "test_system_accounts_file_dir";
-        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let dir = TempDir::new("system_accounts_file");
+        let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, None)?;
+            let mut db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
             db.create_account("USER1", None)?;
-            db.create_account("USER2", Some("custom_path/user2"))?;
+            db.create_account("USER2", Some(&format!("{}/custom_path/user2", base_dir)))?;
 
             // Verify $ACCOUNTS exists and contains USER1 and USER2
             db.logto("SYSTEM")?;
@@ -228,7 +222,7 @@ mod tests {
             assert!(rec1.fields[0].values[0].sub_values[0].contains("USER1"));
 
             let rec2 = accounts_table.records.get("USER2").unwrap();
-            assert_eq!(rec2.fields[0].values[0].sub_values[0], "custom_path/user2");
+            assert_eq!(rec2.fields[0].values[0].sub_values[0], format!("{}/custom_path/user2", base_dir));
 
             // Test deletion
             db.delete_account("USER1")?;
@@ -239,23 +233,22 @@ mod tests {
 
         // Test auto-population on restart
         {
-            let mut db = Database::new(base_dir, None)?;
+            let mut db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
             let accounts_table = db.get_table("$ACCOUNTS").unwrap();
             assert!(accounts_table.records.contains_key("USER2"), "$ACCOUNTS should contain USER2 after restart");
         }
 
-        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 
     #[test]
     fn test_accounts() -> io::Result<()> {
-        let base_dir = "test_accounts_dir";
-        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let dir = TempDir::new("accounts");
+        let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, None)?;
+            let mut db = Database::new(base_dir, Some(isolated_config()))?;
             db.create_account("ACC1", None)?;
             db.create_account("ACC2", None)?;
 
@@ -278,7 +271,7 @@ mod tests {
 
         // Re-open and verify isolation
         {
-            let mut db = Database::new(base_dir, None)?;
+            let mut db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("ACC1")?;
             let t1 = db.get_table("T1").unwrap();
             assert_eq!(String::from_utf8_lossy(&t1.records.get("K1").unwrap().to_bytes()), "VAL1");
@@ -288,17 +281,16 @@ mod tests {
             assert_eq!(String::from_utf8_lossy(&t1.records.get("K1").unwrap().to_bytes()), "VAL2");
         }
 
-        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 
     #[test]
     fn test_dir_file_auto_creation() -> io::Result<()> {
-        let base_dir = "test_dir_auto_creation_dir";
-        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let dir = TempDir::new("dir_auto_creation");
+        let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, None)?;
+            let mut db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
             assert!(db.is_table_available("DIR"), "DIR table should be automatically created in SYSTEM account");
 
@@ -322,17 +314,16 @@ mod tests {
             assert!(!dir_table_test.records.contains_key("DIR"));
         }
 
-        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 
     #[test]
     fn test_dictionary_field_index() -> io::Result<()> {
-        let base_dir = "test_dict_field_index_dir";
-        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let dir = TempDir::new("dict_field_index");
+        let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, None)?;
+            let mut db = Database::new(base_dir, Some(isolated_config()))?;
             db.create_test_account("DICT_TEST")?;
             db.logto("DICT_TEST")?;
 
@@ -394,17 +385,16 @@ mod tests {
             assert_eq!(db.format_record_field("PRODUCTS", &p1, "PRICE"), "1200.00");
         }
 
-        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 
     #[test]
     fn test_record_serialization() -> io::Result<()> {
-        let base_dir = "test_serialization_dir";
-        if Path::new(base_dir).exists() { fs::remove_dir_all(base_dir)?; }
+        let dir = TempDir::new("serialization");
+        let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, None)?;
+            let mut db = Database::new(base_dir, Some(isolated_config()))?;
             db.create_test_account("SERIAL_TEST")?;
             db.logto("SERIAL_TEST")?;
 
@@ -442,7 +432,6 @@ mod tests {
             assert_eq!(deserialized.fields[2].values[0].sub_values[0], "30");
         }
 
-        fs::remove_dir_all(base_dir)?;
         Ok(())
     }
 }
