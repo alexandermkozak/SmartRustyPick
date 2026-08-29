@@ -42,7 +42,7 @@ pub fn handle_request(req: Request, db: &SharedDb, client_info: &crate::db::Clie
     if is_read_only(&command) {
         if let (Some(acc), Some(table_name)) = (allowed_account(&req, client_info), req.file.as_deref()) {
             let db = read_lock(db);
-            if let Some(table) = db.table_ready_for_read(&acc, table_name) {
+            if let Some(table) = db.table_ready_for_read(acc, table_name) {
                 return match command.as_str() {
                     "READ" => read_command(&db, table, &req),
                     _ => query_command(&db, table, &req),
@@ -57,16 +57,16 @@ pub fn handle_request(req: Request, db: &SharedDb, client_info: &crate::db::Clie
 
 /// The account a request targets, or `None` when resolving it needs the slow
 /// path (unspecified, or denied and therefore worth an error log entry).
-fn allowed_account(req: &Request, client_info: &crate::db::ClientInfo) -> Option<String> {
+fn allowed_account<'a>(req: &'a Request, client_info: &'a crate::db::ClientInfo) -> Option<&'a str> {
     match req.account.as_deref() {
         Some(acc) => {
             if client_info.is_admin || client_info.allowed_accounts.iter().any(|a| a == acc) {
-                Some(acc.to_string())
+                Some(acc)
             } else {
                 None
             }
         }
-        None if client_info.allowed_accounts.len() == 1 => Some(client_info.allowed_accounts[0].clone()),
+        None if client_info.allowed_accounts.len() == 1 => Some(&client_info.allowed_accounts[0]),
         None => None,
     }
 }
@@ -113,11 +113,13 @@ fn query_command(db: &Database, table: &Table, req: &Request) -> Response {
         None
     };
 
+    // Resolve the dictionary once for the whole result set rather than per record.
+    let schema = db.record_schema(table);
     let results_processed: Vec<(String, serde_json::Value)> = if let Some(q) = query_node {
         let mut results = Database::query_in(table, is_dict, &q, None);
         Database::sort_results_in(table, &mut results, &sort_specs);
         results.into_iter()
-            .map(|(k, r)| (k, db.serialize_record_in(table, r)))
+            .map(|(k, r)| (k, db.serialize_record_with_schema(&schema, r)))
             .collect()
     } else {
         // Full scan: sort the keys only, then serialize each record by reference so the
@@ -134,7 +136,7 @@ fn query_command(db: &Database, table: &Table, req: &Request) -> Response {
         keys.into_iter()
             .filter_map(|k| {
                 let record = records.get(&k)?;
-                Some((k, db.serialize_record_in(table, record)))
+                Some((k, db.serialize_record_with_schema(&schema, record)))
             })
             .collect()
     };
@@ -372,25 +374,25 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 (keys, table_name, is_dict)
             };
 
-            let mut results = Vec::new();
-            {
-                let table = match db.get_table_mut_for_account(acc, &table_name) {
-                    Ok(t) => t,
-                    Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
-                };
-                let records = if is_dict { &table.dictionary } else { &table.records };
-
-                for key in &keys_batch {
-                    if let Some(r) = records.get(key) {
-                        results.push((key.clone(), r.clone()));
-                    }
-                }
+            if let Err(e) = db.get_table_mut_for_account(acc, &table_name) {
+                return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() };
             }
+            let table = match db.get_table_read_only_for_account(acc, &table_name) {
+                Some(t) => t,
+                None => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {} not loaded", table_name)), ..Default::default() },
+            };
+            let records = if is_dict { &table.dictionary } else { &table.records };
 
-            let results_len = results.len();
-            let results_processed: Vec<(String, serde_json::Value)> = results.into_iter()
-                .map(|(k, r)| (k, db.serialize_record_for_account(acc, &table_name, &r)))
+            // One dictionary walk for the batch, and each record serialized by
+            // reference instead of cloned.
+            let schema = db.record_schema(table);
+            let results_processed: Vec<(String, serde_json::Value)> = keys_batch.iter()
+                .filter_map(|key| {
+                    let record = records.get(key)?;
+                    Some((key.clone(), db.serialize_record_with_schema(&schema, record)))
+                })
                 .collect();
+            let results_len = results_processed.len();
 
             Response {
                 status: "OK".to_string(),

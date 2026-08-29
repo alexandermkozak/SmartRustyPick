@@ -50,6 +50,23 @@ pub struct Database {
     durable_tables: HashMap<(String, String), bool>,
 }
 
+/// A table's dictionary resolved to just what serialization emits, so a result
+/// set pays the dictionary walk once. Built by
+/// [`Database::record_schema`] and consumed by
+/// [`Database::serialize_record_with_schema`].
+pub struct RecordSchema {
+    fields: Vec<RecordSchemaField>,
+}
+
+struct RecordSchemaField {
+    /// 0-based index into a record's internal `fields` vector.
+    field_idx: usize,
+    /// camelCase key this field is emitted under.
+    camel_key: String,
+    /// Pick MDn conversion code, if the field has one.
+    conversion: Option<String>,
+}
+
 impl Table {
     /// The 0-based index of a dictionary field, or `None` when the field is
     /// unknown. Reading it off the table directly spares the caller a lookup in
@@ -1492,33 +1509,53 @@ impl Database {
         }
     }
 
-    /// Serializes `record` using `table`, which the caller has already
-    /// resolved. Spares the caller a second table lookup per record, which
-    /// matters when serializing an entire result set.
-    pub fn serialize_record_in(&self, table: &Table, record: &Record) -> serde_json::Value {
-        let mut map = serde_json::Map::new();
-
+    /// Resolves a table's dictionary into the fields that serialization actually
+    /// emits: the attribute index, the camelCase output key, and the MDn
+    /// conversion code. Built once per result set and reused for every record,
+    /// this turns the O(records * dict) index parsing and camel-casing in
+    /// [`serialize_record_in`](Self::serialize_record_in) into O(dict).
+    pub fn record_schema(&self, table: &Table) -> RecordSchema {
+        let mut fields = Vec::with_capacity(table.dictionary.len());
         for (dict_key, dict_rec) in &table.dictionary {
-            if let Some(f1) = dict_rec.fields.get(DICT_FIELD_IDX) {
-                if let Some(v1) = f1.values.get(0) {
-                    if let Some(idx_str) = v1.sub_values.get(0) {
-                        if let Ok(idx) = idx_str.parse::<usize>() {
-                            if idx > 0 {
-                                let field_idx = idx - 1;
-                                let raw_val = record.get_field_display_string(field_idx);
-                                let value = match Table::conversion_code_from_dict_record(dict_rec) {
-                                    Some(code) => Self::apply_conversion(&raw_val, &code),
-                                    None => raw_val,
-                                };
-                                let camel_key = self.to_camel_case(dict_key);
-                                map.insert(camel_key, serde_json::Value::String(value));
-                            }
-                        }
-                    }
-                }
-            }
+            let idx = dict_rec.fields.get(DICT_FIELD_IDX)
+                .and_then(|f| f.values.get(0))
+                .and_then(|v| v.sub_values.get(0))
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|idx| *idx > 0);
+            let Some(idx) = idx else { continue };
+            fields.push(RecordSchemaField {
+                // Pick attribute 1 is 0-indexed 0 in our internal fields vector
+                field_idx: idx - 1,
+                camel_key: self.to_camel_case(dict_key),
+                conversion: Table::conversion_code_from_dict_record(dict_rec).map(str::to_string),
+            });
+        }
+        RecordSchema { fields }
+    }
+
+    /// Serializes `record` against a schema resolved earlier by
+    /// [`record_schema`](Self::record_schema), so a whole result set shares one
+    /// pass over the dictionary.
+    pub fn serialize_record_with_schema(&self, schema: &RecordSchema, record: &Record) -> serde_json::Value {
+        let mut map = serde_json::Map::with_capacity(schema.fields.len());
+        for field in &schema.fields {
+            let raw_val = record.get_field_display_string(field.field_idx);
+            let value = match &field.conversion {
+                Some(code) => Self::apply_conversion(&raw_val, code),
+                None => raw_val,
+            };
+            map.insert(field.camel_key.clone(), serde_json::Value::String(value));
         }
         serde_json::Value::Object(map)
+    }
+
+    /// Serializes `record` using `table`, which the caller has already
+    /// resolved. Spares the caller a second table lookup per record. Callers
+    /// serializing an entire result set should instead resolve a
+    /// [`RecordSchema`] once and call
+    /// [`serialize_record_with_schema`](Self::serialize_record_with_schema).
+    pub fn serialize_record_in(&self, table: &Table, record: &Record) -> serde_json::Value {
+        self.serialize_record_with_schema(&self.record_schema(table), record)
     }
 
     pub fn deserialize_record(&self, table_name: &str, data: &serde_json::Value) -> Option<Record> {

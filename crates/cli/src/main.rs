@@ -69,7 +69,7 @@ fn main() -> io::Result<()> {
     // Account login prompt if not logged in
     loop {
         {
-            let db_lock = db.write().unwrap();
+            let db_lock = db.read().unwrap();
             if !db_lock.current_account.is_empty() {
                 break;
             }
