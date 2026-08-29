@@ -68,7 +68,7 @@ impl Table {
     /// The Pick MDn conversion code of a dictionary field, if it has one.
     pub fn conversion_code(&self, field_name: &str) -> Option<String> {
         let rec = self.dictionary.get(field_name)?;
-        Self::conversion_code_from_dict_record(rec)
+        Self::conversion_code_from_dict_record(rec).map(str::to_string)
     }
 
     /// Same as [`conversion_code`], but for a caller that already has the
@@ -90,7 +90,7 @@ impl Table {
             Ok(idx) if idx > 0 => idx - 1,
             _ => return None,
         };
-        Some((idx, Self::conversion_code_from_dict_record(rec)))
+        Some((idx, Self::conversion_code_from_dict_record(rec).map(str::to_string)))
     }
 }
 
