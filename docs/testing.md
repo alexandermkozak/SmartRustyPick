@@ -50,8 +50,9 @@ The suites live in `test/` and share `test/harness.py`:
 reported as a latency distribution (p50/p95/p99/max) plus throughput, because one timing on a shared machine says more
 about the host than about the code.
 
-- **`test/performance/test_load.py`** — bulk writes, random point reads, four query shapes, `SELECT` and `GET.NEXT`
-  against a 10 000-record file, plus the resident memory and CPU time of the server process throughout the run.
+- **`test/performance/test_load.py`** — bulk writes, random point reads, four query shapes, three sorted query shapes,
+  `SELECT` and `GET.NEXT` against a 10 000-record file, plus the resident memory and CPU time of the server process
+  throughout the run.
 - **`test/performance/test_concurrency.py`** — mutual-TLS handshake cost, single-client vs. 8-client read throughput,
   tail latency under contention, handshake cost while a large buffered burst is flushed to disk, concurrent writers
   (including a lost-update check), and per-connection memory.
@@ -77,6 +78,30 @@ make perf-compare BASE=/tmp/base.json
 ```
 
 `perf-compare` exits non-zero if any metric worsened by more than 25% (`--tolerance` to change it).
+
+### Sorting
+
+`LIST` and `SELECT` sort by resolving each value once, in front of the sort, rather than deriving it inside the
+comparator - a sort makes O(n log n) comparisons over n values, so anything done per comparison is paid roughly `log n`
+times more often than it needs to be. Three sorted scans guard that, each in the three ways above:
+
+- **Correctness.** The expected key order is computed independently, from the record keys, and compared position by
+  position. This is the guard that matters most: the unsorted path returns records in record-ID order, so a sort that
+  silently stopped sorting would return exactly that, and all three shapes are chosen to differ from ID order. A sort
+  that got fast by not sorting fails here regardless of any timing.
+- **Growth ratio.** 4x the records must cost about 4.7x (n log n), not 16x - `SRP_LIMIT_SORT_GROWTH`, default 8.0. Host
+  independent, and the check that catches an accidental O(n^2).
+- **Overhead ratio.** What ordering adds to the same scan - `SRP_LIMIT_SORT_OVERHEAD`, default 2.5. Coarse by
+  construction: end to end a full scan is dominated by serialising and shipping the records, so this fails when sorting
+  becomes the *dominant* cost of a query, not when the comparator merely gets slower.
+
+The sharp guard on the comparator itself is the `sort` group in `make bench`, which measures it without TLS or JSON in
+the way. Sorting 10 000 records there is single-digit milliseconds against tens of milliseconds for the surrounding
+request, which is why the microbenchmark rather than the end-to-end ratio is where a comparator regression shows up
+clearly.
+
+The three shapes cover the branches of the comparison: a numeric key (`BY SEQ`), a text key with heavy ties (`BY VAL2`,
+100 distinct values across the file), and a compound sort mixing both directions (`BY VAL1 BY.DSND SEQ`).
 
 ### Hashed Storage Performance
 
@@ -127,6 +152,8 @@ you what to install if neither is present. Narrow it down with `make profile FIL
 | `SRP_KEEP_WORKSPACE`     | unset    | Keep the temporary directory after the run, for debugging.        |
 | `SRP_LIMIT_WRITE_GROWTH` | `2.0`    | Max allowed growth ratio for write cost as the table grows.       |
 | `SRP_LIMIT_GROUP_SHARE`  | `0.05`   | Max allowed fraction of the table for a single hash group.        |
+| `SRP_LIMIT_SORT_GROWTH`  | `8.0`    | Max allowed growth ratio for sort cost as the file grows.         |
+| `SRP_LIMIT_SORT_OVERHEAD`| `2.5`    | Max cost of a sorted scan relative to the same unsorted scan.     |
 
 Individual budgets and ratio limits have their own variables (`SRP_BUDGET_*`, `SRP_LIMIT_*`, `SRP_CONC_*`); they are
 listed at the top of each performance suite.

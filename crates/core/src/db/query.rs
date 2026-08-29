@@ -8,6 +8,61 @@ pub struct FieldQueryInfo {
     pub conversion: Option<String>,
 }
 
+/// One record's value for one sort spec, resolved once so that comparing is
+/// only comparing.
+///
+/// A sort does O(n log n) comparisons over n values. Deriving anything inside
+/// the comparator therefore pays for it n log n times, when the input it is
+/// derived from only ever changes n times: at 10,000 records that is roughly a
+/// 14x multiplier on the same work. Both derivations the ordering needs - the
+/// numeric reading of the text and its lowercase form - are moved here, in
+/// front of the sort.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SortValue {
+    /// The trimmed text, which is what the ordering is defined over.
+    text: String,
+    /// `Some` when `text` parses as a number. Two values compare numerically
+    /// only when both do, so that a numeric column containing one stray label
+    /// still orders sensibly rather than half-numerically.
+    number: Option<f64>,
+    /// `text` lowercased, or `None` when lowercasing leaves it unchanged -
+    /// which is the common case (digits, keys, already-lowercase text), and
+    /// worth not allocating a second string for.
+    lower: Option<String>,
+}
+
+impl SortValue {
+    pub(crate) fn new(raw: &str) -> Self {
+        let text = raw.trim();
+        let number = text.parse::<f64>().ok();
+        // Collecting the lowercase form is equivalent to comparing
+        // `char::to_lowercase` iterators lazily, because UTF-8 orders its bytes
+        // the same way Unicode orders its code points.
+        let lower: String = text.chars().flat_map(char::to_lowercase).collect();
+        let lower = if lower == text { None } else { Some(lower) };
+        SortValue { text: text.to_string(), number, lower }
+    }
+
+    /// The form the case-insensitive comparison is made over.
+    fn folded(&self) -> &str {
+        self.lower.as_deref().unwrap_or(&self.text)
+    }
+
+    pub(crate) fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        if let (Some(l), Some(r)) = (self.number, other.number) {
+            return l.partial_cmp(&r).unwrap_or(std::cmp::Ordering::Equal);
+        }
+        // Text comparison is case-insensitive so that "Ztest" and "ztest" sort together instead of
+        // all uppercase values coming before all lowercase ones. Ties fall back to the raw byte
+        // comparison to keep the ordering deterministic.
+        let ci = self.folded().cmp(other.folded());
+        if ci != std::cmp::Ordering::Equal {
+            return ci;
+        }
+        self.text.cmp(&other.text)
+    }
+}
+
 impl Database {
     pub fn parse_query(&mut self, table_name: &str, parts: &[&str]) -> Option<QueryNode> {
         self.parse_query_read_only(table_name, parts)
@@ -153,7 +208,7 @@ impl Database {
         let resolved = Self::resolve_sort_fields(table, specs);
 
         // Pre-calculate the sort values once per record instead of on every comparison.
-        let sort_keys: Vec<Vec<String>> = results
+        let sort_keys: Vec<Vec<SortValue>> = results
             .iter()
             .map(|(id, record)| Self::sort_key_for(id, record.borrow(), &resolved))
             .collect();
@@ -182,24 +237,26 @@ impl Database {
     }
 
     /// Builds the pre-calculated sort values of a single record, one per sort spec.
-    fn sort_key_for(id: &str, record: &Record, resolved: &[(Option<usize>, bool)]) -> Vec<String> {
+    fn sort_key_for(id: &str, record: &Record, resolved: &[(Option<usize>, bool)]) -> Vec<SortValue> {
         resolved
             .iter()
             .map(|(idx, _)| match idx {
-                None => id.to_string(),
-                Some(i) if *i == usize::MAX => String::new(),
-                Some(i) => record.get_field_display_string(*i),
+                None => SortValue::new(id),
+                // An unknown field compares equal, so `sorted_order` skips it
+                // entirely; there is nothing to resolve.
+                Some(i) if *i == usize::MAX => SortValue::default(),
+                Some(i) => SortValue::new(&record.get_field_display_string(*i)),
             })
             .collect()
     }
 
     /// Sorts indices `0..sort_keys.len()` by the pre-calculated values, falling back to the ID.
-    fn sorted_order<'a, F: Fn(usize) -> &'a str>(sort_keys: &[Vec<String>], resolved: &[(Option<usize>, bool)], id_of: F) -> Vec<usize> {
+    fn sorted_order<'a, F: Fn(usize) -> &'a str>(sort_keys: &[Vec<SortValue>], resolved: &[(Option<usize>, bool)], id_of: F) -> Vec<usize> {
         let mut order: Vec<usize> = (0..sort_keys.len()).collect();
         order.sort_by(|&a, &b| {
             for (n, (idx, descending)) in resolved.iter().enumerate() {
                 if matches!(idx, Some(i) if *i == usize::MAX) { continue; }
-                let mut ord = Self::compare_sort_values(&sort_keys[a][n], &sort_keys[b][n]);
+                let mut ord = sort_keys[a][n].compare(&sort_keys[b][n]);
                 if *descending {
                     ord = ord.reverse();
                 }
@@ -234,12 +291,12 @@ impl Database {
         let resolved = Self::resolve_sort_fields(table, specs);
 
         // Look the records up by reference and pre-calculate their sort values; no record is cloned.
-        let sort_keys: Vec<Vec<String>> = {
+        let sort_keys: Vec<Vec<SortValue>> = {
             let map = if is_dict { &table.dictionary } else { &table.records };
             keys.iter()
                 .map(|k| match map.get(k) {
                     Some(r) => Self::sort_key_for(k, r, &resolved),
-                    None => vec![String::new(); resolved.len()],
+                    None => vec![SortValue::default(); resolved.len()],
                 })
                 .collect()
         };
@@ -248,24 +305,6 @@ impl Database {
 
         let mut taken: Vec<Option<String>> = keys.into_iter().map(Some).collect();
         order.into_iter().map(|i| taken[i].take().unwrap()).collect()
-    }
-
-    pub(crate) fn compare_sort_values(left: &str, right: &str) -> std::cmp::Ordering {
-        let l = left.trim();
-        let r = right.trim();
-        if let (Ok(lf), Ok(rf)) = (l.parse::<f64>(), r.parse::<f64>()) {
-            return lf.partial_cmp(&rf).unwrap_or(std::cmp::Ordering::Equal);
-        }
-        // Text comparison is case-insensitive so that "Ztest" and "ztest" sort together instead of
-        // all uppercase values coming before all lowercase ones. Ties fall back to the raw byte
-        // comparison to keep the ordering deterministic.
-        let ci = l.chars()
-            .flat_map(char::to_lowercase)
-            .cmp(r.chars().flat_map(char::to_lowercase));
-        if ci != std::cmp::Ordering::Equal {
-            return ci;
-        }
-        l.cmp(r)
     }
 
     pub fn query(&mut self, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
