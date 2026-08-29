@@ -8,6 +8,7 @@ that issued it. Both are checked here against the real binaries.
 
 import json
 import os
+import re
 import shutil
 import ssl
 import sys
@@ -107,6 +108,27 @@ def main():
 
             status, _, _ = dashboard.call("/", token=None)
             suite.check_eq("The page itself needs a token too", status, 401)
+
+            # The page is a built Vue bundle: if the server and the bundle
+            # disagree about a filename, the browser gets a blank screen and
+            # nothing else in this suite would notice.
+            _, page, _ = dashboard.call("/")
+            referenced = sorted(set(re.findall(r'/dist/[A-Za-z0-9._-]+', page if isinstance(page, str) else "")))
+            served = {}
+            for asset in referenced:
+                status, _, headers = dashboard.call(asset)
+                served[asset] = (status, headers.get("Content-Type", ""))
+            suite.check(
+                "Every asset the page references is served",
+                bool(referenced) and all(status == 200 for status, _ in served.values()),
+                "" if referenced else "the page references no bundle assets",
+            )
+            suite.check(
+                "The bundle is served with usable content types",
+                served.get("/dist/app.js", (0, ""))[1].startswith("application/javascript")
+                and served.get("/dist/app.css", (0, ""))[1].startswith("text/css"),
+                json.dumps(served),
+            )
 
             # --- server view -----------------------------------------------
             status, payload, _ = dashboard.call("/api/stats")

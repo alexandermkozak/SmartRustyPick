@@ -1,6 +1,6 @@
 # Testing
 
-The project has four layers of tests, all runnable from the `Makefile` and all executed by the
+The project has five layers of tests, all runnable from the `Makefile` and all executed by the
 `Build and Test` GitHub workflow on every push to `main` and every pull request.
 
 | Layer       | Command                 | What it covers                                                                                                                                  |
@@ -9,8 +9,10 @@ The project has four layers of tests, all runnable from the `Makefile` and all e
 | Integration | `make test-integration` | The real binaries over the TLS protocol: CRUD, queries, select lists, headless mode, access control, per-file durability and the web dashboard. |
 | Performance | `make test-performance` | End-to-end latency distributions, throughput, scaling ratios, concurrency and resource usage.                                                   |
 | Benchmarks  | `make bench`            | Criterion micro-benchmarks of the engine: record codec, query execution, sorting, persistence.                                                  |
+| Front end   | `make ui-test`          | The dashboard's Vue components under jsdom: it mounts, polls, renders live figures and degrades when the API refuses.                           |
 
-`make test-all` runs the first three. Everything below the unit layer requires `cargo build` first; the Make targets
+`make test-all` runs the first three; `make ui-test` covers the dashboard's front end and needs node. Everything below
+the unit layer requires `cargo build` first; the Make targets
 take care of it.
 
 ## Requirements
@@ -18,6 +20,8 @@ take care of it.
 - A Rust toolchain (for `cargo build` / `cargo test`).
 - `python3` (standard library only — no packages to install).
 - `openssl` on the `PATH`, used to mint throwaway certificates.
+- Node 22+ **only** for the dashboard front end (`make ui-test`, `make ui-build`). The built bundle is committed, so
+  building and testing the database itself never needs it.
 
 ## How the Python suites work
 

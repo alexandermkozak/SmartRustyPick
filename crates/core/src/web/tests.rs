@@ -92,23 +92,43 @@ fn the_page_only_loads_assets_this_server_serves() {
     // browser and nothing at all in the tests.
     assert!(!INDEX_HTML.contains("http://"), "the page must not load anything over plain HTTP");
     assert!(!INDEX_HTML.contains("https://"), "the page must not load remote assets");
-    assert!(INDEX_HTML.contains("/app.css") && INDEX_HTML.contains("/app.js"));
-    assert!(!INDEX_HTML.contains("<script>"), "inline scripts are refused by the policy");
     assert!(!APP_JS.is_empty() && !APP_CSS.is_empty());
 }
 
 #[test]
-fn every_view_the_page_offers_has_a_section_to_show() {
-    for view in ["overview", "clients", "certificates", "accounts"] {
+fn every_asset_the_page_asks_for_is_one_the_server_serves() {
+    // Vite writes the script and stylesheet tags, so the page and the routing
+    // table have to agree without anyone remembering to keep them in step. A
+    // rebuild that renames an output file fails here rather than in a browser.
+    for (path, _, body) in BUNDLE {
         assert!(
-            INDEX_HTML.contains(&format!("data-view=\"{}\"", view)),
-            "no tab for the {} view",
-            view
+            INDEX_HTML.contains(path),
+            "the built page does not reference {path}; is `make ui-build` stale?"
         );
+        assert!(!body.is_empty(), "{path} is embedded but empty");
+    }
+
+    // Anything the page pulls in that the table does not know about would be a
+    // 404 at load time, which is the one failure a strict CSP cannot explain.
+    for reference in INDEX_HTML.split(&['"', '\''][..]).filter(|part| part.starts_with("/dist/")) {
         assert!(
-            INDEX_HTML.contains(&format!("id=\"view-{}\"", view)),
-            "no section for the {} view",
-            view
+            BUNDLE.iter().any(|(path, _, _)| path == &reference),
+            "the page references {reference}, which the server does not serve"
         );
     }
+}
+
+#[test]
+fn the_bundle_is_a_production_build() {
+    // A development build carries Vue's dev-mode warnings and, worse, a runtime
+    // template compiler that wants `unsafe-eval`. The page's policy refuses
+    // that, so shipping one would be a blank screen.
+    assert!(
+        !APP_JS.contains("__VUE_HMR_RUNTIME__"),
+        "the committed bundle is a development build; run `make ui-build`"
+    );
+    assert!(
+        !INDEX_HTML.contains("/@vite/client"),
+        "the committed page is the dev server's, not a build"
+    );
 }

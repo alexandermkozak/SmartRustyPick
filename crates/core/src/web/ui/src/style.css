@@ -415,3 +415,74 @@ textarea {
 .success {
     color: var(--accent);
 }
+
+/* --- additions for the Vue views --- */
+
+/* A refresh that failed leaves the last good numbers on screen, dimmed, with
+   the reason above them. */
+.stat-grid.stale {
+    opacity: 0.55;
+}
+
+.stat-warn .value {
+    color: var(--warn);
+}
+
+.alert.inline {
+    margin: 1rem 0 0;
+}
+
+.error-text {
+    color: var(--danger);
+}
+
+.hint {
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--warn);
+}
+
+.success {
+    margin-top: 0;
+}
+
+td.actions {
+    display: flex;
+    gap: 0.4rem;
+}
+
+.editor-row td {
+    background: var(--bg);
+}
+
+.inline-form {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.inline-form input {
+    flex: 1 1 16rem;
+}
+
+.live-toggle {
+    color: var(--muted);
+    font-size: 0.8rem;
+    white-space: nowrap;
+}
+
+.issued h3,
+.card h3 {
+    margin: 0 0 0.6rem;
+    font-size: 0.9rem;
+}
+
+.list button[aria-current='true'] {
+    background: var(--bg);
+    box-shadow: inset 3px 0 0 var(--accent);
+}
+
+main section {
+    display: block;
+}

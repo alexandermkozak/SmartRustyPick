@@ -124,6 +124,10 @@ The project is organized into a Rust workspace with the following crates:
 - `crates/cli`: The interactive command-line interface.
 - `crates/server`: The dedicated headless server entry point.
 
+The web dashboard's Vue front end lives in `crates/core/src/web/ui`, and its built bundle is committed to
+`crates/core/src/web/assets/dist` so `cargo build` never needs a node toolchain. See
+[Web Dashboard](docs/web_dashboard.md) for the front-end workflow.
+
 ## MCP Server
 
 This project includes a Model Context Protocol (MCP) server located in the `mcp/` directory. This allows other AI agents

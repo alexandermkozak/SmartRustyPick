@@ -47,9 +47,26 @@ const TOKEN_COOKIE: &str = "srp_token";
 /// How long a kept-alive connection may sit idle before it is closed.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-const INDEX_HTML: &str = include_str!("assets/index.html");
-const APP_CSS: &str = include_str!("assets/app.css");
-const APP_JS: &str = include_str!("assets/app.js");
+/// The built front end, embedded at compile time.
+///
+/// The sources live in `ui/` as Vue single-file components and are compiled by
+/// Vite into these three files, which are committed. That keeps `cargo build`
+/// the only build step needed to produce a working server - node is required
+/// only to *change* the interface, not to build the database - and the CI job
+/// in `.github/workflows/main.yml` rebuilds the bundle to prove the committed
+/// copy matches the sources.
+const INDEX_HTML: &str = include_str!("assets/dist/index.html");
+const APP_JS: &str = include_str!("assets/dist/app.js");
+const APP_CSS: &str = include_str!("assets/dist/app.css");
+
+/// The bundle's files, by the path the page asks for them at. Vite is told to
+/// emit fixed names rather than content-hashed ones, because `include_str!`
+/// needs a path known at compile time - and with `Cache-Control: no-store`
+/// there is no cache to bust.
+const BUNDLE: &[(&str, &str, &str)] = &[
+    ("/dist/app.js", "application/javascript; charset=utf-8", APP_JS),
+    ("/dist/app.css", "text/css; charset=utf-8", APP_CSS),
+];
 
 /// Starts the dashboard beside a running protocol server, unless it is switched
 /// off in the configuration.
@@ -285,10 +302,11 @@ async fn handle(client: &Arc<ProtocolClient>, token: &str, request: &http::Reque
                 None => response,
             }
         }
-        "/app.css" => Response::new(200, "text/css; charset=utf-8", APP_CSS),
-        "/app.js" => Response::new(200, "application/javascript; charset=utf-8", APP_JS),
         path if path.starts_with("/api/") => api::route(client, request).await,
-        _ => Response::error(404, "Not found"),
+        path => match BUNDLE.iter().find(|(asset, _, _)| *asset == path) {
+            Some((_, content_type, body)) => Response::new(200, content_type, *body),
+            None => Response::error(404, "Not found"),
+        },
     }
 }
 

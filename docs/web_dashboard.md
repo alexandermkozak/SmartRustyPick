@@ -109,18 +109,75 @@ curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 
 ## Implementation
 
-Everything lives in `crates/core/src/web/`:
+The server side lives in `crates/core/src/web/`:
 
-| File        | Role                                                                             |
-|-------------|----------------------------------------------------------------------------------|
-| `mod.rs`    | Boot: issue and authorize the certificate, mint the token, accept connections.   |
-| `http.rs`   | The HTTP/1.1 subset the dashboard needs, with every read bounded.                |
-| `client.rs` | The pooled TLS connection to the protocol server.                                |
-| `api.rs`    | Routes: one HTTP shape in, one protocol command out.                             |
-| `assets/`   | The page, its stylesheet and its script, embedded in the binary at compile time. |
+| File           | Role                                                                           |
+|----------------|--------------------------------------------------------------------------------|
+| `mod.rs`       | Boot: issue and authorize the certificate, mint the token, accept connections. |
+| `http.rs`      | The HTTP/1.1 subset the dashboard needs, with every read bounded.              |
+| `client.rs`    | The pooled TLS connection to the protocol server.                              |
+| `api.rs`       | Routes: one HTTP shape in, one protocol command out.                           |
+| `assets/dist/` | The built front end, embedded in the binary at compile time.                   |
 
-There is no HTTP framework and no JavaScript framework. The protocol server was written the same way, and a dependency
+There is no HTTP framework: the protocol server was written the same way, and a dependency
 tree larger than the database itself is a poor trade for a handful of routes.
 
-`test/integration/test_web.py` drives the real binaries: the bootstrap, the token checks, every endpoint, certificate
-issuing and revocation, and the certificate rotation across a restart.
+### Front end
+
+The page is a Vue 3 application using the Composition API, written as single-file components and built by Vite. Sources
+live in `crates/core/src/web/ui/`:
+
+| Path                                | Role                                                            |
+|-------------------------------------|-----------------------------------------------------------------|
+| `src/App.vue`                       | The shell: header, tabs, alert banner, live toggle.             |
+| `src/views/`                        | One component per tab.                                          |
+| `src/components/`                   | Small shared pieces: stat cards, role pills, panel states.      |
+| `src/composables/usePolling.ts`     | Interval refresh with the behaviour live views need.            |
+| `src/composables/useServerStats.ts` | One shared server poll for the header and the overview.         |
+| `src/composables/useAlerts.ts`      | The banner any view can raise an error into.                    |
+| `src/api.ts`, `src/types.ts`        | The HTTP client, and the wire types mirroring the Rust structs. |
+
+`usePolling` is where the live-monitoring behaviour lives, and new watched views should be built on it rather than on
+their own timers:
+
+- Requests never overlap; the next tick is scheduled when the previous response lands, so a slow server slows the
+  refresh rate instead of queueing requests.
+- Polling stops while the browser tab is hidden, and refreshes immediately when it returns.
+- A failed refresh keeps the last good data on screen, dimmed, with the reason beside it.
+- A `401` stops the poll rather than retrying into a log full of refusals.
+
+### Building it
+
+The built bundle in `assets/dist/` is **committed**, so `cargo build` alone produces a working server and neither CI nor
+the container image needs a node toolchain. Node is required only to change the interface:
+
+```sh
+make ui-build     # rebuild assets/dist - commit the result
+make ui-test      # component tests (vitest + jsdom)
+make ui-check     # type-check only
+make ui-dev       # Vite dev server on :5173 with hot reload
+```
+
+For `make ui-dev`, start a database server first and open the dashboard URL it prints with the port changed to 5173 —
+`http://127.0.0.1:5173/?token=...`. Vite proxies `/api` and
+`/health` to `127.0.0.1:8080`, and in a dev build only, the page replays that token as a bearer header because the
+production `HttpOnly` cookie belongs to a different origin. The production bundle contains no path that puts the token
+anywhere script-readable.
+
+Vite is configured to emit fixed filenames (`app.js`, `app.css`) rather than content-hashed ones, because `include_str!`
+needs paths known at compile time. Nothing is lost: responses carry `Cache-Control: no-store`, so there is no cache to
+bust.
+
+### What keeps the bundle honest
+
+A committed build artefact is only safe if it cannot silently drift from its sources:
+
+- `.github/workflows/main.yml` has a `dashboard-bundle` job that runs the component tests, rebuilds the bundle and fails
+  if `git diff` shows the committed copy differs.
+- `cargo test` checks that the embedded page references exactly the assets the server serves, and that the bundle is a
+  production build rather than a dev one — a dev build would need `unsafe-eval`, which the page's own policy refuses.
+- `test/integration/test_web.py` fetches every `/dist/...` path the served page references and checks each returns 200
+  with a usable content type.
+
+`test/integration/test_web.py` also drives the real binaries end to end: the bootstrap, the token checks, every
+endpoint, certificate issuing and revocation, and the certificate rotation across a restart.

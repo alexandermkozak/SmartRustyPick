@@ -72,3 +72,34 @@ jobs:
           name: test-results
           path: target/test-results/
           if-no-files-found: warn
+
+  # The dashboard's Vue bundle is committed so that `cargo build` needs no node
+  # toolchain. That only stays true if the committed copy actually matches the
+  # sources, which is what this job proves: rebuild it, and fail if the result
+  # differs from what is in the repository.
+  dashboard-bundle:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: crates/core/src/web/ui/package-lock.json
+
+      - name: Test the dashboard front end
+        run: make ui-test
+
+      - name: Rebuild the dashboard bundle
+        run: make ui-build
+
+      - name: Fail if the committed bundle is stale
+        run: |
+          if ! git diff --exit-code -- crates/core/src/web/assets/dist; then
+            echo "::error::The committed dashboard bundle does not match crates/core/src/web/ui."
+            echo "Run 'make ui-build' and commit crates/core/src/web/assets/dist."
+            exit 1
+          fi
