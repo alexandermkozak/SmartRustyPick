@@ -81,13 +81,7 @@ impl Record {
     }
 
     pub fn to_display_string(&self) -> String {
-        let display_bytes: Vec<u8> = self.to_bytes().iter().map(|&b| match b {
-            FM => b'^',
-            VM => b']',
-            SVM => b'\\',
-            _ => b
-        }).collect();
-        String::from_utf8_lossy(&display_bytes).to_string()
+        to_display_chars(&self.to_bytes())
     }
 
     pub fn from_display_string(s: &str) -> Self {
@@ -124,6 +118,33 @@ impl Record {
         Self::from_bytes(&translated_data)
     }
 
+    /// Renders one position of a field: a single sub-value, a single value with
+    /// its sub-values still joined by `\\`, or - for `None` - the whole field
+    /// exactly as [`get_field_display_string`](Self::get_field_display_string)
+    /// renders it.
+    ///
+    /// A position that is out of range renders empty rather than panicking, so
+    /// a select list that outlived an edit to its records degrades quietly.
+    pub fn get_value_display_string(&self, field_idx: usize, pos: Option<ValuePosition>) -> String {
+        let Some(pos) = pos else { return self.get_field_display_string(field_idx) };
+        let Some(field) = self.fields.get(field_idx) else { return String::new() };
+        let Some(value) = field.values.get(pos.value) else { return String::new() };
+        match pos.sub_value {
+            Some(sv) => match value.sub_values.get(sv) {
+                Some(s) => to_display_chars(s.as_bytes()),
+                None => String::new(),
+            },
+            None => {
+                let mut res = Vec::new();
+                for (k, sv) in value.sub_values.iter().enumerate() {
+                    if k > 0 { res.push(SVM); }
+                    res.extend_from_slice(sv.as_bytes());
+                }
+                to_display_chars(&res)
+            }
+        }
+    }
+
     pub fn get_field_display_string(&self, field_idx: usize) -> String {
         if let Some(field) = self.fields.get(field_idx) {
             let mut res = Vec::new();
@@ -134,17 +155,23 @@ impl Record {
                     res.extend_from_slice(sv.as_bytes());
                 }
             }
-            let display_bytes: Vec<u8> = res.iter().map(|&b| match b {
-                FM => b'^',
-                VM => b']',
-                SVM => b'\\',
-                _ => b
-            }).collect();
-            String::from_utf8_lossy(&display_bytes).to_string()
+            to_display_chars(&res)
         } else {
             String::new()
         }
     }
+}
+
+/// Replaces the FM/VM/SVM marks with the printable characters the CLI and the
+/// display-string format use for them.
+fn to_display_chars(bytes: &[u8]) -> String {
+    let display_bytes: Vec<u8> = bytes.iter().map(|&b| match b {
+        FM => b'^',
+        VM => b']',
+        SVM => b'\\',
+        _ => b
+    }).collect();
+    String::from_utf8_lossy(&display_bytes).to_string()
 }
 
 pub struct Table {
@@ -233,11 +260,96 @@ pub struct TableStamp {
     pub dict_len: u64,
 }
 
+/// Where inside a multivalued field a match landed.
+///
+/// `sub_value` is `None` when the whole value is the unit of interest - either
+/// nothing was matched against it, or the criterion was satisfied by the value
+/// as a whole rather than by one of its sub-values.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValuePosition {
+    pub value: usize,
+    pub sub_value: Option<usize>,
+}
+
+impl ValuePosition {
+    pub fn value(value: usize) -> Self {
+        ValuePosition { value, sub_value: None }
+    }
+
+    pub fn sub_value(value: usize, sub_value: usize) -> Self {
+        ValuePosition { value, sub_value: Some(sub_value) }
+    }
+}
+
+/// One row of a select list: a record key, plus the position within an exploded
+/// field that put it there. `position` is `None` for an ordinary, unexploded
+/// selection, which is what every list held before `BY.EXP` existed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectEntry {
+    pub key: String,
+    pub position: Option<ValuePosition>,
+}
+
+impl SelectEntry {
+    pub fn new(key: String) -> Self {
+        SelectEntry { key, position: None }
+    }
+
+    pub fn at(key: String, position: ValuePosition) -> Self {
+        SelectEntry { key, position: Some(position) }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SelectList {
     pub table_name: String,
     pub is_dict: bool,
-    pub keys: Vec<String>,
+    /// The field the entries' positions refer to, when the list was built by a
+    /// `BY.EXP` clause. A later `LIST` of the same file needs this to know which
+    /// column those positions narrow.
+    pub explode_field: Option<String>,
+    pub entries: Vec<SelectEntry>,
+}
+
+impl SelectList {
+    /// Builds an unexploded list, which is what every caller that has only keys
+    /// wants.
+    pub fn from_keys(table_name: String, is_dict: bool, keys: Vec<String>) -> Self {
+        SelectList {
+            table_name,
+            is_dict,
+            explode_field: None,
+            entries: keys.into_iter().map(SelectEntry::new).collect(),
+        }
+    }
+
+    /// The keys of the list, in order. An exploded list repeats a key once per
+    /// matching position, so this is not deduplicated.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|e| e.key.as_str())
+    }
+
+    /// The distinct keys of the list, in first-seen order.
+    ///
+    /// An exploded list repeats a key once per matching position. Commands that
+    /// act on records rather than on values - `GET`, `DELETE`, `CT` - want each
+    /// record once, not once per value that matched.
+    pub fn unique_keys(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        self.entries
+            .iter()
+            .filter(|e| seen.insert(e.key.as_str()))
+            .map(|e| e.key.clone())
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -295,11 +407,20 @@ pub struct FileStats {
     pub modified_seconds_ago: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct QueryCondition {
     pub field_name: String,
     pub op: String,
     pub value: String,
+}
+
+/// A `BY.EXP` clause: the multivalued field whose values become one output row
+/// each, and the criterion absorbed from the compact
+/// `BY.EXP <field> <op> <value>` spelling, if any.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ExplodeSpec {
+    pub field_name: String,
+    pub condition: Option<QueryCondition>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

@@ -1,4 +1,4 @@
-use crate::db::{QueryNode, SortSpec};
+use crate::db::{QueryNode, SortSpec, ValuePosition};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -14,6 +14,11 @@ pub struct Request {
     pub query_node: Option<QueryNode>,
     pub query_string: Option<String>,
     pub sort_specs: Option<Vec<SortSpec>>,
+    /// QUERY and SELECT: multivalued fields to explode, so each matching value
+    /// becomes its own result row. The criterion comes from `query_node` or
+    /// `query_string` as usual; a `BY.EXP` clause inside `query_string` fills
+    /// this in on its own.
+    pub explode: Option<Vec<String>>,
     pub list_name: Option<String>,
     pub batch_size: Option<usize>,
     pub thumbprint: Option<String>,
@@ -32,4 +37,8 @@ pub struct Response {
     pub results: Option<Vec<(String, serde_json::Value)>>,
     pub keys: Option<Vec<String>>,
     pub count: Option<usize>,
+    /// For an exploded result, the position within the exploded field that put
+    /// each row in `results` there. Index-aligned with `results`, and `None`
+    /// for an ordinary, unexploded one.
+    pub positions: Option<Vec<Option<ValuePosition>>>,
 }

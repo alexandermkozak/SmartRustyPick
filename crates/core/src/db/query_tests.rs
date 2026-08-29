@@ -3,6 +3,14 @@ use crate::db::models::*;
 use crate::db::query::SortValue;
 use crate::test_support::{isolated_config, TempDir};
 
+/// The sort half of `parse_clause_specs`, so the tests that predate `BY.EXP`
+/// keep reading the way they did.
+fn parse_sort_specs<'a>(parts: &[&'a str]) -> (Vec<&'a str>, Vec<SortSpec>) {
+    let (rest, specs, _) = Database::parse_clause_specs(parts);
+    (rest, specs)
+}
+
+
 /// Orders one pair the way a sort would. The sort itself resolves each value
 /// once up front; this spells that out for a test that only has two.
 fn sort_cmp(left: &str, right: &str) -> std::cmp::Ordering {
@@ -257,22 +265,22 @@ fn test_query_with_wildcards() {
 #[test]
 fn test_parse_sort_specs() {
     // No sort clauses
-    let (rest, specs) = Database::parse_sort_specs(&["WITH", "DESC", "=", "[new]"]);
+    let (rest, specs) = parse_sort_specs(&["WITH", "DESC", "=", "[new]"]);
     assert_eq!(rest, vec!["WITH", "DESC", "=", "[new]"]);
     assert!(specs.is_empty());
 
     // Ascending only
-    let (rest, specs) = Database::parse_sort_specs(&["PRICE_COL", "BY", "PRICE"]);
+    let (rest, specs) = parse_sort_specs(&["PRICE_COL", "BY", "PRICE"]);
     assert_eq!(rest, vec!["PRICE_COL"]);
     assert_eq!(specs, vec![SortSpec { field_name: "PRICE".to_string(), descending: false }]);
 
     // Descending only
-    let (rest, specs) = Database::parse_sort_specs(&["BY.DSND", "PRICE"]);
+    let (rest, specs) = parse_sort_specs(&["BY.DSND", "PRICE"]);
     assert!(rest.is_empty());
     assert_eq!(specs, vec![SortSpec { field_name: "PRICE".to_string(), descending: true }]);
 
     // Multiple sorts keep left-to-right order
-    let (rest, specs) = Database::parse_sort_specs(&["WITH", "DESC", "=", "[new]", "BY", "PRICE", "BY.DSND", "CREATE.DATE"]);
+    let (rest, specs) = parse_sort_specs(&["WITH", "DESC", "=", "[new]", "BY", "PRICE", "BY.DSND", "CREATE.DATE"]);
     assert_eq!(rest, vec!["WITH", "DESC", "=", "[new]"]);
     assert_eq!(specs, vec![
         SortSpec { field_name: "PRICE".to_string(), descending: false },
@@ -280,24 +288,24 @@ fn test_parse_sort_specs() {
     ]);
 
     // Case insensitive operators
-    let (_, specs) = Database::parse_sort_specs(&["by.dsnd", "PRICE"]);
+    let (_, specs) = parse_sort_specs(&["by.dsnd", "PRICE"]);
     assert_eq!(specs, vec![SortSpec { field_name: "PRICE".to_string(), descending: true }]);
 
     // Sort and column specifiers are order-agnostic
-    let (rest, specs) = Database::parse_sort_specs(&["BY.DSND", "DESC", "DESC", "PRICE"]);
+    let (rest, specs) = parse_sort_specs(&["BY.DSND", "DESC", "DESC", "PRICE"]);
     assert_eq!(rest, vec!["DESC", "PRICE"]);
     assert_eq!(specs, vec![SortSpec { field_name: "DESC".to_string(), descending: true }]);
 
-    let (rest, specs) = Database::parse_sort_specs(&["DESC", "PRICE", "BY.DSND", "DESC"]);
+    let (rest, specs) = parse_sort_specs(&["DESC", "PRICE", "BY.DSND", "DESC"]);
     assert_eq!(rest, vec!["DESC", "PRICE"]);
     assert_eq!(specs, vec![SortSpec { field_name: "DESC".to_string(), descending: true }]);
 
     // Dangling operator without a field is not a sort; the token is kept in the clause
-    let (rest, specs) = Database::parse_sort_specs(&["PRICE_COL", "BY"]);
+    let (rest, specs) = parse_sort_specs(&["PRICE_COL", "BY"]);
     assert_eq!(rest, vec!["PRICE_COL", "BY"]);
     assert!(specs.is_empty());
 
-    let (rest, specs) = Database::parse_sort_specs(&["BY", "PRICE", "BY.DSND"]);
+    let (rest, specs) = parse_sort_specs(&["BY", "PRICE", "BY.DSND"]);
     assert_eq!(rest, vec!["BY.DSND"]);
     assert_eq!(specs, vec![SortSpec { field_name: "PRICE".to_string(), descending: false }]);
 }
@@ -332,7 +340,7 @@ fn test_sort_results_ascending_and_descending() {
     let ids = |res: &Vec<(String, Record)>| res.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
 
     // BY PRICE - numeric ascending, not lexicographic ("25" before "100")
-    let (_, specs) = Database::parse_sort_specs(&["BY", "PRICE"]);
+    let (_, specs) = parse_sort_specs(&["BY", "PRICE"]);
     let mut res = db.query("PRODUCTS", false, &QueryNode::Condition(QueryCondition {
         field_name: "ID".to_string(),
         op: "!=".to_string(),
@@ -343,7 +351,7 @@ fn test_sort_results_ascending_and_descending() {
     assert_eq!(ids(&res), vec!["P2", "P4", "P3", "P1"]);
 
     // BY.DSND PRICE
-    let (_, specs) = Database::parse_sort_specs(&["BY.DSND", "PRICE"]);
+    let (_, specs) = parse_sort_specs(&["BY.DSND", "PRICE"]);
     db.sort_results("PRODUCTS", &mut res, &specs);
     assert_eq!(ids(&res), vec!["P1", "P3", "P2", "P4"]);
 }
@@ -353,7 +361,7 @@ fn test_sort_results_multiple_keys() {
     let (_dir, mut db) = setup_sort_db("sort_multi");
 
     // BY PRICE BY.DSND CREATE.DATE
-    let (clause, specs) = Database::parse_sort_specs(&["WITH", "DESC", "=", "[new]", "BY", "PRICE", "BY.DSND", "CREATE.DATE"]);
+    let (clause, specs) = parse_sort_specs(&["WITH", "DESC", "=", "[new]", "BY", "PRICE", "BY.DSND", "CREATE.DATE"]);
     let query = db.parse_query("PRODUCTS", &clause).unwrap();
     let mut res = db.query("PRODUCTS", false, &query, None);
     db.sort_results("PRODUCTS", &mut res, &specs);
@@ -372,7 +380,7 @@ fn test_sort_text_is_case_insensitive() {
         table.records.insert("P10".to_string(), Record::from_display_string("test!^2^2024-06-01"));
     }
 
-    let (_, specs) = Database::parse_sort_specs(&["BY", "DESC"]);
+    let (_, specs) = parse_sort_specs(&["BY", "DESC"]);
     let keys = vec!["P5".to_string(), "P10".to_string()];
     let sorted = db.sort_keys("PRODUCTS", false, keys, &specs);
     // "test!" sorts before "Ztest" once case is ignored.
@@ -387,18 +395,18 @@ fn test_sort_text_is_case_insensitive() {
 fn test_sort_keys_and_unknown_field() {
     let (_dir, mut db) = setup_sort_db("sort_keys");
 
-    let (_, specs) = Database::parse_sort_specs(&["BY.DSND", "DESC"]);
+    let (_, specs) = parse_sort_specs(&["BY.DSND", "DESC"]);
     let keys = vec!["P1".to_string(), "P2".to_string(), "P3".to_string(), "P4".to_string()];
     let sorted = db.sort_keys("PRODUCTS", false, keys.clone(), &specs);
     assert_eq!(sorted, vec!["P3", "P2", "P1", "P4"]);
 
     // Unknown sort field falls back to ID order without panicking
-    let (_, specs) = Database::parse_sort_specs(&["BY", "NOPE"]);
+    let (_, specs) = parse_sort_specs(&["BY", "NOPE"]);
     let sorted = db.sort_keys("PRODUCTS", false, keys.clone(), &specs);
     assert_eq!(sorted, vec!["P1", "P2", "P3", "P4"]);
 
     // ID is sortable directly
-    let (_, specs) = Database::parse_sort_specs(&["BY.DSND", "ID"]);
+    let (_, specs) = parse_sort_specs(&["BY.DSND", "ID"]);
     let sorted = db.sort_keys("PRODUCTS", false, keys, &specs);
     assert_eq!(sorted, vec!["P4", "P3", "P2", "P1"]);
 }
@@ -460,4 +468,210 @@ fn test_sort_value_case_folding_matches_lazy_folding() {
             assert_eq!(resolved, lazy, "{left:?} vs {right:?}");
         }
     }
+}
+
+#[test]
+fn test_parse_clause_specs_explode() {
+    // The compact spelling absorbs the operator and value that follow the field.
+    let (rest, sorts, explodes) = Database::parse_clause_specs(&["BY.EXP", "ACCOUNTS", "=", "\"TEST\"", "ACCOUNTS"]);
+    assert_eq!(rest, vec!["ACCOUNTS"]);
+    assert!(sorts.is_empty());
+    assert_eq!(explodes.len(), 1);
+    assert_eq!(explodes[0].field_name, "ACCOUNTS");
+    assert_eq!(
+        explodes[0].condition,
+        Some(QueryCondition { field_name: "ACCOUNTS".to_string(), op: "=".to_string(), value: "TEST".to_string() })
+    );
+
+    // A bare column name after the field is a column, not an operator.
+    let (rest, _, explodes) = Database::parse_clause_specs(&["BY.EXP", "ACCOUNTS", "NAME"]);
+    assert_eq!(rest, vec!["NAME"]);
+    assert_eq!(explodes.len(), 1);
+    assert_eq!(explodes[0].condition, None);
+
+    // Word-alias operators are recognised just as the symbols are.
+    let (rest, _, explodes) = Database::parse_clause_specs(&["BY.EXP", "ROLES", "EQ", "DEV"]);
+    assert!(rest.is_empty());
+    assert_eq!(explodes[0].condition.as_ref().unwrap().value, "DEV");
+
+    // Case-insensitive, and freely interleaved with sorts and columns.
+    let (rest, sorts, explodes) = Database::parse_clause_specs(&["NAME", "by.exp", "ROLES", "BY.DSND", "ROLES"]);
+    assert_eq!(rest, vec!["NAME"]);
+    assert_eq!(sorts, vec![SortSpec { field_name: "ROLES".to_string(), descending: true }]);
+    assert_eq!(explodes.len(), 1);
+
+    // A trailing operator with no field name is kept as a plain token.
+    let (rest, _, explodes) = Database::parse_clause_specs(&["NAME", "BY.EXP"]);
+    assert_eq!(rest, vec!["NAME", "BY.EXP"]);
+    assert!(explodes.is_empty());
+
+    // An operator with no value after it is not absorbed.
+    let (rest, _, explodes) = Database::parse_clause_specs(&["BY.EXP", "ROLES", "="]);
+    assert_eq!(rest, vec!["="]);
+    assert_eq!(explodes[0].condition, None);
+}
+
+#[test]
+fn test_parse_query_consuming_reports_its_end() {
+    let dir = TempDir::new("parse_query_consuming");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+
+    // The criteria end, and the columns after them are left to the caller.
+    let (node, consumed) = db.parse_query_consuming("T1", &["WITH", "NAME", "=", "Bob", "NAME", "EMAIL"]);
+    assert!(node.is_some());
+    assert_eq!(consumed, 4);
+
+    let (node, consumed) = db.parse_query_consuming("T1", &["WITH", "NAME", "=", "Bob", "AND", "AGE", ">", "20", "NAME"]);
+    assert!(matches!(node, Some(QueryNode::Logical { .. })));
+    assert_eq!(consumed, 8);
+
+    // A trailing AND with nothing after it stops the clause rather than
+    // swallowing the token.
+    let (node, consumed) = db.parse_query_consuming("T1", &["WITH", "NAME", "=", "Bob", "AND"]);
+    assert!(node.is_some());
+    assert_eq!(consumed, 4);
+
+    // Too short to be a condition at all.
+    assert_eq!(db.parse_query_consuming("T1", &["WITH", "NAME", "="]).1, 0);
+    assert!(db.parse_query_consuming("T1", &[]).0.is_none());
+}
+
+/// A file whose ROLES field is multivalued, and whose second record has a
+/// sub-valued role, so the tests below reach every level of the hierarchy. The
+/// guard is returned alongside the database so callers keep the directory alive
+/// for as long as they use it.
+fn roles_db(label: &str) -> (TempDir, Database) {
+    let dir = TempDir::new(label);
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_account("ACC", None).unwrap();
+    db.logto("ACC").unwrap();
+    db.create_table("USERS").unwrap();
+    let table = db.get_table_mut("USERS").unwrap();
+    table.dictionary.insert("NAME".to_string(), Record::from_display_string("1^NAME^L^15"));
+    table.dictionary.insert("ROLES".to_string(), Record::from_display_string("2^ROLES^L^20"));
+    table.records.insert("1".to_string(), Record::from_display_string("John^ADMIN]DEV]TEST"));
+    table.records.insert("2".to_string(), Record::from_display_string("Jane^DEV]TEST\\LAB"));
+    table.records.insert("3".to_string(), Record::from_display_string("Zed^SALES"));
+    table.mark_dict_dirty();
+    table.touch_all();
+    (dir, db)
+}
+
+#[test]
+fn test_query_exploded_matches_every_position() {
+    let (_dir, mut db) = roles_db("exploded_positions");
+
+    let query = db.parse_query("USERS", &["WITH", "ROLES", "=", "[TEST]"]).unwrap();
+    let explode = ExplodeSpec { field_name: "ROLES".to_string(), condition: None };
+    let table = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+
+    let rows = Database::query_exploded_in(table, false, Some(&query), Some(&explode), None);
+    let seen: Vec<(&str, Option<ValuePosition>)> =
+        rows.iter().map(|(e, _)| (e.key.as_str(), e.position)).collect();
+
+    // John's TEST is the third value; Jane's is the first sub-value of her
+    // second, so the position reaches down to the sub-value.
+    assert_eq!(seen, vec![
+        ("1", Some(ValuePosition::value(2))),
+        ("2", Some(ValuePosition::sub_value(1, 0))),
+    ]);
+
+}
+
+#[test]
+fn test_query_exploded_without_criterion_is_one_row_per_value() {
+    let (_dir, db) = roles_db("exploded_bare");
+    let explode = ExplodeSpec { field_name: "ROLES".to_string(), condition: None };
+    let table = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+
+    let rows = Database::query_exploded_in(table, false, None, Some(&explode), None);
+    let seen: Vec<(&str, Option<ValuePosition>)> =
+        rows.iter().map(|(e, _)| (e.key.as_str(), e.position)).collect();
+
+    // Every value gets a row, sub-values stay together, and a single-valued
+    // record still gets its one row.
+    assert_eq!(seen, vec![
+        ("1", Some(ValuePosition::value(0))),
+        ("1", Some(ValuePosition::value(1))),
+        ("1", Some(ValuePosition::value(2))),
+        ("2", Some(ValuePosition::value(0))),
+        ("2", Some(ValuePosition::value(1))),
+        ("3", Some(ValuePosition::value(0))),
+    ]);
+
+}
+
+#[test]
+fn test_query_exploded_unions_positions_across_conditions() {
+    let (_dir, mut db) = roles_db("exploded_union");
+
+    // Two conditions on the exploded field: both their positions become rows.
+    let query = db.parse_query("USERS", &["WITH", "ROLES", "=", "DEV", "OR", "ROLES", "=", "ADMIN"]).unwrap();
+    let explode = ExplodeSpec { field_name: "ROLES".to_string(), condition: None };
+    let table = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+
+    let rows = Database::query_exploded_in(table, false, Some(&query), Some(&explode), None);
+    let seen: Vec<(&str, Option<ValuePosition>)> =
+        rows.iter().map(|(e, _)| (e.key.as_str(), e.position)).collect();
+    assert_eq!(seen, vec![
+        ("1", Some(ValuePosition::value(0))),
+        ("1", Some(ValuePosition::value(1))),
+        ("2", Some(ValuePosition::value(0))),
+    ]);
+
+}
+
+#[test]
+fn test_query_exploded_keeps_records_matched_on_another_field() {
+    let (_dir, mut db) = roles_db("exploded_other_field");
+
+    // The criterion names NAME, not the exploded ROLES. Inclusion is still the
+    // query's decision, so the record survives - as one unexploded row.
+    let query = db.parse_query("USERS", &["WITH", "NAME", "=", "Zed"]).unwrap();
+    let explode = ExplodeSpec { field_name: "ROLES".to_string(), condition: None };
+    let table = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+
+    let rows = Database::query_exploded_in(table, false, Some(&query), Some(&explode), None);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0.key, "3");
+    assert_eq!(rows[0].0.position, Some(ValuePosition::value(0)));
+
+}
+
+#[test]
+fn test_query_exploded_without_spec_is_an_ordinary_selection() {
+    let (_dir, mut db) = roles_db("exploded_none");
+    let query = db.parse_query("USERS", &["WITH", "ROLES", "=", "[TEST]"]).unwrap();
+    let table = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+
+    let rows = Database::query_exploded_in(table, false, Some(&query), None, None);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|(e, _)| e.position.is_none()));
+
+    // An unknown explode field is no explode at all rather than an error.
+    let unknown = ExplodeSpec { field_name: "NOPE".to_string(), condition: None };
+    let rows = Database::query_exploded_in(table, false, Some(&query), Some(&unknown), None);
+    assert!(rows.iter().all(|(e, _)| e.position.is_none()));
+
+}
+
+#[test]
+fn test_sort_entries_uses_the_exploded_value() {
+    let (_dir, db) = roles_db("sort_entries");
+    let explode = ExplodeSpec { field_name: "ROLES".to_string(), condition: None };
+    let table = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+
+    let mut rows = Database::query_exploded_in(table, false, None, Some(&explode), None);
+    let explode_idx = Database::explode_field_index(table, Some(&explode));
+    assert_eq!(explode_idx, Some(1));
+    let specs = vec![SortSpec { field_name: "ROLES".to_string(), descending: false }];
+    Database::sort_entries_in(table, &mut rows, &specs, explode_idx);
+
+    // Ordered by each row's own value, not by the whole joined field - which
+    // would have kept every one of record 1's rows together.
+    let values: Vec<String> = rows.iter()
+        .map(|(e, r)| r.get_value_display_string(1, e.position))
+        .collect();
+    assert_eq!(values, vec!["ADMIN", "DEV", "DEV", "SALES", "TEST", "TEST\\LAB"]);
+
 }

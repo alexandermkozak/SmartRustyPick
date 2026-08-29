@@ -70,95 +70,126 @@ impl Database {
 
     /// Parsing needs nothing from the database; this variant exists so a caller
     /// holding only a shared reference can build a query too.
-    pub fn parse_query_read_only(&self, _table_name: &str, parts: &[&str]) -> Option<QueryNode> {
-        // Simple parser for WITH <field> <op> <value> [AND/OR <field> <op> <value> ...]
-        if parts.is_empty() { return None; }
-        let mut start_idx = 0;
-        if parts[0].to_uppercase() == "WITH" {
-            start_idx = 1;
-        }
-
-        let mut i = start_idx;
-        let mut current_node: Option<QueryNode> = None;
-
-        while i < parts.len() {
-            if i + 2 >= parts.len() { break; }
-
-            let field_name = parts[i];
-            let op = parts[i + 1];
-            let mut value = parts[i + 2].to_string();
-            if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-                value = value[1..value.len() - 1].to_string();
-            }
-            let value = value.trim().to_string();
-
-            let condition = QueryNode::Condition(QueryCondition {
-                field_name: field_name.to_string(),
-                op: op.to_string(),
-                value,
-            });
-
-            match current_node {
-                None => {
-                    current_node = Some(condition);
-                    i += 3;
-                }
-                Some(_) => {
-                    // This shouldn't happen without a logical op
-                    return None;
-                }
-            }
-
-            // Check for logical operator
-            while i < parts.len() {
-                let logical_op_str = parts[i].to_uppercase();
-                let logical_op = match logical_op_str.as_str() {
-                    "AND" => LogicalOp::And,
-                    "OR" => LogicalOp::Or,
-                    _ => break, // End of query or unknown
-                };
-                i += 1;
-
-                // Parse next condition
-                if i + 2 >= parts.len() { break; }
-                let field_name = parts[i];
-                let op = parts[i + 1];
-                let mut value = parts[i + 2].to_string();
-                if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-                    value = value[1..value.len() - 1].to_string();
-                }
-                let value = value.trim().to_string();
-                let next_condition = QueryNode::Condition(QueryCondition {
-                    field_name: field_name.to_string(),
-                    op: op.to_string(),
-                    value,
-                });
-
-                current_node = Some(QueryNode::Logical {
-                    op: logical_op,
-                    left: Box::new(current_node.unwrap()),
-                    right: Box::new(next_condition),
-                });
-                i += 3;
-            }
-        }
-
-        current_node
+    pub fn parse_query_read_only(&self, table_name: &str, parts: &[&str]) -> Option<QueryNode> {
+        self.parse_query_consuming(table_name, parts).0
     }
 
-    /// Splits a clause list into the non-sort tokens and the parsed sort specs.
-    /// Sort operators are `BY` (ascending) and `BY.DSND` (descending), each followed by a field name.
-    /// Any number of them may be present, anywhere in the clause, and they are applied from left to
-    /// right. Tokens that are not part of a sort operator keep their relative order, so sort and
-    /// column specifiers may be freely interleaved.
-    pub fn parse_sort_specs<'a>(parts: &[&'a str]) -> (Vec<&'a str>, Vec<SortSpec>) {
+    /// Parses `WITH <field> <op> <value> [AND|OR <field> <op> <value> ...]` and
+    /// reports how many tokens it consumed.
+    ///
+    /// The count is what lets `LIST USERS WITH NAME = "Bob" NAME EMAIL` work:
+    /// the criteria run out, and everything after them is a column list rather
+    /// than a malformed condition.
+    pub fn parse_query_consuming(&self, _table_name: &str, parts: &[&str]) -> (Option<QueryNode>, usize) {
+        if parts.is_empty() { return (None, 0); }
+        let mut i = if parts[0].to_uppercase() == "WITH" { 1 } else { 0 };
+
+        // A condition is three tokens; anything shorter is not a clause.
+        if i + 3 > parts.len() { return (None, 0); }
+
+        let mut current_node = QueryNode::Condition(QueryCondition {
+            field_name: parts[i].to_string(),
+            op: parts[i + 1].to_string(),
+            value: unquote(parts[i + 2]),
+        });
+        i += 3;
+
+        while i < parts.len() {
+            let logical_op = match parts[i].to_uppercase().as_str() {
+                "AND" => LogicalOp::And,
+                "OR" => LogicalOp::Or,
+                // Not a logical operator: the clause ends here, and whatever
+                // follows belongs to the caller.
+                _ => break,
+            };
+            if i + 4 > parts.len() {
+                // A trailing AND/OR with no condition after it. Leave the token
+                // to the caller rather than silently swallowing it.
+                break;
+            }
+            let next_condition = QueryNode::Condition(QueryCondition {
+                field_name: parts[i + 1].to_string(),
+                op: parts[i + 2].to_string(),
+                value: unquote(parts[i + 3]),
+            });
+            current_node = QueryNode::Logical {
+                op: logical_op,
+                left: Box::new(current_node),
+                right: Box::new(next_condition),
+            };
+            i += 4;
+        }
+
+        (Some(current_node), i)
+    }
+
+    /// `AND`s a condition absorbed from a `BY.EXP` clause onto whatever the
+    /// `WITH` clause parsed, so the compact spelling filters exactly as the
+    /// explicit one does.
+    pub fn and_condition(node: Option<QueryNode>, condition: Option<QueryCondition>) -> Option<QueryNode> {
+        let condition = QueryNode::Condition(condition?);
+        Some(match node {
+            Some(existing) => QueryNode::Logical {
+                op: LogicalOp::And,
+                left: Box::new(existing),
+                right: Box::new(condition),
+            },
+            None => condition,
+        })
+    }
+
+    /// Splits a clause list into the non-clause tokens, the sort specs and the
+    /// explode specs.
+    ///
+    /// Sort operators are `BY` (ascending) and `BY.DSND` (descending), each
+    /// followed by a field name. `BY.EXP` is the explode operator: it names a
+    /// multivalued field whose values become one output row each. Where
+    /// `BY.EXP <field>` is followed by a recognised comparison operator, the
+    /// `<op> <value>` after it is absorbed as a selection criterion, so the
+    /// compact `BY.EXP ACCOUNTS = "TEST"` and the explicit
+    /// `BY.EXP ACCOUNTS WITH ACCOUNTS = "TEST"` both work. The operator set is
+    /// closed, so `BY.EXP ACCOUNTS NAME` still reads `NAME` as a column.
+    ///
+    /// Any number of operators may be present, anywhere in the clause, and they
+    /// are applied from left to right. Tokens that are not part of one keep
+    /// their relative order, so sort, explode and column specifiers may be
+    /// freely interleaved.
+    pub fn parse_clause_specs<'a>(parts: &[&'a str]) -> (Vec<&'a str>, Vec<SortSpec>, Vec<ExplodeSpec>) {
         let mut remaining = Vec::new();
         let mut specs = Vec::new();
+        let mut explodes = Vec::new();
         let mut i = 0;
         while i < parts.len() {
-            let descending = match parts[i].to_uppercase().as_str() {
+            let upper = parts[i].to_uppercase();
+            let descending = match upper.as_str() {
                 "BY" => false,
                 "BY.DSND" => true,
+                "BY.EXP" => {
+                    if i + 1 >= parts.len() {
+                        // Trailing operator without a field name: keep the token
+                        // so it is not lost.
+                        remaining.push(parts[i]);
+                        i += 1;
+                        continue;
+                    }
+                    let field_name = parts[i + 1].to_string();
+                    i += 2;
+                    // Absorb a trailing `<op> <value>` when the next token is
+                    // unambiguously an operator.
+                    let condition = if i + 1 < parts.len() && is_comparison_op(parts[i]) {
+                        let cond = QueryCondition {
+                            field_name: field_name.clone(),
+                            op: parts[i].to_string(),
+                            value: unquote(parts[i + 1]),
+                        };
+                        i += 2;
+                        Some(cond)
+                    } else {
+                        None
+                    };
+                    explodes.push(ExplodeSpec { field_name, condition });
+                    continue;
+                }
                 _ => {
                     remaining.push(parts[i]);
                     i += 1;
@@ -177,7 +208,7 @@ impl Database {
             });
             i += 2;
         }
-        (remaining, specs)
+        (remaining, specs, explodes)
     }
 
     pub fn sort_results(&mut self, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
@@ -238,6 +269,20 @@ impl Database {
 
     /// Builds the pre-calculated sort values of a single record, one per sort spec.
     fn sort_key_for(id: &str, record: &Record, resolved: &[(Option<usize>, bool)]) -> Vec<SortValue> {
+        Self::sort_key_at(id, record, resolved, None, None)
+    }
+
+    /// Same, for one row of an exploded result. A spec naming the exploded
+    /// field (`explode_idx`) sorts on that row's own value rather than on the
+    /// whole joined field, so `BY.EXP ACCOUNTS BY ACCOUNTS` orders the rows the
+    /// way the reader expects.
+    fn sort_key_at(
+        id: &str,
+        record: &Record,
+        resolved: &[(Option<usize>, bool)],
+        explode_idx: Option<usize>,
+        position: Option<ValuePosition>,
+    ) -> Vec<SortValue> {
         resolved
             .iter()
             .map(|(idx, _)| match idx {
@@ -245,9 +290,38 @@ impl Database {
                 // An unknown field compares equal, so `sorted_order` skips it
                 // entirely; there is nothing to resolve.
                 Some(i) if *i == usize::MAX => SortValue::default(),
+                Some(i) if Some(*i) == explode_idx => {
+                    SortValue::new(&record.get_value_display_string(*i, position))
+                }
                 Some(i) => SortValue::new(&record.get_field_display_string(*i)),
             })
             .collect()
+    }
+
+    /// Sorts the rows of an exploded result set. Rows arrive in key order and,
+    /// within a key, in value-position order; a `BY` / `BY.DSND` spec reorders
+    /// them, resolving the exploded column per row.
+    pub fn sort_entries_in<T: std::borrow::Borrow<Record>>(
+        table: &Table,
+        rows: &mut Vec<(SelectEntry, T)>,
+        specs: &[SortSpec],
+        explode_idx: Option<usize>,
+    ) {
+        if specs.is_empty() { return; }
+
+        let resolved = Self::resolve_sort_fields(table, specs);
+
+        let sort_keys: Vec<Vec<SortValue>> = rows
+            .iter()
+            .map(|(entry, record)| {
+                Self::sort_key_at(&entry.key, record.borrow(), &resolved, explode_idx, entry.position)
+            })
+            .collect();
+
+        let order = Self::sorted_order(&sort_keys, &resolved, |i| rows[i].0.key.as_str());
+
+        let mut taken: Vec<Option<(SelectEntry, T)>> = rows.drain(..).map(Some).collect();
+        rows.extend(order.into_iter().map(|i| taken[i].take().unwrap()));
     }
 
     /// Sorts indices `0..sort_keys.len()` by the pre-calculated values, falling back to the ID.
@@ -364,6 +438,168 @@ impl Database {
     }
 
 
+    /// Runs `query` (if any) and expands each surviving record into one entry
+    /// per exploded position.
+    ///
+    /// Record inclusion is decided exactly as it always was, by evaluating the
+    /// whole node. The positions are collected separately, so a record kept by
+    /// an `AND` over two fields still explodes only on the field `BY.EXP` named.
+    /// With no explode spec this degenerates to [`query_in`](Self::query_in)
+    /// with a `None` position on every entry, which is what an ordinary
+    /// selection has always produced.
+    ///
+    /// Returns borrowed records, so a caller holding the database lock does not
+    /// pay for a clone of every match.
+    pub fn query_exploded_in<'a>(
+        table: &'a Table,
+        use_dict_section: bool,
+        query: Option<&QueryNode>,
+        explode: Option<&ExplodeSpec>,
+        keys_to_filter: Option<&[String]>,
+    ) -> Vec<(SelectEntry, &'a Record)> {
+        let matches: Vec<(String, &Record)> = match query {
+            Some(q) => Self::query_in(table, use_dict_section, q, keys_to_filter),
+            None => Self::all_in(table, use_dict_section, keys_to_filter),
+        };
+
+        let resolved = explode.and_then(|spec| {
+            let (index, _) = table.field_index_and_conversion(&spec.field_name)?;
+            let mut conditions = Vec::new();
+            if let Some(q) = query {
+                Self::collect_conditions_for(q, &spec.field_name, &mut conditions);
+            }
+            Some((index, conditions))
+        });
+
+        let Some((index, conditions)) = resolved else {
+            return matches
+                .into_iter()
+                .map(|(key, record)| (SelectEntry::new(key), record))
+                .collect();
+        };
+
+        // Resolve the exploded field's conversion once, rather than per record.
+        let mut field_map = HashMap::new();
+        if let Some(q) = query {
+            Self::collect_field_indices(table, q, &mut field_map);
+        }
+
+        let mut results = Vec::new();
+        let mut positions = Vec::new();
+        for (key, record) in matches {
+            positions.clear();
+            Self::collect_positions(record, index, &conditions, &field_map, &mut positions);
+            if positions.is_empty() {
+                // Either the field is absent, or the record was kept by a
+                // condition on some other field. Keep it as one unexploded row:
+                // inclusion is the query's decision, not the explode clause's.
+                results.push((SelectEntry::new(key), record));
+            } else {
+                for position in &positions {
+                    results.push((SelectEntry::at(key.clone(), *position), record));
+                }
+            }
+        }
+        results
+    }
+
+    /// The field index an exploded list's positions refer to, so a `BY` spec
+    /// naming that field can sort on the row's own value rather than on the
+    /// whole joined field.
+    pub fn explode_field_index(table: &Table, explode: Option<&ExplodeSpec>) -> Option<usize> {
+        let spec = explode?;
+        table.field_index(&spec.field_name)
+    }
+
+    /// Every key of the section, filtered to `keys_to_filter` when given, in the
+    /// same key order [`query_in`](Self::query_in) produces.
+    fn all_in<'a>(table: &'a Table, use_dict_section: bool, keys_to_filter: Option<&[String]>) -> Vec<(String, &'a Record)> {
+        let source_map = if use_dict_section { &table.dictionary } else { &table.records };
+        match keys_to_filter {
+            Some(filter_keys) => filter_keys
+                .iter()
+                .filter_map(|key| source_map.get_key_value(key).map(|(k, r)| (k.clone(), r)))
+                .collect(),
+            None => {
+                let mut all: Vec<(String, &Record)> = source_map.iter().map(|(k, r)| (k.clone(), r)).collect();
+                all.sort_by(|a, b| a.0.cmp(&b.0));
+                all
+            }
+        }
+    }
+
+    /// Gathers every condition in the node that names `field_name`, regardless
+    /// of how the node combines them. The positions they match are unioned, so
+    /// `WITH ACCOUNTS = "TEST" OR ACCOUNTS = "DEV"` explodes on both.
+    fn collect_conditions_for<'q>(node: &'q QueryNode, field_name: &str, out: &mut Vec<&'q QueryCondition>) {
+        match node {
+            QueryNode::Condition(cond) => {
+                if cond.field_name == field_name {
+                    out.push(cond);
+                }
+            }
+            QueryNode::Logical { left, right, .. } => {
+                Self::collect_conditions_for(left, field_name, out);
+                Self::collect_conditions_for(right, field_name, out);
+            }
+        }
+    }
+
+    /// The positions of `field_idx` that satisfy any of `conditions`, in field
+    /// order and without duplicates.
+    ///
+    /// With no conditions every value is a position, which is how a bare
+    /// `BY.EXP <field>` explodes a record into one row per value. Unlike
+    /// [`evaluate_node_static_with_id`](Self::evaluate_node_static_with_id)
+    /// this deliberately does not short-circuit: every match is a row.
+    pub(crate) fn collect_positions(
+        record: &Record,
+        field_idx: usize,
+        conditions: &[&QueryCondition],
+        field_map: &HashMap<String, FieldQueryInfo>,
+        out: &mut Vec<ValuePosition>,
+    ) {
+        let Some(field) = record.fields.get(field_idx) else { return };
+
+        if conditions.is_empty() {
+            out.extend((0..field.values.len()).map(ValuePosition::value));
+            return;
+        }
+
+        // Input conversion of each search value is resolved once for the field.
+        let search_vals: Vec<String> = conditions
+            .iter()
+            .map(|cond| match field_map.get(&cond.field_name).and_then(|i| i.conversion.as_ref()) {
+                Some(code) => Self::apply_iconv(&cond.value, code),
+                None => cond.value.clone(),
+            })
+            .collect();
+
+        for (v_idx, value) in field.values.iter().enumerate() {
+            // A value with one sub-value is an ordinary value, not a sub-valued
+            // one, so it reports as a plain value position.
+            if value.sub_values.len() <= 1 {
+                let text = value.sub_values.first().map(String::as_str).unwrap_or("");
+                if Self::any_condition_matches(text, conditions, &search_vals) {
+                    push_unique(out, ValuePosition::value(v_idx));
+                }
+                continue;
+            }
+            for (sv_idx, sub) in value.sub_values.iter().enumerate() {
+                if Self::any_condition_matches(sub, conditions, &search_vals) {
+                    push_unique(out, ValuePosition::sub_value(v_idx, sv_idx));
+                }
+            }
+        }
+    }
+
+    fn any_condition_matches(text: &str, conditions: &[&QueryCondition], search_vals: &[String]) -> bool {
+        conditions
+            .iter()
+            .zip(search_vals)
+            .any(|(cond, search)| Self::compare_values(text, &cond.op, search))
+    }
+
     pub(crate) fn collect_field_indices(table: &Table, node: &QueryNode, map: &mut HashMap<String, FieldQueryInfo>) {
         match node {
             QueryNode::Condition(cond) => {
@@ -459,5 +695,32 @@ impl Database {
             ">=" | "GE" => record_val >= search_val,
             _ => false,
         }
+    }
+}
+
+/// The comparison operators [`compare_values`](Database::compare_values)
+/// understands. `BY.EXP <field>` only absorbs a criterion when the token after
+/// the field name is one of these, which is what keeps a bare column name after
+/// an explode readable as a column.
+pub fn is_comparison_op(token: &str) -> bool {
+    matches!(
+        token.to_uppercase().as_str(),
+        "=" | "EQ" | "!=" | "#" | "<>" | "NE" | "<" | "LT" | ">" | "GT" | "<=" | "LE" | ">=" | "GE"
+    )
+}
+
+/// Strips one layer of surrounding double quotes from a clause value.
+pub fn unquote(raw: &str) -> String {
+    let value = if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    value.trim().to_string()
+}
+
+fn push_unique(out: &mut Vec<ValuePosition>, pos: ValuePosition) {
+    if !out.contains(&pos) {
+        out.push(pos);
     }
 }

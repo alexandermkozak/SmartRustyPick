@@ -85,3 +85,51 @@ fn test_table_new() {
     assert_eq!(table.dictionary.len(), 0);
     assert!(!table.is_dirty());
 }
+
+#[test]
+fn test_get_value_display_string() {
+    let record = Record::from_display_string("John^ADMIN]DEV]TEST\\LAB");
+
+    // No position is the whole field, exactly as get_field_display_string.
+    assert_eq!(record.get_value_display_string(1, None), "ADMIN]DEV]TEST\\LAB");
+    assert_eq!(record.get_value_display_string(1, None), record.get_field_display_string(1));
+
+    // A value position takes one value, sub-values still joined.
+    assert_eq!(record.get_value_display_string(1, Some(ValuePosition::value(0))), "ADMIN");
+    assert_eq!(record.get_value_display_string(1, Some(ValuePosition::value(2))), "TEST\\LAB");
+
+    // A sub-value position reaches one level deeper.
+    assert_eq!(record.get_value_display_string(1, Some(ValuePosition::sub_value(2, 1))), "LAB");
+
+    // Out of range renders empty rather than panicking, so a select list that
+    // outlived an edit to its records degrades quietly.
+    assert_eq!(record.get_value_display_string(1, Some(ValuePosition::value(9))), "");
+    assert_eq!(record.get_value_display_string(1, Some(ValuePosition::sub_value(0, 9))), "");
+    assert_eq!(record.get_value_display_string(9, Some(ValuePosition::value(0))), "");
+    assert_eq!(record.get_value_display_string(9, None), "");
+}
+
+#[test]
+fn test_select_list_keys() {
+    let list = SelectList {
+        table_name: "USERS".to_string(),
+        is_dict: false,
+        explode_field: Some("ROLES".to_string()),
+        entries: vec![
+            SelectEntry::at("1".to_string(), ValuePosition::value(0)),
+            SelectEntry::at("1".to_string(), ValuePosition::value(2)),
+            SelectEntry::at("2".to_string(), ValuePosition::sub_value(1, 0)),
+        ],
+    };
+
+    // An exploded list repeats a key once per position...
+    assert_eq!(list.keys().collect::<Vec<_>>(), vec!["1", "1", "2"]);
+    assert_eq!(list.len(), 3);
+    // ...but the commands that act on records want each record once.
+    assert_eq!(list.unique_keys(), vec!["1".to_string(), "2".to_string()]);
+
+    let plain = SelectList::from_keys("USERS".to_string(), false, vec!["1".to_string(), "2".to_string()]);
+    assert!(plain.explode_field.is_none());
+    assert!(plain.entries.iter().all(|e| e.position.is_none()));
+    assert!(!plain.is_empty());
+}
