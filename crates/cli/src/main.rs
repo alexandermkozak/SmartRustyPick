@@ -2,7 +2,7 @@ use smart_rusty_pick_core::config::Config;
 use smart_rusty_pick_core::db::{Database, Record};
 use smart_rusty_pick_core::server;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -24,7 +24,7 @@ fn main() -> io::Result<()> {
     let config_arc = Arc::new(config.clone());
 
     // We use a directory "db_storage" to hold our tables
-    let db = Arc::new(Mutex::new(Database::new(&db_dir, Some(config.clone()))?));
+    let db = Arc::new(RwLock::new(Database::new(&db_dir, Some(config.clone()))?));
 
     // Check if server should be auto-started in background for CLI
     if config.cert_path.is_some() && config.key_path.is_some() && config.ca_path.is_some() {
@@ -52,13 +52,13 @@ fn main() -> io::Result<()> {
 
     // Auto-login based on current directory
     let auto_account = {
-        let db_lock = db.lock().unwrap();
+        let db_lock = db.read().unwrap();
         let current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         db_lock.get_account_for_dir(current_dir.to_str().unwrap_or("."))
     };
 
     if let Some(account_name) = auto_account {
-        let mut db_lock = db.lock().unwrap();
+        let mut db_lock = db.write().unwrap();
         let acc_to_log = account_name.clone();
         if db_lock.logto(&acc_to_log).is_ok() {
             println!("Auto-logged into account '{}' based on current directory.", account_name);
@@ -69,7 +69,7 @@ fn main() -> io::Result<()> {
     // Account login prompt if not logged in
     loop {
         {
-            let db_lock = db.lock().unwrap();
+            let db_lock = db.read().unwrap();
             if !db_lock.current_account.is_empty() {
                 break;
             }
@@ -91,7 +91,7 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        let mut db_lock = db.lock().unwrap();
+        let mut db_lock = db.write().unwrap();
         if let Err(e) = db_lock.logto(&account_name) {
             let msg = format!("Login error: {}", e);
             let _ = db_lock.log_error("CLI", &msg);
@@ -116,7 +116,7 @@ fn main() -> io::Result<()> {
 
     loop {
         let prompt = {
-            let db_lock = db.lock().unwrap();
+            let db_lock = db.read().unwrap();
             let acc = db_lock.current_account.clone();
             if acc.is_empty() {
                 "PICK> ".to_string()
@@ -143,42 +143,42 @@ fn main() -> io::Result<()> {
 
         match command.as_str() {
             "SET" => {
-                handle_set(&mut db.lock().unwrap(), &parts);
+                handle_set(&mut db.write().unwrap(), &parts);
             }
             "GET" => {
-                handle_get(&mut db.lock().unwrap(), &parts);
+                handle_get(&mut db.write().unwrap(), &parts);
             }
             "DELETE" => {
-                handle_delete(&mut db.lock().unwrap(), &parts);
+                handle_delete(&mut db.write().unwrap(), &parts);
             }
             "LIST" => {
-                handle_list(&mut db.lock().unwrap(), &parts);
+                handle_list(&mut db.write().unwrap(), &parts);
             }
             "SELECT" => {
-                handle_select(&mut db.lock().unwrap(), &parts);
+                handle_select(&mut db.write().unwrap(), &parts);
             }
             "EDIT" => {
-                handle_edit(&mut db.lock().unwrap(), &parts, &config);
+                handle_edit(&mut db.write().unwrap(), &parts, &config);
             }
             "CT" => {
-                handle_ct(&mut db.lock().unwrap(), &parts);
+                handle_ct(&mut db.write().unwrap(), &parts);
             }
             "SAVE-LIST" => {
-                handle_save_list(&mut db.lock().unwrap(), &parts);
+                handle_save_list(&mut db.write().unwrap(), &parts);
             }
             "GET-LIST" => {
-                handle_get_list(&mut db.lock().unwrap(), &parts);
+                handle_get_list(&mut db.write().unwrap(), &parts);
             }
             "CREATE.FILE" => {
-                let mut db_lock = db.lock().unwrap();
+                let mut db_lock = db.write().unwrap();
                 handle_create_file(&mut db_lock, &parts);
             }
             "DELETE.FILE" => {
-                let mut db_lock = db.lock().unwrap();
+                let mut db_lock = db.write().unwrap();
                 handle_delete_file(&mut db_lock, &parts);
             }
             "CREATE.ACCOUNT" => {
-                let mut db_lock = db.lock().unwrap();
+                let mut db_lock = db.write().unwrap();
                 if db_lock.current_account == "SYSTEM" {
                     handle_create_account(&mut db_lock, &parts);
                 } else {
@@ -186,7 +186,7 @@ fn main() -> io::Result<()> {
                 }
             }
             "CREATE.TEST.ACCOUNT" => {
-                let mut db_lock = db.lock().unwrap();
+                let mut db_lock = db.write().unwrap();
                 if db_lock.current_account == "SYSTEM" {
                     handle_create_test_account(&mut db_lock, &parts);
                 } else {
@@ -194,7 +194,7 @@ fn main() -> io::Result<()> {
                 }
             }
             "DELETE.ACCOUNT" => {
-                let mut db_lock = db.lock().unwrap();
+                let mut db_lock = db.write().unwrap();
                 if db_lock.current_account == "SYSTEM" {
                     handle_delete_account(&mut db_lock, &parts);
                 } else {
@@ -202,15 +202,15 @@ fn main() -> io::Result<()> {
                 }
             }
             "LOGTO" => {
-                let mut db_lock = db.lock().unwrap();
+                let mut db_lock = db.write().unwrap();
                 handle_logto(&mut db_lock, &parts);
                 let _ = check_dir_file(&mut db_lock);
             }
             "LIST.FILES" => {
-                handle_list_files(&mut db.lock().unwrap());
+                handle_list_files(&mut db.write().unwrap());
             }
             "AUTHORIZE.CONN" => {
-                let mut db_lock = db.lock().unwrap();
+                let mut db_lock = db.write().unwrap();
                 if db_lock.current_account == "SYSTEM" {
                     handle_authorize_conn(&mut db_lock, &parts);
                 } else {
@@ -218,7 +218,7 @@ fn main() -> io::Result<()> {
                 }
             }
             "ADD.CLIENT.ACCOUNT" => {
-                let mut db_lock = db.lock().unwrap();
+                let mut db_lock = db.write().unwrap();
                 if db_lock.current_account == "SYSTEM" {
                     handle_add_client_account(&mut db_lock, &parts);
                 } else {
@@ -226,7 +226,7 @@ fn main() -> io::Result<()> {
                 }
             }
             "REMOVE.CLIENT.ACCOUNT" => {
-                let mut db_lock = db.lock().unwrap();
+                let mut db_lock = db.write().unwrap();
                 if db_lock.current_account == "SYSTEM" {
                     handle_remove_client_account(&mut db_lock, &parts);
                 } else {
@@ -234,7 +234,7 @@ fn main() -> io::Result<()> {
                 }
             }
             "DEAUTHORIZE.CONN" => {
-                let mut db_lock = db.lock().unwrap();
+                let mut db_lock = db.write().unwrap();
                 if db_lock.current_account == "SYSTEM" {
                     handle_deauthorize_conn(&mut db_lock, &parts);
                 } else {
@@ -242,7 +242,7 @@ fn main() -> io::Result<()> {
                 }
             }
             "LIST.CONNS" => {
-                let mut db_lock = db.lock().unwrap();
+                let mut db_lock = db.write().unwrap();
                 if db_lock.current_account == "SYSTEM" {
                     handle_list_conns(&mut db_lock);
                 } else {
@@ -250,7 +250,7 @@ fn main() -> io::Result<()> {
                 }
             }
             "GENERATE.CERT" => {
-                let mut db_lock = db.lock().unwrap();
+                let mut db_lock = db.write().unwrap();
                 if db_lock.current_account == "SYSTEM" {
                     handle_generate_cert(&mut db_lock, &parts, &config);
                 } else {
@@ -261,11 +261,11 @@ fn main() -> io::Result<()> {
                 handle_start_server(db.clone(), &parts, config_arc.clone());
             }
             "SAVE" => {
-                db.lock().unwrap().save()?;
+                db.write().unwrap().save()?;
                 println!("OK");
             }
             "HELP" => {
-                let db_lock = db.lock().unwrap();
+                let db_lock = db.read().unwrap();
                 print_help(&db_lock.current_account);
             }
             "EXIT" | "QUIT" => break,
@@ -274,7 +274,7 @@ fn main() -> io::Result<()> {
     }
 
     // Auto-save on exit
-    db.lock().unwrap().save()?;
+    db.write().unwrap().save()?;
     Ok(())
 }
 
@@ -1393,7 +1393,7 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
     }
 }
 
-fn handle_start_server(db: Arc<Mutex<Database>>, parts: &[&str], config: Arc<Config>) {
+fn handle_start_server(db: Arc<RwLock<Database>>, parts: &[&str], config: Arc<Config>) {
     let mut offset = 1;
     let mut addr = "127.0.0.1".to_string();
 

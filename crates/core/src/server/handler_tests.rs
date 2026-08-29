@@ -3,7 +3,7 @@ use crate::server::handler::handle_request;
 use crate::server::models::Request;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 #[test]
 fn test_handle_request_read_write() {
@@ -12,7 +12,7 @@ fn test_handle_request_read_write() {
     let mut db = Database::new(base_dir, None).unwrap();
     db.create_test_account("SERVER_TEST").unwrap();
 
-    let db_arc = Arc::new(Mutex::new(db));
+    let db_arc = Arc::new(RwLock::new(db));
     let client_info = ClientInfo {
         thumbprint: "test_tp".to_string(),
         allowed_accounts: vec!["SERVER_TEST".to_string()],
@@ -72,7 +72,7 @@ fn test_create_and_delete_file_target_the_requested_account() {
     db.create_account("FILE_TEST", None).unwrap();
     db.current_account = String::new();
 
-    let db_arc = Arc::new(Mutex::new(db));
+    let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
@@ -149,7 +149,7 @@ fn test_create_file_durable_flag_is_honoured() {
     db.flush_max_pending = 1_000;
     db.flush_interval = std::time::Duration::from_secs(3_600);
 
-    let db_arc = Arc::new(Mutex::new(db));
+    let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
@@ -185,12 +185,12 @@ fn test_create_file_durable_flag_is_honoured() {
     );
 
     assert_eq!(write("SCRATCH").status, "OK");
-    assert!(db_arc.lock().unwrap().has_pending_writes(), "a normal file should be buffered");
+    assert!(db_arc.read().unwrap().has_pending_writes(), "a normal file should be buffered");
 
     assert_eq!(write("LEDGER").status, "OK");
-    assert!(!db_arc.lock().unwrap().has_pending_writes(), "a durable file must flush at once");
-    assert!(db_arc.lock().unwrap().is_table_durable_for_account("DUR_TEST", "LEDGER"));
-    assert!(!db_arc.lock().unwrap().is_table_durable_for_account("DUR_TEST", "SCRATCH"));
+    assert!(!db_arc.read().unwrap().has_pending_writes(), "a durable file must flush at once");
+    assert!(db_arc.write().unwrap().is_table_durable_for_account("DUR_TEST", "LEDGER"));
+    assert!(!db_arc.write().unwrap().is_table_durable_for_account("DUR_TEST", "SCRATCH"));
 
     fs::remove_dir_all(base_dir).unwrap();
 }
@@ -203,7 +203,7 @@ fn test_handle_request_query_select() {
     db.create_test_account("QUERY_TEST").unwrap();
     db.logto("QUERY_TEST").unwrap();
 
-    let db_arc = Arc::new(Mutex::new(db));
+    let db_arc = Arc::new(RwLock::new(db));
     let client_info = ClientInfo {
         thumbprint: "test_tp".to_string(),
         allowed_accounts: vec!["QUERY_TEST".to_string()],

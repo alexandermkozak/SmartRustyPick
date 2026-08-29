@@ -9,7 +9,13 @@ pub struct FieldQueryInfo {
 }
 
 impl Database {
-    pub fn parse_query(&mut self, _table_name: &str, parts: &[&str]) -> Option<QueryNode> {
+    pub fn parse_query(&mut self, table_name: &str, parts: &[&str]) -> Option<QueryNode> {
+        self.parse_query_read_only(table_name, parts)
+    }
+
+    /// Parsing needs nothing from the database; this variant exists so a caller
+    /// holding only a shared reference can build a query too.
+    pub fn parse_query_read_only(&self, _table_name: &str, parts: &[&str]) -> Option<QueryNode> {
         // Simple parser for WITH <field> <op> <value> [AND/OR <field> <op> <value> ...]
         if parts.is_empty() { return None; }
         let mut start_idx = 0;
@@ -126,30 +132,47 @@ impl Database {
 
     pub fn sort_results_for_account(&mut self, account: &str, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
         if specs.is_empty() { return; }
+        let _ = self.get_table_mut_for_account(account, table_name);
+        let table = match self.get_table_read_only_for_account(account, table_name) {
+            Some(t) => t,
+            None => return,
+        };
+        Self::sort_results_in(table, results, specs);
+    }
 
-        let resolved = self.resolve_sort_fields(account, table_name, specs);
+    /// Same as [`sort_results_for_account`], but for a caller that has already
+    /// resolved the table, so no lookup is repeated here. Unknown fields compare
+    /// equal, so they simply leave the order untouched.
+    ///
+    /// Generic over `T: Borrow<Record>` so it works both for owned results and
+    /// for the borrowed records returned by [`query_in`](Self::query_in),
+    /// without cloning.
+    pub fn sort_results_in<T: std::borrow::Borrow<Record>>(table: &Table, results: &mut Vec<(String, T)>, specs: &[SortSpec]) {
+        if specs.is_empty() { return; }
+
+        let resolved = Self::resolve_sort_fields(table, specs);
 
         // Pre-calculate the sort values once per record instead of on every comparison.
         let sort_keys: Vec<Vec<String>> = results
             .iter()
-            .map(|(id, record)| Self::sort_key_for(id, record, &resolved))
+            .map(|(id, record)| Self::sort_key_for(id, record.borrow(), &resolved))
             .collect();
 
         let order = Self::sorted_order(&sort_keys, &resolved, |i| results[i].0.as_str());
 
-        let mut taken: Vec<Option<(String, Record)>> = results.drain(..).map(Some).collect();
+        let mut taken: Vec<Option<(String, T)>> = results.drain(..).map(Some).collect();
         results.extend(order.into_iter().map(|i| taken[i].take().unwrap()));
     }
 
     /// Resolves each sort spec to a field index. `None` means the record ID, `Some(usize::MAX)`
     /// marks an unknown field, which compares equal so the ordering stays stable.
-    fn resolve_sort_fields(&mut self, account: &str, table_name: &str, specs: &[SortSpec]) -> Vec<(Option<usize>, bool)> {
+    fn resolve_sort_fields(table: &Table, specs: &[SortSpec]) -> Vec<(Option<usize>, bool)> {
         let mut resolved: Vec<(Option<usize>, bool)> = Vec::with_capacity(specs.len());
         for spec in specs {
             if spec.field_name == "ID" {
                 resolved.push((None, spec.descending));
             } else {
-                match self.get_field_index_for_account(account, table_name, &spec.field_name) {
+                match table.field_index(&spec.field_name) {
                     Some(i) => resolved.push((Some(i), spec.descending)),
                     None => resolved.push((Some(usize::MAX), spec.descending)),
                 }
@@ -196,15 +219,22 @@ impl Database {
 
     pub fn sort_keys_for_account(&mut self, account: &str, table_name: &str, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
         if specs.is_empty() { return keys; }
+        if self.get_table_mut_for_account(account, table_name).is_err() { return keys; }
+        match self.get_table_read_only_for_account(account, table_name) {
+            Some(table) => Self::sort_keys_in(table, is_dict, keys, specs),
+            None => keys,
+        }
+    }
 
-        let resolved = self.resolve_sort_fields(account, table_name, specs);
+    /// Same as [`sort_keys_for_account`], but for a caller that has already
+    /// resolved the table.
+    pub fn sort_keys_in(table: &Table, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
+        if specs.is_empty() { return keys; }
+
+        let resolved = Self::resolve_sort_fields(table, specs);
 
         // Look the records up by reference and pre-calculate their sort values; no record is cloned.
         let sort_keys: Vec<Vec<String>> = {
-            let table = match self.get_table_mut_for_account(account, table_name) {
-                Ok(t) => t,
-                Err(_) => return keys,
-            };
             let map = if is_dict { &table.dictionary } else { &table.records };
             keys.iter()
                 .map(|k| match map.get(k) {
@@ -244,61 +274,70 @@ impl Database {
     }
 
     pub fn query_for_account(&mut self, account: &str, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
-        // Pre-calculate field indices and conversions to avoid repeated mutable borrows of self
+        if self.get_table_mut_for_account(account, table_name).is_err() {
+            return Vec::new(); // Return empty results if table not found
+        }
+        match self.get_table_read_only_for_account(account, table_name) {
+            Some(table) => Self::query_in(table, use_dict_section, query, keys_to_filter)
+                .into_iter()
+                .map(|(key, record)| (key, record.clone()))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Same as [`query_for_account`], but for a caller that has already resolved
+    /// the table. Returns borrowed records, so a caller that already holds the
+    /// database lock (e.g. serializing results immediately) does not pay for a
+    /// clone of every matching record.
+    pub fn query_in<'a>(table: &'a Table, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, &'a Record)> {
+        // Pre-calculate field indices and conversions to avoid repeated lookups per record
         let mut field_map = HashMap::new();
-        self.collect_field_indices_for_account(account, table_name, query, &mut field_map);
+        Self::collect_field_indices(table, query, &mut field_map);
 
         let mut results = Vec::new();
 
-        // Use a block to limit the borrow of `table`
-        {
-            let table = match self.get_table_mut_for_account(account, table_name) {
-                Ok(t) => t,
-                Err(_) => return results, // Return empty results if table not found
-            };
-            let source_map = if use_dict_section {
-                &table.dictionary
-            } else {
-                &table.records
-            };
+        let source_map = if use_dict_section {
+            &table.dictionary
+        } else {
+            &table.records
+        };
 
-            if let Some(filter_keys) = keys_to_filter {
-                for key in filter_keys {
-                    if let Some(record) = source_map.get(key) {
-                        if Self::evaluate_node_static_with_id(key, record, query, &field_map) {
-                            results.push((key.clone(), record.clone()));
-                        }
+        if let Some(filter_keys) = keys_to_filter {
+            for key in filter_keys {
+                if let Some(record) = source_map.get(key) {
+                    if Self::evaluate_node_static_with_id(key, record, query, &field_map) {
+                        results.push((key.clone(), record));
                     }
                 }
-            } else {
-                // Optimize: Filter before sorting.
-                // Avoid cloning the entire table by using an iterator.
-                results = source_map.iter()
-                    .filter(|(key, record)| Self::evaluate_node_static_with_id(key, record, query, &field_map))
-                    .map(|(key, record)| (key.clone(), record.clone()))
-                    .collect();
-                results.sort_by(|a, b| a.0.cmp(&b.0));
             }
+        } else {
+            // Optimize: Filter before sorting.
+            // Avoid cloning the entire table by using an iterator.
+            results = source_map.iter()
+                .filter(|(key, record)| Self::evaluate_node_static_with_id(key, record, query, &field_map))
+                .map(|(key, record)| (key.clone(), record))
+                .collect();
+            results.sort_by(|a, b| a.0.cmp(&b.0));
         }
 
         results
     }
 
 
-    pub(crate) fn collect_field_indices_for_account(&mut self, account: &str, table_name: &str, node: &QueryNode, map: &mut HashMap<String, FieldQueryInfo>) {
+    pub(crate) fn collect_field_indices(table: &Table, node: &QueryNode, map: &mut HashMap<String, FieldQueryInfo>) {
         match node {
             QueryNode::Condition(cond) => {
                 if cond.field_name == "ID" { return; }
                 if !map.contains_key(&cond.field_name) {
-                    if let Some(idx) = self.get_field_index_for_account(account, table_name, &cond.field_name) {
-                        let conversion = self.get_conversion_code_read_only_for_account(account, table_name, &cond.field_name);
+                    if let Some((idx, conversion)) = table.field_index_and_conversion(&cond.field_name) {
                         map.insert(cond.field_name.clone(), FieldQueryInfo { index: idx, conversion });
                     }
                 }
             }
             QueryNode::Logical { left, right, .. } => {
-                self.collect_field_indices_for_account(account, table_name, left, map);
-                self.collect_field_indices_for_account(account, table_name, right, map);
+                Self::collect_field_indices(table, left, map);
+                Self::collect_field_indices(table, right, map);
             }
         }
     }

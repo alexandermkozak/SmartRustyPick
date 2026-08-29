@@ -48,7 +48,8 @@ about the host than about the code.
 - **`test/performance/test_load.py`** — bulk writes, random point reads, four query shapes, `SELECT` and `GET.NEXT`
   against a 10 000-record file, plus the resident memory and CPU time of the server process throughout the run.
 - **`test/performance/test_concurrency.py`** — mutual-TLS handshake cost, single-client vs. 8-client read throughput,
-  tail latency under contention, concurrent writers (including a lost-update check), and per-connection memory.
+  tail latency under contention, handshake cost while a large buffered burst is flushed to disk, concurrent writers
+  (including a lost-update check), and per-connection memory.
 
 Each measurement is guarded in up to three ways, in increasing order of trustworthiness:
 

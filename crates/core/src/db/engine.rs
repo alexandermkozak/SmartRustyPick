@@ -50,6 +50,67 @@ pub struct Database {
     durable_tables: HashMap<(String, String), bool>,
 }
 
+/// A table's dictionary resolved to just what serialization emits, so a result
+/// set pays the dictionary walk once. Built by
+/// [`Database::record_schema`] and consumed by
+/// [`Database::serialize_record_with_schema`].
+pub struct RecordSchema {
+    fields: Vec<RecordSchemaField>,
+}
+
+struct RecordSchemaField {
+    /// 0-based index into a record's internal `fields` vector.
+    field_idx: usize,
+    /// camelCase key this field is emitted under.
+    camel_key: String,
+    /// Pick MDn conversion code, if the field has one.
+    conversion: Option<String>,
+}
+
+impl Table {
+    /// The 0-based index of a dictionary field, or `None` when the field is
+    /// unknown. Reading it off the table directly spares the caller a lookup in
+    /// `loaded_tables`, which costs two string allocations per call.
+    pub fn field_index(&self, field_name: &str) -> Option<usize> {
+        if field_name == "ID" { return Some(0); }
+        let rec = self.dictionary.get(field_name)?;
+        let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.get(0)?.sub_values.get(0)?;
+        match idx_str.parse::<usize>() {
+            // Pick attribute 1 is 0-indexed 0 in our internal fields vector
+            Ok(idx) if idx > 0 => Some(idx - 1),
+            _ => None,
+        }
+    }
+
+    /// The Pick MDn conversion code of a dictionary field, if it has one.
+    pub fn conversion_code(&self, field_name: &str) -> Option<String> {
+        let rec = self.dictionary.get(field_name)?;
+        Self::conversion_code_from_dict_record(rec).map(str::to_string)
+    }
+
+    /// Same as [`conversion_code`], but for a caller that already has the
+    /// dictionary record in hand, sparing a second lookup in `dictionary`.
+    pub(crate) fn conversion_code_from_dict_record(dict_rec: &Record) -> Option<&str> {
+        // Pick MDn conversion is in Field 8
+        let code = dict_rec.fields.get(DICT_CONV_IDX)?.values.get(0)?.sub_values.get(0)?;
+        if code.is_empty() { None } else { Some(code.as_str()) }
+    }
+
+    /// The 0-based index and conversion code of a dictionary field in a single
+    /// dictionary lookup, instead of one lookup per property.
+    pub fn field_index_and_conversion(&self, field_name: &str) -> Option<(usize, Option<String>)> {
+        if field_name == "ID" { return Some((0, None)); }
+        let rec = self.dictionary.get(field_name)?;
+        let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.get(0)?.sub_values.get(0)?;
+        let idx = match idx_str.parse::<usize>() {
+            // Pick attribute 1 is 0-indexed 0 in our internal fields vector
+            Ok(idx) if idx > 0 => idx - 1,
+            _ => return None,
+        };
+        Some((idx, Self::conversion_code_from_dict_record(rec).map(str::to_string)))
+    }
+}
+
 impl Database {
     pub fn new(base_storage_dir: &str, config: Option<crate::config::Config>) -> io::Result<Self> {
         let config = config.unwrap_or_else(crate::config::Config::load);
@@ -474,6 +535,21 @@ impl Database {
         };
         let (dict_modified, dict_len) = Self::file_stamp(&format!("{}/{}/dict", storage, name));
         TableStamp { data_modified, data_len, dict_modified, dict_len }
+    }
+
+    /// The table, when it can be read through a shared reference alone: it is
+    /// already in memory and either holds unflushed changes of ours or still
+    /// matches the files on disk. Callers that only hold `&self` cannot load or
+    /// invalidate a table, so they use this to decide whether they have to fall
+    /// back to an exclusive borrow. Returning the table itself saves them a
+    /// second lookup.
+    pub fn table_ready_for_read(&self, account: &str, name: &str) -> Option<&Table> {
+        let table = self.get_table_read_only_for_account(account, name)?;
+        if table.is_dirty() || table.stamp == Some(self.disk_stamp(account, name)) {
+            Some(table)
+        } else {
+            None
+        }
     }
 
     /// Drops a cached table whose backing files were modified by another process,
@@ -1250,19 +1326,7 @@ impl Database {
     }
 
     pub fn get_conversion_code_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> Option<String> {
-        let table = self.get_table_read_only_for_account(account, table_name)?;
-        if let Some(rec) = table.dictionary.get(field_name) {
-            // Pick MDn conversion is in Field 8
-            if let Some(f8) = rec.fields.get(DICT_CONV_IDX) {
-                if let Some(v) = f8.values.get(0) {
-                    let code: &String = v.sub_values.get(0)?;
-                    if !code.is_empty() {
-                        return Some(code.clone());
-                    }
-                }
-            }
-        }
-        None
+        self.get_table_read_only_for_account(account, table_name)?.conversion_code(field_name)
     }
 
     pub fn get_conversion_code(&mut self, table_name: &str, field_name: &str) -> Option<String> {
@@ -1420,21 +1484,7 @@ impl Database {
 
     pub fn get_field_index_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> Option<usize> {
         if field_name == "ID" { return Some(0); }
-        let table = self.get_table_read_only_for_account(account, table_name)?;
-        if let Some(rec) = table.dictionary.get(field_name) {
-            if let Some(f1) = rec.fields.get(DICT_FIELD_IDX) {
-                if let Some(v1) = f1.values.get(0) {
-                    let idx_str: &String = v1.sub_values.get(0)?;
-                    if let Ok(idx) = idx_str.parse::<usize>() {
-                        // Pick attribute 1 is 0-indexed 0 in our internal fields vector
-                        if idx > 0 {
-                            return Some(idx - 1);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        self.get_table_read_only_for_account(account, table_name)?.field_index(field_name)
     }
 
     pub fn get_field_index(&mut self, table_name: &str, field_name: &str) -> Option<usize> {
@@ -1453,29 +1503,59 @@ impl Database {
     }
 
     pub fn serialize_record_for_account(&self, account: &str, table_name: &str, record: &Record) -> serde_json::Value {
-        let mut map = serde_json::Map::new();
-        let table = match self.get_table_read_only_for_account(account, table_name) {
-            Some(t) => t,
-            None => return serde_json::Value::Object(map),
-        };
+        match self.get_table_read_only_for_account(account, table_name) {
+            Some(table) => self.serialize_record_in(table, record),
+            None => serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
 
+    /// Resolves a table's dictionary into the fields that serialization actually
+    /// emits: the attribute index, the camelCase output key, and the MDn
+    /// conversion code. Built once per result set and reused for every record,
+    /// this turns the O(records * dict) index parsing and camel-casing in
+    /// [`serialize_record_in`](Self::serialize_record_in) into O(dict).
+    pub fn record_schema(&self, table: &Table) -> RecordSchema {
+        let mut fields = Vec::with_capacity(table.dictionary.len());
         for (dict_key, dict_rec) in &table.dictionary {
-            if let Some(f1) = dict_rec.fields.get(DICT_FIELD_IDX) {
-                if let Some(v1) = f1.values.get(0) {
-                    if let Some(idx_str) = v1.sub_values.get(0) {
-                        if let Ok(idx) = idx_str.parse::<usize>() {
-                            if idx > 0 {
-                                let _field_idx = idx - 1;
-                                let value = self.format_record_field_for_account(account, table_name, record, dict_key);
-                                let camel_key = self.to_camel_case(dict_key);
-                                map.insert(camel_key, serde_json::Value::String(value));
-                            }
-                        }
-                    }
-                }
-            }
+            let idx = dict_rec.fields.get(DICT_FIELD_IDX)
+                .and_then(|f| f.values.get(0))
+                .and_then(|v| v.sub_values.get(0))
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|idx| *idx > 0);
+            let Some(idx) = idx else { continue };
+            fields.push(RecordSchemaField {
+                // Pick attribute 1 is 0-indexed 0 in our internal fields vector
+                field_idx: idx - 1,
+                camel_key: self.to_camel_case(dict_key),
+                conversion: Table::conversion_code_from_dict_record(dict_rec).map(str::to_string),
+            });
+        }
+        RecordSchema { fields }
+    }
+
+    /// Serializes `record` against a schema resolved earlier by
+    /// [`record_schema`](Self::record_schema), so a whole result set shares one
+    /// pass over the dictionary.
+    pub fn serialize_record_with_schema(&self, schema: &RecordSchema, record: &Record) -> serde_json::Value {
+        let mut map = serde_json::Map::with_capacity(schema.fields.len());
+        for field in &schema.fields {
+            let raw_val = record.get_field_display_string(field.field_idx);
+            let value = match &field.conversion {
+                Some(code) => Self::apply_conversion(&raw_val, code),
+                None => raw_val,
+            };
+            map.insert(field.camel_key.clone(), serde_json::Value::String(value));
         }
         serde_json::Value::Object(map)
+    }
+
+    /// Serializes `record` using `table`, which the caller has already
+    /// resolved. Spares the caller a second table lookup per record. Callers
+    /// serializing an entire result set should instead resolve a
+    /// [`RecordSchema`] once and call
+    /// [`serialize_record_with_schema`](Self::serialize_record_with_schema).
+    pub fn serialize_record_in(&self, table: &Table, record: &Record) -> serde_json::Value {
+        self.serialize_record_with_schema(&self.record_schema(table), record)
     }
 
     pub fn deserialize_record(&self, table_name: &str, data: &serde_json::Value) -> Option<Record> {

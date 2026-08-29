@@ -1,19 +1,21 @@
 """Behaviour and cost of the server under concurrent clients.
 
-The server serialises every request behind a single global `Mutex<Database>`, so this
-suite deliberately does *not* assert linear scaling - that would fail by design. What
-it does assert is the properties that matter for a lock-serialised server:
+Reads run under a shared lock and the blocking engine runs off the async runtime, so
+readers scale with the client count while writers still take the database exclusively.
+That mix is why this suite asserts properties rather than a fixed speedup:
 
 * correctness under contention - no lost updates, no cross-talk between connections;
 * no throughput collapse - N clients must still get at least a fraction of the
   single-client throughput, which is what convoy effects and lock thrashing destroy;
 * bounded tail latency - the p99 a client sees must stay within a fair-queueing
   multiple of the single-client p95;
+* connection setup is independent of database work - a client hammering the disk must
+  not delay the handshakes of unrelated connections;
 * bounded per-connection cost - mutual-TLS handshakes and idle connections must not
   cost unreasonable memory, so a connection leak shows up here.
 
-The observed scaling factor is recorded as a metric on every run, so if the global
-lock is ever replaced by finer-grained locking the improvement is visible immediately.
+The observed scaling factor is recorded as a metric on every run, so a regression in
+the locking granularity is visible immediately.
 """
 
 import os
@@ -39,6 +41,15 @@ MIN_THROUGHPUT_RATIO = float(os.environ.get("SRP_CONC_MIN_THROUGHPUT_RATIO", "0.
 # Under perfect fair queueing a client waits for the other N-1, so its tail latency
 # grows about N-fold. Anything beyond this multiple means unfair or degrading queueing.
 TAIL_LATENCY_SLACK = float(os.environ.get("SRP_CONC_TAIL_SLACK", "3"))
+# A handshake shares nothing with the database, so a flush may cost it scheduling
+# noise but not a multiple of its idle cost. The comparison is worst case against
+# worst case: a blocking flush delays the one handshake it overlaps, which is an
+# outlier the percentiles would hide.
+HANDSHAKE_LOAD_SLACK = float(os.environ.get("SRP_CONC_HANDSHAKE_LOAD_SLACK", "3"))
+# A buffered burst large enough that writing it out is measurable disk work rather
+# than a memcpy: the point is to have one long flush in flight, not to load the CPU.
+BULK_PAYLOAD = "X" * int(os.environ.get("SRP_CONC_PAYLOAD_BYTES", "4096"))
+BULK_RECORDS = int(os.environ.get("SRP_CONC_BULK_RECORDS", "2000"))
 BUDGET_HANDSHAKE_MS = float(os.environ.get("SRP_BUDGET_HANDSHAKE_MS", "150"))
 BUDGET_KB_PER_CONNECTION = float(os.environ.get("SRP_BUDGET_KB_PER_CONNECTION", "1024"))
 
@@ -99,6 +110,38 @@ def run_parallel(make_client, clients, ops, op):
     return harness.Stats(merged), problems, wall
 
 
+def handshakes_during_slow_flush(make_client, handshake_stats):
+    """Measure handshake latency while the server writes out a large buffered burst.
+
+    The engine is synchronous and file backed, so a flush must not run on an async
+    worker thread: it would block every other task scheduled there, and an unrelated
+    client would wait for the disk before its TLS handshake even starts. A burst is
+    buffered and then released in one go, which puts a single long flush in flight
+    without loading the CPU, so what is measured is blocking and not contention.
+    """
+    errors = []
+    try:
+        conn = make_client()
+        for index in range(BULK_RECORDS):
+            conn.request(
+                command="WRITE",
+                file=FILE,
+                key=f"BULK{index}",
+                data=f"{BULK_PAYLOAD}^{index}",
+                account=ACCOUNT,
+            )
+        # Disconnecting makes the server persist the burst immediately instead of
+        # waiting for the flush ticker.
+        conn.close()
+    except Exception as exc:  # noqa: BLE001 - surfaced as a suite failure
+        errors.append(str(exc))
+
+    # No warmup: the flush is in flight now and a warmup handshake would spend it.
+    loaded, _ = harness.benchmark(lambda _: make_client().close(), HANDSHAKES)
+    ratio = loaded.max / handshake_stats.max if handshake_stats.max else 0.0
+    return loaded, ratio, errors
+
+
 def main():
     suite = harness.Suite(
         "Concurrency",
@@ -139,12 +182,12 @@ def main():
                         account=ACCOUNT,
                     )
 
-                stats, _ = harness.benchmark(
+                handshake_stats, _ = harness.benchmark(
                     lambda _: make_client().close(), HANDSHAKES, warmup=1
                 )
                 suite.measure(
                     f"Mutual-TLS connection setup ({HANDSHAKES} handshakes)",
-                    stats,
+                    handshake_stats,
                     budget_ms=BUDGET_HANDSHAKE_MS,
                 )
 
@@ -225,6 +268,25 @@ def main():
                 )
                 found = len(resp.get("results") or [])
                 suite.check_eq("No writes are lost under contention", found, expected)
+
+            loaded, handshake_ratio, load_errors = handshakes_during_slow_flush(
+                make_client, handshake_stats
+            )
+            suite.measure(
+                f"Mutual-TLS connection setup during a flush ({HANDSHAKES} handshakes)",
+                loaded,
+                passed=not load_errors,
+                extra=f"while {BULK_RECORDS} buffered records are written out"
+                if not load_errors
+                else f"{len(load_errors)} failures ({load_errors[0]})",
+            )
+            suite.check_ratio(
+                "A slow flush does not delay the handshakes of other connections",
+                handshake_ratio,
+                HANDSHAKE_LOAD_SLACK,
+                detail=f"slowest handshake {loaded.max:.2f}ms during the flush "
+                f"vs {handshake_stats.max:.2f}ms idle",
+            )
 
             monitor.stop()
             if monitor.available:
