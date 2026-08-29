@@ -60,12 +60,31 @@ pub fn spawn_dashboard(config: Arc<Config>, db: SharedDb, protocol_addr: &str) {
     if !config.web_enabled() {
         return;
     }
-    let protocol_target = loopback_target(protocol_addr);
+    let protocol_addr = protocol_addr.to_string();
     tokio::spawn(async move {
-        if let Err(e) = run(config, db, protocol_target).await {
+        if let Err(e) = run(config, db, protocol_addr).await {
             eprintln!("Web dashboard unavailable: {}", e);
         }
     });
+}
+
+/// The host part of an `addr:port`, with any brackets around an IPv6 literal
+/// removed.
+fn host_of(addr: &str) -> &str {
+    let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or("");
+    host.trim_matches(|c| c == '[' || c == ']')
+}
+
+/// True when `addr` binds every interface, and is therefore reachable from
+/// outside this machine - or outside this container.
+fn is_wildcard(addr: &str) -> bool {
+    matches!(host_of(addr), "0.0.0.0" | "::" | "")
+}
+
+/// True when `addr` can only be reached from the machine it runs on.
+fn is_loopback(addr: &str) -> bool {
+    let host = host_of(addr);
+    host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
 /// The address a client on this machine should use to reach a server bound to
@@ -73,11 +92,10 @@ pub fn spawn_dashboard(config: Arc<Config>, db: SharedDb, protocol_addr: &str) {
 /// also the only name the server certificate is issued for.
 fn loopback_target(addr: &str) -> String {
     let port = addr.rsplit(':').next().unwrap_or("8443");
-    let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or("");
-    match host.trim_matches(|c| c == '[' || c == ']') {
-        "0.0.0.0" | "::" | "" => format!("127.0.0.1:{}", port),
-        host => format!("{}:{}", host, port),
+    if is_wildcard(addr) {
+        return format!("127.0.0.1:{}", port);
     }
+    format!("{}:{}", host_of(addr), port)
 }
 
 /// A token nobody can guess, from the system's entropy source.
@@ -127,7 +145,8 @@ fn issue_dashboard_certificate(config: &Config, db: &SharedDb) -> std::io::Resul
     Ok(generated)
 }
 
-async fn run(config: Arc<Config>, db: SharedDb, protocol_target: String) -> std::io::Result<()> {
+async fn run(config: Arc<Config>, db: SharedDb, protocol_addr: String) -> std::io::Result<()> {
+    let protocol_target = loopback_target(&protocol_addr);
     let bind_addr = config.web_bind_addr();
     let token = match config.web_token.clone() {
         Some(token) if !token.trim().is_empty() => token.trim().to_string(),
@@ -161,8 +180,18 @@ async fn run(config: Arc<Config>, db: SharedDb, protocol_target: String) -> std:
         "  authorized as {} (thumbprint {}), reissued on every start",
         DASHBOARD_CLIENT_NAME, generated.thumbprint
     );
-    if !bind_addr.starts_with("127.") && !bind_addr.starts_with("localhost") {
+    if !is_loopback(&bind_addr) {
         println!("  warning: the dashboard is bound to a non-loopback address and is served over plain HTTP");
+    } else if is_wildcard(&protocol_addr) {
+        // The database is reachable from elsewhere and the dashboard is not.
+        // Inside a container that reads as the dashboard simply not working:
+        // the published port lands on an interface nothing is listening on.
+        println!(
+            "  note: the database accepts connections on {} but the dashboard is bound to {},",
+            protocol_addr, bind_addr
+        );
+        println!("        so it can only be opened from this machine - inside the container, if this is one.");
+        println!("        Set web_addr in config.toml to expose it, and keep it behind a TLS proxy if you do.");
     }
 
     let token = Arc::new(token);

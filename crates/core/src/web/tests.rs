@@ -26,6 +26,24 @@ fn a_wildcard_bind_is_reached_over_the_loopback_interface() {
 }
 
 #[test]
+fn a_bind_address_is_classified_by_who_can_reach_it() {
+    // Which of these two an address is decides what the startup line says, and
+    // the mismatch - database on every interface, dashboard on loopback - is
+    // exactly what makes a containerised dashboard look broken.
+    assert!(is_wildcard("0.0.0.0:8443"));
+    assert!(is_wildcard("[::]:8443"));
+    assert!(!is_wildcard("127.0.0.1:8443"));
+    assert!(!is_wildcard("192.168.1.10:8443"));
+
+    assert!(is_loopback("127.0.0.1:8080"));
+    assert!(is_loopback("127.0.0.53:8080"));
+    assert!(is_loopback("localhost:8080"));
+    assert!(is_loopback("[::1]:8080"));
+    assert!(!is_loopback("0.0.0.0:8080"));
+    assert!(!is_loopback("192.168.1.10:8080"));
+}
+
+#[test]
 fn tokens_have_to_match_exactly() {
     assert!(tokens_match("abc123", "abc123"));
     assert!(!tokens_match("abc123", "abc124"));
