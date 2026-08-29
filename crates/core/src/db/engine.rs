@@ -1598,22 +1598,59 @@ impl Database {
         val.to_string()
     }
 
+    /// Applies an output conversion to each value and sub-value of a field
+    /// rather than to the whole field.
+    ///
+    /// The field's display string joins its values with `]` and sub-values with
+    /// `\\`, so handing that to [`apply_conversion`](Self::apply_conversion)
+    /// gives it something like `"200]300"`, which parses as no number at all
+    /// and comes back unconverted. Splitting on the marks first means an `MD2`
+    /// column of a multivalued field converts the way a single-valued one does.
+    fn convert_display_string(raw: &str, code: &str) -> String {
+        if !raw.contains([']', '\\']) {
+            return Self::apply_conversion(raw, code);
+        }
+        raw.split(']')
+            .map(|value| {
+                value
+                    .split('\\')
+                    .map(|sub| Self::apply_conversion(sub, code))
+                    .collect::<Vec<_>>()
+                    .join("\\")
+            })
+            .collect::<Vec<_>>()
+            .join("]")
+    }
+
     pub fn format_record_field(&self, table_name: &str, record: &Record, field_name: &str) -> String {
         let account = self.current_account.clone();
         self.format_record_field_for_account(&account, table_name, record, field_name)
     }
 
     pub fn format_record_field_for_account(&self, account: &str, table_name: &str, record: &Record, field_name: &str) -> String {
+        self.format_record_field_at_for_account(account, table_name, record, field_name, None)
+    }
+
+    /// Renders one column of one output row. `position` is the row's exploded
+    /// position, so an exploded column shows only the value (or sub-value) that
+    /// put the row there; `None` renders the whole field, which is what every
+    /// unexploded row does.
+    pub fn format_record_field_at(&self, table_name: &str, record: &Record, field_name: &str, position: Option<ValuePosition>) -> String {
+        let account = self.current_account.clone();
+        self.format_record_field_at_for_account(&account, table_name, record, field_name, position)
+    }
+
+    pub fn format_record_field_at_for_account(&self, account: &str, table_name: &str, record: &Record, field_name: &str, position: Option<ValuePosition>) -> String {
         let field_idx = match self.get_field_index_read_only_for_account(account, table_name, field_name) {
             Some(idx) => idx,
             None => return String::new(),
         };
 
-        let raw_val = record.get_field_display_string(field_idx);
+        let raw_val = record.get_value_display_string(field_idx, position);
         let conv = self.get_conversion_code_read_only_for_account(account, table_name, field_name);
 
         if let Some(code) = conv {
-            Self::apply_conversion(&raw_val, &code)
+            Self::convert_display_string(&raw_val, &code)
         } else {
             raw_val
         }
@@ -1680,14 +1717,47 @@ impl Database {
     pub fn serialize_record_with_schema(&self, schema: &RecordSchema, record: &Record) -> serde_json::Value {
         let mut map = serde_json::Map::with_capacity(schema.fields.len());
         for field in &schema.fields {
-            let raw_val = record.get_field_display_string(field.field_idx);
-            let value = match &field.conversion {
-                Some(code) => Self::apply_conversion(&raw_val, code),
-                None => raw_val,
-            };
-            map.insert(field.camel_key.clone(), serde_json::Value::String(value));
+            map.insert(
+                field.camel_key.clone(),
+                Self::serialize_field(record.fields.get(field.field_idx), field.conversion.as_deref()),
+            );
         }
         serde_json::Value::Object(map)
+    }
+
+    /// One field as JSON.
+    ///
+    /// A field holding a single value with a single sub-value - by far the
+    /// common case - is a string, so existing clients see no change. Anything
+    /// with real multivalue structure becomes an array of values, and a value
+    /// with sub-values becomes a nested array. Emitting `"TEST]PAYROLL"` for
+    /// those instead would be ambiguous with a value that genuinely contains a
+    /// `]`, which is what made a read/modify/write round trip lossy.
+    fn serialize_field(field: Option<&Field>, conversion: Option<&str>) -> serde_json::Value {
+        let convert = |s: &str| match conversion {
+            Some(code) => Self::apply_conversion(s, code),
+            None => s.to_string(),
+        };
+        let Some(field) = field else { return serde_json::Value::String(String::new()) };
+
+        match field.values.as_slice() {
+            [] => return serde_json::Value::String(String::new()),
+            [only] if only.sub_values.len() <= 1 => {
+                let text = only.sub_values.first().map(String::as_str).unwrap_or("");
+                return serde_json::Value::String(convert(text));
+            }
+            _ => {}
+        }
+
+        serde_json::Value::Array(
+            field.values.iter().map(|value| match value.sub_values.as_slice() {
+                [] => serde_json::Value::String(String::new()),
+                [only] => serde_json::Value::String(convert(only)),
+                subs => serde_json::Value::Array(
+                    subs.iter().map(|sub| serde_json::Value::String(convert(sub))).collect(),
+                ),
+            }).collect(),
+        )
     }
 
     /// Serializes `record` using `table`, which the caller has already
@@ -1697,6 +1767,40 @@ impl Database {
     /// [`serialize_record_with_schema`](Self::serialize_record_with_schema).
     pub fn serialize_record_in(&self, table: &Table, record: &Record) -> serde_json::Value {
         self.serialize_record_with_schema(&self.record_schema(table), record)
+    }
+
+    /// The mirror of [`serialize_field`](Self::serialize_field): an array
+    /// becomes values, a nested array becomes sub-values, and a scalar stays a
+    /// single value.
+    ///
+    /// A plain string is deliberately *not* re-split on `]`, so a client that
+    /// genuinely means to store that character still can.
+    fn deserialize_field(val: &serde_json::Value, conversion: Option<&str>) -> Vec<Value> {
+        let scalar = |v: &serde_json::Value| -> String {
+            let text = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
+                other => other.to_string(),
+            };
+            match conversion {
+                Some(code) => Self::apply_iconv(&text, code),
+                None => text,
+            }
+        };
+
+        match val {
+            serde_json::Value::Array(values) => values
+                .iter()
+                .map(|value| match value {
+                    serde_json::Value::Array(subs) => Value {
+                        sub_values: subs.iter().map(&scalar).collect(),
+                    },
+                    other => Value { sub_values: vec![scalar(other)] },
+                })
+                .collect(),
+            other => vec![Value { sub_values: vec![scalar(other)] }],
+        }
     }
 
     pub fn deserialize_record(&self, table_name: &str, data: &serde_json::Value) -> Option<Record> {
@@ -1738,20 +1842,7 @@ impl Database {
                 while record.fields.len() <= idx {
                     record.fields.push(Field::default());
                 }
-                let val_str = match val {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
-                    _ => val.to_string(),
-                };
-
-                let final_val = if let Some(code) = conv_map.get(key) {
-                    Self::apply_iconv(&val_str, code)
-                } else {
-                    val_str
-                };
-
-                record.fields[idx].values = vec![Value { sub_values: vec![final_val] }];
+                record.fields[idx].values = Self::deserialize_field(val, conv_map.get(key).map(String::as_str));
             }
         }
 
@@ -1947,8 +2038,12 @@ impl Database {
             let table = self.get_table_mut("USERS")?;
             table.dictionary.insert("NAME".to_string(), Record::from_display_string("1^NAME^L^15"));
             table.dictionary.insert("EMAIL".to_string(), Record::from_display_string("2^EMAIL^L^20"));
-            table.records.insert("1".to_string(), Record::from_display_string("John Doe^john@example.com"));
-            table.records.insert("2".to_string(), Record::from_display_string("Jane Smith^jane@example.com"));
+            // ROLES is multivalued, and Jane's second role is sub-valued, so the
+            // fixture exercises every level of the hierarchy rather than only
+            // the flat one.
+            table.dictionary.insert("ROLES".to_string(), Record::from_display_string("3^ROLES^L^20"));
+            table.records.insert("1".to_string(), Record::from_display_string("John Doe^john@example.com^ADMIN]DEV]TEST"));
+            table.records.insert("2".to_string(), Record::from_display_string("Jane Smith^jane@example.com^DEV]TEST\\LAB"));
             table.touch_all();
             table.mark_dict_dirty();
         }

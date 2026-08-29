@@ -51,12 +51,15 @@ AI agents have been responsible for several critical improvements and fixes in t
 
 ### 4. Database Core
 
-- **MultiValue Logic:** Implementation of hierarchical data structures (FM, VM, SVM).
+- **MultiValue Logic:** Implementation of hierarchical data structures (FM, VM, SVM), and the `BY.EXP` clause that
+  gives each value of a multivalued field its own `LIST` row, carrying the matched position through select lists,
+  `SAVE-LIST`/`GET-LIST` and the remote protocol.
 - **Dictionary Support:** Logic for field formatting and conversions (Dates, Numbers).
 - **Query Engine:** Implementation of `SELECT` and `QUERY` commands for data retrieval.
 - **Test Infrastructure:** Added `CREATE.TEST.ACCOUNT` command in the `SYSTEM` account to quickly spin up pre-populated
   accounts for feature verification and regression testing. This command must be maintained and updated as new data
-  structures or features are added to the system.
+  structures or features are added to the system - the `USERS` file now carries a multivalued `ROLES` field, one of
+  whose values is sub-valued, so the fixture reaches every level of the hierarchy.
 - **Certificate Management:** Implemented `GENERATE.CERT` in the `SYSTEM` account, allowing users to create signed
   client certificates and PKCS#12 (.pfx) files directly from the database CLI for simplified secure remote access setup.
 

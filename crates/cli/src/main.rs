@@ -1,5 +1,5 @@
 use smart_rusty_pick_core::config::Config;
-use smart_rusty_pick_core::db::{Database, Record};
+use smart_rusty_pick_core::db::{report, Database, Record, SelectEntry, SelectList, ValuePosition};
 use smart_rusty_pick_core::server;
 use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
@@ -342,7 +342,7 @@ fn handle_get(db: &mut Database, parts: &[&str]) {
         let mut keys_from_list = None;
         if let Some(list) = &db.active_select_list {
             if list.table_name == table_name && list.is_dict == is_dict {
-                keys_from_list = Some(list.keys.clone());
+                keys_from_list = Some(list.unique_keys());
             }
         }
 
@@ -400,7 +400,7 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
         let mut used_list = false;
         if let Some(list) = &db.active_select_list {
             if list.table_name == table_name && list.is_dict == is_dict {
-                keys_to_delete = list.keys.clone();
+                keys_to_delete = list.unique_keys();
                 used_list = true;
             }
         }
@@ -465,7 +465,8 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
 }
 
 fn handle_list(db: &mut Database, parts: &[&str]) {
-    // LIST [DICT] <table> [<fields>...] [BY|BY.DSND <field> ...]
+    // LIST [DICT] <table> [<fields>...] [WITH <field> <op> <value>]
+    //                     [BY|BY.DSND <field> ...] [BY.EXP <field> [<op> <value>]]
     let mut offset = 1;
     let is_dict = if parts.len() > offset && parts[offset].to_uppercase() == "DICT" {
         offset += 1;
@@ -484,149 +485,92 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
     }
 
     let table_name = parts[offset];
-    // Strip any BY / BY.DSND sort clauses; what remains are the fields to display.
-    let (field_names, sort_specs) = Database::parse_sort_specs(&parts[offset + 1..]);
-    let field_names = &field_names[..];
-
-    let mut use_select_list = false;
-    let mut selected_keys = Vec::new();
-    if let Some(list) = &db.active_select_list {
-        if list.table_name == table_name && list.is_dict == is_dict {
-            use_select_list = true;
-            selected_keys = list.keys.clone();
-        }
+    if !db.list_tables().contains(&table_name.to_string()) {
+        println!("TABLE NOT FOUND");
+        return;
     }
 
-    let table_exists = db.list_tables().contains(&table_name.to_string());
-    if table_exists {
-        let (mut map_keys, is_dict_val) = {
-            let table = match db.get_table_mut(table_name) {
-                Ok(t) => t,
-                Err(e) => {
-                    println!("Error: {}", e);
-                    return;
-                }
-            };
-            let map = if is_dict { &table.dictionary } else { &table.records };
-            let keys = if use_select_list {
-                selected_keys
-            } else {
-                let mut k: Vec<_> = map.keys().cloned().collect();
-                // `sort_keys` falls back to the ID, so only sort here when it is not called.
-                if sort_specs.is_empty() {
-                    k.sort();
-                }
-                k
-            };
-            (keys, is_dict)
+    // Strip the sort and explode clauses; a WITH clause, if any, ends the
+    // column list. What is left in front of it are the fields to display.
+    let (clause_parts, sort_specs, explode_specs) = Database::parse_clause_specs(&parts[offset + 1..]);
+    let explode = match explode_specs.len() {
+        0 => None,
+        1 => explode_specs.into_iter().next(),
+        _ => {
+            println!("Only one BY.EXP field may be given");
+            return;
+        }
+    };
+
+    // Columns may sit on either side of the selection clause, so the criteria
+    // are cut out of the token list and what is left is the column list.
+    let with_at = clause_parts.iter().position(|p| p.to_uppercase() == "WITH");
+    let (mut query, field_names) = match with_at {
+        None => (None, clause_parts.clone()),
+        Some(at) => {
+            let (node, consumed) = db.parse_query_consuming(table_name, &clause_parts[at..]);
+            if node.is_none() {
+                println!("INVALID QUERY FORMAT");
+                return;
+            }
+            let mut columns = clause_parts[..at].to_vec();
+            columns.extend_from_slice(&clause_parts[at + consumed..]);
+            (node, columns)
+        }
+    };
+    if let Some(condition) = explode.as_ref().and_then(|e| e.condition.clone()) {
+        // The compact `BY.EXP ACCOUNTS = "TEST"` filters exactly as the
+        // explicit `BY.EXP ACCOUNTS WITH ACCOUNTS = "TEST"` does.
+        query = Database::and_condition(query, Some(condition));
+    }
+
+    // An active list for this table stands in for a fresh scan, keeping the
+    // positions - and the field they belong to - that a preceding
+    // SELECT ... BY.EXP recorded.
+    let active = db.active_select_list.as_ref()
+        .filter(|l| l.table_name == table_name && l.is_dict == is_dict);
+    let from_list = active.map(|l| l.entries.clone());
+    let list_explode_field = active.and_then(|l| l.explode_field.clone());
+    let use_select_list = from_list.is_some();
+
+    let lines = {
+        let account = db.current_account.clone();
+        let _ = db.get_table_mut_for_account(&account, table_name);
+        let Some(table) = db.get_table_read_only_for_account(&account, table_name) else {
+            println!("TABLE NOT FOUND");
+            return;
         };
 
-        if !sort_specs.is_empty() {
-            map_keys = db.sort_keys(table_name, is_dict_val, map_keys, &sort_specs);
-        }
+        let mut rows: Vec<(SelectEntry, &Record)> = match &from_list {
+            // The list already decided which rows exist, positions included;
+            // re-running the selection over it would only lose them.
+            Some(entries) => {
+                let map = if is_dict { &table.dictionary } else { &table.records };
+                entries.iter()
+                    .filter_map(|e| Some((e.clone(), map.get(&e.key)?)))
+                    .collect()
+            }
+            None => Database::query_exploded_in(table, is_dict, query.as_ref(), explode.as_ref(), None),
+        };
+
+        // Rows already arrive in key order, and within a key in value-position
+        // order, so an absent sort clause needs nothing further.
+        let explode_idx = Database::explode_field_index(table, explode.as_ref());
+        Database::sort_entries_in(table, &mut rows, &sort_specs, explode_idx);
 
         if field_names.is_empty() {
-            for key in map_keys {
-                println!("{}", key);
-            }
+            rows.iter().map(|(entry, _)| entry.key.clone()).collect()
         } else {
-            // Collect field info for headers and formatting
-            struct FieldFormat {
-                name: String,
-                header: String,
-                width: usize,
-                justify: String,
-            }
-
-            let mut formats = Vec::new();
-            // First column is always ID
-            formats.push(FieldFormat {
-                name: "ID".to_string(),
-                header: "ID".to_string(),
-                width: 10,
-                justify: "L".to_string(),
-            });
-
-            let mut expanded_fields = Vec::new();
-            for &name in field_names {
-                if name == "*" {
-                    expanded_fields.extend(db.get_all_dict_fields_read_only_for_account(&db.current_account, table_name));
-                } else {
-                    expanded_fields.push(name.to_string());
-                }
-            }
-
-            for name in &expanded_fields {
-                let header = db.get_field_header_read_only_for_account(&db.current_account, table_name, name);
-                let width = db.get_field_width_read_only_for_account(&db.current_account, table_name, name);
-                let justify = db.get_field_justification_read_only_for_account(&db.current_account, table_name, name);
-                formats.push(FieldFormat {
-                    name: name.clone(),
-                    header,
-                    width,
-                    justify,
-                });
-            }
-
-            // Print headers
-            let mut header_line = String::new();
-            let mut separator_line = String::new();
-            for (i, fmt) in formats.iter().enumerate() {
-                if i > 0 {
-                    header_line.push(' ');
-                    separator_line.push(' ');
-                }
-                let cell = if fmt.justify == "R" {
-                    format!("{:>width$.width$}", fmt.header, width = fmt.width)
-                } else {
-                    format!("{:<width$.width$}", fmt.header, width = fmt.width)
-                };
-                header_line.push_str(&cell);
-                separator_line.push_str(&"-".repeat(fmt.width));
-            }
-            println!("{}", header_line);
-            println!("{}", separator_line);
-
-            // Now iterate over records
-            for key in map_keys {
-                let record = {
-                    let table = match db.get_table_mut(table_name) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            println!("Error: {}", e);
-                            return;
-                        }
-                    };
-                    let map = if is_dict_val { &table.dictionary } else { &table.records };
-                    map.get(&key).cloned()
-                };
-
-                if let Some(record) = record {
-                    let mut row_line = String::new();
-                    for (i, fmt) in formats.iter().enumerate() {
-                        if i > 0 {
-                            row_line.push(' ');
-                        }
-
-                        let formatted_val = if fmt.name == "ID" {
-                            key.clone()
-                        } else {
-                            db.format_record_field(table_name, &record, &fmt.name)
-                        };
-
-                        let cell = if fmt.justify == "R" {
-                            format!("{:>width$.width$}", formatted_val, width = fmt.width)
-                        } else {
-                            format!("{:<width$.width$}", formatted_val, width = fmt.width)
-                        };
-                        row_line.push_str(&cell);
-                    }
-                    println!("{}", row_line);
-                }
-            }
+            let columns: Vec<String> = field_names.iter().map(|s| s.to_string()).collect();
+            let explode_field = explode.as_ref()
+                .map(|e| e.field_name.clone())
+                .or(list_explode_field.clone());
+            report::render_list(db, table_name, &columns, explode_field.as_deref(), &rows)
         }
-    } else {
-        println!("TABLE NOT FOUND");
+    };
+
+    for line in lines {
+        println!("{}", line);
     }
 
     if use_select_list {
@@ -656,7 +600,7 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
     // Check if we should refine the active select list
     let keys_to_filter = if let Some(list) = &db.active_select_list {
         if list.table_name == table_name && list.is_dict == is_dict {
-            Some(list.keys.clone())
+            Some(list.unique_keys())
         } else {
             None
         }
@@ -664,43 +608,63 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
         None
     };
 
-    // Strip any trailing BY / BY.DSND sort clauses before parsing the selection criteria.
-    let (clause_parts, sort_specs) = Database::parse_sort_specs(&parts[offset + 1..]);
-
-    let mut results = if !clause_parts.is_empty() && clause_parts[0].to_uppercase() == "WITH" {
-        if let Some(query) = db.parse_query(table_name, &clause_parts) {
-            db.query(table_name, is_dict, &query, keys_to_filter.as_deref())
-        } else {
-            println!("INVALID QUERY FORMAT");
+    // Strip the sort and explode clauses before parsing the selection criteria.
+    let (clause_parts, sort_specs, explode_specs) = Database::parse_clause_specs(&parts[offset + 1..]);
+    let explode = match explode_specs.len() {
+        0 => None,
+        1 => explode_specs.into_iter().next(),
+        _ => {
+            println!("Only one BY.EXP field may be given");
             return;
         }
-    } else if clause_parts.is_empty() {
-        if let Some(table) = db.get_table(table_name) {
-            let map = if is_dict { &table.dictionary } else { &table.records };
-            let mut res: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            res.sort_by(|a, b| a.0.cmp(&b.0));
-            res
-        } else {
-            println!("TABLE NOT FOUND");
-            return;
-        }
-    } else {
-        println!("Usage: SELECT [DICT] <table> [WITH <field> <op> <value>] [BY|BY.DSND <field> ...]");
-        return;
     };
 
-    db.sort_results(table_name, &mut results, &sort_specs);
+    let mut query = if clause_parts.is_empty() {
+        None
+    } else if clause_parts[0].to_uppercase() == "WITH" {
+        match db.parse_query(table_name, &clause_parts) {
+            Some(q) => Some(q),
+            None => {
+                println!("INVALID QUERY FORMAT");
+                return;
+            }
+        }
+    } else {
+        println!("Usage: SELECT [DICT] <table> [WITH <field> <op> <value>] [BY|BY.DSND <field> ...] [BY.EXP <field> [<op> <value>]]");
+        return;
+    };
+    if let Some(condition) = explode.as_ref().and_then(|e| e.condition.clone()) {
+        query = Database::and_condition(query, Some(condition));
+    }
 
-    if results.is_empty() {
+    if !db.list_tables().contains(&table_name.to_string()) {
+        println!("TABLE NOT FOUND");
+        return;
+    }
+
+    let entries: Vec<SelectEntry> = {
+        let account = db.current_account.clone();
+        let _ = db.get_table_mut_for_account(&account, table_name);
+        let Some(table) = db.get_table_read_only_for_account(&account, table_name) else {
+            println!("TABLE NOT FOUND");
+            return;
+        };
+        let mut rows = Database::query_exploded_in(table, is_dict, query.as_ref(), explode.as_ref(), keys_to_filter.as_deref());
+        let explode_idx = Database::explode_field_index(table, explode.as_ref());
+        Database::sort_entries_in(table, &mut rows, &sort_specs, explode_idx);
+        rows.into_iter().map(|(entry, _)| entry).collect()
+    };
+
+    if entries.is_empty() {
         println!("NO RECORDS FOUND");
         db.active_select_list = None;
     } else {
-        let keys: Vec<String> = results.iter().map(|(k, _)| k.clone()).collect();
-        println!("[{}] records selected", keys.len());
-        db.active_select_list = Some(smart_rusty_pick_core::db::SelectList {
+        println!("[{}] records selected", entries.len());
+        db.active_select_list = Some(SelectList {
             table_name: table_name.to_string(),
             is_dict,
-            keys,
+            explode_field: explode.map(|e| e.field_name),
+            entries,
         });
     }
 }
@@ -818,7 +782,7 @@ fn handle_ct(db: &mut Database, parts: &[&str]) {
         let mut keys_from_list = None;
         if let Some(list) = &db.active_select_list {
             if list.table_name == table_name && list.is_dict == is_dict {
-                keys_from_list = Some(list.keys.clone());
+                keys_from_list = Some(list.unique_keys());
             }
         }
 
@@ -885,10 +849,16 @@ fn print_help(current_account: &str) {
     println!("  SELECT [DICT] <table> [WITH <field> <op> <value>] - Create/refine active select list.");
     println!("    Operators: =, #, <>, <, >, <=, >=, EQ, NE, LT, GT, LE, GE");
     println!("    Wildcards (with = or #): [value (ends with), value] (starts with), [value] (contains)");
+    println!("    Selection (LIST and SELECT): WITH <field> <op> <value> [AND|OR ...]");
     println!("    Sorting (LIST and SELECT): BY <field> (ascending), BY.DSND <field> (descending)");
     println!("      Any number may be given; they are applied from left to right.");
     println!("      Sort operators and column names may appear in any order.");
     println!("      e.g. SELECT PRODUCTS WITH DESC = \"[new]\" BY PRICE BY.DSND CREATE.DATE");
+    println!("    Multivalue (LIST and SELECT): BY.EXP <field> [<op> <value>]");
+    println!("      Gives each value of a multivalued field its own row. With a");
+    println!("      criterion, only the values that satisfied it are shown, and a");
+    println!("      following LIST of the same file keeps them.");
+    println!("      e.g. LIST $CLIENTS BY.EXP ACCOUNTS = \"TEST\" ACCOUNTS");
     println!("  EDIT [DICT] <table> <key>             - Edit a record using external editor.");
     println!("  CT [DICT] <table> [<key>]             - Print record contents, field by field. Uses SELECT list if key omitted.");
     println!("  SAVE                                  - Save database to disk.");
@@ -934,21 +904,60 @@ fn handle_save_list(db: &mut Database, parts: &[&str]) {
         }
     };
 
+    // Field 1 is the file, field 2 the dict flag (and the exploded field, if
+    // any), and one field per entry:
+    // `key`, or `key]value` / `key]value]sub_value` for an exploded list. A
+    // list saved before positions existed has no value mark in its key fields,
+    // so it still loads as a plain list of keys.
     let mut data = Vec::new();
     data.extend_from_slice(list.table_name.as_bytes());
     data.push(smart_rusty_pick_core::db::FM);
     data.extend_from_slice(if list.is_dict { b"1" } else { b"0" });
-    for key in &list.keys {
+    if let Some(field) = &list.explode_field {
+        data.push(smart_rusty_pick_core::db::VM);
+        data.extend_from_slice(field.as_bytes());
+    }
+    for entry in &list.entries {
         data.push(smart_rusty_pick_core::db::FM);
-        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(entry.key.as_bytes());
+        if let Some(pos) = entry.position {
+            data.push(smart_rusty_pick_core::db::VM);
+            data.extend_from_slice(pos.value.to_string().as_bytes());
+            if let Some(sub) = pos.sub_value {
+                data.push(smart_rusty_pick_core::db::VM);
+                data.extend_from_slice(sub.to_string().as_bytes());
+            }
+        }
     }
 
     let record = Record::from_bytes(&data);
-    let table = db.get_table_mut("$SAVEDLISTS").unwrap();
+    // `$SAVEDLISTS` lives in SYSTEM, so this is a missing file rather than an
+    // impossibility - report it instead of taking the whole CLI down.
+    let table = match db.get_table_mut("$SAVEDLISTS") {
+        Ok(t) => t,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
     table.insert_record(list_name, record);
 
     db.active_select_list = None;
     println!("List '{}' saved", list_name);
+}
+
+/// Reads one saved-list field: `key`, `key]value`, or `key]value]sub_value`.
+/// A position that is not a number is discarded rather than rejecting the whole
+/// list - the key is the part that matters.
+fn parse_saved_entry(field: &[u8]) -> SelectEntry {
+    let mut parts = field.split(|&b| b == smart_rusty_pick_core::db::VM);
+    let key = String::from_utf8_lossy(parts.next().unwrap_or(b"")).to_string();
+    let number = |p: Option<&[u8]>| p.and_then(|b| String::from_utf8_lossy(b).parse::<usize>().ok());
+
+    match number(parts.next()) {
+        Some(value) => SelectEntry::at(key, ValuePosition { value, sub_value: number(parts.next()) }),
+        None => SelectEntry::new(key),
+    }
 }
 
 fn handle_get_list(db: &mut Database, parts: &[&str]) {
@@ -959,7 +968,13 @@ fn handle_get_list(db: &mut Database, parts: &[&str]) {
 
     let list_name = parts[1];
 
-    let table = db.get_table_mut("$SAVEDLISTS").unwrap();
+    let table = match db.get_table_mut("$SAVEDLISTS") {
+        Ok(t) => t,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
     if let Some(record) = table.records.get(list_name) {
         let data = record.to_bytes();
         let fields: Vec<&[u8]> = data.split(|&b| b == smart_rusty_pick_core::db::FM).collect();
@@ -970,18 +985,14 @@ fn handle_get_list(db: &mut Database, parts: &[&str]) {
         }
 
         let table_name = String::from_utf8_lossy(fields[0]).to_string();
-        let is_dict = fields[1] == b"1";
-        let mut keys = Vec::new();
-        for f in &fields[2..] {
-            keys.push(String::from_utf8_lossy(f).to_string());
-        }
+        let mut flags = fields[1].splitn(2, |&b| b == smart_rusty_pick_core::db::VM);
+        let is_dict = flags.next() == Some(b"1");
+        let explode_field = flags.next().map(|f| String::from_utf8_lossy(f).to_string());
+        let entries: Vec<SelectEntry> = fields[2..].iter().map(|f| parse_saved_entry(f)).collect();
+        let count = entries.len();
 
-        db.active_select_list = Some(smart_rusty_pick_core::db::SelectList {
-            table_name,
-            is_dict,
-            keys,
-        });
-        println!("[{}] records retrieved", db.active_select_list.as_ref().unwrap().keys.len());
+        db.active_select_list = Some(SelectList { table_name, is_dict, explode_field, entries });
+        println!("[{}] records retrieved", count);
     } else {
         println!("LIST '{}' NOT FOUND", list_name);
     }

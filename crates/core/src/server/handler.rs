@@ -1,4 +1,4 @@
-use crate::db::{Database, Record, Table};
+use crate::db::{Database, ExplodeSpec, QueryNode, Record, SortSpec, Table};
 use crate::server::models::{Request, Response};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -106,29 +106,15 @@ fn query_command(db: &Database, table: &Table, req: &Request) -> Response {
     };
     let is_dict = req.is_dict.unwrap_or(false);
 
-    let mut sort_specs = req.sort_specs.clone().unwrap_or_default();
-    let query_node = if let Some(node) = req.query_node.clone() {
-        Some(node)
-    } else if let Some(q_str) = req.query_string.as_deref() {
-        let parts: Vec<&str> = q_str.split_whitespace().collect();
-        let (clause_parts, parsed_sorts) = Database::parse_sort_specs(&parts);
-        if sort_specs.is_empty() { sort_specs = parsed_sorts; }
-        db.parse_query_read_only(table_name, &clause_parts)
-    } else {
-        None
-    };
+    let (query_node, sort_specs, explode) = resolve_clause(db, table_name, req);
 
     // Resolve the dictionary once for the whole result set rather than per record.
     let schema = db.record_schema(table);
-    let results_processed: Vec<(String, serde_json::Value)> = if let Some(q) = query_node {
-        let mut results = Database::query_in(table, is_dict, &q, None);
-        Database::sort_results_in(table, &mut results, &sort_specs);
-        results.into_iter()
-            .map(|(k, r)| (k, db.serialize_record_with_schema(&schema, r)))
-            .collect()
-    } else {
-        // Full scan: sort the keys only, then serialize each record by reference so the
-        // whole table is never cloned into memory.
+
+    if query_node.is_none() && explode.is_none() {
+        // Full scan with nothing to explode: sort the keys only, then serialize
+        // each record by reference so the whole table is never cloned into
+        // memory.
         let records = if is_dict { &table.dictionary } else { &table.records };
         let mut keys: Vec<String> = records.keys().cloned().collect();
         if sort_specs.is_empty() {
@@ -138,19 +124,64 @@ fn query_command(db: &Database, table: &Table, req: &Request) -> Response {
             keys = Database::sort_keys_in(table, is_dict, keys, &sort_specs);
         }
 
-        keys.into_iter()
+        let results_processed: Vec<(String, serde_json::Value)> = keys.into_iter()
             .filter_map(|k| {
                 let record = records.get(&k)?;
                 Some((k, db.serialize_record_with_schema(&schema, record)))
             })
-            .collect()
-    };
+            .collect();
+
+        return Response {
+            status: "OK".to_string(),
+            results: Some(results_processed),
+            ..Default::default()
+        };
+    }
+
+    let mut rows = Database::query_exploded_in(table, is_dict, query_node.as_ref(), explode.as_ref(), None);
+    let explode_idx = Database::explode_field_index(table, explode.as_ref());
+    Database::sort_entries_in(table, &mut rows, &sort_specs, explode_idx);
+
+    let exploded = explode.is_some();
+    let mut results_processed = Vec::with_capacity(rows.len());
+    let mut positions = Vec::with_capacity(rows.len());
+    for (entry, record) in rows {
+        results_processed.push((entry.key, db.serialize_record_with_schema(&schema, record)));
+        positions.push(entry.position);
+    }
 
     Response {
         status: "OK".to_string(),
         results: Some(results_processed),
+        positions: exploded.then_some(positions),
         ..Default::default()
     }
+}
+
+/// Resolves the selection clause a QUERY or SELECT carries, however it was
+/// spelled: a pre-built `query_node`, or a `query_string` re-parsed here.
+/// `sort_specs` and `explode` given as their own fields win over anything the
+/// query string spells out, so a structured client is never second-guessed.
+fn resolve_clause(db: &Database, table_name: &str, req: &Request) -> (Option<QueryNode>, Vec<SortSpec>, Option<ExplodeSpec>) {
+    let mut sort_specs = req.sort_specs.clone().unwrap_or_default();
+    let mut explode = req.explode.as_ref().and_then(|names| names.first()).map(|name| ExplodeSpec {
+        field_name: name.clone(),
+        condition: None,
+    });
+
+    let mut query_node = req.query_node.clone();
+    if let (None, Some(q_str)) = (&query_node, req.query_string.as_deref()) {
+        let parts: Vec<&str> = q_str.split_whitespace().collect();
+        let (clause_parts, parsed_sorts, parsed_explodes) = Database::parse_clause_specs(&parts);
+        if sort_specs.is_empty() { sort_specs = parsed_sorts; }
+        query_node = db.parse_query_read_only(table_name, &clause_parts);
+        if let (None, Some(spec)) = (&explode, parsed_explodes.into_iter().next()) {
+            query_node = Database::and_condition(query_node, spec.condition.clone());
+            explode = Some(spec);
+        }
+    }
+
+    (query_node, sort_specs, explode)
 }
 
 /// Handles a request against an exclusively borrowed database. Commands that
@@ -308,48 +339,36 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             if target_account.is_none() {
                 return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), ..Default::default() };
             }
-            let table_name = match req.file {
+            let table_name = match req.file.clone() {
                 Some(t) => t,
                 None => return Response { status: "ERROR".to_string(), message: Some("File not specified".to_string()), ..Default::default() },
             };
             let is_dict = req.is_dict.unwrap_or(false);
-            let list_name = req.list_name.unwrap_or_else(|| "DEFAULT".to_string());
+            let list_name = req.list_name.clone().unwrap_or_else(|| "DEFAULT".to_string());
 
-            let mut sort_specs = req.sort_specs.unwrap_or_default();
-            let query_node = if let Some(node) = req.query_node {
-                Some(node)
-            } else if let Some(q_str) = req.query_string.as_deref() {
-                let parts: Vec<&str> = q_str.split_whitespace().collect();
-                let (clause_parts, parsed_sorts) = Database::parse_sort_specs(&parts);
-                if sort_specs.is_empty() { sort_specs = parsed_sorts; }
-                db.parse_query(&table_name, &clause_parts)
-            } else {
-                None
-            };
+            let (query_node, sort_specs, explode) = resolve_clause(db, &table_name, &req);
 
-            let keys = if let Some(q) = query_node {
-                let mut results = db.query_for_account(acc, &table_name, is_dict, &q, None);
-                db.sort_results_for_account(acc, &table_name, &mut results, &sort_specs);
-                results.into_iter().map(|(k, _)| k).collect()
-            } else {
-                let mut keys: Vec<String> = {
-                    let table = match db.get_table_mut_for_account(acc, &table_name) {
-                        Ok(t) => t,
-                        Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
-                    };
-                    let records = if is_dict { &table.dictionary } else { &table.records };
-                    records.keys().cloned().collect()
-                };
-                if sort_specs.is_empty() {
-                    // `sort_keys_for_account` already falls back to the ID, so only sort here.
-                    keys.sort();
-                    keys
-                } else {
-                    db.sort_keys_for_account(acc, &table_name, is_dict, keys, &sort_specs)
+            if let Err(e) = db.get_table_mut_for_account(acc, &table_name) {
+                return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() };
+            }
+            let entries = match db.get_table_read_only_for_account(acc, &table_name) {
+                Some(table) => {
+                    let mut rows = Database::query_exploded_in(table, is_dict, query_node.as_ref(), explode.as_ref(), None);
+                    let explode_idx = Database::explode_field_index(table, explode.as_ref());
+                    Database::sort_entries_in(table, &mut rows, &sort_specs, explode_idx);
+                    rows.into_iter().map(|(entry, _)| entry).collect()
                 }
+                None => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {} not loaded", table_name)), ..Default::default() },
             };
-            let count = keys.len();
-            db.remote_select_lists.insert(list_name.clone(), crate::db::SelectList { table_name, is_dict, keys });
+
+            let list = crate::db::SelectList {
+                table_name,
+                is_dict,
+                explode_field: explode.map(|e| e.field_name),
+                entries,
+            };
+            let count = list.len();
+            db.remote_select_lists.insert(list_name.clone(), list);
             db.remote_select_cursors.insert(list_name, 0);
 
             Response { status: "OK".to_string(), count: Some(count), ..Default::default() }
@@ -358,25 +377,25 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             let list_name = req.list_name.unwrap_or_else(|| "DEFAULT".to_string());
             let batch_size = req.batch_size.unwrap_or(1);
 
-            let (keys_batch, table_name, is_dict) = {
+            let (entries_batch, table_name, is_dict) = {
                 let list = match db.remote_select_lists.get(&list_name) {
                     Some(l) => l,
                     None => return Response { status: "ERROR".to_string(), message: Some("Select list not found".to_string()), ..Default::default() },
                 };
 
-                let list_keys_len = list.keys.len();
+                let list_len = list.len();
                 let table_name = list.table_name.clone();
                 let is_dict = list.is_dict;
 
                 let cursor = *db.remote_select_cursors.get(&list_name).unwrap();
-                if cursor >= list_keys_len {
+                if cursor >= list_len {
                     return Response { status: "EOF".to_string(), ..Default::default() };
                 }
 
-                let end = std::cmp::min(cursor + batch_size, list_keys_len);
-                let keys = list.keys[cursor..end].to_vec();
+                let end = std::cmp::min(cursor + batch_size, list_len);
+                let entries = list.entries[cursor..end].to_vec();
                 db.remote_select_cursors.insert(list_name, end);
-                (keys, table_name, is_dict)
+                (entries, table_name, is_dict)
             };
 
             if let Err(e) = db.get_table_mut_for_account(acc, &table_name) {
@@ -391,18 +410,23 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             // One dictionary walk for the batch, and each record serialized by
             // reference instead of cloned.
             let schema = db.record_schema(table);
-            let results_processed: Vec<(String, serde_json::Value)> = keys_batch.iter()
-                .filter_map(|key| {
-                    let record = records.get(key)?;
-                    Some((key.clone(), db.serialize_record_with_schema(&schema, record)))
-                })
-                .collect();
+            let mut results_processed = Vec::with_capacity(entries_batch.len());
+            let mut positions = Vec::with_capacity(entries_batch.len());
+            for entry in &entries_batch {
+                let Some(record) = records.get(&entry.key) else { continue };
+                results_processed.push((entry.key.clone(), db.serialize_record_with_schema(&schema, record)));
+                positions.push(entry.position);
+            }
             let results_len = results_processed.len();
+            // Only an exploded list has anything to say here; an ordinary one
+            // leaves the field out entirely rather than sending a run of nulls.
+            let exploded = positions.iter().any(Option::is_some);
 
             Response {
                 status: "OK".to_string(),
                 results: Some(results_processed),
                 count: Some(results_len),
+                positions: exploded.then_some(positions),
                 ..Default::default()
             }
         }

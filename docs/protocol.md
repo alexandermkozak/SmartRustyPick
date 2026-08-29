@@ -50,6 +50,7 @@ matched case-insensitively.
 | `query_string`    | string           | `QUERY`, `SELECT`                                                                                                  | Pick-style query, e.g. `WITH NAME = "John" BY NAME`. Alternative to `query_node`. A bare command with neither selects every record.                                                                                                                                                       |
 | `query_node`      | object           | `QUERY`, `SELECT`                                                                                                  | Structured query tree. Takes precedence over `query_string`. See [Query node](#query-node).                                                                                                                                                                                               |
 | `sort_specs`      | array of objects | `QUERY`, `SELECT`                                                                                                  | Explicit sort order: `[{"field_name": "NAME", "descending": false}]`. Overrides any `BY`/`BY.DSND` parsed from `query_string`.                                                                                                                                                            |
+| `explode`         | array of strings | `QUERY`, `SELECT`                                                                                                  | Multivalued fields to explode, so each matching value becomes its own result row. Only the first is used. Overrides any `BY.EXP` parsed from `query_string`. See [Exploded results](#exploded-results).                                                                                    |
 | `list_name`       | string           | `SELECT`, `GET.NEXT`                                                                                               | Names the server-side select list. Default `"DEFAULT"`.                                                                                                                                                                                                                                   |
 | `batch_size`      | integer          | `GET.NEXT`                                                                                                         | Records per batch. Default `1`.                                                                                                                                                                                                                                                           |
 | `thumbprint`      | string           | `AUTHORIZE.CONN`                                                                                                   | SHA-256 thumbprint (lowercase hex) of the client certificate to authorize.                                                                                                                                                                                                                |
@@ -71,6 +72,7 @@ populates it.
 | `results` | array of `[key, record]` | `QUERY`, `GET.NEXT`, `LIST.CONNS`, `LIST.ACCOUNTS`                | Ordered `[string, object]` pairs. For `QUERY` and `GET.NEXT` each `record` has the same shape as `READ`; the management commands document their own.                                                             |
 | `keys`    | array of strings         | `LIST.FILES`                                                      | Plain list of names.                                                                                                                                                                                             |
 | `count`   | integer                  | `SELECT`, `GET.NEXT`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES` | `SELECT`: number of keys selected into the list. `GET.NEXT`: number of records in the batch just returned. The list commands: number of entries returned.                                                        |
+| `positions` | array of objects or nulls | `QUERY`, `GET.NEXT`                                             | Present only for an exploded result. Index-aligned with `results`: the position within the exploded field that put each row there. See [Exploded results](#exploded-results).                                    |
 
 There is no `NOT_FOUND` status. A missing record, table or list yields
 `status: "ERROR"` with an explanatory `message`.
@@ -79,10 +81,55 @@ There is no `NOT_FOUND` status. A missing record, table or list yields
 
 A serialized record is a JSON object built from the file's dictionary: one entry per
 dictionary field that maps to attribute 1 or higher. Keys are the dictionary name lowered
-to camelCase (`FIRST.NAME` → `firstName`). Values are always strings, in display format,
-with the dictionary's output conversion (OCONV) applied. The record **key itself is not
-included** — it appears as the pair's first element in `results`, or is the `key` you sent
-to `READ`. Fields with no dictionary entry are not returned.
+to camelCase (`FIRST.NAME` → `firstName`). Values are in display format, with the
+dictionary's output conversion (OCONV) applied to each of them. The record **key itself is
+not included** — it appears as the pair's first element in `results`, or is the `key` you
+sent to `READ`. Fields with no dictionary entry are not returned.
+
+A field holding one value is a **string**. A multivalued field is an **array** of its
+values, and a value that has sub-values is a **nested array** of those:
+
+```json
+{"name": "Jane Smith", "roles": ["DEV", ["TEST", "LAB"]]}
+```
+
+`WRITE` accepts the same shapes back, so a record read, edited and written again keeps its
+multivalue structure. A plain string is always stored as a single value — it is never
+re-split on `]` — so a value that genuinely contains that character survives the round
+trip.
+
+### Exploded results
+
+`QUERY` and `SELECT` can explode a multivalued field: instead of one row per record, the
+result carries one row per value of that field, and — when a criterion names the same field
+— only the values that satisfied it. This is the wire form of the CLI's `BY.EXP` clause.
+
+Name the field with `explode`, or spell it inside `query_string`; both of these ask the
+same question:
+
+```json
+{"command": "QUERY", "account": "SYSTEM", "file": "$CLIENTS",
+ "explode": ["ACCOUNTS"], "query_string": "WITH ACCOUNTS = \"TEST\""}
+```
+
+```json
+{"command": "QUERY", "account": "SYSTEM", "file": "$CLIENTS",
+ "query_string": "BY.EXP ACCOUNTS = \"TEST\""}
+```
+
+A key appears once per matching position, and `positions` says which position each row
+came from. `sub_value` is `null` when the whole value matched:
+
+```json
+{"status": "OK",
+ "results": [["WEB", {"accounts": ["TEST", "PAYROLL"]}],
+             ["API", {"accounts": ["DEV", "TEST"]}]],
+ "positions": [{"value": 0, "sub_value": null}, {"value": 1, "sub_value": null}]}
+```
+
+The record in each row is still the whole record; `positions` is what tells you which part
+of it answered the query. Records kept by a condition on some other field appear once with
+a `null` position. `positions` is omitted entirely when nothing was exploded.
 
 ### Query node
 
@@ -197,8 +244,9 @@ Remove one record. Succeeds whether or not the key existed.
 Search a file and return the matching records inline, in one response.
 
 - Required: `file`. Optional: `account`, `is_dict`, `query_string`, `query_node`,
-  `sort_specs`. With no query given, every record is returned.
-- Response: `results`, an ordered list of `[key, record]` pairs.
+  `sort_specs`, `explode`. With no query given, every record is returned.
+- Response: `results`, an ordered list of `[key, record]` pairs, plus `positions` when
+  `explode` was given.
 - Errors: `"File not specified"`, `"Table error: <detail>"`, access-denied.
 
 ```json
@@ -216,8 +264,10 @@ Run the same search as `QUERY` but store the resulting keys in a named server-si
 list for paged retrieval with `GET.NEXT`. Only the count is returned.
 
 - Required: `file`. Optional: `account`, `is_dict`, `query_string`, `query_node`,
-  `sort_specs`, `list_name` (default `"DEFAULT"`).
+  `sort_specs`, `explode`, `list_name` (default `"DEFAULT"`).
 - Re-using a `list_name` replaces the previous list and resets its cursor.
+- With `explode`, `count` is the number of exploded rows, not of distinct records, and the
+  positions are remembered for `GET.NEXT`.
 - Errors: `"File not specified"`, `"Table error: <detail>"`, access-denied.
 
 ```json
@@ -234,8 +284,9 @@ list for paged retrieval with `GET.NEXT`. Only the count is returned.
 Fetch the next batch of records from a select list. Advances the list's cursor.
 
 - Required: `list_name` (default `"DEFAULT"`). Optional: `batch_size` (default `1`).
-- Response: `results` (`[key, record]` pairs) and `count` (batch size). When the cursor is
-  already at the end, `status: "EOF"` with no other fields.
+- Response: `results` (`[key, record]` pairs) and `count` (batch size), plus `positions`
+  when the list was exploded. When the cursor is already at the end, `status: "EOF"` with
+  no other fields.
 - Errors: `"Select list not found"`, `"Table error: <detail>"`.
 
 ```json

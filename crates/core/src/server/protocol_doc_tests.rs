@@ -27,6 +27,7 @@ const REQUEST_FIELDS: &[&str] = &[
     "query_node",
     "query_string",
     "sort_specs",
+    "explode",
     "list_name",
     "batch_size",
     "thumbprint",
@@ -37,7 +38,7 @@ const REQUEST_FIELDS: &[&str] = &[
 ];
 
 /// Every JSON key a `Response` can carry.
-const RESPONSE_FIELDS: &[&str] = &["status", "message", "record", "results", "keys", "count"];
+const RESPONSE_FIELDS: &[&str] = &["status", "message", "record", "results", "keys", "count", "positions"];
 
 /// Every command string accepted by `handle_request_locked`.
 const COMMANDS: &[&str] = &[

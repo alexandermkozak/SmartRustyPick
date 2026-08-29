@@ -1,4 +1,4 @@
-use crate::db::{ClientInfo, Database};
+use crate::db::{ClientInfo, Database, ValuePosition};
 use crate::server::handler::handle_request;
 use crate::server::models::Request;
 use crate::test_support::{isolated_config, TempDir};
@@ -391,4 +391,171 @@ fn test_list_conns_and_server_stats_describe_the_running_server() {
     // The engine-side numbers are merged into the same object.
     assert_eq!(stats["authorized_clients"].as_u64().unwrap(), 1);
     assert!(stats["pending_writes"].is_number());
+}
+
+/// The test account's USERS file: John has three roles, Jane has two and her
+/// second is sub-valued. The guard is returned alongside the database so callers
+/// keep the directory alive for as long as they use it.
+fn exploded_test_db(label: &str) -> (TempDir, Arc<RwLock<Database>>, ClientInfo) {
+    let dir = TempDir::new(label);
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_test_account("EXP_TEST").unwrap();
+    db.logto("EXP_TEST").unwrap();
+    let client_info = ClientInfo {
+        name: "test_client".to_string(),
+        thumbprint: "test_tp".to_string(),
+        allowed_accounts: vec!["EXP_TEST".to_string()],
+        is_admin: false,
+    };
+    (dir, Arc::new(RwLock::new(db)), client_info)
+}
+
+#[test]
+fn test_query_returns_multivalued_fields_as_arrays() {
+    let (_dir, db_arc, client_info) = exploded_test_db("mv_shape");
+
+    let req = Request {
+        command: "QUERY".to_string(),
+        account: Some("EXP_TEST".to_string()),
+        file: Some("USERS".to_string()),
+        ..Default::default()
+    };
+    let resp = handle_request(req, &db_arc, &client_info);
+    assert_eq!(resp.status, "OK");
+    // Nothing was exploded, so no positions are sent.
+    assert!(resp.positions.is_none());
+
+    let results = resp.results.unwrap();
+    let john = &results.iter().find(|(k, _)| k == "1").unwrap().1;
+    assert_eq!(john["roles"], serde_json::json!(["ADMIN", "DEV", "TEST"]));
+    // A single-valued field is still a plain string.
+    assert_eq!(john["name"], serde_json::json!("John Doe"));
+
+    let jane = &results.iter().find(|(k, _)| k == "2").unwrap().1;
+    assert_eq!(jane["roles"], serde_json::json!(["DEV", ["TEST", "LAB"]]));
+
+}
+
+#[test]
+fn test_query_explodes_and_reports_positions() {
+    let (_dir, db_arc, client_info) = exploded_test_db("explode_query");
+
+    // The explode field named on its own, with the criterion in query_string.
+    let req = Request {
+        command: "QUERY".to_string(),
+        account: Some("EXP_TEST".to_string()),
+        file: Some("USERS".to_string()),
+        query_string: Some("WITH ROLES = [TEST]".to_string()),
+        explode: Some(vec!["ROLES".to_string()]),
+        ..Default::default()
+    };
+    let resp = handle_request(req, &db_arc, &client_info);
+    assert_eq!(resp.status, "OK");
+
+    let results = resp.results.unwrap();
+    let positions = resp.positions.unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(positions.len(), results.len());
+    assert_eq!(results[0].0, "1");
+    assert_eq!(positions[0], Some(ValuePosition::value(2)));
+    assert_eq!(results[1].0, "2");
+    assert_eq!(positions[1], Some(ValuePosition::sub_value(1, 0)));
+
+    // The same question spelled entirely inside query_string.
+    let req = Request {
+        command: "QUERY".to_string(),
+        account: Some("EXP_TEST".to_string()),
+        file: Some("USERS".to_string()),
+        query_string: Some("BY.EXP ROLES = [TEST]".to_string()),
+        ..Default::default()
+    };
+    let resp = handle_request(req, &db_arc, &client_info);
+    assert_eq!(resp.status, "OK");
+    assert_eq!(resp.results.unwrap().len(), 2);
+    assert_eq!(resp.positions.unwrap(), vec![
+        Some(ValuePosition::value(2)),
+        Some(ValuePosition::sub_value(1, 0)),
+    ]);
+
+}
+
+#[test]
+fn test_select_explodes_and_get_next_carries_the_positions() {
+    let (_dir, db_arc, client_info) = exploded_test_db("explode_select");
+
+    // A bare explode: every value of every record becomes a row, so the count
+    // is of rows rather than of distinct records.
+    let req_select = Request {
+        command: "SELECT".to_string(),
+        account: Some("EXP_TEST".to_string()),
+        file: Some("USERS".to_string()),
+        list_name: Some("MVLIST".to_string()),
+        explode: Some(vec!["ROLES".to_string()]),
+        ..Default::default()
+    };
+    let resp = handle_request(req_select, &db_arc, &client_info);
+    assert_eq!(resp.status, "OK");
+    assert_eq!(resp.count, Some(5));
+
+    let req_next = Request {
+        command: "GET.NEXT".to_string(),
+        account: Some("EXP_TEST".to_string()),
+        list_name: Some("MVLIST".to_string()),
+        batch_size: Some(10),
+        ..Default::default()
+    };
+    let resp = handle_request(req_next, &db_arc, &client_info);
+    assert_eq!(resp.status, "OK");
+    let results = resp.results.unwrap();
+    let positions = resp.positions.unwrap();
+    assert_eq!(results.len(), 5);
+    assert_eq!(positions.len(), 5);
+    let seen: Vec<(&str, Option<ValuePosition>)> = results.iter()
+        .map(|(k, _)| k.as_str())
+        .zip(positions.iter().copied())
+        .collect();
+    assert_eq!(seen, vec![
+        ("1", Some(ValuePosition::value(0))),
+        ("1", Some(ValuePosition::value(1))),
+        ("1", Some(ValuePosition::value(2))),
+        ("2", Some(ValuePosition::value(0))),
+        ("2", Some(ValuePosition::value(1))),
+    ]);
+
+    // The cursor is exhausted, so the list reports EOF as it always has.
+    let req_next = Request {
+        command: "GET.NEXT".to_string(),
+        account: Some("EXP_TEST".to_string()),
+        list_name: Some("MVLIST".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(handle_request(req_next, &db_arc, &client_info).status, "EOF");
+
+}
+
+#[test]
+fn test_unexploded_select_sends_no_positions() {
+    let (_dir, db_arc, client_info) = exploded_test_db("no_positions");
+
+    let req_select = Request {
+        command: "SELECT".to_string(),
+        account: Some("EXP_TEST".to_string()),
+        file: Some("USERS".to_string()),
+        list_name: Some("PLAIN".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(handle_request(req_select, &db_arc, &client_info).count, Some(2));
+
+    let req_next = Request {
+        command: "GET.NEXT".to_string(),
+        account: Some("EXP_TEST".to_string()),
+        list_name: Some("PLAIN".to_string()),
+        batch_size: Some(10),
+        ..Default::default()
+    };
+    let resp = handle_request(req_next, &db_arc, &client_info);
+    assert_eq!(resp.results.unwrap().len(), 2);
+    // An ordinary list leaves the field out rather than sending a run of nulls.
+    assert!(resp.positions.is_none());
+
 }

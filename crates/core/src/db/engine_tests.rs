@@ -320,3 +320,114 @@ fn test_all_dict_fields() {
     assert_eq!(fields[1], "ALT_NAME");
     assert_eq!(fields[2], "ZIP");
 }
+
+/// A file whose dictionary covers a plain field, a multivalued one and a
+/// multivalued one carrying an MD2 conversion. The guard is returned alongside
+/// the database so callers keep the directory alive for as long as they use it.
+fn json_shape_db(label: &str) -> (TempDir, Database) {
+    let dir = TempDir::new(label);
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_account("ACC", None).unwrap();
+    db.logto("ACC").unwrap();
+    db.create_table("USERS").unwrap();
+    let table = db.get_table_mut("USERS").unwrap();
+    table.dictionary.insert("NAME".to_string(), Record::from_display_string("1^NAME^L^15"));
+    table.dictionary.insert("ROLES".to_string(), Record::from_display_string("2^ROLES^L^20"));
+    table.dictionary.insert("PRICE".to_string(), Record::from_display_string("3^PRICE^R^10^^^^MD2"));
+    table.mark_dict_dirty();
+    (dir, db)
+}
+
+#[test]
+fn test_serialize_record_shapes_multivalues_as_arrays() {
+    let (_dir, db) = json_shape_db("serialize_shape");
+
+    // A single value stays a string, so existing clients see no change.
+    let plain = Record::from_display_string("John^ADMIN^500");
+    let json = db.serialize_record("USERS", &plain);
+    assert_eq!(json["name"], serde_json::json!("John"));
+    assert_eq!(json["roles"], serde_json::json!("ADMIN"));
+    assert_eq!(json["price"], serde_json::json!("5.00"));
+
+    // Multiple values become an array; a value with sub-values nests.
+    let multi = Record::from_display_string("Jane^DEV]TEST\\LAB^120000]250");
+    let json = db.serialize_record("USERS", &multi);
+    assert_eq!(json["name"], serde_json::json!("Jane"));
+    assert_eq!(json["roles"], serde_json::json!(["DEV", ["TEST", "LAB"]]));
+    // The conversion applies per value rather than to the joined string.
+    assert_eq!(json["price"], serde_json::json!(["1200.00", "2.50"]));
+
+    // An absent field is an empty string, as it always was.
+    let short = Record::from_display_string("Zed");
+    let json = db.serialize_record("USERS", &short);
+    assert_eq!(json["roles"], serde_json::json!(""));
+
+}
+
+#[test]
+fn test_multivalue_record_survives_a_json_round_trip() {
+    let (_dir, db) = json_shape_db("json_roundtrip");
+
+    // Reading a record, then writing it back unchanged, used to collapse the
+    // multivalued field into one value holding a literal `]`.
+    for display in ["Jane^DEV]TEST\\LAB^120000]250", "John^ADMIN^500", "Zed^^"] {
+        let original = Record::from_display_string(display);
+        let json = db.serialize_record("USERS", &original);
+        let back = db.deserialize_record("USERS", &json).unwrap();
+        assert_eq!(
+            back.get_field_display_string(1),
+            original.get_field_display_string(1),
+            "ROLES did not survive the round trip of {display}"
+        );
+        assert_eq!(
+            back.get_field_display_string(2),
+            original.get_field_display_string(2),
+            "PRICE did not survive the round trip of {display}"
+        );
+    }
+
+}
+
+#[test]
+fn test_deserialize_does_not_resplit_a_plain_string() {
+    let (_dir, db) = json_shape_db("json_nosplit");
+
+    // A client that means to store a `]` still can: only an array makes values.
+    let json = serde_json::json!({ "name": "Jane", "roles": "A]B" });
+    let record = db.deserialize_record("USERS", &json).unwrap();
+    assert_eq!(record.fields[1].values.len(), 1);
+    assert_eq!(record.fields[1].values[0].sub_values[0], "A]B");
+
+    // Numbers and booleans keep the scalar handling they always had.
+    let json = serde_json::json!({ "roles": 7, "price": [true, 4.0] });
+    let record = db.deserialize_record("USERS", &json).unwrap();
+    assert_eq!(record.fields[1].values[0].sub_values[0], "7");
+    assert_eq!(record.fields[2].values.len(), 2);
+    assert_eq!(record.fields[2].values[0].sub_values[0], "100");
+    assert_eq!(record.fields[2].values[1].sub_values[0], "400");
+
+}
+
+#[test]
+fn test_format_record_field_at_narrows_to_a_position() {
+    let (_dir, db) = json_shape_db("format_at");
+    let record = Record::from_display_string("Jane^DEV]TEST\\LAB^120000]250");
+
+    assert_eq!(db.format_record_field("USERS", &record, "ROLES"), "DEV]TEST\\LAB");
+    assert_eq!(
+        db.format_record_field_at("USERS", &record, "ROLES", Some(ValuePosition::value(1))),
+        "TEST\\LAB"
+    );
+    assert_eq!(
+        db.format_record_field_at("USERS", &record, "ROLES", Some(ValuePosition::sub_value(1, 1))),
+        "LAB"
+    );
+    // The conversion still applies when a position narrows the field.
+    assert_eq!(
+        db.format_record_field_at("USERS", &record, "PRICE", Some(ValuePosition::value(1))),
+        "2.50"
+    );
+    // An unknown field is empty, as it always was.
+    assert_eq!(db.format_record_field_at("USERS", &record, "NOPE", None), "");
+
+}

@@ -28,6 +28,15 @@ import harness
 
 ACCOUNT = "PERF_ACC"
 FILE = "PERF"
+# Exploding is measured on its own file so every measurement above keeps the
+# record shape its published numbers were taken against: adding a multivalued
+# attribute to PERF would move every write, read and scan number at once and
+# make the run-to-run comparison meaningless for one run.
+MV_FILE = "PERFMV"
+# Values per multivalued record. A bare explode yields this many rows per
+# record, so the file is kept to a slice of the main one and still produces more
+# rows than PERF has records.
+MV_VALUES = 8
 NUM_RECORDS = int(os.environ.get("SRP_PERF_RECORDS", "10000"))
 QUERY_ITERATIONS = int(os.environ.get("SRP_PERF_QUERY_ITERS", "20"))
 READ_SAMPLES = min(int(os.environ.get("SRP_PERF_READ_SAMPLES", "1000")), NUM_RECORDS)
@@ -41,6 +50,8 @@ GROWTH = NUM_RECORDS / FIRST_SLICE
 # the table grows. This is the allowed drift between the two write phases, which
 # see the file at very different sizes.
 WRITE_GROWTH = float(os.environ.get("SRP_LIMIT_WRITE_GROWTH", "2.0"))
+
+MV_RECORDS = max(1, NUM_RECORDS // 4)
 
 MIDDLE_SEQ = NUM_RECORDS // 2
 BATCH_SIZE = max(1, min(500, NUM_RECORDS // 10))
@@ -70,9 +81,22 @@ BUDGET_SCAN_MS = float(os.environ.get("SRP_BUDGET_SCAN_MS", "500")) * SCAN_SCALE
 BUDGET_SORTED_SCAN_MS = float(os.environ.get("SRP_BUDGET_SORTED_SCAN_MS", "600")) * SCAN_SCALE
 BUDGET_SELECT_MS = float(os.environ.get("SRP_BUDGET_SELECT_MS", "120")) * SCAN_SCALE
 BUDGET_GET_NEXT_MS = float(os.environ.get("SRP_BUDGET_GET_NEXT_MS", "60"))
-# Resident memory attributable to the data set. A record is ~30 bytes on the wire, so
-# this ceiling is very loose; it exists to catch a leak or a per-record blow-up.
+# Exploding scans MV_FILE and builds one row per matching value. Scaled off the
+# MV file rather than the main one, since that is what it walks.
+MV_SCAN_SCALE = max(MV_RECORDS / 10000.0, 0.2)
+BUDGET_EXPLODE_MS = float(os.environ.get("SRP_BUDGET_EXPLODE_MS", "200")) * MV_SCAN_SCALE
+BUDGET_EXPLODE_BARE_MS = float(os.environ.get("SRP_BUDGET_EXPLODE_BARE_MS", "1600")) * MV_SCAN_SCALE
+# A bare explode walks the same records as a selective one but returns far more
+# rows. Cost must therefore grow no faster than the row count does: at or below
+# 1.0x the row ratio the per-row work is linear, which is the property that
+# separates it from an accidentally quadratic row builder.
+EXPLODE_ROW_GROWTH = float(os.environ.get("SRP_LIMIT_EXPLODE_ROW_GROWTH", "1.0"))
+# Resident memory attributable to the data set, which spans both files: dividing
+# by PERF's records alone would charge MV_FILE's records to them. A record is
+# ~30 bytes on the wire, so this ceiling is very loose; it exists to catch a leak
+# or a per-record blow-up.
 BUDGET_BYTES_PER_RECORD = float(os.environ.get("SRP_BUDGET_BYTES_PER_RECORD", "8192"))
+TOTAL_RECORDS = NUM_RECORDS + MV_RECORDS
 
 SETUP_COMMANDS = [
     f"CREATE.ACCOUNT {ACCOUNT}",
@@ -82,12 +106,22 @@ SETUP_COMMANDS = [
     f"SET DICT {FILE} VAL1 1",
     f"SET DICT {FILE} VAL2 2",
     f"SET DICT {FILE} SEQ 3",
+    f"CREATE.FILE {MV_FILE}",
+    f"SET DICT {MV_FILE} VAL1 1",
+    f"SET DICT {MV_FILE} TAGS 2",
     "SAVE",
 ]
 
 
 def record_data(i):
     return f"Val{i % 10}^Data{i % 100}^{i}"
+
+
+# TAGS holds MV_VALUES values drawn from a hundred, so `TAGS = Tag42` matches
+# MV_VALUES records in every hundred, with one matching value each.
+def mv_record_data(i):
+    tags = "]".join(f"Tag{(i + k) % 100}" for k in range(MV_VALUES))
+    return f"Val{i % 10}^{tags}"
 
 
 def find_section_dir(root, table):
@@ -432,6 +466,95 @@ def main():
                     else f"{len(short)} short batches",
                 )
 
+                # Exploding multivalues. The work is bounded by values rather
+                # than by records, which is the one shape none of the
+                # measurements above can see.
+                print(f"Writing {MV_RECORDS} multivalued records...")
+                for i in range(MV_RECORDS):
+                    conn.request(
+                        command="WRITE",
+                        file=MV_FILE,
+                        key=f"MV{i}",
+                        data=mv_record_data(i),
+                        account=ACCOUNT,
+                    )
+
+                selective_hits = (MV_RECORDS // 100) * MV_VALUES
+                stats, resp = harness.benchmark(
+                    lambda _i: conn.request(
+                        command="QUERY",
+                        file=MV_FILE,
+                        query_string="WITH TAGS = Tag42",
+                        explode=["TAGS"],
+                        account=ACCOUNT,
+                    ),
+                    QUERY_ITERATIONS,
+                    warmup=1,
+                )
+                rows = len(resp.get("results") or [])
+                positions = resp.get("positions") or []
+                explode_selective = stats
+                suite.measure(
+                    "QUERY exploding a matched value",
+                    stats,
+                    budget_ms=BUDGET_EXPLODE_MS,
+                    # A fast answer that lost the positions is not the answer.
+                    passed=rows == selective_hits and len(positions) == rows,
+                    extra=f"{rows} row(s), {len(positions)} position(s)",
+                )
+
+                stats, resp = harness.benchmark(
+                    lambda _i: conn.request(
+                        command="QUERY",
+                        file=MV_FILE,
+                        query_string="BY.EXP TAGS",
+                        account=ACCOUNT,
+                    ),
+                    max(3, QUERY_ITERATIONS // 4),
+                    warmup=1,
+                )
+                bare_rows = len(resp.get("results") or [])
+                suite.measure(
+                    "QUERY exploding every value",
+                    stats,
+                    budget_ms=BUDGET_EXPLODE_BARE_MS,
+                    passed=bare_rows == MV_RECORDS * MV_VALUES,
+                    extra=f"{bare_rows} row(s) from {MV_RECORDS} records",
+                )
+
+                # Time ratio against row ratio: returning a hundred times the
+                # rows must not cost more than a hundred times as much.
+                row_growth = bare_rows / selective_hits if selective_hits else 0.0
+                time_growth = stats.p50 / explode_selective.p50 if explode_selective.p50 else 0.0
+                suite.check_ratio(
+                    "Exploding costs no more than the rows it returns",
+                    time_growth / row_growth if row_growth else 0.0,
+                    EXPLODE_ROW_GROWTH,
+                    detail=f"{selective_hits} rows p50 {explode_selective.p50:.2f}ms -> "
+                    f"{bare_rows} rows p50 {stats.p50:.2f}ms "
+                    f"({time_growth:.1f}x time for {row_growth:.0f}x rows)",
+                )
+
+                stats, resp = harness.benchmark(
+                    lambda i: conn.request(
+                        command="SELECT",
+                        file=MV_FILE,
+                        query_string="WITH TAGS = Tag42",
+                        explode=["TAGS"],
+                        list_name=f"MVLIST{i}",
+                        account=ACCOUNT,
+                    ),
+                    QUERY_ITERATIONS,
+                    warmup=1,
+                )
+                suite.measure(
+                    "SELECT into an exploded list",
+                    stats,
+                    budget_ms=BUDGET_EXPLODE_MS,
+                    passed=resp.get("count") == selective_hits,
+                    extra=f"{resp.get('count')} row(s)",
+                )
+
             # Write amplification, measured directly on disk rather than inferred from
             # timings: a write rewrites one group, so the largest group is the real
             # per-write I/O cost and must stay a small fraction of the whole table.
@@ -471,13 +594,13 @@ def main():
             monitor.stop()
             if monitor.available:
                 growth_kb = max(monitor.peak_rss_kb - (monitor.first_rss_kb or 0), 0)
-                bytes_per_record = growth_kb * 1024.0 / NUM_RECORDS
+                bytes_per_record = growth_kb * 1024.0 / TOTAL_RECORDS
                 suite.record("Server resources", dict(monitor.as_dict(), wall_seconds=round(elapsed, 2)))
                 suite.check(
                     "Resident memory per record",
                     bytes_per_record <= BUDGET_BYTES_PER_RECORD * harness.BUDGET_SCALE
                     or not harness.ENFORCE_BUDGETS,
-                    f"{bytes_per_record:.0f} B/record over {NUM_RECORDS} records "
+                    f"{bytes_per_record:.0f} B/record over {TOTAL_RECORDS} records "
                     f"(budget {BUDGET_BYTES_PER_RECORD * harness.BUDGET_SCALE:.0f}); "
                     f"{monitor.summary()}",
                 )

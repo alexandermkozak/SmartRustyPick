@@ -42,11 +42,16 @@ Remove a record from the database.
 
 List tables, keys, or records with formatted fields.
 
-- **Usage**: `LIST [DICT] [<table> [<fields>...] [BY|BY.DSND <field> ...]]`
+- **Usage**:
+  `LIST [DICT] [<table> [<fields>...] [WITH <field> <op> <value> ...] [BY|BY.DSND <field> ...] [BY.EXP <field> [<op> <value>]]]`
 - **Example**: `LIST USERS First.Name Last.Name`
 - **Example**: `LIST PRODUCTS BY PRICE`
 - **Example**: `LIST PRODUCTS BY.DSND PRICE`
+- **Example**: `LIST USERS WITH Last.Name = "Smith" First.Name Last.Name`
+- **Selection**: `LIST` takes the same `WITH` clause `SELECT` does. Column names may sit on either side of it. Without
+  one, `LIST` consumes the active select list if there is one for the same file, as it always has.
 - **Sorting**: See [Sorting](#sorting) below.
+- **Multivalue**: See [Exploding multivalues](#exploding-multivalues) below.
 
 #### SELECT
 
@@ -58,6 +63,54 @@ Create or refine an active select list based on field criteria.
 - **Logical Operators**: `AND`, `OR`
 - **Example**: `SELECT USERS WITH First.Name = "Ted" AND Last.Name = "Smith"`
 - **Sorting**: See [Sorting](#sorting) below.
+- **Multivalue**: See [Exploding multivalues](#exploding-multivalues) below.
+
+#### Exploding multivalues
+
+A field can hold several values, and by default `LIST` shows all of them in one cell, separated by `]`. `BY.EXP` gives
+each value its own row instead, so a multivalued field reads like a list rather than like one long string.
+
+- `BY.EXP <field>` - one row per value of that field
+- `BY.EXP <field> <op> <value>` - the same, filtered: only the values that satisfy the criterion get a row
+
+The second form is shorthand. `BY.EXP ACCOUNTS = "TEST"` and `BY.EXP ACCOUNTS WITH ACCOUNTS = "TEST"` ask the same
+question. The operator set is closed, so a bare column name after the field is still read as a column:
+`LIST USERS BY.EXP ROLES NAME` explodes `ROLES` and shows the `NAME` column.
+
+Given a `$CLIENTS` record `WEB` whose `ACCOUNTS` field holds `TEST]PAYROLL]TESTLAB`:
+
+```
+LIST $CLIENTS BY.EXP ACCOUNTS = "[TEST]" ACCOUNTS
+
+ID         ACCOUNTS
+---------- --------------------
+WEB        TEST
+WEB        TESTLAB
+```
+
+The select list remembers the positions, so the two-step form works too - the `LIST` that follows shows the same rows:
+
+```
+SELECT $CLIENTS BY.EXP ACCOUNTS = "TEST"
+LIST $CLIENTS ACCOUNTS
+```
+
+`SAVE-LIST` and `GET-LIST` carry the positions with the list, so a saved exploded list restores as one.
+
+The rules in detail:
+
+- Only the named field explodes. Every other column repeats the record's whole field down the rows.
+- Which records appear is still the query's decision. A record kept by a condition on some other field appears once,
+  unexploded. A record whose exploded field is empty does too.
+- With a criterion, the unit is the deepest thing that matched: a value, or a sub-value when the field has them. Two
+  conditions on the same field union their positions, so `WITH ROLES = "DEV" OR ROLES = "ADMIN"` gives a row for each.
+- `BY.EXP` does not sort. Rows come out in record-key order, and within a record in value order. Add `BY <field>` to
+  order them - and when that field is the exploded one, it sorts on each row's own value rather than on the whole
+  joined field.
+- Only one `BY.EXP` field may be given.
+
+Commands that act on records rather than on values - `GET`, `DELETE`, `CT` - take each record from an exploded list
+once, not once per matching value.
 
 #### Sorting
 
@@ -77,6 +130,7 @@ otherwise they are compared as text.
   contains "new", ordered by ascending price, then by descending create date
 - **Example**: `LIST PRODUCTS BY.DSND DESC DESC PRICE` and `LIST PRODUCTS DESC PRICE BY.DSND DESC` are equivalent - both
   show the `DESC` and `PRICE` columns sorted by descending `DESC`
+- **Example**: `LIST USERS BY.EXP ROLES ROLES BY ROLES` - one row per role, ordered by the role on that row
 
 #### EDIT
 

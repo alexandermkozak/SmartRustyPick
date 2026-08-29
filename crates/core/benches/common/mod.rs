@@ -72,3 +72,44 @@ pub fn build_table(db: &mut Database, table_name: &str, count: usize) {
     }
     table.touch_all();
 }
+
+/// Values held by the multivalued field of [`sample_mv_record`]. Eight is
+/// enough that the per-value work dominates the per-record work, which is
+/// exactly what exploding a query changes.
+pub const MV_VALUES: usize = 8;
+
+/// Record shaped `NAME^CITY^AMOUNT^ROLES`, where `ROLES` holds [`MV_VALUES`]
+/// values drawn from a hundred and its last value is sub-valued, so the
+/// sub-value path is measured rather than only the value one.
+///
+/// Deliberately a superset of [`sample_record`] rather than a change to it: the
+/// existing benches keep the record shape their published baselines were
+/// measured against.
+pub fn sample_mv_record(i: usize) -> Record {
+    let mut rec = sample_record(i);
+    let mut roles = Field::default();
+    for k in 0..MV_VALUES - 1 {
+        roles.values.push(Value { sub_values: vec![format!("ROLE{}", (i + k) % 100)] });
+    }
+    roles.values.push(Value {
+        sub_values: vec![format!("TEAM{}", i % 10), format!("SITE{}", i % 4)],
+    });
+    rec.fields.push(roles);
+    rec
+}
+
+/// Creates `table_name` with the [`build_table`] dictionary plus a multivalued
+/// `ROLES` attribute, and `count` records from [`sample_mv_record`].
+///
+/// A criterion of `ROLES = ROLE<n>` matches `MV_VALUES - 1` records in every
+/// hundred, one position each; a bare explode yields [`MV_VALUES`] rows per
+/// record.
+pub fn build_mv_table(db: &mut Database, table_name: &str, count: usize) {
+    build_table(db, table_name, count);
+    let table = db.get_table_mut(table_name).unwrap();
+    table.dictionary.insert("ROLES".to_string(), dict_entry("ROLES", 4));
+    for i in 0..count {
+        table.records.insert(format!("K{i:06}"), sample_mv_record(i));
+    }
+    table.touch_all();
+}

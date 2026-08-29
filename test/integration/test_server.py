@@ -20,6 +20,7 @@ SETUP_COMMANDS = [
     "SET DICT %s NAME 1" % FILE,
     "SET DICT %s SURNAME 2" % FILE,
     "SET DICT %s AGE 3" % FILE,
+    "SET DICT %s ROLES 4" % FILE,
     "SAVE",
 ]
 
@@ -52,7 +53,7 @@ def main():
                 suite.check_eq(
                     "READ returns the structured record",
                     resp.get("record"),
-                    {"name": "John", "surname": "Doe", "age": "30"},
+                    {"name": "John", "surname": "Doe", "age": "30", "roles": ""},
                 )
 
                 resp = conn.request(
@@ -86,6 +87,87 @@ def main():
                     command="GET.NEXT", list_name="MYLIST", batch_size=1, account=ACCOUNT
                 )
                 suite.check_eq("GET.NEXT reports EOF at the end", resp["status"], "EOF")
+
+                # Multivalue: a record whose ROLES field holds three values, the
+                # last of them sub-valued.
+                resp = conn.request(
+                    command="WRITE",
+                    file=FILE,
+                    key="USER2",
+                    data="Jane^Smith^41^ADMIN]DEV]TEST\\LAB",
+                    account=ACCOUNT,
+                )
+                suite.check_eq("WRITE a multivalued record", resp["status"], "OK")
+
+                resp = conn.request(command="READ", file=FILE, key="USER2", account=ACCOUNT)
+                record = resp.get("record") or {}
+                suite.check_eq(
+                    "READ shapes a multivalued field as an array",
+                    record.get("roles"),
+                    ["ADMIN", "DEV", ["TEST", "LAB"]],
+                )
+                suite.check_eq(
+                    "READ leaves a single-valued field a string", record.get("name"), "Jane"
+                )
+
+                # Writing the record straight back must not flatten it.
+                resp = conn.request(
+                    command="WRITE",
+                    file=FILE,
+                    key="USER2",
+                    structured_data=record,
+                    account=ACCOUNT,
+                )
+                suite.check_eq("WRITE the record back unchanged", resp["status"], "OK")
+                resp = conn.request(command="READ", file=FILE, key="USER2", account=ACCOUNT)
+                suite.check_eq(
+                    "the multivalue structure survives the round trip",
+                    (resp.get("record") or {}).get("roles"),
+                    ["ADMIN", "DEV", ["TEST", "LAB"]],
+                )
+
+                resp = conn.request(
+                    command="QUERY",
+                    file=FILE,
+                    query_string="WITH ROLES = [TEST]",
+                    explode=["ROLES"],
+                    account=ACCOUNT,
+                )
+                keys = [item[0] for item in resp.get("results") or []]
+                suite.check_eq("QUERY explodes on the matching value", keys, ["USER2"])
+                suite.check_eq(
+                    "QUERY reports which position matched",
+                    resp.get("positions"),
+                    [{"value": 2, "sub_value": 0}],
+                )
+
+                resp = conn.request(
+                    command="SELECT",
+                    file=FILE,
+                    query_string="BY.EXP ROLES",
+                    list_name="MVLIST",
+                    account=ACCOUNT,
+                )
+                # Four rows, not three: USER1 has no ROLES at all, and a record
+                # the explode clause cannot expand stays as one unexploded row.
+                suite.check_eq("SELECT counts exploded rows, not records", resp.get("count"), 4)
+
+                resp = conn.request(
+                    command="GET.NEXT", list_name="MVLIST", batch_size=10, account=ACCOUNT
+                )
+                suite.check_eq(
+                    "GET.NEXT carries the exploded positions",
+                    resp.get("positions"),
+                    [
+                        None,
+                        {"value": 0, "sub_value": None},
+                        {"value": 1, "sub_value": None},
+                        {"value": 2, "sub_value": None},
+                    ],
+                )
+
+                resp = conn.request(command="DELETE", file=FILE, key="USER2", account=ACCOUNT)
+                suite.check_eq("DELETE the multivalued record", resp["status"], "OK")
 
                 resp = conn.request(command="DELETE", file=FILE, key="USER1", account=ACCOUNT)
                 suite.check_eq("DELETE", resp["status"], "OK")
