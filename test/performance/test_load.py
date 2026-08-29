@@ -45,6 +45,17 @@ WRITE_GROWTH = float(os.environ.get("SRP_LIMIT_WRITE_GROWTH", "2.0"))
 MIDDLE_SEQ = NUM_RECORDS // 2
 BATCH_SIZE = max(1, min(500, NUM_RECORDS // 10))
 
+# Sorting is O(n log n), so 4x the records is a little under 5x the comparisons -
+# nothing like the 16x an accidental O(n^2) would cost. That gap is what this limit
+# separates, which is why it can be well below 16 without being fragile.
+SORT_GROWTH = float(os.environ.get("SRP_LIMIT_SORT_GROWTH", "8.0"))
+# How much of a scan's cost sorting it is allowed to add. End to end a full scan is
+# dominated by serialising and shipping the records, so this ratio is coarse by
+# construction: it fails when sorting becomes the dominant cost of a query, not when
+# the comparator merely gets slower. The sharp guard on the comparator itself is the
+# `sort` group in `cargo bench`, which measures it without TLS or JSON in the way.
+SORT_OVERHEAD = float(os.environ.get("SRP_LIMIT_SORT_OVERHEAD", "2.5"))
+
 # Budgets are p95 milliseconds. Scan-bound operations are budgeted per 10k records so
 # the suite stays meaningful when SRP_PERF_RECORDS is overridden.
 SCAN_SCALE = max(NUM_RECORDS / 10000.0, 0.2)
@@ -56,6 +67,7 @@ BUDGET_UNIQUE_MS = float(os.environ.get("SRP_BUDGET_UNIQUE_MS", "60")) * SCAN_SC
 BUDGET_ATTRIBUTE_MS = float(os.environ.get("SRP_BUDGET_ATTRIBUTE_MS", "120")) * SCAN_SCALE
 BUDGET_COMPOUND_MS = float(os.environ.get("SRP_BUDGET_COMPOUND_MS", "80")) * SCAN_SCALE
 BUDGET_SCAN_MS = float(os.environ.get("SRP_BUDGET_SCAN_MS", "500")) * SCAN_SCALE
+BUDGET_SORTED_SCAN_MS = float(os.environ.get("SRP_BUDGET_SORTED_SCAN_MS", "600")) * SCAN_SCALE
 BUDGET_SELECT_MS = float(os.environ.get("SRP_BUDGET_SELECT_MS", "120")) * SCAN_SCALE
 BUDGET_GET_NEXT_MS = float(os.environ.get("SRP_BUDGET_GET_NEXT_MS", "60"))
 # Resident memory attributable to the data set. A record is ~30 bytes on the wire, so
@@ -108,6 +120,57 @@ def write_range(conn, start, end):
 
     stats, _ = harness.benchmark(write_one, end - start)
     return stats, failures
+
+
+def sort_field_of(key, field):
+    """The value the engine sorts on, derived from the record's key.
+
+    `record_data` is deterministic, so the expected ordering can be computed from
+    the keys alone. That keeps the check independent of how a record is spelled on
+    the wire, and means it verifies the order rather than re-deriving it from the
+    very response it is meant to be checking.
+    """
+    i = int(key[len("REC"):])
+    if field == "SEQ":
+        return i  # numeric: 9 sorts before 10, not after it
+    if field == "VAL1":
+        return f"Val{i % 10}"
+    return f"Data{i % 100}"
+
+
+def expected_sorted_keys(count, specs):
+    """The key order a correct sort must produce for `specs`.
+
+    Built by stable sorts applied from the least significant spec to the most, over
+    a list that starts in record-ID order - which is exactly how the engine breaks a
+    tie once every sort key compares equal.
+    """
+    keys = sorted(f"REC{i}" for i in range(count))
+    for field, descending in reversed(specs):
+        keys.sort(key=lambda k: sort_field_of(k, field), reverse=descending)
+    return keys
+
+
+def sorted_query_stats(conn, query_string, iterations=QUERY_ITERATIONS):
+    """Run a sorted query repeatedly and return (Stats, the keys it returned)."""
+    stats, resp = harness.benchmark(
+        lambda _: conn.request(
+            command="QUERY", file=FILE, query_string=query_string, account=ACCOUNT
+        ),
+        iterations,
+        warmup=1,
+    )
+    return stats, [pair[0] for pair in (resp.get("results") or [])]
+
+
+def order_verdict(returned, expected):
+    """(passed, detail) for a returned key order against the expected one."""
+    if returned == expected:
+        return True, f"{len(returned)} records in order"
+    if len(returned) != len(expected):
+        return False, f"{len(returned)} records returned, expected {len(expected)}"
+    first = next(i for i, (a, b) in enumerate(zip(returned, expected)) if a != b)
+    return False, f"order differs at position {first}: {returned[first]}, expected {expected[first]}"
 
 
 def query_stats(conn, query_string, iterations=QUERY_ITERATIONS):
@@ -163,6 +226,11 @@ def main():
                     else f"{len(early_failures)} failed ({early_failures[0]})",
                 )
                 small_scan, small_count = query_stats(conn, "", iterations=max(3, QUERY_ITERATIONS // 4))
+                # More iterations than the scans above: this pair feeds the growth
+                # ratio, and a p50 taken from a handful of samples is a noisy divisor.
+                small_sorted, _ = sorted_query_stats(
+                    conn, "BY SEQ", iterations=max(5, QUERY_ITERATIONS // 2)
+                )
 
                 late, late_failures = write_range(conn, FIRST_SLICE, NUM_RECORDS)
                 suite.measure(
@@ -251,6 +319,73 @@ def main():
                     GROWTH * float(os.environ.get("SRP_LIMIT_SCAN_SLACK", "1.8")),
                     detail=f"{small_count} -> {count} records, "
                     f"p50 {small_scan.p50:.2f}ms -> {full_scan.p50:.2f}ms",
+                )
+
+                # Sorting had no end-to-end coverage at all before this: every query
+                # above is unsorted, so a regression in the comparator - the cost that
+                # `SortValue` exists to keep out of it - was invisible here.
+                # `SEQ` is the numeric path, which is the one that historically parsed
+                # each value again on every comparison.
+                sorted_scan, sorted_keys = sorted_query_stats(
+                    conn, "BY SEQ", iterations=max(5, QUERY_ITERATIONS // 2)
+                )
+                passed, detail = order_verdict(sorted_keys, expected_sorted_keys(NUM_RECORDS, [("SEQ", False)]))
+                suite.measure(
+                    "Sorted scan, numeric key (BY SEQ)",
+                    sorted_scan,
+                    budget_ms=BUDGET_SORTED_SCAN_MS,
+                    passed=passed,
+                    extra=detail,
+                )
+
+                text_sorted, text_keys = sorted_query_stats(
+                    conn, "BY VAL2", iterations=max(3, QUERY_ITERATIONS // 4)
+                )
+                passed, detail = order_verdict(text_keys, expected_sorted_keys(NUM_RECORDS, [("VAL2", False)]))
+                suite.measure(
+                    "Sorted scan, text key with ties (BY VAL2)",
+                    text_sorted,
+                    budget_ms=BUDGET_SORTED_SCAN_MS,
+                    passed=passed,
+                    extra=detail,
+                )
+
+                # Text primary with heavy ties, numeric secondary descending: the shape
+                # that exercises every branch of the comparison in one query.
+                compound_sorted, compound_keys = sorted_query_stats(
+                    conn, "BY VAL1 BY.DSND SEQ", iterations=max(3, QUERY_ITERATIONS // 4)
+                )
+                passed, detail = order_verdict(
+                    compound_keys,
+                    expected_sorted_keys(NUM_RECORDS, [("VAL1", False), ("SEQ", True)]),
+                )
+                suite.measure(
+                    "Sorted scan, compound (BY VAL1 BY.DSND SEQ)",
+                    compound_sorted,
+                    budget_ms=BUDGET_SORTED_SCAN_MS,
+                    passed=passed,
+                    extra=detail,
+                )
+
+                # The regression signal for the sort itself: 4x the records must cost
+                # about 4.7x (n log n), not 16x. Host independent, like the scan ratio.
+                suite.check_ratio(
+                    "Sort cost grows no worse than n log n",
+                    sorted_scan.p50 / small_sorted.p50 if small_sorted.p50 else 0.0,
+                    SORT_GROWTH,
+                    detail=f"{small_count} -> {len(sorted_keys)} records, "
+                    f"p50 {small_sorted.p50:.2f}ms -> {sorted_scan.p50:.2f}ms",
+                )
+
+                # And what ordering adds to the same scan. Coarse - serialising the
+                # records dominates both sides - but it fails outright if sorting ever
+                # becomes the dominant cost of a query again.
+                suite.check_ratio(
+                    "Sorting adds a bounded share of a scan's cost",
+                    compound_sorted.p50 / full_scan.p50 if full_scan.p50 else 0.0,
+                    SORT_OVERHEAD,
+                    detail=f"unsorted p50 {full_scan.p50:.2f}ms -> compound-sorted "
+                    f"p50 {compound_sorted.p50:.2f}ms",
                 )
 
                 stats, resp = harness.benchmark(
