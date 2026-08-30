@@ -311,14 +311,18 @@ fn handle_set(db: &mut Database, parts: &[&str]) {
             return;
         }
     };
-    let mut table = handle.write();
-    let record = Record::from_display_string(&data);
-    if is_dict {
-        table.dictionary.insert(key, record);
-        table.mark_dict_dirty();
-    } else {
-        table.insert_record(&key, record);
+    {
+        let mut table = handle.write();
+        let record = Record::from_display_string(&data);
+        if is_dict {
+            table.dictionary.insert(key, record);
+            table.mark_dict_dirty();
+        } else {
+            table.insert_record(&key, record);
+        }
     }
+    // The file's lock goes before the flush: a flush locks each dirty file in
+    // turn, and would wait here for a lock this thread is holding.
     if table_name == "$CLIENTS" {
         let _ = db.save();
     }
@@ -455,15 +459,19 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
             return;
         }
     };
-    let mut table = handle.write();
-    let removed = if is_dict {
-        let removed = table.dictionary.remove(key).is_some();
-        if removed { table.mark_dict_dirty(); }
-        removed
-    } else {
-        table.remove_record(key).is_some()
+    let removed = {
+        let mut table = handle.write();
+        if is_dict {
+            let removed = table.dictionary.remove(key).is_some();
+            if removed { table.mark_dict_dirty(); }
+            removed
+        } else {
+            table.remove_record(key).is_some()
+        }
     };
     if removed {
+        // Flushing locks each dirty file in turn, so the file's own lock has to
+        // be released before asking for one.
         if table_name == "$CLIENTS" {
             let _ = db.save();
         }
@@ -746,15 +754,18 @@ fn handle_edit(db: &mut Database, parts: &[&str], config: &Config) {
                             return;
                         }
                     };
-                    let mut table = handle.write();
-                    let record = Record::from_edit_string(&new_content);
-                    let key_str = key.to_string();
-                    if is_dict {
-                        table.dictionary.insert(key_str, record);
-                        table.mark_dict_dirty();
-                    } else {
-                        table.insert_record(&key_str, record);
+                    {
+                        let mut table = handle.write();
+                        let record = Record::from_edit_string(&new_content);
+                        let key_str = key.to_string();
+                        if is_dict {
+                            table.dictionary.insert(key_str, record);
+                            table.mark_dict_dirty();
+                        } else {
+                            table.insert_record(&key_str, record);
+                        }
                     }
+                    // Released before the flush: a flush wants this file's lock too.
                     if table_name == "$CLIENTS" {
                         let _ = db.save();
                     }
