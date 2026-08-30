@@ -61,8 +61,9 @@ matched case-insensitively.
 
 ## Response object
 
-Only `status` is always present. Every other field is present only when that command
-populates it.
+Only `status` is always present. Every other field is **omitted from the JSON** unless the
+command populates it — read an absent field as "not populated", the same as the `null` an
+older server sent in its place.
 
 | Field       | Type                      | Populated by                                                                                         | Notes                                                                                                                                                                                                            |
 |-------------|---------------------------|------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -719,9 +720,3 @@ it holds a certificate reissued on each boot and drives the commands above. See 
 ```
 START.SERVER 0.0.0.0:8443 server.crt server.key ca.crt
 ```
-
-## MCP server integration
-
-For high-level interaction via AI agents, a Model Context Protocol server lives in `mcp/`.
-It wraps this protocol into tools such as `read_record`, `write_record` and
-`query_records`. See [mcp/README.md](../mcp/README.md).

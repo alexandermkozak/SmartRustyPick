@@ -95,7 +95,18 @@ fn request_struct_serializes_to_exactly_the_documented_fields() {
 
 #[test]
 fn response_struct_serializes_to_exactly_the_documented_fields() {
-    let mut actual = json_keys(&Response::default());
+    // Every field is `skip_serializing_if`, so only a fully populated response
+    // shows the whole set. The empty one is pinned separately below.
+    let populated = Response {
+        status: "OK".to_string(),
+        message: Some(String::new()),
+        record: Some(serde_json::Value::Null),
+        results: Some(Vec::new()),
+        keys: Some(Vec::new()),
+        count: Some(0),
+        positions: Some(Vec::new()),
+    };
+    let mut actual = json_keys(&populated);
     actual.sort();
     let mut expected: Vec<String> = RESPONSE_FIELDS.iter().map(|s| s.to_string()).collect();
     expected.sort();
@@ -103,6 +114,28 @@ fn response_struct_serializes_to_exactly_the_documented_fields() {
         actual, expected,
         "Response fields changed in models.rs. Update docs/protocol.md and RESPONSE_FIELDS."
     );
+}
+
+/// `docs/protocol.md` promises "Only `status` is always present. Every other
+/// field is omitted from the JSON unless the command populates it." A field
+/// that loses its `skip_serializing_if` breaks that promise silently, so it is
+/// pinned here rather than left to a reader of the documentation to notice.
+#[test]
+fn an_unpopulated_response_carries_only_status() {
+    assert_eq!(json_keys(&Response::default()), vec!["status".to_string()]);
+}
+
+/// The other half of the contract: a client that omits a field must still
+/// deserialize, which is what lets a response round-trip through the wire form.
+#[test]
+fn an_omitted_response_field_reads_back_as_unpopulated() {
+    let response: Response = serde_json::from_str(r#"{"status": "OK"}"#).unwrap();
+    assert!(response.message.is_none());
+    assert!(response.record.is_none());
+    assert!(response.results.is_none());
+    assert!(response.keys.is_none());
+    assert!(response.count.is_none());
+    assert!(response.positions.is_none());
 }
 
 #[test]

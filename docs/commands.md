@@ -26,13 +26,6 @@ and this boot's access token on startup.
 - **Usage**: open the printed `http://127.0.0.1:8080/?token=...` link.
 - **Documentation**: See [Web Dashboard](web_dashboard.md).
 
-#### MCP Mode
-
-SmartRustyPick also includes a Model Context Protocol (MCP) server for integration with AI agents.
-
-- **Usage**: `make mcp-run` (after `make mcp-setup`)
-- **Documentation**: See [MCP Server README](../mcp/README.md) for detailed tool descriptions and configuration.
-
 ### Data Organization
 
 SmartRustyPick organizes data into **Accounts**. Each account is a collection of files (tables).

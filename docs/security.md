@@ -53,7 +53,6 @@ implies otherwise is worse than none:
 | CA, server and client keys | Nothing beyond the filesystem. | Unencrypted PEM (`openssl req -nodes`, `openssl genrsa`). PKCS#12 bundles are exported with an **empty password**. No explicit mode is set on any of them anywhere in the workspace, so the umask decides who can read them. |
 | Certificate lifetime | Client certificates last 365 days, the CA 3650. Deauthorization by name takes effect on the client's next request. | There is **no revocation path** — no CRL, no OCSP, no CA rotation. Removing a thumbprint from `$CLIENTS` is the only revocation, and it works only for this database. |
 | `config.toml` | — | It is **committed to the repository** and has a `web_token` field. Treat it as a non-secret file; a token set there is a token in git history. |
-| MCP client | Verifies the server certificate against the CA (`CERT_REQUIRED`). | Sets `check_hostname = False` (`mcp/server.py`), so the name on the certificate is not checked. |
 
 `$LOGS` is capped at `max_log_records` (default 100) and holds the message plus, in `detailed` mode, a UTC timestamp.
 Its **record keys** embed a timestamp and the account name, which is why it is the clearest case for the key-encryption

@@ -75,7 +75,8 @@ export async function call<T>(path: string, init: RequestInit = {}): Promise<T> 
 /** Unwraps the envelope's `record`, which every single-object command fills. */
 export async function record<T>(path: string, init?: RequestInit): Promise<T> {
     const response = await call<ProtocolResponse<T>>(path, init)
-    if (response.record === null) throw new ApiError(502, 'The database returned no data')
+    // Loose equality on purpose: an unpopulated `record` is absent or null.
+    if (response.record == null) throw new ApiError(502, 'The database returned no data')
     return response.record
 }
 

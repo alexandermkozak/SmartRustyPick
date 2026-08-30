@@ -32,16 +32,27 @@ pub struct Request {
     pub durable: Option<bool>,
 }
 
+/// Every field but `status` is skipped when empty, so a reply carries only what
+/// the command it answers actually populated. That is the contract
+/// `docs/protocol.md` states, and it keeps the six-field null tail off every
+/// response on the wire. Clients must read an absent field as "not populated",
+/// exactly as they read a null one.
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Response {
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub record: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub results: Option<Vec<(String, serde_json::Value)>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<usize>,
     /// For an exploded result, the position within the exploded field that put
     /// each row in `results` there. Index-aligned with `results`, and `None`
     /// for an ordinary, unexploded one.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub positions: Option<Vec<Option<ValuePosition>>>,
 }
