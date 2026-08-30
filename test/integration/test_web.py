@@ -245,6 +245,36 @@ def main():
                 "" if "WEB_MADE" not in remaining else json.dumps(remaining),
             )
 
+            # The demo fixture is the same endpoint with a flag, and the point
+            # of it is that the account arrives with something in it.
+            status, payload, _ = dashboard.call(
+                "/api/accounts", method="POST", payload={"name": "WEB_DEMO", "demo": True}
+            )
+            created = (payload or {}).get("record") or {}
+            suite.check(
+                "A demo account can be created",
+                status == 200 and created.get("files") == ["DIR", "PRODUCTS", "USERS"],
+                json.dumps(created),
+            )
+
+            _, payload, _ = dashboard.call("/api/accounts")
+            demo = {name: info for name, info in (payload or {}).get("results") or []}
+            suite.check(
+                "The demo account is listed with the records it came with",
+                demo.get("WEB_DEMO", {}).get("record_count", 0) > 0,
+                json.dumps(demo.get("WEB_DEMO", {})),
+            )
+
+            # Populated means dictionaries too, which is what makes it worth
+            # opening: the dashboard can show them the moment it is created.
+            _, payload, _ = dashboard.call("/api/accounts/WEB_DEMO/files/PRODUCTS/dictionary")
+            entries = {name: info for name, info in (payload or {}).get("results") or []}
+            suite.check_eq(
+                "Its files come with their dictionaries", entries.get("PRICE", {}).get("conversion"), "MD2"
+            )
+
+            dashboard.call("/api/accounts/WEB_DEMO", method="DELETE")
+
             # SYSTEM holds the account registry and the authorized clients, so
             # the database refuses to drop it however it is asked.
             status, payload, _ = dashboard.call("/api/accounts/SYSTEM", method="DELETE")

@@ -36,11 +36,12 @@ AI agents have been responsible for several critical improvements and fixes in t
 
 - **Web Dashboard:** Built the browser-based management interface that starts with the database server, covering
   connection authorization, certificate issuing and download, live connection and usage monitoring, navigation of
-  accounts and their files, per-file durability, creating and dropping accounts and files, and maintaining a file's
-  dictionary. It connects to the database as an ordinary remote client, with a certificate reissued and
+  accounts and their files, per-file durability, creating and dropping accounts and files, creating the populated demo
+  account, and maintaining a file's dictionary. It connects to the database as an ordinary remote client, with a certificate reissued and
   re-authorized on every boot, so it can do nothing the documented protocol does not already allow.
 - **Protocol Extensions:** Added the management commands the dashboard needed - `LIST.CONNS`, `LIST.ACCOUNTS`,
-  `LIST.FILES`, `FILE.STATS`, `SERVER.STATS`, `SET.FILE`, `GENERATE.CERT`, `LIST.DICT` and `SET.DICT` - to the remote
+  `LIST.FILES`, `FILE.STATS`, `SERVER.STATS`, `SET.FILE`, `GENERATE.CERT`, `LIST.DICT`, `SET.DICT` and
+  `CREATE.TEST.ACCOUNT` - to the remote
   protocol rather than giving the interface a private path into the engine. The rule the additions follow is that a
   command earns its place by filling a gap rather than by matching a page's shape: dictionary entries are created and
   listed through new commands because `WRITE`/`READ` with `is_dict` label them with the *data* file's field names, but
@@ -61,7 +62,8 @@ AI agents have been responsible for several critical improvements and fixes in t
 - **Dictionary Support:** Logic for field formatting and conversions (Dates, Numbers).
 - **Query Engine:** Implementation of `SELECT` and `QUERY` commands for data retrieval.
 - **Test Infrastructure:** Added `CREATE.TEST.ACCOUNT` command in the `SYSTEM` account to quickly spin up pre-populated
-  accounts for feature verification and regression testing. This command must be maintained and updated as new data
+  accounts for feature verification and regression testing. It is reachable over the remote protocol and from the web
+  dashboard as well, so the fixture is one command away from any interface. This command must be maintained and updated as new data
   structures or features are added to the system - the `USERS` file now carries a multivalued `ROLES` field, one of
   whose values is sub-valued, so the fixture reaches every level of the hierarchy.
 - **Certificate Management:** Implemented `GENERATE.CERT` in the `SYSTEM` account, allowing users to create signed

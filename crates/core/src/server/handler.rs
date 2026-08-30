@@ -552,6 +552,31 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), ..Default::default() },
             }
         }
+        "CREATE.TEST.ACCOUNT" => {
+            // The CLI restricts this to the SYSTEM account; over the wire the
+            // equivalent is an admin certificate, the same gate the other
+            // account commands sit behind.
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), ..Default::default() };
+            }
+            let name = match req.target_account {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("Account name not specified".to_string()), ..Default::default() },
+            };
+            match db.create_test_account(&name) {
+                // The files are read back rather than listed here, so this
+                // reports whatever the fixture actually creates today.
+                Ok(_) => {
+                    let files = db.list_tables_for_account(&name);
+                    Response {
+                        status: "OK".to_string(),
+                        record: Some(serde_json::json!({ "account": name, "files": files })),
+                        ..Default::default()
+                    }
+                }
+                Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), ..Default::default() },
+            }
+        }
         "DELETE.ACCOUNT" => {
             if !client_info.is_admin {
                 return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), ..Default::default() };

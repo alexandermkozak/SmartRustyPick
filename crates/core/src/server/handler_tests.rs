@@ -999,3 +999,101 @@ fn test_a_file_created_in_an_account_that_lost_its_dir_brings_it_back() {
     );
     assert_eq!(resp.keys.unwrap(), vec!["DIR", "LEDGER"]);
 }
+
+#[test]
+fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
+    // The CLI restricts this to the SYSTEM account. A headless server is not
+    // logged into one, so the wire equivalent is an admin certificate - and the
+    // command has to work without any account context at all.
+    let dir = TempDir::new("protocol_demo_account");
+    let base_dir = dir.path();
+    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
+    db.current_account = String::new();
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "test_admin".to_string(),
+        thumbprint: "admin_tp".to_string(),
+        allowed_accounts: Vec::new(),
+        is_admin: true,
+    };
+
+    let resp = handle_request(
+        Request { command: "CREATE.TEST.ACCOUNT".to_string(), target_account: Some("DEMO".to_string()), ..Default::default() },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let created = resp.record.unwrap();
+    assert_eq!(created["account"], "DEMO");
+    assert_eq!(created["files"], serde_json::json!(["DIR", "PRODUCTS", "USERS"]));
+
+    // Populated, not just created: a record read back carries the dictionary's
+    // names, its multivalues and the MD2 conversion the fixture exists to show.
+    let read = |file: &str, key: &str| {
+        handle_request(
+            Request {
+                command: "READ".to_string(),
+                account: Some("DEMO".to_string()),
+                file: Some(file.to_string()),
+                key: Some(key.to_string()),
+                ..Default::default()
+            },
+            &db_arc,
+            &admin,
+        )
+        .record
+        .unwrap()
+    };
+    let user = read("USERS", "2");
+    assert_eq!(user["name"], "Jane Smith");
+    assert_eq!(user["roles"], serde_json::json!(["DEV", ["TEST", "LAB"]]));
+    assert_eq!(read("PRODUCTS", "P1")["price"], "1200.00");
+
+    // The account left no login behind on a server that had none.
+    assert_eq!(crate::server::handler::read_lock(&db_arc).current_account, "");
+
+    // Making it twice is refused rather than half-rebuilt over the first.
+    let resp = handle_request(
+        Request { command: "CREATE.TEST.ACCOUNT".to_string(), target_account: Some("DEMO".to_string()), ..Default::default() },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "ERROR");
+    assert!(resp.message.unwrap().contains("already exists"));
+}
+
+#[test]
+fn test_the_demo_account_is_admin_only_and_needs_a_name() {
+    let dir = TempDir::new("protocol_demo_guards");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_account("PLAIN", None).unwrap();
+    db.current_account = String::new();
+    let db_arc = Arc::new(RwLock::new(db));
+
+    let ordinary = ClientInfo {
+        name: "reporting".to_string(),
+        thumbprint: "reporting_tp".to_string(),
+        allowed_accounts: vec!["PLAIN".to_string()],
+        is_admin: false,
+    };
+    let resp = handle_request(
+        Request { command: "CREATE.TEST.ACCOUNT".to_string(), target_account: Some("DEMO".to_string()), ..Default::default() },
+        &db_arc,
+        &ordinary,
+    );
+    assert_eq!(resp.message.unwrap(), "Admin privileges required");
+
+    let admin = ClientInfo {
+        name: "test_admin".to_string(),
+        thumbprint: "admin_tp".to_string(),
+        allowed_accounts: Vec::new(),
+        is_admin: true,
+    };
+    let resp = handle_request(
+        Request { command: "CREATE.TEST.ACCOUNT".to_string(), ..Default::default() },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.message.unwrap(), "Account name not specified");
+}

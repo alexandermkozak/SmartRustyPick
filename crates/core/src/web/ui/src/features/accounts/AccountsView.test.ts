@@ -362,9 +362,26 @@ describe('account and file maintenance', () => {
         await wrapper.find('.new-account').trigger('submit')
         await flushPromises()
 
-        expect(sent).toEqual([{method: 'POST', path: '/api/accounts', body: '{"name":"REPORTS"}'}])
+        expect(sent).toEqual([
+            {method: 'POST', path: '/api/accounts', body: '{"name":"REPORTS","demo":false}'},
+        ])
         // Re-read straight after, so a created account appears now rather than
         // whenever the twenty-second poll next comes round.
+        expect(traffic).toEqual(['GET /api/accounts', 'POST /api/accounts', 'GET /api/accounts'])
+    })
+
+    it('creates the demo account through the same field, asking for the fixture', async () => {
+        const wrapper = mount(View)
+        await flushPromises()
+
+        await wrapper.find('.new-account input').setValue('DEMO')
+        await wrapper.findAll('.new-account button')[1].trigger('click')
+        await flushPromises()
+
+        // One endpoint, one flag: the page is asking for an account either way.
+        expect(sent).toEqual([
+            {method: 'POST', path: '/api/accounts', body: '{"name":"DEMO","demo":true}'},
+        ])
         expect(traffic).toEqual(['GET /api/accounts', 'POST /api/accounts', 'GET /api/accounts'])
     })
 
@@ -458,6 +475,13 @@ describe('account and file maintenance', () => {
 
         await wrapper.find('.new-account input').setValue('REPORTS')
         await wrapper.find('.new-account').trigger('submit')
+        await flushPromises()
+
+        expect(alerts.message.value).toBe('Admin privileges required')
+
+        // The demo account is refused the same way, being the same endpoint.
+        await wrapper.find('.new-account input').setValue('DEMO')
+        await wrapper.findAll('.new-account button')[1].trigger('click')
         await flushPromises()
 
         expect(alerts.message.value).toBe('Admin privileges required')

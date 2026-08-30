@@ -79,8 +79,11 @@ whatever the button asked for. See [Storage Engine](storage.md).
 
 ### Creating and dropping
 
-Under the account list is a field that creates one (`CREATE.ACCOUNT`), and each row carries a **Drop**
-(`DELETE.ACCOUNT`). The same pair sits under the file list: a name and a **Durable** tick create a file
+Under the account list is a field that creates one. **Create account** makes an empty one (`CREATE.ACCOUNT`) and
+**Create demo** makes the populated fixture (`CREATE.TEST.ACCOUNT`) — the same one the CLI creates, with `USERS` and
+`PRODUCTS` files, their dictionaries, a multivalued field whose values go one level deeper still, and a price carrying
+an `MD2` conversion. It is the quickest way to have something real to point the file statistics and the dictionary
+editor at. Each row carries a **Drop** (`DELETE.ACCOUNT`). The same pair sits under the file list: a name and a **Durable** tick create a file
 (`CREATE.FILE`, durable from its first write), and each file has its own **Drop** (`DELETE.FILE`). All four are admin
 commands, so a dashboard whose certificate is not an admin one is refused by the database and says so.
 
@@ -143,7 +146,7 @@ Each endpoint is one protocol command. Responses are the protocol's own JSON; fa
 | `POST`   | `/api/clients/{name}/accounts`         | `ADD.CLIENT.ACCOUNT` / `REMOVE.CLIENT.ACCOUNT` (`"remove": true`) |
 | `POST`   | `/api/certificates`                    | `GENERATE.CERT`                                                   |
 | `GET`    | `/api/accounts`                        | `LIST.ACCOUNTS`                                                   |
-| `POST`   | `/api/accounts`                        | `CREATE.ACCOUNT`                                                  |
+| `POST`   | `/api/accounts`                        | `CREATE.ACCOUNT`, or `CREATE.TEST.ACCOUNT` (`"demo": true`)       |
 | `DELETE` | `/api/accounts/{account}`              | `DELETE.ACCOUNT`                                                  |
 | `GET`    | `/api/accounts/{account}/files`        | `LIST.FILES`                                                      |
 | `POST`   | `/api/accounts/{account}/files`        | `CREATE.FILE`                                                     |

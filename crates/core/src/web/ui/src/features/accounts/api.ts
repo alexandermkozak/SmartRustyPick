@@ -28,9 +28,13 @@ export const accountsApi = {
             body: JSON.stringify({durable}),
         }),
 
-    /** `CREATE.ACCOUNT`. Admin only. */
-    createAccount: (name: string): Promise<unknown> =>
-        call('/api/accounts', {method: 'POST', body: JSON.stringify({name})}),
+    /**
+     * `CREATE.ACCOUNT`, or `CREATE.TEST.ACCOUNT` for the demo fixture. Admin
+     * only, and one endpoint for both: the page is asking for an account either
+     * way, and only the contents differ.
+     */
+    createAccount: (name: string, demo: boolean): Promise<unknown> =>
+        call('/api/accounts', {method: 'POST', body: JSON.stringify({name, demo})}),
 
     /** `DELETE.ACCOUNT`: the account and every file in it. Admin only. */
     deleteAccount: (name: string): Promise<unknown> =>

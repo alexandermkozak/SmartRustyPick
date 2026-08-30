@@ -126,9 +126,13 @@ export function useAccountBrowser() {
         }
     }
 
-    /** Creates an account. It is not selected: its file list is empty by definition. */
-    const createAccount = (name: string): Promise<boolean> =>
-        maintain(() => accountsApi.createAccount(name), false)
+    /**
+     * Creates an account, empty or populated with the demo fixture. Neither is
+     * selected afterwards: an empty one has nothing to show, and a demo account
+     * is worth arriving at deliberately.
+     */
+    const createAccount = (name: string, demo = false): Promise<boolean> =>
+        maintain(() => accountsApi.createAccount(name, demo), false)
 
     /** Drops an account and everything in it, clearing the selection if it was this one. */
     function deleteAccount(name: string): Promise<boolean> {

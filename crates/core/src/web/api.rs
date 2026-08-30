@@ -183,12 +183,16 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
         // it is the file's shape rather than its contents, and maintaining it
         // is why an operator opens a management interface at all.
         ("GET", ["api", "accounts"]) => run(client, json!({ "command": "LIST.ACCOUNTS" })).await,
+        // One endpoint for both kinds of account, because the page is asking
+        // for the same thing either way: an empty one, or the demo fixture the
+        // CLI's CREATE.TEST.ACCOUNT populates.
         ("POST", ["api", "accounts"]) => {
             let name = match field(&body, "name") {
                 Some(name) => name,
                 None => return Response::error(400, "An account name is required"),
             };
-            run(client, json!({ "command": "CREATE.ACCOUNT", "target_account": name })).await
+            let command = if flag(&body, "demo") { "CREATE.TEST.ACCOUNT" } else { "CREATE.ACCOUNT" };
+            run(client, json!({ "command": command, "target_account": name })).await
         }
         // Dropping an account deletes every file in it. The confirmation is the
         // page's job; the database refuses SYSTEM whatever is asked here.

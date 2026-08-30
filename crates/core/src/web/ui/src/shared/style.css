@@ -423,6 +423,12 @@ button:disabled {
   border-color: var(--danger);
 }
 
+/* A line of explanation under a form, rather than a paragraph of its own. */
+.small-note {
+  margin: 0.5rem 0 0;
+  font-size: 0.8rem;
+}
+
 /* A form under a list, rather than beside its rows. */
 .inline-form.spaced {
   margin-top: 0.7rem;

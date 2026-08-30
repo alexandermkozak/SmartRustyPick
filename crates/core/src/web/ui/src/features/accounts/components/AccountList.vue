@@ -15,17 +15,22 @@ defineProps<{
 }>()
 const emit = defineEmits<{
   select: [name: string]
-  create: [name: string]
+  create: [name: string, demo: boolean]
   drop: [name: string]
 }>()
 
 const draft = ref('')
 
-function create(): void {
+/**
+ * One name, two kinds of account. A demo account is the `CREATE.TEST.ACCOUNT`
+ * fixture the CLI makes: two files with dictionaries and a few records in them,
+ * which is enough to try a query or the dictionary editor against.
+ */
+function create(demo: boolean): void {
   const name = draft.value.trim()
   if (!name) return
   draft.value = ''
-  emit('create', name)
+  emit('create', name, demo)
 }
 
 // Dropping an account takes every file in it, and nothing here can put them
@@ -61,8 +66,22 @@ function drop(account: AccountStats): void {
     </li>
   </ul>
 
-  <form class="inline-form spaced new-account" @submit.prevent="create">
+  <form class="inline-form spaced new-account" @submit.prevent="create(false)">
     <input v-model="draft" aria-label="New account name" autocomplete="off" placeholder="SALES" />
     <button :disabled="busy || !draft.trim()" class="small" type="submit">Create account</button>
+    <button
+      :disabled="busy || !draft.trim()"
+      class="small"
+      title="Creates the account populated with the CLI's CREATE.TEST.ACCOUNT fixture"
+      type="button"
+      @click="create(true)"
+    >
+      Create demo
+    </button>
   </form>
+  <p class="note small-note">
+    A demo account arrives with <span class="mono">USERS</span> and
+    <span class="mono">PRODUCTS</span> — dictionaries, a multivalued field and a priced item — so
+    there is something to query and something to edit.
+  </p>
 </template>

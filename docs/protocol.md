@@ -41,7 +41,7 @@ matched case-insensitively.
 |-------------------|------------------|--------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `command`         | string           | all                                                                                                                | Required. See [Commands](#commands).                                                                                                                                                                                                                                                      |
 | `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `GET.NEXT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS`, `LIST.DICT`, `SET.DICT` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
-| `target_account`  | string           | `CREATE.ACCOUNT`, `DELETE.ACCOUNT`                                                                                 | Name of the account to create or drop. (Distinct from `account`, which selects an existing context.)                                                                                                                                                                                      |
+| `target_account`  | string           | `CREATE.ACCOUNT`, `CREATE.TEST.ACCOUNT`, `DELETE.ACCOUNT`                                                          | Name of the account to create or drop. (Distinct from `account`, which selects an existing context.)                                                                                                                                                                                      |
 | `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`, `LIST.DICT`, `SET.DICT` | Table (file) name.                                                                                                                                                                                                                                                                        |
 | `key`             | string           | `READ`, `WRITE`, `DELETE`, `SET.DICT`                                                                              | Record key; for `SET.DICT`, the name of the dictionary entry.                                                                                                                                                                                                                                                                               |
 | `data`            | string \| object | `WRITE`                                                                                                            | Record contents. A string is parsed as a display-format record (`^` field mark, `]` value mark, `\` sub-value mark). An object maps field names — original dictionary names or their camelCase form — to values, applying the dictionary's input conversions (ICONV).                     |
@@ -162,6 +162,7 @@ a `null` position. `positions` is omitted entirely when nothing was exploded.
 | `SELECT`                |       |   yes   | `file`                                               | `count`                                 |
 | `GET.NEXT`              |       |  yes¹   | `list_name` (defaults to `"DEFAULT"`)                | `results` + `count`, or `status: "EOF"` |
 | `CREATE.ACCOUNT`        |  yes  |    —    | `target_account`                                     | `status: "OK"`                          |
+| `CREATE.TEST.ACCOUNT`   |  yes  |    —    | `target_account`                                     | `record`                                |
 | `DELETE.ACCOUNT`        |  yes  |    —    | `target_account`                                     | `status: "OK"`                          |
 | `CREATE.FILE`           |  yes  |   yes   | `account`, `file`                                    | `status: "OK"`                          |
 | `SET.FILE`              |  yes  |   yes   | `account`, `file`, `durable`                         | `record`                                |
@@ -322,6 +323,30 @@ Create or drop an account. Names the account with `target_account`, not `account
 
 ```json
 {"status": "OK"}
+```
+
+### CREATE.TEST.ACCOUNT — admin
+
+Create an account already populated with the demo fixture — the same one the CLI's
+`CREATE.TEST.ACCOUNT` makes, so there is something to query without typing records in first.
+
+- Required: `target_account`. Admin only. The CLI restricts the command to the `SYSTEM`
+  account; over the wire an admin certificate is the equivalent gate.
+- The account gets a `DIR`, a `USERS` file and a `PRODUCTS` file, each with a dictionary and a
+  couple of records. Between them they reach every level of the hierarchy — `ROLES` is
+  multivalued and one of its values is sub-valued — and `PRODUCTS.PRICE` carries an `MD2`
+  conversion, so the fixture exercises multivalues and conversions rather than only flat text.
+- `record` names the account and the files it was given, read back after the fact rather than
+  listed from a constant, so it describes whatever the fixture creates today.
+- The account must not already exist; nothing is written when it does.
+- Errors: `"Admin privileges required"`, `"Account name not specified"`, `"Error: <detail>"`.
+
+```json
+{"command": "CREATE.TEST.ACCOUNT", "target_account": "DEMO"}
+```
+
+```json
+{"status": "OK", "record": {"account": "DEMO", "files": ["DIR", "PRODUCTS", "USERS"]}}
 ```
 
 ### CREATE.FILE — admin

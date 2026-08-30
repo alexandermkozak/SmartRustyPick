@@ -49,6 +49,7 @@ const COMMANDS: &[&str] = &[
     "SELECT",
     "GET.NEXT",
     "CREATE.ACCOUNT",
+    "CREATE.TEST.ACCOUNT",
     "DELETE.ACCOUNT",
     "CREATE.FILE",
     "SET.FILE",
