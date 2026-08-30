@@ -63,7 +63,8 @@ pub fn sample_record(i: usize) -> Record {
 /// Creates `TABLE` with a `NAME`/`CITY`/`AMOUNT` dictionary and `count` sample records.
 pub fn build_table(db: &mut Database, table_name: &str, count: usize) {
     db.create_table(table_name).unwrap();
-    let table = db.get_table_mut(table_name).unwrap();
+    let table_handle = db.get_table_mut(table_name).unwrap();
+    let mut table = table_handle.write();
     table.dictionary.insert("NAME".to_string(), dict_entry("NAME", 1));
     table.dictionary.insert("CITY".to_string(), dict_entry("CITY", 2));
     table.dictionary.insert("AMOUNT".to_string(), dict_entry("AMOUNT", 3));
@@ -106,7 +107,8 @@ pub fn sample_mv_record(i: usize) -> Record {
 /// record.
 pub fn build_mv_table(db: &mut Database, table_name: &str, count: usize) {
     build_table(db, table_name, count);
-    let table = db.get_table_mut(table_name).unwrap();
+    let table_handle = db.get_table_mut(table_name).unwrap();
+    let mut table = table_handle.write();
     table.dictionary.insert("ROLES".to_string(), dict_entry("ROLES", 4));
     for i in 0..count {
         table.records.insert(format!("K{i:06}"), sample_mv_record(i));

@@ -64,7 +64,7 @@ impl SortValue {
 }
 
 impl Database {
-    pub fn parse_query(&mut self, table_name: &str, parts: &[&str]) -> Option<QueryNode> {
+    pub fn parse_query(&self, table_name: &str, parts: &[&str]) -> Option<QueryNode> {
         self.parse_query_read_only(table_name, parts)
     }
 
@@ -211,19 +211,17 @@ impl Database {
         (remaining, specs, explodes)
     }
 
-    pub fn sort_results(&mut self, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
-        let account = self.current_account.clone();
-        self.sort_results_for_account(&account, table_name, results, specs);
+    pub fn sort_results(&self, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
+        self.sort_results_for_account(&self.current_account(), table_name, results, specs);
     }
 
-    pub fn sort_results_for_account(&mut self, account: &str, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
+    pub fn sort_results_for_account(&self, account: &str, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
         if specs.is_empty() { return; }
-        let _ = self.get_table_mut_for_account(account, table_name);
-        let table = match self.get_table_read_only_for_account(account, table_name) {
-            Some(t) => t,
-            None => return,
+        let handle = match self.get_table_mut_for_account(account, table_name) {
+            Ok(handle) => handle,
+            Err(_) => return,
         };
-        Self::sort_results_in(table, results, specs);
+        Self::sort_results_in(&handle.read(), results, specs);
     }
 
     /// Same as [`sort_results_for_account`], but for a caller that has already
@@ -343,17 +341,15 @@ impl Database {
         order
     }
 
-    pub fn sort_keys(&mut self, table_name: &str, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
-        let account = self.current_account.clone();
-        self.sort_keys_for_account(&account, table_name, is_dict, keys, specs)
+    pub fn sort_keys(&self, table_name: &str, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
+        self.sort_keys_for_account(&self.current_account(), table_name, is_dict, keys, specs)
     }
 
-    pub fn sort_keys_for_account(&mut self, account: &str, table_name: &str, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
+    pub fn sort_keys_for_account(&self, account: &str, table_name: &str, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
         if specs.is_empty() { return keys; }
-        if self.get_table_mut_for_account(account, table_name).is_err() { return keys; }
-        match self.get_table_read_only_for_account(account, table_name) {
-            Some(table) => Self::sort_keys_in(table, is_dict, keys, specs),
-            None => keys,
+        match self.get_table_mut_for_account(account, table_name) {
+            Ok(handle) => Self::sort_keys_in(&handle.read(), is_dict, keys, specs),
+            Err(_) => keys,
         }
     }
 
@@ -381,22 +377,20 @@ impl Database {
         order.into_iter().map(|i| taken[i].take().unwrap()).collect()
     }
 
-    pub fn query(&mut self, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
-        let account = self.current_account.clone();
-        self.query_for_account(&account, table_name, use_dict_section, query, keys_to_filter)
+    pub fn query(&self, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
+        self.query_for_account(&self.current_account(), table_name, use_dict_section, query, keys_to_filter)
     }
 
-    pub fn query_for_account(&mut self, account: &str, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
-        if self.get_table_mut_for_account(account, table_name).is_err() {
-            return Vec::new(); // Return empty results if table not found
-        }
-        match self.get_table_read_only_for_account(account, table_name) {
-            Some(table) => Self::query_in(table, use_dict_section, query, keys_to_filter)
-                .into_iter()
-                .map(|(key, record)| (key, record.clone()))
-                .collect(),
-            None => Vec::new(),
-        }
+    pub fn query_for_account(&self, account: &str, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
+        let handle = match self.get_table_mut_for_account(account, table_name) {
+            Ok(handle) => handle,
+            // Return empty results if table not found
+            Err(_) => return Vec::new(),
+        };
+        Self::query_in(&handle.read(), use_dict_section, query, keys_to_filter)
+            .into_iter()
+            .map(|(key, record)| (key, record.clone()))
+            .collect()
     }
 
     /// Same as [`query_for_account`], but for a caller that has already resolved

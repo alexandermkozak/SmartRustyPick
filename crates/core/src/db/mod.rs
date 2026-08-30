@@ -18,5 +18,5 @@ mod hashfile_tests;
 #[cfg(test)]
 mod durability_tests;
 
-pub use engine::Database;
+pub use engine::{Database, TableHandle, TableKey};
 pub use models::*;

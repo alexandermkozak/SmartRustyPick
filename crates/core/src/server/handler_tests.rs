@@ -68,7 +68,7 @@ fn test_create_and_delete_file_target_the_requested_account() {
     let base_dir = dir.path();
     let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
     db.create_account("FILE_TEST", None).unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
@@ -140,7 +140,7 @@ fn test_create_file_durable_flag_is_honoured() {
     let dir = TempDir::new("server_durable_file");
     let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("DUR_TEST", None).unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
     db.durable_writes = false;
     db.flush_max_pending = 1_000;
     db.flush_interval = std::time::Duration::from_secs(3_600);
@@ -197,7 +197,7 @@ fn test_set_file_promotes_and_demotes_an_existing_file() {
     let dir = TempDir::new("server_set_file");
     let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("SET_TEST", None).unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
     db.durable_writes = false;
     db.flush_max_pending = 1_000;
     db.flush_interval = std::time::Duration::from_secs(3_600);
@@ -365,7 +365,7 @@ fn test_management_commands_report_accounts_files_and_statistics() {
     let dir = TempDir::new("server_management");
     let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("MGMT_TEST").unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
@@ -438,7 +438,7 @@ fn test_management_commands_respect_the_clients_permissions() {
     let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("VISIBLE").unwrap();
     db.create_test_account("HIDDEN").unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let client_info = ClientInfo {
@@ -479,7 +479,7 @@ fn test_list_conns_and_server_stats_describe_the_running_server() {
     let dir = TempDir::new("server_stats");
     let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.add_authorized_client("reporting-bot", "AB12CD", vec!["SALES".to_string()], false).unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
@@ -682,7 +682,7 @@ fn dictionary_test_db(name: &str) -> (TempDir, Arc<RwLock<Database>>, ClientInfo
     let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("DICT_TEST", None).unwrap();
     db.create_table_for_account("DICT_TEST", "STOCK").unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let client_info = ClientInfo {
         name: "dict_client".to_string(),
@@ -906,7 +906,7 @@ fn test_an_account_created_over_the_protocol_gets_a_dir_file() {
     let dir = TempDir::new("protocol_dir_file");
     let base_dir = dir.path();
     let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
@@ -953,8 +953,10 @@ fn test_an_account_created_over_the_protocol_gets_a_dir_file() {
     assert_eq!(listed(&db_arc), vec!["DIR", "LEDGER", "STOCK"]);
     let dir_entries = {
         let mut db = crate::server::handler::write_lock(&db_arc);
-        let table = db.get_table_mut_for_account("NEW_ACC", "DIR").unwrap();
+        let table_handle = db.get_table_mut_for_account("NEW_ACC", "DIR").unwrap();
+        let mut table = table_handle.write();
         let mut keys: Vec<String> = table.records.keys().cloned().collect();
+        drop(table);
         keys.sort();
         keys
     };
@@ -970,7 +972,7 @@ fn test_a_file_created_in_an_account_that_lost_its_dir_brings_it_back() {
     let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
     db.create_account("OLD_ACC", None).unwrap();
     db.delete_table_for_account("OLD_ACC", "DIR").unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
@@ -1008,7 +1010,7 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
     let dir = TempDir::new("protocol_demo_account");
     let base_dir = dir.path();
     let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
@@ -1051,7 +1053,7 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
     assert_eq!(read("PRODUCTS", "P1")["price"], "1200.00");
 
     // The account left no login behind on a server that had none.
-    assert_eq!(crate::server::handler::read_lock(&db_arc).current_account, "");
+    assert_eq!(crate::server::handler::read_lock(&db_arc).current_account(), "");
 
     // Making it twice is refused rather than half-rebuilt over the first.
     let resp = handle_request(
@@ -1068,7 +1070,7 @@ fn test_the_demo_account_is_admin_only_and_needs_a_name() {
     let dir = TempDir::new("protocol_demo_guards");
     let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("PLAIN", None).unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
     let db_arc = Arc::new(RwLock::new(db));
 
     let ordinary = ClientInfo {
