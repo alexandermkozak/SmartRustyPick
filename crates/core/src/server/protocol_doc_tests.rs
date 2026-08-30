@@ -5,7 +5,10 @@
 //! or add a command there and the documentation is wrong with nothing to catch
 //! it. These tests fail in that case: the expected sets below are the contract,
 //! every name in them must appear in `docs/protocol.md`, and the structs must
-//! serialize to exactly those keys.
+//! serialize to exactly those keys. The commands are read out of `handler.rs`
+//! itself, so a new one fails here until it is written up, and the nested
+//! objects the management commands return in `record` and `results` are pinned
+//! the same way as the wire structs.
 //!
 //! When the protocol genuinely changes: update `models.rs` / `handler.rs`, then
 //! `docs/protocol.md`, then the lists here.
@@ -130,4 +133,184 @@ fn every_command_is_documented() {
             "command `{command}` is not mentioned in docs/protocol.md"
         );
     }
+}
+
+/// The command arms of the dispatch `match` in `handler.rs`, read out of the
+/// source. Parsing beats a second hand-kept list: the point is to fail when a
+/// command is added and left undocumented, which one more list maintained by
+/// hand could never do.
+fn commands_in_handler() -> Vec<String> {
+    const HANDLER: &str = include_str!("handler.rs");
+    HANDLER
+        .lines()
+        .filter_map(|line| {
+            // The arms of that `match`, and only those: they sit at one indent
+            // inside `handle_request_locked`, unlike the read-only fast path's
+            // more deeply nested `"READ" =>`.
+            let arm = line.strip_prefix("        \"")?;
+            let (command, rest) = arm.split_once('"')?;
+            rest.trim_start().starts_with("=>").then(|| command.to_string())
+        })
+        .collect()
+}
+
+/// The keys of a JSON object a command returns inside `record` or `results`.
+fn value_keys(value: &serde_json::Value) -> Vec<String> {
+    value.as_object().expect("must be a JSON object").keys().cloned().collect()
+}
+
+fn assert_documented_shape(what: &str, actual: Vec<String>, expected: &[&str]) {
+    let mut actual = actual;
+    actual.sort();
+    let mut wanted: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+    wanted.sort();
+    assert_eq!(actual, wanted, "the {what} object changed. Update docs/protocol.md and this list.");
+    for key in expected {
+        assert!(
+            PROTOCOL_DOC.contains(&format!("\"{key}\"")),
+            "`{key}` of the {what} object is not shown in docs/protocol.md"
+        );
+    }
+}
+
+#[test]
+fn documented_commands_match_the_handler_dispatch() {
+    let mut actual = commands_in_handler();
+    actual.sort();
+    let mut expected: Vec<String> = COMMANDS.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "the commands handler.rs dispatches are no longer the documented ones. \
+         Update docs/protocol.md and COMMANDS (an empty left side means the arms \
+         of the dispatch match moved and commands_in_handler can no longer read them)."
+    );
+}
+
+#[test]
+fn list_accounts_entry_is_documented() {
+    let value = serde_json::to_value(crate::db::AccountStats::default()).unwrap();
+    assert_documented_shape(
+        "LIST.ACCOUNTS",
+        value_keys(&value),
+        &["name", "directory", "file_count", "record_count", "disk_bytes"],
+    );
+}
+
+#[test]
+fn file_stats_record_is_documented() {
+    let value = serde_json::to_value(crate::db::FileStats::default()).unwrap();
+    assert_documented_shape(
+        "FILE.STATS",
+        value_keys(&value),
+        &[
+            "account",
+            "name",
+            "record_count",
+            "dict_count",
+            "modulus",
+            "version",
+            "group_count",
+            "smallest_group_bytes",
+            "largest_group_bytes",
+            "disk_bytes",
+            "checksums",
+            "legacy",
+            "durable",
+            "loaded",
+            "modified_seconds_ago",
+        ],
+    );
+}
+
+#[test]
+fn server_stats_record_is_documented() {
+    let value = serde_json::to_value(crate::server::stats::ServerSnapshot::default()).unwrap();
+    assert_documented_shape(
+        "SERVER.STATS",
+        value_keys(&value),
+        &[
+            "uptime_seconds",
+            "started_at",
+            "listen_addr",
+            "total_connections",
+            "rejected_connections",
+            "total_requests",
+            "failed_requests",
+            "active_connections",
+        ],
+    );
+    // The engine side of the snapshot, added to the object by the handler
+    // rather than carried by the struct.
+    for key in ["pending_writes", "loaded_tables", "authorized_clients"] {
+        assert!(
+            PROTOCOL_DOC.contains(&format!("\"{key}\"")),
+            "`{key}` of the SERVER.STATS record is not shown in docs/protocol.md"
+        );
+    }
+}
+
+#[test]
+fn server_stats_connection_is_documented() {
+    let value = serde_json::to_value(crate::server::stats::ConnectionSnapshot::default()).unwrap();
+    assert_documented_shape(
+        "SERVER.STATS active_connections",
+        value_keys(&value),
+        &[
+            "id",
+            "peer",
+            "client_name",
+            "thumbprint",
+            "is_admin",
+            "connected_seconds",
+            "requests",
+            "last_command",
+            "idle_seconds",
+        ],
+    );
+}
+
+#[test]
+fn generate_cert_record_is_documented() {
+    let generated = crate::server::certs::GeneratedCert {
+        common_name: String::new(),
+        thumbprint: String::new(),
+        certificate_pem: String::new(),
+        private_key_pem: String::new(),
+        ca_pem: String::new(),
+        cert_path: String::new(),
+        key_path: String::new(),
+        pfx_path: None,
+    };
+    let value = serde_json::to_value(&generated).unwrap();
+    assert_documented_shape(
+        "GENERATE.CERT",
+        value_keys(&value),
+        &[
+            "common_name",
+            "thumbprint",
+            "certificate_pem",
+            "private_key_pem",
+            "ca_pem",
+            "cert_path",
+            "key_path",
+            "pfx_path",
+        ],
+    );
+}
+
+#[test]
+fn dictionary_entry_is_documented() {
+    let value = crate::server::handler::dictionary_entry(&crate::db::Record::default());
+    assert_documented_shape(
+        "LIST.DICT / SET.DICT",
+        value_keys(&value),
+        &["field", "heading", "justification", "width", "conversion", "definition"],
+    );
+}
+
+#[test]
+fn exploded_position_is_documented() {
+    let value = serde_json::to_value(crate::db::ValuePosition::value(0)).unwrap();
+    assert_documented_shape("positions", value_keys(&value), &["value", "sub_value"]);
 }
