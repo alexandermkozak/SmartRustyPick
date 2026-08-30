@@ -80,6 +80,21 @@ fn optional_flag(body: &Value, name: &str) -> Option<bool> {
     }
 }
 
+/// The dictionary attributes of a `SET.DICT` body, without the entry's name.
+///
+/// The page sends one flat object; the protocol wants the name as the record's
+/// key and the rest as the record. Copying the known attributes rather than
+/// deleting `name` keeps anything else a caller sent out of the record.
+fn dictionary_attributes(body: &Value) -> Value {
+    let mut attributes = serde_json::Map::new();
+    for name in ["field", "heading", "justification", "width", "conversion"] {
+        if let Some(value) = body.get(name) {
+            attributes.insert(name.to_string(), value.clone());
+        }
+    }
+    Value::Object(attributes)
+}
+
 fn flag(body: &Value, name: &str) -> bool {
     match body.get(name) {
         Some(Value::Bool(value)) => *value,
@@ -161,18 +176,50 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                 .await
         }
 
-        // Accounts and their files. Statistics and storage settings only - no
-        // endpoint here returns a stored record, which is the point: the
-        // dashboard manages the database, it is not a second way to read it.
+        // Accounts and their files: what exists, how big it is, and how it is
+        // stored. No endpoint here returns a stored *record*, which is the
+        // point - the dashboard manages the database, it is not a second way to
+        // read it. A file's dictionary is the exception that proves the rule:
+        // it is the file's shape rather than its contents, and maintaining it
+        // is why an operator opens a management interface at all.
         ("GET", ["api", "accounts"]) => run(client, json!({ "command": "LIST.ACCOUNTS" })).await,
+        ("POST", ["api", "accounts"]) => {
+            let name = match field(&body, "name") {
+                Some(name) => name,
+                None => return Response::error(400, "An account name is required"),
+            };
+            run(client, json!({ "command": "CREATE.ACCOUNT", "target_account": name })).await
+        }
+        // Dropping an account deletes every file in it. The confirmation is the
+        // page's job; the database refuses SYSTEM whatever is asked here.
+        ("DELETE", ["api", "accounts", account]) => {
+            run(client, json!({ "command": "DELETE.ACCOUNT", "target_account": account })).await
+        }
         ("GET", ["api", "accounts", account, "files"]) => {
             run(client, json!({ "command": "LIST.FILES", "account": account })).await
+        }
+        ("POST", ["api", "accounts", account, "files"]) => {
+            let name = match field(&body, "name") {
+                Some(name) => name,
+                None => return Response::error(400, "A file name is required"),
+            };
+            run(
+                client,
+                json!({
+                    "command": "CREATE.FILE",
+                    "account": account,
+                    "file": name,
+                    "durable": flag(&body, "durable"),
+                }),
+            )
+                .await
         }
         ("GET", ["api", "accounts", account, "files", file]) => {
             run(client, json!({ "command": "FILE.STATS", "account": account, "file": file })).await
         }
-        // The one thing about a file the dashboard changes rather than reports:
-        // whether its writes are flushed before they are acknowledged.
+        // The one thing about an existing file the dashboard changes rather
+        // than reports: whether its writes are flushed before they are
+        // acknowledged.
         ("POST", ["api", "accounts", account, "files", file]) => {
             let durable = match optional_flag(&body, "durable") {
                 Some(durable) => durable,
@@ -181,6 +228,44 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
             run(
                 client,
                 json!({ "command": "SET.FILE", "account": account, "file": file, "durable": durable }),
+            )
+                .await
+        }
+        ("DELETE", ["api", "accounts", account, "files", file]) => {
+            run(client, json!({ "command": "DELETE.FILE", "account": account, "file": file })).await
+        }
+
+        // A file's dictionary: the definitions that decide what its fields are
+        // called, how they are laid out and how they convert.
+        ("GET", ["api", "accounts", account, "files", file, "dictionary"]) => {
+            run(client, json!({ "command": "LIST.DICT", "account": account, "file": file })).await
+        }
+        ("POST", ["api", "accounts", account, "files", file, "dictionary"]) => {
+            let name = match field(&body, "name") {
+                Some(name) => name,
+                None => return Response::error(400, "A dictionary entry name is required"),
+            };
+            // Forwarded whole rather than picked apart: `SET.DICT` is where an
+            // attribute number or a justification is judged, so a rule lives in
+            // one place and this endpoint cannot drift from it.
+            run(
+                client,
+                json!({
+                    "command": "SET.DICT",
+                    "account": account,
+                    "file": file,
+                    "key": name,
+                    "structured_data": dictionary_attributes(&body),
+                }),
+            )
+                .await
+        }
+        // `DELETE` with `is_dict` already removes one entry correctly, so there
+        // is no separate command for it to duplicate.
+        ("DELETE", ["api", "accounts", account, "files", file, "dictionary", name]) => {
+            run(
+                client,
+                json!({ "command": "DELETE", "account": account, "file": file, "key": name, "is_dict": true }),
             )
                 .await
         }
@@ -231,6 +316,29 @@ mod tests {
         assert_eq!(optional_flag(&json!({ "durable": "Y" }), "durable"), Some(true));
         assert_eq!(optional_flag(&json!({ "durable": null }), "durable"), None);
         assert_eq!(optional_flag(&json!({}), "durable"), None);
+    }
+
+    #[test]
+    fn dictionary_attributes_carry_only_what_a_definition_is_made_of() {
+        // The entry's name is the record's key, not one of its attributes, and
+        // anything else a caller sent is not part of the definition either.
+        let body = json!({
+            "name": "PRICE",
+            "field": 2,
+            "heading": "Unit price",
+            "justification": "R",
+            "width": "12",
+            "conversion": "MD2",
+            "durable": true,
+        });
+        assert_eq!(
+            dictionary_attributes(&body),
+            json!({"field": 2, "heading": "Unit price", "justification": "R", "width": "12", "conversion": "MD2"})
+        );
+
+        // An attribute left out stays out, so SET.DICT applies its own default
+        // rather than being handed a null to interpret.
+        assert_eq!(dictionary_attributes(&json!({ "name": "NAME", "field": 1 })), json!({ "field": 1 }));
     }
 
     #[test]

@@ -62,6 +62,8 @@ const COMMANDS: &[&str] = &[
     "LIST.ACCOUNTS",
     "LIST.FILES",
     "FILE.STATS",
+    "LIST.DICT",
+    "SET.DICT",
     "SERVER.STATS",
 ];
 

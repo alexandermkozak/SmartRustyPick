@@ -17,7 +17,7 @@ fn open_account(base: &str, account: &str) -> Database {
     let mut db = Database::new(base, Some(isolated_config())).unwrap();
     db.create_account(account, Some(base)).unwrap();
     db.logto(account).unwrap();
-    db.create_dir_file().unwrap();
+    // DIR comes with the account; nothing here has to ask for it.
     db
 }
 
@@ -125,7 +125,6 @@ fn write_then_die(base: &str) -> ! {
     let mut db = Database::new(base, Some(isolated_config())).unwrap();
     db.create_account("KILL", Some(base)).unwrap();
     db.logto("KILL").unwrap();
-    db.create_dir_file().unwrap();
     db.create_table_durable("LEDGER", true).unwrap();
 
     // Buffering set so that only the durable flag can get this to disk.
@@ -278,6 +277,10 @@ fn test_an_account_without_a_dir_file_gets_one_when_a_file_is_promoted() {
     db.create_account("DUR8", Some(base)).unwrap();
     db.logto("DUR8").unwrap();
     db.create_table("LEDGER").unwrap();
+    // An account created now comes with a DIR file. The account this covers is
+    // an older one that never had a listing, so it is taken away again to reach
+    // the state the fallback exists for.
+    db.delete_table("DIR").unwrap();
     assert!(!db.list_tables().contains(&"DIR".to_string()));
 
     db.set_table_durable("LEDGER", true).unwrap();

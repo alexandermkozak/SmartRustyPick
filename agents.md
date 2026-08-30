@@ -36,11 +36,15 @@ AI agents have been responsible for several critical improvements and fixes in t
 
 - **Web Dashboard:** Built the browser-based management interface that starts with the database server, covering
   connection authorization, certificate issuing and download, live connection and usage monitoring, navigation of
-  accounts and their files, and per-file durability. It connects to the database as an ordinary remote client, with a certificate reissued and
+  accounts and their files, per-file durability, creating and dropping accounts and files, and maintaining a file's
+  dictionary. It connects to the database as an ordinary remote client, with a certificate reissued and
   re-authorized on every boot, so it can do nothing the documented protocol does not already allow.
 - **Protocol Extensions:** Added the management commands the dashboard needed - `LIST.CONNS`, `LIST.ACCOUNTS`,
-  `LIST.FILES`, `FILE.STATS`, `SERVER.STATS`, `SET.FILE` and `GENERATE.CERT` - to the remote protocol rather than giving
-  the interface a private path into the engine.
+  `LIST.FILES`, `FILE.STATS`, `SERVER.STATS`, `SET.FILE`, `GENERATE.CERT`, `LIST.DICT` and `SET.DICT` - to the remote
+  protocol rather than giving the interface a private path into the engine. The rule the additions follow is that a
+  command earns its place by filling a gap rather than by matching a page's shape: dictionary entries are created and
+  listed through new commands because `WRITE`/`READ` with `is_dict` label them with the *data* file's field names, but
+  they are deleted with the `DELETE` that already did the job correctly.
 
 ### 3. Testing and Automation
 

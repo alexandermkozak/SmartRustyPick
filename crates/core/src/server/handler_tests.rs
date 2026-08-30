@@ -675,3 +675,327 @@ fn test_unexploded_select_sends_no_positions() {
     assert!(resp.positions.is_none());
 
 }
+
+/// A database with one account and one file, and a client that may reach it.
+fn dictionary_test_db(name: &str) -> (TempDir, Arc<RwLock<Database>>, ClientInfo) {
+    let dir = TempDir::new(name);
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_account("DICT_TEST", None).unwrap();
+    db.create_table_for_account("DICT_TEST", "STOCK").unwrap();
+    db.current_account = String::new();
+
+    let client_info = ClientInfo {
+        name: "dict_client".to_string(),
+        thumbprint: "dict_tp".to_string(),
+        allowed_accounts: vec!["DICT_TEST".to_string()],
+        is_admin: false,
+    };
+    (dir, Arc::new(RwLock::new(db)), client_info)
+}
+
+fn set_dict(db: &Arc<RwLock<Database>>, client: &ClientInfo, key: &str, attributes: serde_json::Value) -> crate::server::models::Response {
+    handle_request(
+        Request {
+            command: "SET.DICT".to_string(),
+            account: Some("DICT_TEST".to_string()),
+            file: Some("STOCK".to_string()),
+            key: Some(key.to_string()),
+            structured_data: Some(attributes),
+            ..Default::default()
+        },
+        db,
+        client,
+    )
+}
+
+fn list_dict(db: &Arc<RwLock<Database>>, client: &ClientInfo) -> crate::server::models::Response {
+    handle_request(
+        Request {
+            command: "LIST.DICT".to_string(),
+            account: Some("DICT_TEST".to_string()),
+            file: Some("STOCK".to_string()),
+            ..Default::default()
+        },
+        db,
+        client,
+    )
+}
+
+#[test]
+fn test_set_dict_stores_an_entry_and_fills_in_its_defaults() {
+    let (_dir, db_arc, client_info) = dictionary_test_db("set_dict");
+
+    // Only the attribute number is required; everything else has a default, and
+    // the response is the stored entry so the caller can see what they were.
+    let resp = set_dict(&db_arc, &client_info, "NAME", serde_json::json!({ "field": 1 }));
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let stored = resp.record.unwrap();
+    assert_eq!(stored["field"], 1);
+    assert_eq!(stored["heading"], "NAME");
+    assert_eq!(stored["justification"], "L");
+    assert_eq!(stored["width"], 10);
+    assert_eq!(stored["conversion"], "");
+    // An entry with no conversion is the four attributes the CLI writes, not
+    // four followed by a run of empty ones.
+    assert_eq!(stored["definition"], "1^NAME^L^10");
+
+    // A form sends numbers as strings, and a lowercase justification is a
+    // spelling rather than a mistake.
+    let resp = set_dict(
+        &db_arc,
+        &client_info,
+        "PRICE",
+        serde_json::json!({ "field": "2", "heading": "Unit price", "justification": "r", "width": "12", "conversion": "MD2" }),
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let stored = resp.record.unwrap();
+    assert_eq!(stored["field"], 2);
+    assert_eq!(stored["justification"], "R");
+    assert_eq!(stored["width"], 12);
+    assert_eq!(stored["definition"], "2^Unit price^R^12^^^^MD2");
+}
+
+#[test]
+fn test_set_dict_refuses_a_definition_no_query_could_use() {
+    let (_dir, db_arc, client_info) = dictionary_test_db("set_dict_refusals");
+
+    let cases: Vec<(serde_json::Value, &str)> = vec![
+        (serde_json::json!({}), "Attribute number not specified"),
+        (serde_json::json!({ "field": 0 }), "Attribute number must be 1 or greater"),
+        (serde_json::json!({ "field": "first" }), "Attribute number is not a whole number: first"),
+        (serde_json::json!({ "field": 1, "width": 0 }), "Display width must be 1 or greater"),
+        (serde_json::json!({ "field": 1, "width": "wide" }), "Display width is not a whole number: wide"),
+        (serde_json::json!({ "field": 1, "justification": "centre" }), "Justification must be L or R"),
+    ];
+    for (attributes, expected) in cases {
+        let resp = set_dict(&db_arc, &client_info, "NAME", attributes.clone());
+        assert_eq!(resp.status, "ERROR", "{} was accepted", attributes);
+        assert_eq!(resp.message.unwrap(), expected);
+    }
+
+    // A refused entry is not a stored one.
+    assert!(list_dict(&db_arc, &client_info).results.unwrap().is_empty());
+
+    // The attributes themselves are required, and so is a name to file them under.
+    let resp = handle_request(
+        Request {
+            command: "SET.DICT".to_string(),
+            account: Some("DICT_TEST".to_string()),
+            file: Some("STOCK".to_string()),
+            key: Some("NAME".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &client_info,
+    );
+    assert_eq!(resp.message.unwrap(), "Dictionary attributes not specified");
+
+    let resp = set_dict(&db_arc, &client_info, "   ", serde_json::json!({ "field": 1 }));
+    assert_eq!(resp.message.unwrap(), "Key not specified");
+}
+
+#[test]
+fn test_list_dict_reads_the_dictionary_positions_rather_than_the_files_own_names() {
+    let (_dir, db_arc, client_info) = dictionary_test_db("list_dict");
+
+    set_dict(&db_arc, &client_info, "PRICE", serde_json::json!({ "field": 2, "justification": "R", "conversion": "MD2" }));
+    set_dict(&db_arc, &client_info, "NAME", serde_json::json!({ "field": 1, "heading": "Item", "width": 20 }));
+
+    let resp = list_dict(&db_arc, &client_info);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert_eq!(resp.count, Some(2));
+    // Ordered by attribute number, which is how a dictionary is read - not by
+    // the hash order the entries happen to sit in.
+    assert_eq!(resp.keys.unwrap(), vec!["NAME", "PRICE"]);
+
+    let results = resp.results.unwrap();
+    assert_eq!(results[0].0, "NAME");
+    assert_eq!(results[0].1["heading"], "Item");
+    assert_eq!(results[0].1["width"], 20);
+    assert_eq!(results[1].1["conversion"], "MD2");
+    assert_eq!(results[1].1["definition"], "2^PRICE^R^10^^^^MD2");
+
+    // READ with is_dict serializes against the *data* file's dictionary, so the
+    // same entry comes back labelled with the file's own field names. That is
+    // what LIST.DICT exists to avoid, and the difference is asserted rather
+    // than described.
+    let read = handle_request(
+        Request {
+            command: "READ".to_string(),
+            account: Some("DICT_TEST".to_string()),
+            file: Some("STOCK".to_string()),
+            key: Some("NAME".to_string()),
+            is_dict: Some(true),
+            ..Default::default()
+        },
+        &db_arc,
+        &client_info,
+    );
+    assert_eq!(read.status, "OK");
+    let record = read.record.unwrap();
+    assert_eq!(record["name"], "1", "attribute 1 of the entry read as the file's NAME field");
+    assert!(record.get("heading").is_none());
+}
+
+#[test]
+fn test_a_dictionary_entry_is_removed_by_delete_with_is_dict() {
+    let (_dir, db_arc, client_info) = dictionary_test_db("delete_dict");
+
+    set_dict(&db_arc, &client_info, "NAME", serde_json::json!({ "field": 1 }));
+    set_dict(&db_arc, &client_info, "PRICE", serde_json::json!({ "field": 2 }));
+
+    let resp = handle_request(
+        Request {
+            command: "DELETE".to_string(),
+            account: Some("DICT_TEST".to_string()),
+            file: Some("STOCK".to_string()),
+            key: Some("PRICE".to_string()),
+            is_dict: Some(true),
+            ..Default::default()
+        },
+        &db_arc,
+        &client_info,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert_eq!(list_dict(&db_arc, &client_info).keys.unwrap(), vec!["NAME"]);
+}
+
+#[test]
+fn test_dictionary_commands_need_an_account_a_file_and_permission() {
+    let (_dir, db_arc, client_info) = dictionary_test_db("dict_guards");
+
+    let resp = handle_request(
+        Request { command: "LIST.DICT".to_string(), account: Some("DICT_TEST".to_string()), ..Default::default() },
+        &db_arc,
+        &client_info,
+    );
+    assert_eq!(resp.message.unwrap(), "File not specified");
+
+    let resp = handle_request(
+        Request {
+            command: "LIST.DICT".to_string(),
+            account: Some("DICT_TEST".to_string()),
+            file: Some("NO_SUCH_FILE".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &client_info,
+    );
+    assert!(resp.message.unwrap().contains("not found"));
+
+    // A client may only reach the accounts it was authorized for, dictionary or not.
+    let resp = handle_request(
+        Request {
+            command: "LIST.DICT".to_string(),
+            account: Some("SYSTEM".to_string()),
+            file: Some("$CLIENTS".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &client_info,
+    );
+    assert!(resp.message.unwrap().contains("Access denied"));
+}
+
+#[test]
+fn test_an_account_created_over_the_protocol_gets_a_dir_file() {
+    // The dashboard creates an account and then files in it, and never logs in
+    // anywhere. Nothing in that path used to make a DIR file, so the account's
+    // own listing did not exist until somebody opened the CLI and answered a
+    // prompt - and until then the per-file durability flags had nowhere to live.
+    let dir = TempDir::new("protocol_dir_file");
+    let base_dir = dir.path();
+    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
+    db.current_account = String::new();
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "test_admin".to_string(),
+        thumbprint: "admin_tp".to_string(),
+        allowed_accounts: Vec::new(),
+        is_admin: true,
+    };
+
+    let resp = handle_request(
+        Request { command: "CREATE.ACCOUNT".to_string(), target_account: Some("NEW_ACC".to_string()), ..Default::default() },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert!(Path::new(base_dir).join("NEW_ACC").join("DIR").exists(), "a new account has no DIR file");
+
+    let listed = |db_arc: &Arc<RwLock<Database>>| {
+        handle_request(
+            Request { command: "LIST.FILES".to_string(), account: Some("NEW_ACC".to_string()), ..Default::default() },
+            db_arc,
+            &admin,
+        )
+        .keys
+        .unwrap()
+    };
+    assert_eq!(listed(&db_arc), vec!["DIR"]);
+
+    for file in ["LEDGER", "STOCK"] {
+        let resp = handle_request(
+            Request {
+                command: "CREATE.FILE".to_string(),
+                account: Some("NEW_ACC".to_string()),
+                file: Some(file.to_string()),
+                ..Default::default()
+            },
+            &db_arc,
+            &admin,
+        );
+        assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    }
+
+    // Both files are in the account's own listing, not just on the filesystem.
+    assert_eq!(listed(&db_arc), vec!["DIR", "LEDGER", "STOCK"]);
+    let dir_entries = {
+        let mut db = crate::server::handler::write_lock(&db_arc);
+        let table = db.get_table_mut_for_account("NEW_ACC", "DIR").unwrap();
+        let mut keys: Vec<String> = table.records.keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(dir_entries, vec!["LEDGER", "STOCK"]);
+}
+
+#[test]
+fn test_a_file_created_in_an_account_that_lost_its_dir_brings_it_back() {
+    // Accounts made before DIR came with them, and any account whose listing
+    // was dropped, must not stay unlisted for the rest of their lives.
+    let dir = TempDir::new("protocol_dir_recovery");
+    let base_dir = dir.path();
+    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
+    db.create_account("OLD_ACC", None).unwrap();
+    db.delete_table_for_account("OLD_ACC", "DIR").unwrap();
+    db.current_account = String::new();
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "test_admin".to_string(),
+        thumbprint: "admin_tp".to_string(),
+        allowed_accounts: Vec::new(),
+        is_admin: true,
+    };
+
+    let resp = handle_request(
+        Request {
+            command: "CREATE.FILE".to_string(),
+            account: Some("OLD_ACC".to_string()),
+            file: Some("LEDGER".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+
+    let resp = handle_request(
+        Request { command: "LIST.FILES".to_string(), account: Some("OLD_ACC".to_string()), ..Default::default() },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.keys.unwrap(), vec!["DIR", "LEDGER"]);
+}

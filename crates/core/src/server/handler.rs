@@ -31,6 +31,115 @@ fn error(message: impl Into<String>) -> Response {
     Response { status: "ERROR".to_string(), message: Some(message.into()), ..Default::default() }
 }
 
+/// The default display width `SET.DICT` gives an entry that does not name one.
+const DEFAULT_DICT_WIDTH: i64 = 10;
+/// The justifications a dictionary entry may carry, as `LIST` understands them.
+const DICT_JUSTIFICATIONS: [&str; 2] = ["L", "R"];
+
+/// One dictionary entry decomposed into the attributes
+/// [Data Structures](../../../../docs/data_structures.md) documents.
+///
+/// A dictionary record is a record like any other, so serializing it the way
+/// `READ` does would label it with the *data* file's field names - attribute 1
+/// would come back as whatever attribute 1 of the file is called. This reads
+/// the fixed positions instead, and carries the raw display string alongside
+/// them so an entry using a position this does not name is still visible.
+fn dictionary_entry(record: &Record) -> serde_json::Value {
+    let attribute = |idx: usize| record.get_field_display_string(idx);
+    let number = |idx: usize| attribute(idx).trim().parse::<i64>().ok();
+    serde_json::json!({
+        "field": number(crate::db::DICT_FIELD_IDX),
+        "heading": attribute(crate::db::DICT_NAME_IDX),
+        "justification": attribute(crate::db::DICT_JUSTIFY_IDX),
+        "width": number(crate::db::DICT_WIDTH_IDX),
+        "conversion": attribute(crate::db::DICT_CONV_IDX),
+        "definition": record.to_display_string(),
+    })
+}
+
+/// A field of the `structured_data` object `SET.DICT` takes, as text. A number
+/// is accepted for a field a form would more naturally send as one.
+fn dict_text(spec: &serde_json::Value, name: &str) -> Option<String> {
+    match spec.get(name) {
+        Some(serde_json::Value::String(text)) => Some(text.trim().to_string()),
+        Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// The same, as a whole number. `Err` carries what was sent instead, so a
+/// mistyped width is refused with the reason rather than treated as absent.
+fn dict_number(spec: &serde_json::Value, name: &str) -> Result<Option<i64>, String> {
+    match spec.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(number)) => match number.as_i64() {
+            Some(value) => Ok(Some(value)),
+            None => Err(number.to_string()),
+        },
+        Some(serde_json::Value::String(text)) if text.trim().is_empty() => Ok(None),
+        Some(serde_json::Value::String(text)) => match text.trim().parse::<i64>() {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => Err(text.clone()),
+        },
+        Some(other) => Err(other.to_string()),
+    }
+}
+
+/// Builds the dictionary record `SET.DICT` stores, or says why the attributes
+/// it was given do not describe one.
+///
+/// Validating here rather than in a caller is the point of the command: a
+/// dictionary entry with no attribute number is invisible to every query, and
+/// one with a justification `LIST` does not understand lays out wrongly, and
+/// neither failure shows up until someone reads the file.
+fn dictionary_record(key: &str, spec: &serde_json::Value) -> Result<Record, String> {
+    let field = match dict_number(spec, "field") {
+        Ok(Some(number)) if number >= 1 => number,
+        Ok(Some(_)) => return Err("Attribute number must be 1 or greater".to_string()),
+        Ok(None) => return Err("Attribute number not specified".to_string()),
+        Err(text) => return Err(format!("Attribute number is not a whole number: {}", text)),
+    };
+    let width = match dict_number(spec, "width") {
+        Ok(Some(number)) if number >= 1 => number,
+        Ok(Some(_)) => return Err("Display width must be 1 or greater".to_string()),
+        Ok(None) => DEFAULT_DICT_WIDTH,
+        Err(text) => return Err(format!("Display width is not a whole number: {}", text)),
+    };
+
+    // An entry with no heading of its own is headed by its name, which is what
+    // every dictionary written by hand in this database already does.
+    let heading = match dict_text(spec, "heading") {
+        Some(heading) if !heading.is_empty() => heading,
+        _ => key.to_string(),
+    };
+    let justification = match dict_text(spec, "justification") {
+        Some(text) if !text.is_empty() => text.to_uppercase(),
+        _ => DICT_JUSTIFICATIONS[0].to_string(),
+    };
+    if !DICT_JUSTIFICATIONS.contains(&justification.as_str()) {
+        return Err(format!("Justification must be {} or {}", DICT_JUSTIFICATIONS[0], DICT_JUSTIFICATIONS[1]));
+    }
+    let conversion = dict_text(spec, "conversion").unwrap_or_default();
+
+    // The conversion sits at attribute 8, so the positions between it and the
+    // width are filled and then trimmed back off when nothing occupies them -
+    // an entry without a conversion is `1^NAME^L^20`, as the CLI writes it.
+    let mut attributes = vec![
+        field.to_string(),
+        heading,
+        justification,
+        width.to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+        conversion,
+    ];
+    while attributes.last().is_some_and(String::is_empty) {
+        attributes.pop();
+    }
+    Ok(Record::from_attributes(attributes))
+}
+
 /// The commands that never modify the database and can therefore run under the
 /// shared lock, in parallel with each other.
 fn is_read_only(command: &str) -> bool {
@@ -649,6 +758,70 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     ..Default::default()
                 },
                 Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), ..Default::default() },
+            }
+        }
+        "LIST.DICT" => {
+            if target_account.is_none() {
+                return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), ..Default::default() };
+            }
+            let name = match req.file {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("File not specified".to_string()), ..Default::default() },
+            };
+            let table = match db.get_table_mut_for_account(acc, &name) {
+                Ok(t) => t,
+                Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
+            };
+            // Ordered by attribute number, then by name: the order the file's
+            // records are laid out in, which is the order a dictionary is read.
+            let mut entries: Vec<(&String, &Record)> = table.dictionary.iter().collect();
+            entries.sort_by(|(left_name, left), (right_name, right)| {
+                let position = |record: &Record| {
+                    record.get_field_display_string(crate::db::DICT_FIELD_IDX).trim().parse::<i64>().unwrap_or(i64::MAX)
+                };
+                position(left).cmp(&position(right)).then_with(|| left_name.cmp(right_name))
+            });
+            let keys: Vec<String> = entries.iter().map(|(name, _)| (*name).clone()).collect();
+            let results: Vec<(String, serde_json::Value)> = entries
+                .into_iter()
+                .map(|(name, record)| (name.clone(), dictionary_entry(record)))
+                .collect();
+            let count = results.len();
+            Response { status: "OK".to_string(), keys: Some(keys), results: Some(results), count: Some(count), ..Default::default() }
+        }
+        "SET.DICT" => {
+            if target_account.is_none() {
+                return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), ..Default::default() };
+            }
+            let name = match req.file {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("File not specified".to_string()), ..Default::default() },
+            };
+            let key = match req.key.as_deref().map(str::trim) {
+                Some(k) if !k.is_empty() => k.to_string(),
+                _ => return Response { status: "ERROR".to_string(), message: Some("Key not specified".to_string()), ..Default::default() },
+            };
+            let spec = match req.structured_data {
+                Some(spec @ serde_json::Value::Object(_)) => spec,
+                _ => return Response { status: "ERROR".to_string(), message: Some("Dictionary attributes not specified".to_string()), ..Default::default() },
+            };
+            let record = match dictionary_record(&key, &spec) {
+                Ok(record) => record,
+                Err(message) => return Response { status: "ERROR".to_string(), message: Some(message), ..Default::default() },
+            };
+            // Read back what was stored rather than echoing what was asked for,
+            // so a caller sees the defaults this filled in.
+            let entry = dictionary_entry(&record);
+
+            let table = match db.get_table_mut_for_account(acc, &name) {
+                Ok(t) => t,
+                Err(e) => return Response { status: "ERROR".to_string(), message: Some(format!("Table error: {}", e)), ..Default::default() },
+            };
+            table.dictionary.insert(key, record);
+            table.mark_dict_dirty();
+            match db.note_write_for(acc, &name) {
+                Ok(_) => Response { status: "OK".to_string(), record: Some(entry), ..Default::default() },
+                Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Save error: {}", e)), ..Default::default() },
             }
         }
         "SERVER.STATS" => {

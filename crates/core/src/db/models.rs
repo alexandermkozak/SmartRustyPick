@@ -84,6 +84,26 @@ impl Record {
         to_display_chars(&self.to_bytes())
     }
 
+    /// A record whose attributes each hold one plain value, in order.
+    ///
+    /// [`from_display_string`](Self::from_display_string) cannot express an
+    /// attribute that itself contains `^`, `]` or `\\`, because those are the
+    /// marks it splits on. Anything assembled from text a caller supplied - a
+    /// dictionary heading, say - is built here instead, so a stray mark
+    /// character is stored rather than silently restructuring the record.
+    pub fn from_attributes<I, S>(attributes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Record {
+            fields: attributes
+                .into_iter()
+                .map(|text| Field { values: vec![Value { sub_values: vec![text.as_ref().to_string()] }] })
+                .collect(),
+        }
+    }
+
     pub fn from_display_string(s: &str) -> Self {
         let translated_data: Vec<u8> = s.as_bytes().iter().map(|&b| match b {
             b'^' => FM,

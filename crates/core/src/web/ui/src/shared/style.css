@@ -394,6 +394,68 @@ button:disabled {
   margin-top: 0.5rem;
 }
 
+/* A row that is both a selection and a thing that can be dropped: the name
+   takes the width, the action sits at the end of it. */
+.list li.entry {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding-right: 0.6rem;
+}
+
+.list li.entry .select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* `.list button` makes a row-wide selection target; the action beside it is an
+   ordinary small button again. */
+.list li.entry .small {
+  flex: 0 0 auto;
+  width: auto;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  padding: 0.2rem 0.5rem;
+}
+
+.list li.entry .small.danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* A form under a list, rather than beside its rows. */
+.inline-form.spaced {
+  margin-top: 0.7rem;
+}
+
+.inline-form.spaced .check {
+  flex: 0 0 auto;
+}
+
+select {
+  font: inherit;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+/* The dictionary sits under the three columns and uses the whole width. */
+.dictionary .form {
+  margin-top: 1rem;
+}
+
+.dictionary tr[aria-current='true'] td {
+  background: var(--bg);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+}
+
 .list .meta {
   display: block;
   font-size: 0.75rem;

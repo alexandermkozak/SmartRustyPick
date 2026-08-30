@@ -37,3 +37,34 @@ export interface FileStats {
     loaded: boolean
     modified_seconds_ago: number | null
 }
+
+/**
+ * One dictionary entry as `LIST.DICT` decomposes it.
+ *
+ * `field` and `width` are `null` for an entry that holds something other than a
+ * number in those positions; `definition` is the raw display string, which is
+ * the whole truth about an entry however unusual it is.
+ */
+export interface DictionaryEntry {
+    name: string
+    field: number | null
+    heading: string
+    justification: string
+    width: number | null
+    conversion: string
+    definition: string
+}
+
+/**
+ * The dictionary form's contents. Everything is a string because that is what
+ * an input holds; `SET.DICT` accepts numbers spelled either way and is the one
+ * place the attributes are judged, so the page does not second-guess them.
+ */
+export interface DictionaryDraft {
+    name: string
+    field: string
+    heading: string
+    justification: string
+    width: string
+    conversion: string
+}
