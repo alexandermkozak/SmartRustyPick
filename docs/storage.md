@@ -124,7 +124,30 @@ Set it when creating the file:
 - Remote protocol: `CREATE.FILE` with `"durable": true` (an account without a `DIR` file gets one, since that is where
   the flag is stored)
 
-The global `durable_writes = true` still wins: it makes every file durable regardless of its `DIR` entry. Reading the
+Or change it afterwards, which is the usual case — a file is rarely known to be mission critical before it has any data
+in it:
+
+- CLI: `SET.FILE LEDGER DURABLE`, and `SET.FILE LEDGER BUFFERED` to go back
+- Remote protocol: `SET.FILE` with `"durable": true` or `false` (admin only, like `CREATE.FILE`)
+- Web dashboard: the Accounts tab, beside the file's statistics
+
+Promoting a file is safe for the data already in it: the flag is written and the file is flushed as part of the same
+change, so anything it had buffered reaches the disk under the durability being turned on rather than after it.
+Demoting only relaxes what a later write has to do, and needs no such care. Either way the file keeps its records — that
+is the point of setting the flag rather than recreating the file.
+
+`DIR` itself cannot be marked durable: it holds the flags rather than carrying one, and its own writes are flushed as
+soon as they are made.
+
+Reading the flag back:
+
+- CLI: `LIST.FILES` shows it per file
+- Remote protocol: `LIST.FILES` pairs each name with `{"durable": …}` in `results`, and `FILE.STATS` reports it for one
+  file
+- Web dashboard: durable files are tagged in the file list
+
+The global `durable_writes = true` still wins: it makes every file durable regardless of its `DIR` entry, and the
+listings say so file by file rather than reporting `DIR` entries that no longer describe what a write does. Reading the
 flag costs nothing on the write path — it is cached per file after the first lookup.
 
 ### Sync Policy

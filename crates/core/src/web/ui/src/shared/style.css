@@ -371,6 +371,29 @@ button:disabled {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
+/* A file's name on the left, what is true about it on the right. */
+.list button .row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.tag.durable {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.file-actions {
+  margin-top: 0.9rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.7rem;
+}
+
+.file-actions .note {
+  margin-top: 0.5rem;
+}
+
 .list .meta {
   display: block;
   font-size: 0.75rem;

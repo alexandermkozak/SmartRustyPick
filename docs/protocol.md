@@ -40,9 +40,9 @@ matched case-insensitively.
 | Field             | Type             | Used by                                                                                                            | Notes                                                                                                                                                                                                                                                                                     |
 |-------------------|------------------|--------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `command`         | string           | all                                                                                                                | Required. See [Commands](#commands).                                                                                                                                                                                                                                                      |
-| `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `GET.NEXT`, `CREATE.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
+| `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `GET.NEXT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
 | `target_account`  | string           | `CREATE.ACCOUNT`, `DELETE.ACCOUNT`                                                                                 | Name of the account to create or drop. (Distinct from `account`, which selects an existing context.)                                                                                                                                                                                      |
-| `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `DELETE.FILE`, `FILE.STATS`                           | Table (file) name.                                                                                                                                                                                                                                                                        |
+| `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`               | Table (file) name.                                                                                                                                                                                                                                                                        |
 | `key`             | string           | `READ`, `WRITE`, `DELETE`                                                                                          | Record key.                                                                                                                                                                                                                                                                               |
 | `data`            | string \| object | `WRITE`                                                                                                            | Record contents. A string is parsed as a display-format record (`^` field mark, `]` value mark, `\` sub-value mark). An object maps field names — original dictionary names or their camelCase form — to values, applying the dictionary's input conversions (ICONV).                     |
 | `structured_data` | object           | `WRITE`                                                                                                            | Same object form as `data`, checked first when present. Use either this or `data`, not both.                                                                                                                                                                                              |
@@ -57,7 +57,7 @@ matched case-insensitively.
 | `name`            | string           | `AUTHORIZE.CONN`, `DEAUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`, `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT`               | Human-readable client name; the identifier for later management. For `GENERATE.CERT` it is also the certificate's common name, so it is limited to letters, digits, `.`, `-` and `_`.                                                                                                     |
 | `accounts_list`   | array of strings | `AUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`, `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT`                                   | Allowed accounts for the client. Default `[]`.                                                                                                                                                                                                                                            |
 | `is_admin`        | bool             | `AUTHORIZE.CONN`, `GENERATE.CERT`                                                                                  | Grant the client admin rights. Default `false`.                                                                                                                                                                                                                                           |
-| `durable`         | bool             | `CREATE.FILE`                                                                                                      | Create the file with per-file durable writes. Default `false`. See [Storage Engine](storage.md).                                                                                                                                                                                          |
+| `durable`         | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Per-file durable writes. Optional for `CREATE.FILE`, default `false`; required for `SET.FILE`, where an absent flag is refused rather than read as a demotion. See [Storage Engine](storage.md).                                                                                          |
 
 ## Response object
 
@@ -68,9 +68,9 @@ populates it.
 |-----------|--------------------------|-------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `status`  | string                   | all                                                               | `"OK"`, `"ERROR"` or `"EOF"`.                                                                                                                                                                                    |
 | `message` | string                   | errors                                                            | Human-readable error text; set whenever `status` is `"ERROR"`.                                                                                                                                                   |
-| `record`  | object                   | `READ`, `FILE.STATS`, `SERVER.STATS`, `GENERATE.CERT`             | For `READ`, the record as field-name → display-formatted string (see [Record shape](#record-shape)). The management commands use it for their single result object, whose shape is documented with each command. |
-| `results` | array of `[key, record]` | `QUERY`, `GET.NEXT`, `LIST.CONNS`, `LIST.ACCOUNTS`                | Ordered `[string, object]` pairs. For `QUERY` and `GET.NEXT` each `record` has the same shape as `READ`; the management commands document their own.                                                             |
-| `keys`    | array of strings         | `LIST.FILES`                                                      | Plain list of names.                                                                                                                                                                                             |
+| `record`  | object                   | `READ`, `SET.FILE`, `FILE.STATS`, `SERVER.STATS`, `GENERATE.CERT` | For `READ`, the record as field-name → display-formatted string (see [Record shape](#record-shape)). The management commands use it for their single result object, whose shape is documented with each command. |
+| `results` | array of `[key, record]` | `QUERY`, `GET.NEXT`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES`  | Ordered `[string, object]` pairs. For `QUERY` and `GET.NEXT` each `record` has the same shape as `READ`; the management commands document their own.                                                             |
+| `keys`    | array of strings         | `LIST.FILES`                                                      | Plain list of names. `LIST.FILES` fills `results` as well, with what is known about each of them.                                                                                                                |
 | `count`   | integer                  | `SELECT`, `GET.NEXT`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES` | `SELECT`: number of keys selected into the list. `GET.NEXT`: number of records in the batch just returned. The list commands: number of entries returned.                                                        |
 | `positions` | array of objects or nulls | `QUERY`, `GET.NEXT`                                             | Present only for an exploded result. Index-aligned with `results`: the position within the exploded field that put each row there. See [Exploded results](#exploded-results).                                    |
 
@@ -164,6 +164,7 @@ a `null` position. `positions` is omitted entirely when nothing was exploded.
 | `CREATE.ACCOUNT`        |  yes  |    —    | `target_account`                                     | `status: "OK"`                          |
 | `DELETE.ACCOUNT`        |  yes  |    —    | `target_account`                                     | `status: "OK"`                          |
 | `CREATE.FILE`           |  yes  |   yes   | `account`, `file`                                    | `status: "OK"`                          |
+| `SET.FILE`              |  yes  |   yes   | `account`, `file`, `durable`                         | `record`                                |
 | `DELETE.FILE`           |  yes  |   yes   | `account`, `file`                                    | `status: "OK"`                          |
 | `AUTHORIZE.CONN`        |  yes  |    —    | `thumbprint`, `name`                                 | `status: "OK"`                          |
 | `DEAUTHORIZE.CONN`      |  yes  |    —    | `name`                                               | `status: "OK"`                          |
@@ -172,7 +173,7 @@ a `null` position. `positions` is omitted entirely when nothing was exploded.
 | `GENERATE.CERT`         |  yes  |    —    | `name`                                               | `record`                                |
 | `LIST.CONNS`            |  yes  |    —    | —                                                    | `results` + `count`                     |
 | `LIST.ACCOUNTS`         |       |    —    | —                                                    | `results` + `count`                     |
-| `LIST.FILES`            |       |   yes   | `account`                                            | `keys` + `count`                        |
+| `LIST.FILES`            |       |   yes   | `account`                                            | `keys` + `results` + `count`            |
 | `FILE.STATS`            |       |   yes   | `account`, `file`                                    | `record`                                |
 | `SERVER.STATS`          |  yes  |    —    | —                                                    | `record`                                |
 
@@ -335,6 +336,31 @@ Create a table (data and dictionary sections) in `account`.
 {"status": "OK"}
 ```
 
+### SET.FILE — admin
+
+Change the durability of a file that already exists, without recreating it — so a file can be
+promoted to mission critical, or demoted back, while keeping the records it holds.
+
+- Required: `account`, `file`, `durable`. Admin only.
+- With `durable: true` the file's pending writes are flushed as part of the change, so the
+  flag never gets ahead of the data it promises to protect. `durable: false` returns the file
+  to the database's buffering policy. See [Storage Engine](storage.md).
+- The flag is stored in the account's `DIR` entry for the file; an account without a `DIR`
+  file gets one.
+- `DIR` itself cannot be set: it carries the flags rather than one of its own, and its writes
+  are always flushed at once.
+- Errors: `"Admin privileges required"`, `"Account not specified"`,
+  `"File name not specified"`, `"Durability flag not specified"` (an absent flag is refused
+  rather than read as a demotion), `"Error: Table '<name>' not found in account '<account>'"`.
+
+```json
+{"command": "SET.FILE", "account": "SALES", "file": "LEDGER", "durable": true}
+```
+
+```json
+{"status": "OK", "record": {"account": "SALES", "name": "LEDGER", "durable": true}}
+```
+
 ### DELETE.FILE — admin
 
 Drop a table from `account`.
@@ -472,9 +498,13 @@ each file's section metadata, so no records are read.
 
 ### LIST.FILES
 
-Names of the files in one account, sorted.
+The files in one account, sorted.
 
 - Required: `account` (or a client with exactly one allowed account).
+- `keys` is the plain list of names. `results` pairs each name with what is known about the
+  file beside its name — currently `durable`, so a client can see which files flush every
+  write without reading the account's `DIR` file. A database running with
+  `durable_writes = true` reports every file as durable, because every write then is.
 - Errors: `"Account not specified"`, access-denied.
 
 ```json
@@ -482,7 +512,11 @@ Names of the files in one account, sorted.
 ```
 
 ```json
-{"status": "OK", "count": 3, "keys": ["DIR", "LEDGER", "USERS"]}
+{"status": "OK", "count": 3, "keys": ["DIR", "LEDGER", "USERS"], "results": [
+  ["DIR", {"durable": false}],
+  ["LEDGER", {"durable": true}],
+  ["USERS", {"durable": false}]
+]}
 ```
 
 ### FILE.STATS

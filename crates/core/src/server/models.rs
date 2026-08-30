@@ -25,7 +25,10 @@ pub struct Request {
     pub name: Option<String>,
     pub accounts_list: Option<Vec<String>>,
     pub is_admin: Option<bool>,
-    /// CREATE.FILE only: create the file with per-file durable writes enabled.
+    /// `CREATE.FILE`: create the file with per-file durable writes enabled.
+    /// `SET.FILE`: turn per-file durable writes on or off for a file that
+    /// already exists. Required there, since an absent flag must not be read as
+    /// a request to demote.
     pub durable: Option<bool>,
 }
 

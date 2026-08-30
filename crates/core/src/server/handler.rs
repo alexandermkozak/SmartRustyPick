@@ -473,6 +473,34 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), ..Default::default() },
             }
         }
+        "SET.FILE" => {
+            // Promoting a file to durable is a storage decision for the account,
+            // like creating one, so it is gated the same way.
+            if !client_info.is_admin {
+                return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), ..Default::default() };
+            }
+            if target_account.is_none() {
+                return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), ..Default::default() };
+            }
+            let name = match req.file {
+                Some(n) => n,
+                None => return Response { status: "ERROR".to_string(), message: Some("File name not specified".to_string()), ..Default::default() },
+            };
+            // Absent rather than false: an omitted flag would otherwise quietly
+            // demote a file the caller only meant to name.
+            let durable = match req.durable {
+                Some(d) => d,
+                None => return Response { status: "ERROR".to_string(), message: Some("Durability flag not specified".to_string()), ..Default::default() },
+            };
+            match db.set_table_durable_for_account(acc, &name, durable) {
+                Ok(_) => Response {
+                    status: "OK".to_string(),
+                    record: Some(serde_json::json!({ "account": acc, "name": name, "durable": durable })),
+                    ..Default::default()
+                },
+                Err(e) => Response { status: "ERROR".to_string(), message: Some(format!("Error: {}", e)), ..Default::default() },
+            }
+        }
         "DELETE.FILE" => {
             if !client_info.is_admin {
                 return Response { status: "ERROR".to_string(), message: Some("Admin privileges required".to_string()), ..Default::default() };
@@ -594,9 +622,17 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             if target_account.is_none() {
                 return Response { status: "ERROR".to_string(), message: Some("Account not specified".to_string()), ..Default::default() };
             }
-            let files = db.list_tables_for_account(acc);
+            // `keys` is the plain listing every client already reads; `results`
+            // carries what is worth knowing about a file beside its name, so
+            // durability is answerable without reading the account's DIR file.
+            let files = db.list_tables_with_durability_for_account(acc);
             let count = files.len();
-            Response { status: "OK".to_string(), keys: Some(files), count: Some(count), ..Default::default() }
+            let keys = files.iter().map(|(name, _)| name.clone()).collect();
+            let results = files
+                .into_iter()
+                .map(|(name, durable)| (name, serde_json::json!({ "durable": durable })))
+                .collect::<Vec<_>>();
+            Response { status: "OK".to_string(), keys: Some(keys), results: Some(results), count: Some(count), ..Default::default() }
         }
         "FILE.STATS" => {
             if target_account.is_none() {

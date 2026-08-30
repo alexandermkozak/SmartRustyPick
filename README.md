@@ -80,8 +80,8 @@ Currently supported settings:
   is kept next to it as `ca.key`, and `GENERATE.CERT` writes new client certificates into the same directory.
 - `records_per_group`: Target records per hashfile group (default: 16).
 - `durable_writes`: Flush every write before acknowledging it (default: false). Individual files can opt in without this
-  global switch: `CREATE.FILE <name> DURABLE` (see
-  [Storage Engine](docs/storage.md)).
+  global switch, at creation with `CREATE.FILE <name> DURABLE` or at any time after it with `SET.FILE <name> DURABLE`
+  (see [Storage Engine](docs/storage.md)).
 - `flush_interval_ms`: Max milliseconds a change stays in memory (default: 250).
 - `flush_max_pending`: Flush once this many writes are pending (default: 256).
 - `web_enabled`: Start the [web management dashboard](docs/web_dashboard.md) with the server (default: true).

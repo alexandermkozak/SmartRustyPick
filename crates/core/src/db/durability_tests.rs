@@ -200,3 +200,115 @@ fn test_durable_file_flushes_while_others_stay_buffered() {
     assert!(!db.has_pending_writes(), "a durable file must flush before acknowledging");
     assert_eq!(on_disk_count(base, "CRITICAL"), 1);
 }
+
+#[test]
+fn test_promoting_a_file_flushes_what_it_had_buffered() {
+    // The point of promoting an existing file is the data already in it, so the
+    // flag must not land while the records it protects are still in memory.
+    let guard = fresh_dir("durability_promote");
+    let base = guard.path();
+    let mut db = open_account(base, "DUR5");
+    db.create_table("LEDGER").unwrap();
+
+    db.durable_writes = false;
+    db.flush_max_pending = 1_000;
+    db.flush_interval = std::time::Duration::from_secs(3_600);
+    db.save().unwrap();
+
+    db.get_table_mut("LEDGER").unwrap().insert_record("K1", record("BUFFERED"));
+    db.note_write_for("DUR5", "LEDGER").unwrap();
+    assert!(db.has_pending_writes(), "the write should still be buffered");
+    assert_eq!(on_disk_count(base, "LEDGER"), 0);
+
+    db.set_table_durable("LEDGER", true).unwrap();
+    assert!(!db.has_pending_writes(), "promoting must flush what was buffered");
+    assert_eq!(on_disk_count(base, "LEDGER"), 1);
+    assert_eq!(dir_flag(&mut db, "LEDGER"), "Y");
+
+    // And from here on every write goes straight to disk.
+    db.get_table_mut("LEDGER").unwrap().insert_record("K2", record("ACKED"));
+    db.note_write_for("DUR5", "LEDGER").unwrap();
+    assert_eq!(on_disk_count(base, "LEDGER"), 2);
+}
+
+#[test]
+fn test_demoting_a_file_returns_it_to_the_buffered_policy() {
+    let guard = fresh_dir("durability_demote");
+    let base = guard.path();
+    let mut db = open_account(base, "DUR6");
+    db.create_table_durable("LEDGER", true).unwrap();
+
+    db.durable_writes = false;
+    db.flush_max_pending = 1_000;
+    db.flush_interval = std::time::Duration::from_secs(3_600);
+
+    db.set_table_durable("LEDGER", false).unwrap();
+    assert_eq!(dir_flag(&mut db, "LEDGER"), "");
+
+    db.get_table_mut("LEDGER").unwrap().insert_record("K1", record("V1"));
+    db.note_write_for("DUR6", "LEDGER").unwrap();
+    assert!(db.has_pending_writes(), "a demoted file buffers like any other");
+    assert_eq!(on_disk_count(base, "LEDGER"), 0);
+}
+
+#[test]
+fn test_the_durability_flag_is_only_settable_on_a_file_that_can_carry_one() {
+    let guard = fresh_dir("durability_refusals");
+    let base = guard.path();
+    let mut db = open_account(base, "DUR7");
+    db.create_table("LEDGER").unwrap();
+
+    let missing = db.set_table_durable("NOPE", true).unwrap_err();
+    assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+    assert!(missing.to_string().contains("NOPE"), "unexpected message: {}", missing);
+
+    // DIR holds the flags and its entry for itself would be dropped the next
+    // time the listing is rebuilt, so the answer is no rather than a lie.
+    let dir = db.set_table_durable("DIR", true).unwrap_err();
+    assert_eq!(dir.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn test_an_account_without_a_dir_file_gets_one_when_a_file_is_promoted() {
+    // The flag has nowhere else to live, so a promotion must not be lost just
+    // because the account never had a listing.
+    let guard = fresh_dir("durability_no_dir");
+    let base = guard.path();
+    let mut db = Database::new(base, Some(isolated_config())).unwrap();
+    db.create_account("DUR8", Some(base)).unwrap();
+    db.logto("DUR8").unwrap();
+    db.create_table("LEDGER").unwrap();
+    assert!(!db.list_tables().contains(&"DIR".to_string()));
+
+    db.set_table_durable("LEDGER", true).unwrap();
+    assert!(db.is_table_durable("LEDGER"));
+    assert_eq!(dir_flag(&mut db, "LEDGER"), "Y");
+}
+
+#[test]
+fn test_the_listing_carries_each_files_durability() {
+    let guard = fresh_dir("durability_listing");
+    let base = guard.path();
+    let mut db = open_account(base, "DUR9");
+    db.create_table("NORMAL").unwrap();
+    db.create_table_durable("CRITICAL", true).unwrap();
+
+    let listed = db.list_tables_with_durability_for_account("DUR9");
+    let of_ours: Vec<(String, bool)> = listed
+        .into_iter()
+        .filter(|(name, _)| name == "CRITICAL" || name == "NORMAL" || name == "DIR")
+        .collect();
+    assert_eq!(
+        of_ours,
+        vec![
+            ("CRITICAL".to_string(), true),
+            ("DIR".to_string(), false),
+            ("NORMAL".to_string(), false),
+        ]
+    );
+
+    // A database running durable throughout says so file by file, rather than
+    // reporting DIR entries that no longer describe what a write does.
+    db.durable_writes = true;
+    assert!(db.list_tables_with_durability_for_account("DUR9").iter().all(|(_, durable)| *durable));
+}

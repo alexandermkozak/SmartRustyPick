@@ -12,8 +12,10 @@ const {
   files,
   filesLoaded,
   stats,
+  changing,
   selectAccount,
   selectFile,
+  setDurable,
 } = useAccountBrowser()
 
 const rows = computed(() => accounts.data.value ?? [])
@@ -40,7 +42,7 @@ const rows = computed(() => accounts.data.value ?? [])
       />
     </div>
     <div>
-      <FileStatistics :stats="stats" />
+      <FileStatistics :changing="changing" :stats="stats" @set-durable="setDurable" />
     </div>
   </section>
 </template>
