@@ -61,6 +61,7 @@ For more information, see the following documentation:
 - [General Use Commands](docs/general_commands.md) - Data operations and queries.
 - [Remote Protocol](docs/protocol.md) - Details on the TCP/SSL remote protocol.
 - [Web Dashboard](docs/web_dashboard.md) - The browser-based management interface.
+- [Security](docs/security.md) - The threat model: what is protected today, what is not, and the decisions the encryption work is designed against.
 - [Container Deployment](docs/deployment.md) - Running the server with podman or docker compose.
 - [Testing](docs/testing.md) - The unit, integration and performance suites and how to run them.
 - [MCP Server](mcp/README.md) - Usage instructions for the Model Context Protocol server.
