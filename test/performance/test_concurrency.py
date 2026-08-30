@@ -56,7 +56,6 @@ BUDGET_KB_PER_CONNECTION = float(os.environ.get("SRP_BUDGET_KB_PER_CONNECTION", 
 SETUP_COMMANDS = [
     f"CREATE.ACCOUNT {ACCOUNT}",
     f"LOGTO {ACCOUNT}",
-    "Y",  # answer the "DIR file missing. Create and populate?" prompt
     f"CREATE.FILE {FILE}",
     f"SET DICT {FILE} VAL1 1",
     f"SET DICT {FILE} SEQ 2",
@@ -172,6 +171,15 @@ def main():
 
             seeder = harness.wait_for_client(port, client_crt, client_key, certs.ca_crt, process=cli)
             with seeder:
+                harness.wait_for_seed(
+                    seeder,
+                    lambda resp: sorted(resp.get("keys") or []) == ["SEQ", "VAL1"],
+                    process=cli,
+                    command="LIST.DICT",
+                    file=FILE,
+                    account=ACCOUNT,
+                )
+
                 print(f"Seeding {SEED_RECORDS} records...")
                 for i in range(SEED_RECORDS):
                     seeder.request(

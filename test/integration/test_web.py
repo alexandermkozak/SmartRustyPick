@@ -30,7 +30,6 @@ def seed_database(thumbprint):
             f"AUTHORIZE.CONN {thumbprint} admin ADMIN",
             f"CREATE.ACCOUNT {ACCOUNT}",
             f"LOGTO {ACCOUNT}",
-            "Y",  # answer the "DIR file missing. Create and populate?" prompt
             f"CREATE.FILE {FILE}",
             f"SET {FILE} K1 Alice]alice@example.com",
             f"SET {FILE} K2 Bob]bob@example.com",

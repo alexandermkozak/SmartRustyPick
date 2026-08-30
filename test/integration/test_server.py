@@ -13,7 +13,6 @@ FILE = "USERS"
 SETUP_COMMANDS = [
     "CREATE.ACCOUNT " + ACCOUNT,
     "LOGTO " + ACCOUNT,
-    "Y",  # answer the "DIR file missing. Create and populate?" prompt
     "CREATE.FILE " + FILE,
     # The dictionary maps attribute numbers onto names; the remote protocol serialises
     # records as JSON objects keyed by the camelCased dictionary entries.
@@ -44,6 +43,18 @@ def main():
 
             conn = harness.wait_for_client(port, client_crt, client_key, certs.ca_crt, process=cli)
             with conn:
+                # The listener comes up while the CLI is still reading the setup
+                # script, so the dictionary the assertions below expect is what
+                # is waited for - not merely a connection.
+                harness.wait_for_seed(
+                    conn,
+                    lambda resp: sorted(resp.get("keys") or []) == ["AGE", "NAME", "ROLES", "SURNAME"],
+                    process=cli,
+                    command="LIST.DICT",
+                    file=FILE,
+                    account=ACCOUNT,
+                )
+
                 resp = conn.request(
                     command="WRITE", file=FILE, key="USER1", data="John^Doe^30", account=ACCOUNT
                 )

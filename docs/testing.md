@@ -37,6 +37,11 @@ The suites live in `test/` and share `test/harness.py`:
   are authorised through the real `AUTHORIZE.CONN` command.
 - **Fixtures.** State is built by driving the actual CLI commands rather than by writing storage files by hand, so the
   suites do not depend on the on-disk byte layout.
+- **Waiting for a fixture.** A suite that seeds by writing to an interactive CLI's stdin must call
+  `harness.wait_for_seed` before its first request. `harness.wait_for_client` proves only that the TLS listener accepts;
+  the CLI is still working through the script, and the protocol server shares its database, so a request that arrives
+  first fails as `Table 'X' not found` — on a slow or loaded machine long before it fails on a developer's. The CLI
+  applies its script in order, so waiting for the last thing the seed does covers everything before it.
 - **Reporting.** A failing check does not abort the suite; every check is recorded and the process exits non-zero at the
   end. Results are written to `target/test-results/`: `integration_results.md`, `performance_results.md` and the
   machine readable `performance_metrics.json`. The whole directory is gitignored and uploaded as a CI artifact, so a
