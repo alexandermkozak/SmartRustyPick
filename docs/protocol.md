@@ -719,9 +719,3 @@ it holds a certificate reissued on each boot and drives the commands above. See 
 ```
 START.SERVER 0.0.0.0:8443 server.crt server.key ca.crt
 ```
-
-## MCP server integration
-
-For high-level interaction via AI agents, a Model Context Protocol server lives in `mcp/`.
-It wraps this protocol into tools such as `read_record`, `write_record` and
-`query_records`. See [mcp/README.md](../mcp/README.md).

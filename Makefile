@@ -112,12 +112,6 @@ test-coverage:
 test-coverage-html:
 	cargo llvm-cov --workspace --html
 
-mcp-setup:
-	pip install -r mcp/requirements.txt
-
-mcp-run:
-	python3 mcp/server.py
-
 container-build:
 	$(CONTAINER_ENGINE) build -f Containerfile -t $(IMAGE) .
 

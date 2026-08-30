@@ -5,7 +5,6 @@ db_storage/
 .idea/
 .junie/
 docs/
-mcp/
 test/
 scripts/
 *.md
