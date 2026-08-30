@@ -173,6 +173,34 @@ def main():
             status, _, _ = dashboard.call(f"/api/accounts/{ACCOUNT}/files/NO_SUCH_FILE")
             suite.check_eq("An unknown file is a 404", status, 404)
 
+            # Durability is the one thing about a file the dashboard changes.
+            status, payload, _ = dashboard.call(
+                f"/api/accounts/{ACCOUNT}/files/{FILE}", method="POST", payload={"durable": True}
+            )
+            suite.check_eq("A file can be promoted to durable writes", status, 200)
+            suite.check_eq(
+                "The promotion reports the new setting",
+                ((payload or {}).get("record") or {}).get("durable"),
+                True,
+            )
+
+            status, payload, _ = dashboard.call(f"/api/accounts/{ACCOUNT}/files")
+            durability = {name: info.get("durable") for name, info in (payload or {}).get("results") or []}
+            suite.check_eq("The file listing shows the file as durable", durability.get(FILE), True)
+
+            status, payload, _ = dashboard.call(
+                f"/api/accounts/{ACCOUNT}/files/{FILE}", method="POST", payload={"durable": False}
+            )
+            suite.check_eq("A file can be returned to buffered writes", status, 200)
+            status, payload, _ = dashboard.call(f"/api/accounts/{ACCOUNT}/files")
+            durability = {name: info.get("durable") for name, info in (payload or {}).get("results") or []}
+            suite.check_eq("The listing follows it back", durability.get(FILE), False)
+
+            status, payload, _ = dashboard.call(
+                f"/api/accounts/{ACCOUNT}/files/{FILE}", method="POST", payload={}
+            )
+            suite.check_eq("A change with no flag is refused", status, 400)
+
             # --- certificates ----------------------------------------------
             status, payload, _ = dashboard.call(
                 "/api/certificates", method="POST", payload={"common_name": "dash-issued", "accounts": [ACCOUNT]}

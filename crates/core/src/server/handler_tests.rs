@@ -191,6 +191,116 @@ fn test_create_file_durable_flag_is_honoured() {
 }
 
 #[test]
+fn test_set_file_promotes_and_demotes_an_existing_file() {
+    // The reason the command exists: changing durability without recreating the
+    // file, so the data it already holds is not the price of the flag.
+    let dir = TempDir::new("server_set_file");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_account("SET_TEST", None).unwrap();
+    db.current_account = String::new();
+    db.durable_writes = false;
+    db.flush_max_pending = 1_000;
+    db.flush_interval = std::time::Duration::from_secs(3_600);
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "test_admin".to_string(),
+        thumbprint: "admin_tp".to_string(),
+        allowed_accounts: Vec::new(),
+        is_admin: true,
+    };
+    let client = ClientInfo {
+        name: "test_client".to_string(),
+        thumbprint: "client_tp".to_string(),
+        allowed_accounts: vec!["SET_TEST".to_string()],
+        is_admin: false,
+    };
+
+    let set = |durable: Option<bool>, who: &ClientInfo| handle_request(
+        Request {
+            command: "SET.FILE".to_string(),
+            account: Some("SET_TEST".to_string()),
+            file: Some("LEDGER".to_string()),
+            durable,
+            ..Default::default()
+        },
+        &db_arc,
+        who,
+    );
+
+    let resp = handle_request(
+        Request {
+            command: "CREATE.FILE".to_string(),
+            account: Some("SET_TEST".to_string()),
+            file: Some("LEDGER".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+
+    let write = || handle_request(
+        Request {
+            command: "WRITE".to_string(),
+            account: Some("SET_TEST".to_string()),
+            file: Some("LEDGER".to_string()),
+            key: Some("K1".to_string()),
+            data: Some(serde_json::Value::String("V1".to_string())),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+
+    assert_eq!(write().status, "OK");
+    assert!(db_arc.read().unwrap().has_pending_writes(), "the write should still be buffered");
+
+    // Promoting flushes what the file had buffered, and every later write goes
+    // to disk before it is acknowledged.
+    let resp = set(Some(true), &admin);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert_eq!(resp.record.unwrap()["durable"], serde_json::json!(true));
+    assert!(!db_arc.read().unwrap().has_pending_writes(), "promoting must flush what was buffered");
+    assert!(db_arc.write().unwrap().is_table_durable_for_account("SET_TEST", "LEDGER"));
+
+    assert_eq!(write().status, "OK");
+    assert!(!db_arc.read().unwrap().has_pending_writes(), "a promoted file must flush at once");
+
+    // And back again.
+    assert_eq!(set(Some(false), &admin).status, "OK");
+    assert!(!db_arc.write().unwrap().is_table_durable_for_account("SET_TEST", "LEDGER"));
+    assert_eq!(write().status, "OK");
+    assert!(db_arc.read().unwrap().has_pending_writes(), "a demoted file buffers again");
+
+    // A request that names no flag must not be read as a demotion.
+    let resp = set(None, &admin);
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.message.unwrap(), "Durability flag not specified");
+
+    // Storage decisions are administrative, like creating the file was.
+    let resp = set(Some(true), &client);
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.message.unwrap(), "Admin privileges required");
+    assert!(!db_arc.write().unwrap().is_table_durable_for_account("SET_TEST", "LEDGER"));
+
+    // A file that does not exist is a not-found error, not a silent success.
+    let resp = handle_request(
+        Request {
+            command: "SET.FILE".to_string(),
+            account: Some("SET_TEST".to_string()),
+            file: Some("NOPE".to_string()),
+            durable: Some(true),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "ERROR");
+    assert!(resp.message.unwrap().contains("not found"));
+}
+
+#[test]
 fn test_handle_request_query_select() {
     let dir = TempDir::new("server_query");
     let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
@@ -281,6 +391,12 @@ fn test_management_commands_report_accounts_files_and_statistics() {
     let files = resp.keys.unwrap();
     assert!(files.contains(&"USERS".to_string()), "USERS missing from {:?}", files);
     assert_eq!(resp.count, Some(files.len()));
+    // The listing carries the durability flag beside the name, so a client does
+    // not have to read the account's DIR file to find it.
+    let listed = resp.results.unwrap();
+    assert_eq!(listed.len(), files.len());
+    let users = listed.iter().find(|(name, _)| name == "USERS").expect("USERS is listed");
+    assert_eq!(users.1["durable"], serde_json::json!(false));
 
     let resp = handle_request(
         Request {

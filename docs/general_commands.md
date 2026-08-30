@@ -12,7 +12,8 @@ Switch the current context to a different account.
 
 #### LIST.FILES
 
-List all files in the current account. This command reads from the `DIR` file.
+List all files in the current account, with the durability of each: `Durable` is `yes` when every write to that file is
+flushed before it is acknowledged, which `SET.FILE` changes. This command reads from the `DIR` file.
 
 - **Usage**: `LIST.FILES`
 - **Example**: `LIST.FILES`
@@ -180,6 +181,20 @@ entry - see [Storage Engine](storage.md).
 - **Usage**: `CREATE.FILE <name> [DURABLE]`
 - **Example**: `CREATE.FILE ORDERS`
 - **Example**: `CREATE.FILE LEDGER DURABLE`
+
+#### SET.FILE
+
+Turn durable writes on or off for a file that already exists, keeping the records it holds.
+
+Promoting a file flushes what it still had buffered as part of the change, so the flag never gets ahead of the data it
+protects. `BUFFERED` returns the file to the database's ordinary flush policy. `DIR` carries the flags for the other
+files and cannot be set itself. See [Storage Engine](storage.md).
+
+- **Usage**: `SET.FILE <name> DURABLE | BUFFERED`
+- **Example**: `SET.FILE LEDGER DURABLE`
+- **Example**: `SET.FILE LEDGER BUFFERED`
+- **Note**: Admin clients can do the same over the [remote protocol](protocol.md) with `SET.FILE`, and from the
+  [web dashboard](web_dashboard.md).
 
 #### DELETE.FILE
 

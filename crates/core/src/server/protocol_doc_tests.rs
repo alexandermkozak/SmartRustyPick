@@ -51,6 +51,7 @@ const COMMANDS: &[&str] = &[
     "CREATE.ACCOUNT",
     "DELETE.ACCOUNT",
     "CREATE.FILE",
+    "SET.FILE",
     "DELETE.FILE",
     "AUTHORIZE.CONN",
     "DEAUTHORIZE.CONN",

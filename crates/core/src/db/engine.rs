@@ -1063,6 +1063,21 @@ impl Database {
         tables
     }
 
+    /// Every file in the account with its durability flag, sorted by name.
+    ///
+    /// The flag is otherwise only readable by reading the account's `DIR` file,
+    /// which is an obscure interface for something a client may reasonably want
+    /// beside the name.
+    pub fn list_tables_with_durability_for_account(&mut self, account: &str) -> Vec<(String, bool)> {
+        self.list_tables_for_account(account)
+            .into_iter()
+            .map(|name| {
+                let durable = self.is_table_durable_for_account(account, &name);
+                (name, durable)
+            })
+            .collect()
+    }
+
     /// Every account in the registry, sorted, picking up accounts created by
     /// another process since the last look.
     pub fn list_accounts(&mut self) -> Vec<String> {
@@ -1230,9 +1245,6 @@ impl Database {
     pub fn create_table_for_account_durable(&mut self, account: &str, name: &str, durable: bool) -> io::Result<()> {
         self.create_table_for_account(account, name)?;
         if durable {
-            // The flag lives in DIR, so an account without one gets it now
-            // rather than silently losing the requested durability.
-            self.ensure_dir_file_for_account(account)?;
             self.set_table_durable_for_account(account, name, true)?;
         }
         Ok(())
@@ -1367,16 +1379,38 @@ impl Database {
         self.set_table_durable_for_account(&account, name, durable)
     }
 
-    /// Records the per-file durability flag in the account's DIR file. The flag
-    /// itself is metadata for mission critical files, so it is flushed at once.
+    /// Records the per-file durability flag in the account's DIR file, which is
+    /// how an existing file is promoted to durable or demoted back without
+    /// being recreated.
+    ///
+    /// The flag is written before the flush rather than after it, so the flush
+    /// this ends with is already the durable one: anything the file had
+    /// buffered reaches the disk under the durability being turned on, and the
+    /// flag never gets ahead of the data it promises to protect. Demoting is
+    /// safe either way - it only ever relaxes what a later write has to do.
     pub fn set_table_durable_for_account(&mut self, account: &str, name: &str, durable: bool) -> io::Result<()> {
         if account.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
         }
         self.ensure_available_tables(account)?;
-        if !self.available_tables.get(account).map(|s| s.contains("DIR")).unwrap_or(false) {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "DIR file not found for account"));
+        if !self.available_tables.get(account).map(|s| s.contains(name)).unwrap_or(false) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Table '{}' not found in account '{}'", name, account),
+            ));
         }
+        if name == "DIR" {
+            // DIR holds the flags; it is not one of the files they describe, and
+            // an entry for itself would be dropped the next time the listing is
+            // rebuilt. Recording a promise nothing honours is worse than saying no.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The DIR file's durability is not settable: its own writes are always flushed at once",
+            ));
+        }
+        // The flag lives in DIR, so an account without one gets it now rather
+        // than silently losing the requested durability.
+        self.ensure_dir_file_for_account(account)?;
         let dir_table = self.get_table_mut_for_account(account, "DIR")?;
         let mut rec = dir_table.records.get(name).cloned().unwrap_or_else(|| Self::dir_entry(false));
         while rec.fields.len() <= DIR_DURABLE_IDX {

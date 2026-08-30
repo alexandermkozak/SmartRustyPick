@@ -70,6 +70,16 @@ fn accounts(body: &Value, name: &str) -> Vec<String> {
     }
 }
 
+/// A flag the caller must actually have sent. `SET.FILE` reads an absent
+/// durability flag as a mistake rather than as "off", so the endpoint has to
+/// tell "false" and "not there" apart before it forwards anything.
+fn optional_flag(body: &Value, name: &str) -> Option<bool> {
+    match body.get(name) {
+        Some(Value::Null) | None => None,
+        Some(_) => Some(flag(body, name)),
+    }
+}
+
 fn flag(body: &Value, name: &str) -> bool {
     match body.get(name) {
         Some(Value::Bool(value)) => *value,
@@ -151,15 +161,28 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                 .await
         }
 
-        // Accounts and their files. Statistics only - no endpoint here returns a
-        // record, which is the point: the dashboard manages the database, it is
-        // not a second way to read it.
+        // Accounts and their files. Statistics and storage settings only - no
+        // endpoint here returns a stored record, which is the point: the
+        // dashboard manages the database, it is not a second way to read it.
         ("GET", ["api", "accounts"]) => run(client, json!({ "command": "LIST.ACCOUNTS" })).await,
         ("GET", ["api", "accounts", account, "files"]) => {
             run(client, json!({ "command": "LIST.FILES", "account": account })).await
         }
         ("GET", ["api", "accounts", account, "files", file]) => {
             run(client, json!({ "command": "FILE.STATS", "account": account, "file": file })).await
+        }
+        // The one thing about a file the dashboard changes rather than reports:
+        // whether its writes are flushed before they are acknowledged.
+        ("POST", ["api", "accounts", account, "files", file]) => {
+            let durable = match optional_flag(&body, "durable") {
+                Some(durable) => durable,
+                None => return Response::error(400, "A durable flag is required"),
+            };
+            run(
+                client,
+                json!({ "command": "SET.FILE", "account": account, "file": file, "durable": durable }),
+            )
+                .await
         }
 
         ("GET", _) | ("HEAD", _) => Response::error(404, "No such endpoint"),
@@ -197,6 +220,17 @@ mod tests {
         assert!(flag(&json!({ "is_admin": "admin" }), "is_admin"));
         assert!(!flag(&json!({ "is_admin": "N" }), "is_admin"));
         assert!(!flag(&json!({}), "is_admin"));
+    }
+
+    #[test]
+    fn a_missing_flag_is_not_a_false_one() {
+        // The difference decides whether an incomplete request demotes a file or
+        // is refused, so it is asserted rather than left to `flag`'s default.
+        assert_eq!(optional_flag(&json!({ "durable": true }), "durable"), Some(true));
+        assert_eq!(optional_flag(&json!({ "durable": false }), "durable"), Some(false));
+        assert_eq!(optional_flag(&json!({ "durable": "Y" }), "durable"), Some(true));
+        assert_eq!(optional_flag(&json!({ "durable": null }), "durable"), None);
+        assert_eq!(optional_flag(&json!({}), "durable"), None);
     }
 
     #[test]

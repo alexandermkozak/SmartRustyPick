@@ -26,6 +26,20 @@ dictionary definitions. This command is restricted to the `SYSTEM` account.
 - **Usage**: `CREATE.TEST.ACCOUNT <account name>`
 - **Example**: `CREATE.TEST.ACCOUNT TESTDB`
 
+#### SET.FILE
+
+Turn per-file durable writes on or off for a file that already exists, keeping its data. Over the
+[remote protocol](protocol.md) this is admin only, like `CREATE.FILE`; in the CLI it applies to the current account.
+
+- **Usage**: `SET.FILE <name> DURABLE | BUFFERED`
+- **Example**: `SET.FILE LEDGER DURABLE`
+- **Note**:
+  - Promoting a file flushes what it still had buffered, so the flag never gets ahead of the data it protects.
+  - The flag is stored as attribute 2 (`DURABLE`) of the file's `DIR` entry; an account without a `DIR` file gets one.
+  - `DIR` itself cannot be set: it carries the flags rather than one of its own, and its writes are always flushed.
+  - The current setting shows in `LIST.FILES`, in `FILE.STATS` and in the [web dashboard](web_dashboard.md). See
+    [Storage Engine](storage.md).
+
 #### AUTHORIZE.CONN
 
 Authorize a client certificate SHA-256 thumbprint with a name and access restrictions. This command is restricted to the

@@ -8,6 +8,15 @@ export interface AccountStats {
 }
 
 /**
+ * One file as the listing describes it: its name, and whether its writes are
+ * flushed before they are acknowledged.
+ */
+export interface FileEntry {
+    name: string
+    durable: boolean
+}
+
+/**
  * One file's statistics. Deliberately record free: the dashboard navigates
  * files, it does not browse their contents.
  */

@@ -62,11 +62,19 @@ by default), so they follow `ca_path` rather than littering the working director
 | Overview       | Uptime, listener, connection and request totals, pending writes, tables in memory, and every connection open right now.          |
 | Authorizations | Every authorized client: name, thumbprint, allowed accounts, admin flag. Authorize a thumbprint, add or remove accounts, revoke. |
 | Certificates   | Issue a certificate signed by the server's CA, authorized in the same step, with its key downloadable once.                      |
-| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics.       |
+| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Durable files are tagged in the listing, and the flag can be turned on or off there. |
 
 File statistics cover the record and dictionary counts, the hash modulus and group distribution, bytes on disk, the
 durability flag and whether the file is currently held in the server's cache. Record counts come from each file's
 section metadata, so opening the view does not load the file.
+
+Durability is the one thing about a file the dashboard changes rather than reports: beside the statistics, **Make
+durable** promotes the file so every write to it is flushed before being acknowledged, and **Buffer writes** returns it
+to the database's flush policy. Promoting flushes what the file still had buffered, so no data is at risk while the flag
+lands, and the file keeps its records either way. The change goes out as the ordinary `SET.FILE` command, so it is
+refused unless the dashboard's own certificate is an admin one, and the page re-reads the flag from the database rather
+than assuming the click took effect — a server running with `durable_writes = true` reports every file as durable
+whatever the button asked for. See [Storage Engine](storage.md).
 
 ## Security
 

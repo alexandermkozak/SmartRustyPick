@@ -176,6 +176,10 @@ fn main() -> io::Result<()> {
                 let mut db_lock = db.write().unwrap();
                 handle_create_file(&mut db_lock, &parts);
             }
+            "SET.FILE" => {
+                let mut db_lock = db.write().unwrap();
+                handle_set_file(&mut db_lock, &parts);
+            }
             "DELETE.FILE" => {
                 let mut db_lock = db.write().unwrap();
                 handle_delete_file(&mut db_lock, &parts);
@@ -867,6 +871,8 @@ fn print_help(current_account: &str) {
     println!("  GET-LIST <name>                       - Restore a saved select list.");
     println!("  CREATE.FILE <name> [DURABLE]          - Create a new file (data and dict) (SYSTEM only).");
     println!("                                          DURABLE flushes every write to that file immediately.");
+    println!("  SET.FILE <name> DURABLE | BUFFERED    - Turn durable writes on or off for an existing file.");
+    println!("                                          Turning it on flushes what the file still had buffered.");
     println!("  DELETE.FILE <name>                    - Delete a file (data and dict) (SYSTEM only).");
     println!("  CREATE.ACCOUNT <name> [<dir>]         - Create a new account (SYSTEM only).");
     if current_account == "SYSTEM" {
@@ -874,7 +880,7 @@ fn print_help(current_account: &str) {
     }
     println!("  DELETE.ACCOUNT <name>                 - Delete an account and all its files (SYSTEM only).");
     println!("  LOGTO <name>                          - Switch to a different account.");
-    println!("  LIST.FILES                            - List all files in the current account.");
+    println!("  LIST.FILES                            - List all files in the current account, with their durability.");
     if current_account == "SYSTEM" {
         println!("  AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts> - Authorize a client.");
         println!("  ADD.CLIENT.ACCOUNT <name> <accounts>  - Add allowed accounts to a client.");
@@ -1026,6 +1032,32 @@ fn handle_create_file(db: &mut Database, parts: &[&str]) {
     }
 }
 
+fn handle_set_file(db: &mut Database, parts: &[&str]) {
+    if parts.len() < 3 {
+        println!("Usage: SET.FILE <file_name> DURABLE | BUFFERED");
+        return;
+    }
+    let file_name = parts[1];
+    let durable = match parts[2].to_uppercase().as_str() {
+        "DURABLE" | "-D" => true,
+        "BUFFERED" | "NODURABLE" | "-B" => false,
+        other => {
+            println!("Unknown option '{}'. Usage: SET.FILE <file_name> DURABLE | BUFFERED", other);
+            return;
+        }
+    };
+    match db.set_table_durable(file_name, durable) {
+        Ok(_) => {
+            if durable {
+                println!("[{}] now flushes every write before acknowledging it", file_name);
+            } else {
+                println!("[{}] now follows the database's buffering policy", file_name);
+            }
+        }
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
 fn handle_delete_file(db: &mut Database, parts: &[&str]) {
     if parts.len() < 2 {
         println!("Usage: DELETE.FILE <file_name>");
@@ -1097,29 +1129,38 @@ fn handle_list_files(db: &mut Database) {
         return;
     }
 
-    match db.get_table("DIR") {
+    // Collected first: reading each file's durability needs the database again,
+    // and the DIR table is borrowed from it here.
+    let listed: Vec<String> = match db.get_table("DIR") {
         Some(table) => {
-            println!("{:<20} {:<10}", "File", "Type");
-            println!("{:-<20} {:-<10}", "", "");
-
-            let mut files: Vec<_> = table.records.iter().collect();
-            files.sort_by_key(|(k, _)| *k);
-
-            for (name, record) in files {
-                let file_type = record.fields.get(0)
-                    .and_then(|f| f.values.get(0))
-                    .and_then(|v| v.sub_values.get(0))
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-
-                if file_type == "F" {
-                    println!("{:<20} {:<10}", name, file_type);
-                }
-            }
+            let mut files: Vec<_> = table.records.iter()
+                .filter(|(_, record)| {
+                    record.fields.get(0)
+                        .and_then(|f| f.values.get(0))
+                        .and_then(|v| v.sub_values.get(0))
+                        .map(|s| s.as_str())
+                        .unwrap_or("") == "F"
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            files.sort();
+            files
         }
         None => {
             println!("Error: DIR file not found. Use LOGTO or check account.");
+            return;
         }
+    };
+
+    println!("{:<20} {:<10} {:<10}", "File", "Type", "Durable");
+    println!("{:-<20} {:-<10} {:-<10}", "", "", "");
+
+    // Asked per file rather than read off the DIR record: a database running
+    // with durable_writes makes every file durable, and a listing that said
+    // otherwise would be describing the DIR entry rather than what a write does.
+    for name in listed {
+        let durable = if db.is_table_durable(&name) { "yes" } else { "no" };
+        println!("{:<20} {:<10} {:<10}", name, "F", durable);
     }
 }
 
