@@ -61,8 +61,9 @@ matched case-insensitively.
 
 ## Response object
 
-Only `status` is always present. Every other field is present only when that command
-populates it.
+Only `status` is always present. Every other field is **omitted from the JSON** unless the
+command populates it — read an absent field as "not populated", the same as the `null` an
+older server sent in its place.
 
 | Field       | Type                      | Populated by                                                                                         | Notes                                                                                                                                                                                                            |
 |-------------|---------------------------|------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|

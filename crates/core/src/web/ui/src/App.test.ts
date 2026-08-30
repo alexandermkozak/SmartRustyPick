@@ -39,15 +39,10 @@ const snapshot: ServerSnapshot = {
     ],
 }
 
-const envelope = (body: Record<string, unknown>) => ({
-    status: 'OK',
-    message: null,
-    record: null,
-    results: null,
-    keys: null,
-    count: null,
-    ...body,
-})
+// The real envelope: the server omits every field the command did not populate,
+// so a stub that spells them out as nulls would not catch a reader that breaks
+// on an absent one.
+const envelope = (body: Record<string, unknown>) => ({status: 'OK', ...body})
 
 /** Answers the endpoints the way the dashboard's HTTP API does. */
 function stubFetch(routes: Record<string, unknown>, status = 200) {
