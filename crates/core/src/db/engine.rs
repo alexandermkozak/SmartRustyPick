@@ -67,6 +67,23 @@ impl TableHandle {
     }
 }
 
+/// What one file has buffered since it was last written out.
+///
+/// Batching per file rather than per database is what keeps a burst on one file
+/// from dragging every other file through a flush - and through that file's
+/// lock - with it.
+#[derive(Clone, Copy)]
+struct WriteMark {
+    pending: usize,
+    last_flush: Instant,
+}
+
+impl WriteMark {
+    fn fresh() -> Self {
+        WriteMark { pending: 0, last_flush: Instant::now() }
+    }
+}
+
 /// The client authorizations, kept together because they are read on every
 /// request and rewritten as a unit whenever `SYSTEM/$CLIENTS` changes.
 #[derive(Default)]
@@ -142,6 +159,8 @@ pub struct Database {
     pub flush_max_pending: usize,
     pending_writes: AtomicUsize,
     last_flush: Mutex<Instant>,
+    /// Per-file flush batching, for the writes that name the file they touch.
+    write_marks: Mutex<HashMap<TableKey, WriteMark>>,
     /// Per-file durability flags read from the DIR file, cached so the write
     /// path does not touch the filesystem on every request.
     durable_tables: RwLock<HashMap<TableKey, bool>>,
@@ -245,6 +264,7 @@ impl Database {
             flush_max_pending: config.flush_max_pending.unwrap_or(256).max(1),
             pending_writes: AtomicUsize::new(0),
             last_flush: Mutex::new(Instant::now()),
+            write_marks: Mutex::new(HashMap::new()),
             durable_tables: RwLock::new(HashMap::new()),
         };
 
@@ -1200,6 +1220,7 @@ impl Database {
             handle.write().stamp = Some(stamp);
         }
         self.pending_writes.store(0, Ordering::Relaxed);
+        mlock(&self.write_marks).clear();
         *mlock(&self.last_flush) = Instant::now();
         if clients_updated {
             self.load_clients_from_table()?;
@@ -1215,16 +1236,21 @@ impl Database {
 
     pub fn pending_write_count(&self) -> usize {
         self.pending_writes.load(Ordering::Relaxed)
+            + mlock(&self.write_marks).values().map(|mark| mark.pending).sum::<usize>()
     }
 
-    /// Records that a write happened and flushes only when the batch is full
-    /// or the flush interval has elapsed.
+    /// Records a write that does not name the file it touched, and flushes the
+    /// whole database when the batch is full or the flush interval has elapsed.
     ///
-    /// This is the write path used by the server. Saving on every request meant
-    /// one disk write per record even when a client streamed thousands of them;
-    /// batching turns that into one write per group per interval. The cost is a
-    /// bounded window (`flush_interval`) in which an acknowledged write is only
-    /// in memory - set `durable_writes` to trade the throughput back for it.
+    /// Saving on every request meant one disk write per record even when a
+    /// client streamed thousands of them; batching turns that into one write per
+    /// group per interval. The cost is a bounded window (`flush_interval`) in
+    /// which an acknowledged write is only in memory - set `durable_writes` to
+    /// trade the throughput back for it.
+    ///
+    /// The server names the file on every write and so goes through
+    /// [`note_write_for`](Self::note_write_for) instead; this is for a caller
+    /// that has edited something without saying what.
     pub fn note_write(&self) -> io::Result<()> {
         if self.durable_writes {
             return self.save();
@@ -1237,16 +1263,53 @@ impl Database {
         Ok(())
     }
 
-    /// Same as [`Database::note_write`], but honours the durability flag of the
-    /// file that was written: a file marked durable in its account's DIR entry
-    /// is flushed before the write is acknowledged, even when the rest of the
-    /// database is buffering. This lets mission critical files opt out of the
-    /// in-memory window without slowing everything else down.
+    /// Records a write to one named file, batching and flushing per file.
+    ///
+    /// This is the write path the server uses. Two things follow from naming the
+    /// file. A file marked durable in its account's DIR entry is flushed before
+    /// the write is acknowledged even when the rest of the database is
+    /// buffering, which lets mission critical files opt out of the in-memory
+    /// window without slowing everything else down. And an ordinary buffered
+    /// write is batched against that file's own counter and flushed on its own,
+    /// so a burst on one file neither writes out nor waits for any other.
     pub fn note_write_for(&self, account: &str, name: &str) -> io::Result<()> {
         if self.is_table_durable_for_account(account, name) {
+            // A file promised to be durable is flushed before the write is
+            // acknowledged - and so is everything else buffered at the time,
+            // because a promise about the disk is not worth much if it leaves
+            // the rest of the database behind in memory.
             return self.save();
         }
-        self.note_write()
+        // Everything else batches per file, so two connections writing to two
+        // files never flush - or wait on - each other's.
+        let key = (account.to_string(), name.to_string());
+        let due = {
+            let mut marks = mlock(&self.write_marks);
+            let mark = marks.entry(key.clone()).or_insert_with(WriteMark::fresh);
+            mark.pending += 1;
+            mark.pending >= self.flush_max_pending || mark.last_flush.elapsed() >= self.flush_interval
+        };
+        if due {
+            self.flush_table(&key)?;
+        }
+        Ok(())
+    }
+
+    /// Writes out one file and clears its batch, leaving every other file's
+    /// buffer, and every other file's lock, untouched.
+    fn flush_table(&self, key: &TableKey) -> io::Result<()> {
+        if let Some(handle) = self.get_table_read_only_for_account(&key.0, &key.1) {
+            if handle.read().is_dirty() {
+                self.flush_handle(key, &handle)?;
+                let stamp = self.disk_stamp(&key.0, &key.1);
+                handle.write().stamp = Some(stamp);
+                if key.0 == "SYSTEM" && key.1 == "$CLIENTS" {
+                    self.load_clients_from_table()?;
+                }
+            }
+        }
+        mlock(&self.write_marks).insert(key.clone(), WriteMark::fresh());
+        Ok(())
     }
 
     /// Flushes if the interval has elapsed. Intended for a background ticker,

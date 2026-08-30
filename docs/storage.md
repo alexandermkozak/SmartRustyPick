@@ -95,11 +95,16 @@ Writes and deletes are buffered in memory and flushed in batches to improve thro
 
 A flush is triggered by any of the following events:
 
-1. `flush_max_pending` (default 256) writes have accumulated.
-2. `flush_interval_ms` (default 250) has elapsed since the last flush.
+1. `flush_max_pending` (default 256) writes to a file have accumulated.
+2. `flush_interval_ms` (default 250) has elapsed since that file was last flushed.
 3. A client connection is closed.
 4. The server's background ticker fires.
 5. Graceful server shutdown (SIGTERM or Ctrl-C).
+
+The first two are counted **per file**: a burst of writes to one file flushes that file, and takes no other file's lock
+on the way. The last three flush everything that is buffered, which is what bounds how long any change can sit in
+memory. A write to a file marked durable also flushes the whole database, because a promise about the disk is not worth
+much if it leaves the rest of the database behind in memory.
 
 ### Durability Trade-off
 
@@ -164,12 +169,53 @@ A file marked `DURABLE` (and a database running with `durable_writes = true`) us
 write is acknowledged" has to mean on disk and not merely in the page cache. Setting `fsync` explicitly overrides that
 too, for an operator who knowingly trades the guarantee for throughput.
 
+## Concurrency and Lock Ordering
+
+Every loaded file carries its own read/write lock, and the database's own state - the account registry, each account's
+file listing, the client authorizations, the flush accounting, the cached durability flags - sits behind locks of its
+own. Ordinary record work therefore needs nothing but a shared borrow of the database:
+
+- `READ`, `WRITE`, `DELETE` and `QUERY` take the shared database lock and then lock only the one file they name. Two
+  connections writing to two different files never wait for each other.
+- A flush locks each dirty file in turn, so writing out one large file excludes work on that file and nothing else.
+- Creating and dropping files and accounts, changing authorizations and the stateful select lists still take the
+  database exclusively. None of it is on the hot path.
+
+Locks are acquired in this order, and never the other way round:
+
+1. the outer lock the server wraps the database in;
+2. the account registry;
+3. the per-account file listings;
+4. the map of loaded files;
+5. the eviction order;
+6. a single file;
+7. the durability, client and flush-accounting caches.
+
+A thread holds **at most one file lock at a time**. Nothing in the engine needs two, and a command that ever does must
+take them in `(account, file)` order. In particular, a full flush must not be started while a file is locked: it locks
+each dirty file in turn, and would deadlock on the one already held. The same rule is why a report renders from the file
+its caller has already locked rather than looking the dictionary up again per column.
+
+### Cache Eviction
+
+Once more than `max_loaded_tables` files are in memory, the coldest are written out and dropped. A file another
+connection is still working on is skipped rather than evicted - dropping it would let a third connection load a second
+copy from disk, and the two would overwrite each other - and a victim is flushed with the map still locked, so nothing
+can reload it between it leaving the cache and its changes reaching the disk.
+
+Two connections may load the same cold file at the same time. The second to finish finds the first one's entry already
+in the map and discards its own copy. That costs a duplicate read of a file nobody had written to yet, and is what keeps
+the map's lock off the disk.
+
 ## Configuration
 
 The following optional keys in `config.toml` control the storage engine:
 
 - `records_per_group` (default 16): Target number of records per group. Lower values result in smaller group files and
   faster rewrites but more files.
+- `max_loaded_tables` (default 64): How many files may be held in memory at once. A file is only as large in memory as
+  the records that have been read into it, and eviction is what makes two connections working on different files
+  interfere with each other, so this is worth raising rather than lowering on a database with many active files.
 - `durable_writes` (default false): If true, every write is flushed to disk before being acknowledged.
 - `fsync` (default `never`): How much of a flush is forced to the disk — `never`, `meta` or `always`. Durable files use
   `always` unless this is set explicitly.

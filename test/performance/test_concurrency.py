@@ -1,10 +1,13 @@
 """Behaviour and cost of the server under concurrent clients.
 
-Reads run under a shared lock and the blocking engine runs off the async runtime, so
-readers scale with the client count while writers still take the database exclusively.
-That mix is why this suite asserts properties rather than a fixed speedup:
+Reads run under a shared lock, writers lock only the file they name, and the blocking
+engine runs off the async runtime, so both readers and writers to different files
+scale with the client count. That is why this suite asserts properties rather than a
+fixed speedup:
 
 * correctness under contention - no lost updates, no cross-talk between connections;
+* per-file locking - writers to *different* files must beat a single writer, and must
+  see a shorter tail than the same writers all queueing on one file;
 * no throughput collapse - N clients must still get at least a fraction of the
   single-client throughput, which is what convoy effects and lock thrashing destroy;
 * bounded tail latency - the p99 a client sees must stay within a fair-queueing
@@ -38,6 +41,23 @@ HANDSHAKES = int(os.environ.get("SRP_CONC_HANDSHAKES", "20"))
 # aggregate. Serialised execution alone costs nothing here; only pathological
 # contention (convoying, repeated lock hand-off, per-request rebuilds) does.
 MIN_THROUGHPUT_RATIO = float(os.environ.get("SRP_CONC_MIN_THROUGHPUT_RATIO", "0.5"))
+# Writers on distinct files hold distinct locks, so N of them must get more work done
+# than one. Above 1x rather than near N: the ceiling here is the test client, not the
+# server - N Python threads share a GIL and a machine with fewer cores than clients,
+# which is also why the read-scaling number above is nowhere near N.
+MIN_WRITE_SCALING = float(os.environ.get("SRP_CONC_MIN_WRITE_SCALING", "1.25"))
+# The same N writers, on N files versus all on one. Same clients, same requests and
+# the same work for the server: the only difference is whether the writes queue for
+# one lock, which isolates the lock granularity itself. Compared as tail latency
+# rather than throughput, because aggregate throughput here is capped by the test
+# client while what a shared lock does is make a request wait its turn.
+MIN_WRITE_SPREAD = float(os.environ.get("SRP_CONC_MIN_WRITE_SPREAD", "1.15"))
+# Writes per connection in the distinct-file comparison. Long enough to span several
+# flush intervals - a run shorter than that measures whichever flush happened to land
+# inside it - and short enough to stay a quick check.
+DISTINCT_WRITES = int(os.environ.get("SRP_CONC_DISTINCT_WRITES", str(max(100, OPS_PER_CLIENT * 2))))
+# Unmeasured writes that create and load a file before the baseline is timed.
+WRITE_WARMUP = 20
 # Under perfect fair queueing a client waits for the other N-1, so its tail latency
 # grows about N-fold. Anything beyond this multiple means unfair or degrading queueing.
 TAIL_LATENCY_SLACK = float(os.environ.get("SRP_CONC_TAIL_SLACK", "3"))
@@ -82,8 +102,17 @@ def run_workload(conn, ops, op, offset=0):
     return samples, failures
 
 
-def run_parallel(make_client, clients, ops, op):
-    """Drive `clients` connections in parallel and return (Stats, failures, wall time)."""
+def run_parallel(make_client, clients, ops, op=None, op_for_slot=None):
+    """Drive `clients` connections in parallel and return (Stats, failures, wall time).
+
+    `op_for_slot` gives each connection an operation of its own, which is how the
+    distinct-file check points every writer at a different file; `op` is the shorthand
+    for the common case where they all do the same thing.
+    """
+    if op_for_slot is None:
+        def op_for_slot(_slot):
+            return op
+
     samples = [None] * clients
     failures = [None] * clients
     errors = []
@@ -91,7 +120,9 @@ def run_parallel(make_client, clients, ops, op):
     def worker(slot):
         try:
             with make_client() as conn:
-                samples[slot], failures[slot] = run_workload(conn, ops, op, offset=slot * ops)
+                samples[slot], failures[slot] = run_workload(
+                    conn, ops, op_for_slot(slot), offset=slot * ops
+                )
         except Exception as exc:  # noqa: BLE001 - surfaced as a suite failure
             errors.append(f"client {slot}: {exc}")
             samples[slot], failures[slot] = [], []
@@ -276,6 +307,136 @@ def main():
                 )
                 found = len(resp.get("results") or [])
                 suite.check_eq("No writes are lost under contention", found, expected)
+
+            # Writers on files of their own: with a lock per file rather than one
+            # for the whole database, they proceed in parallel instead of taking
+            # turns, and N connections get more done than one. The tail-latency
+            # comparison below is the sharper of the two signals - this ratio is
+            # measured against a baseline of one connection, and a single Python
+            # client is fast enough to blur it.
+            distinct_files = [f"{FILE}_W{slot}" for slot in range(CLIENTS)]
+            shared_file = f"{FILE}_SHARED"
+            baseline_file = f"{FILE}_BASE"
+            with make_client() as builder:
+                file_errors = [
+                    builder.request(command="CREATE.FILE", file=name, account=ACCOUNT).get("message")
+                    for name in distinct_files + [shared_file, baseline_file]
+                ]
+                file_errors = [message for message in file_errors if message]
+
+            def write_to(file_name):
+                def op(conn, index):
+                    return conn.request(
+                        command="WRITE",
+                        file=file_name,
+                        key=f"D{index}",
+                        data=f"Distinct^{index}",
+                        account=ACCOUNT,
+                    )
+                return op
+
+            with make_client() as lone_writer:
+                # The first writes to a fresh file create and load it. Timing them
+                # would put a one-off cost into the baseline that every client of
+                # the parallel run gets to spread over its whole workload.
+                run_workload(lone_writer, WRITE_WARMUP, write_to(baseline_file))
+                lone_samples, lone_failures = run_workload(
+                    lone_writer, DISTINCT_WRITES, write_to(baseline_file), offset=WRITE_WARMUP
+                )
+            lone = harness.Stats(lone_samples)
+            suite.measure(
+                f"Single writer, {DISTINCT_WRITES} writes to one file",
+                lone,
+                passed=not (lone_failures or file_errors),
+                extra="baseline for the per-file locking check"
+                if not file_errors
+                else f"{len(file_errors)} setup failures ({file_errors[0]})",
+            )
+
+            spread, problems, wall = run_parallel(
+                make_client,
+                CLIENTS,
+                DISTINCT_WRITES,
+                op_for_slot=lambda slot: write_to(distinct_files[slot]),
+            )
+            spread_aggregate = (CLIENTS * DISTINCT_WRITES) / wall if wall else 0.0
+            suite.measure(
+                f"{CLIENTS} concurrent writers, one file each, {DISTINCT_WRITES} writes",
+                spread,
+                passed=not problems,
+                extra=f"{spread_aggregate:.0f} ops/s aggregate over {wall:.2f}s"
+                if not problems
+                else f"{len(problems)} failures ({problems[0]})",
+            )
+
+            # The same writers again, all on one file. Everything else is held
+            # constant, so what separates this from the run above is only whether
+            # the writes queue behind a single lock.
+            shared, shared_problems, shared_wall = run_parallel(
+                make_client, CLIENTS, DISTINCT_WRITES, write_to(shared_file)
+            )
+            shared_aggregate = (CLIENTS * DISTINCT_WRITES) / shared_wall if shared_wall else 0.0
+            suite.measure(
+                f"{CLIENTS} concurrent writers, all on one file, {DISTINCT_WRITES} writes",
+                shared,
+                passed=not shared_problems,
+                extra=f"{shared_aggregate:.0f} ops/s aggregate over {shared_wall:.2f}s"
+                if not shared_problems
+                else f"{len(shared_problems)} failures ({shared_problems[0]})",
+            )
+
+            write_scaling = spread_aggregate / lone.ops_per_second if lone.ops_per_second else 0.0
+            suite.record(
+                "Concurrent write scaling, distinct files",
+                {
+                    "clients": CLIENTS,
+                    "single_ops_per_second": round(lone.ops_per_second, 2),
+                    "aggregate_ops_per_second": round(spread_aggregate, 2),
+                    "scaling": round(write_scaling, 3),
+                    "minimum": MIN_WRITE_SCALING,
+                },
+            )
+            suite.check(
+                "Writers to different files scale with the client count",
+                write_scaling >= MIN_WRITE_SCALING or not harness.ENFORCE_BUDGETS,
+                f"{CLIENTS} writers on {CLIENTS} files reach {write_scaling:.2f}x one writer's "
+                f"throughput ({spread_aggregate:.0f} vs {lone.ops_per_second:.0f} ops/s, "
+                f"minimum {MIN_WRITE_SCALING:.2f}x)",
+            )
+
+            spread_ratio = shared.p95 / spread.p95 if spread.p95 else 0.0
+            suite.record(
+                "Concurrent write spread, distinct files against one",
+                {
+                    "clients": CLIENTS,
+                    "one_file_p95_ms": round(shared.p95, 3),
+                    "distinct_files_p95_ms": round(spread.p95, 3),
+                    "one_file_ops_per_second": round(shared_aggregate, 2),
+                    "distinct_files_ops_per_second": round(spread_aggregate, 2),
+                    "spread": round(spread_ratio, 3),
+                    "minimum": MIN_WRITE_SPREAD,
+                },
+            )
+            suite.check(
+                "A writer waits for the file it writes, not for the database",
+                spread_ratio >= MIN_WRITE_SPREAD or not harness.ENFORCE_BUDGETS,
+                f"{CLIENTS} writers sharing one file see a p95 of {shared.p95:.2f}ms against "
+                f"{spread.p95:.2f}ms on {CLIENTS} files; {spread_ratio:.2f}x "
+                f"(minimum {MIN_WRITE_SPREAD:.2f}x)",
+            )
+
+            with make_client() as verifier:
+                # A full scan rather than a criterion: these files were created
+                # bare, and a selection would need a dictionary they have not got.
+                landed = 0
+                for name in distinct_files:
+                    resp = verifier.request(command="QUERY", file=name, account=ACCOUNT)
+                    landed += len(resp.get("results") or [])
+                suite.check_eq(
+                    "Every write to every file lands",
+                    landed,
+                    CLIENTS * DISTINCT_WRITES,
+                )
 
             loaded, handshake_ratio, load_errors = handshakes_during_slow_flush(
                 make_client, handshake_stats
