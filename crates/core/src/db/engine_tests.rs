@@ -130,7 +130,6 @@ fn test_sync_dir_file() {
 
     db.create_table("T1").unwrap();
     db.create_table("T2").unwrap();
-    db.create_table("DIR").unwrap(); // Ensure DIR exists for this account
 
     // Manually remove DIR entry
     {

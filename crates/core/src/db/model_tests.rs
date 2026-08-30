@@ -133,3 +133,17 @@ fn test_select_list_keys() {
     assert!(plain.entries.iter().all(|e| e.position.is_none()));
     assert!(!plain.is_empty());
 }
+
+#[test]
+fn attributes_survive_the_mark_characters_a_display_string_would_split_on() {
+    // A dictionary heading is text someone typed. Built through the display
+    // form, a `^` in it would silently become a new attribute; built from
+    // attributes, it is stored as the character it is.
+    let record = Record::from_attributes(["1", "PRICE ^ TAX", "L", "20"]);
+    assert_eq!(record.fields.len(), 4);
+    assert_eq!(record.get_field_display_string(1), "PRICE ^ TAX");
+
+    assert_ne!(record, Record::from_display_string(&record.to_display_string()));
+    assert_eq!(Record::from_display_string("1^NAME^L^20"), Record::from_attributes(["1", "NAME", "L", "20"]));
+    assert!(Record::from_attributes(Vec::<String>::new()).fields.is_empty());
+}

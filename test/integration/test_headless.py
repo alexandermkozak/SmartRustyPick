@@ -34,7 +34,6 @@ def main():
                     f"AUTHORIZE.CONN {thumbprint} test_client ADMIN",
                     f"CREATE.ACCOUNT {ACCOUNT} {account_dir}",
                     f"LOGTO {ACCOUNT}",
-                    "Y",  # answer the "DIR file missing. Create and populate?" prompt
                     f"CREATE.FILE {FILE}",
                     "SAVE",
                     "EXIT",

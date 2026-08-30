@@ -8,7 +8,9 @@ Switch the current context to a different account.
 
 - **Usage**: `LOGTO <account name>`
 - **Example**: `LOGTO SALES`
-- **Note**: When switching to an account that lacks a `DIR` file, you will be prompted to create and populate it.
+- **Note**: When switching to an account that lacks a `DIR` file, you will be prompted to create and populate it. An
+  account created by `CREATE.ACCOUNT` comes with one, so the prompt is only for an account that predates that or has had
+  its listing removed.
 
 #### LIST.FILES
 

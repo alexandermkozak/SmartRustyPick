@@ -101,7 +101,6 @@ TOTAL_RECORDS = NUM_RECORDS + MV_RECORDS
 SETUP_COMMANDS = [
     f"CREATE.ACCOUNT {ACCOUNT}",
     f"LOGTO {ACCOUNT}",
-    "Y",  # answer the "DIR file missing. Create and populate?" prompt
     f"CREATE.FILE {FILE}",
     f"SET DICT {FILE} VAL1 1",
     f"SET DICT {FILE} VAL2 2",
@@ -247,6 +246,17 @@ def main():
 
             conn = harness.wait_for_client(port, client_crt, client_key, certs.ca_crt, process=cli)
             with conn:
+                # Setup is the last thing the CLI does; the timings below must
+                # not include the tail of it, let alone race it.
+                harness.wait_for_seed(
+                    conn,
+                    lambda resp: sorted(resp.get("keys") or []) == ["TAGS", "VAL1"],
+                    process=cli,
+                    command="LIST.DICT",
+                    file=MV_FILE,
+                    account=ACCOUNT,
+                )
+
                 print(f"Writing {NUM_RECORDS} records in two phases...")
 
                 early, early_failures = write_range(conn, 0, FIRST_SLICE)

@@ -611,6 +611,14 @@ impl Database {
             Ok(())
         })?;
 
+        // An account describes its files in a DIR file, and everything that
+        // reads one - the CLI's LIST, the per-file durability flags - treats a
+        // missing DIR as an error rather than as an empty account. Creating it
+        // with the account means no caller has to remember to, which is how an
+        // account created over the protocol used to end up without one until
+        // somebody logged into it from the CLI and answered a prompt.
+        self.ensure_dir_file_for_account(name)?;
+
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             let _ = self.logto(&prev_acc);
         } else if prev_acc.is_empty() {
@@ -1269,10 +1277,21 @@ impl Database {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("Table '{}' already exists", name)));
         }
         available.insert(name.to_string());
+        let has_dir = available.contains("DIR");
 
-        // Update DIR file if it exists and this is not the DIR file itself
-        if name != "DIR" && available.contains("DIR") {
-            let _ = self.sync_dir_file_for_account(account);
+        // DIR is the account's own listing of its files, so a file created in
+        // an account that has not got one brings it into being rather than
+        // going unlisted - which is what a client creating an account and then
+        // files over the protocol used to end up with, since nothing outside
+        // the CLI's login prompt ever made one. Creating DIR itself must not
+        // come back through here, which the name check takes care of, and
+        // `ensure_dir_file_for_account` writes the listing when it creates one.
+        if name != "DIR" {
+            let _ = if has_dir {
+                self.sync_dir_file_for_account(account)
+            } else {
+                self.ensure_dir_file_for_account(account)
+            };
         }
 
         // Set default dictionary for SYSTEM files
@@ -2064,7 +2083,7 @@ impl Database {
         let original_account = self.current_account.clone();
         self.create_account(name, None)?;
         self.logto(name)?;
-        self.create_table("DIR")?;
+        // DIR comes with the account now; creating it again would be refused.
         self.create_table("USERS")?;
         self.create_table("PRODUCTS")?;
         self.sync_dir_file()?;

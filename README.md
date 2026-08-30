@@ -43,8 +43,8 @@ field formatting, and complex select operations.
   formatting/conversions (Dates, Numbers).
 - **Active Select Lists**: Perform queries and refine them through sequential `SELECT` commands.
 - **Remote Access**: TCP SSL server with certificate authentication and CRUD protocol.
-- **Web Dashboard**: Browser-based management of connections, certificates, accounts and live server activity, started
-  automatically with the server.
+- **Web Dashboard**: Browser-based management of connections, certificates, accounts, files, their dictionaries and live
+  server activity, started automatically with the server.
 - **Persistent Configuration**: Customize your environment (e.g., preferred editor, SSL certificates, server address).
 - **Headless Mode**: Run the database as a background service without a CLI.
 - **Smart Login**: Automatic CLI account login based on the current working directory.

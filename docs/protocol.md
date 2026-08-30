@@ -40,12 +40,12 @@ matched case-insensitively.
 | Field             | Type             | Used by                                                                                                            | Notes                                                                                                                                                                                                                                                                                     |
 |-------------------|------------------|--------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `command`         | string           | all                                                                                                                | Required. See [Commands](#commands).                                                                                                                                                                                                                                                      |
-| `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `GET.NEXT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
-| `target_account`  | string           | `CREATE.ACCOUNT`, `DELETE.ACCOUNT`                                                                                 | Name of the account to create or drop. (Distinct from `account`, which selects an existing context.)                                                                                                                                                                                      |
-| `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`               | Table (file) name.                                                                                                                                                                                                                                                                        |
-| `key`             | string           | `READ`, `WRITE`, `DELETE`                                                                                          | Record key.                                                                                                                                                                                                                                                                               |
+| `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `GET.NEXT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS`, `LIST.DICT`, `SET.DICT` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
+| `target_account`  | string           | `CREATE.ACCOUNT`, `CREATE.TEST.ACCOUNT`, `DELETE.ACCOUNT`                                                          | Name of the account to create or drop. (Distinct from `account`, which selects an existing context.)                                                                                                                                                                                      |
+| `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`, `LIST.DICT`, `SET.DICT` | Table (file) name.                                                                                                                                                                                                                                                                        |
+| `key`             | string           | `READ`, `WRITE`, `DELETE`, `SET.DICT`                                                                              | Record key; for `SET.DICT`, the name of the dictionary entry.                                                                                                                                                                                                                                                                               |
 | `data`            | string \| object | `WRITE`                                                                                                            | Record contents. A string is parsed as a display-format record (`^` field mark, `]` value mark, `\` sub-value mark). An object maps field names — original dictionary names or their camelCase form — to values, applying the dictionary's input conversions (ICONV).                     |
-| `structured_data` | object           | `WRITE`                                                                                                            | Same object form as `data`, checked first when present. Use either this or `data`, not both.                                                                                                                                                                                              |
+| `structured_data` | object           | `WRITE`, `SET.DICT`                                                                                                | `WRITE`: same object form as `data`, checked first when present — use either this or `data`, not both. `SET.DICT`: the dictionary attributes of one entry.                                                                                                                                 |
 | `is_dict`         | bool             | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`                                                                       | Operate on the file's dictionary section instead of its data section. Default `false`.                                                                                                                                                                                                    |
 | `query_string`    | string           | `QUERY`, `SELECT`                                                                                                  | Pick-style query, e.g. `WITH NAME = "John" BY NAME`. Alternative to `query_node`. A bare command with neither selects every record.                                                                                                                                                       |
 | `query_node`      | object           | `QUERY`, `SELECT`                                                                                                  | Structured query tree. Takes precedence over `query_string`. See [Query node](#query-node).                                                                                                                                                                                               |
@@ -162,6 +162,7 @@ a `null` position. `positions` is omitted entirely when nothing was exploded.
 | `SELECT`                |       |   yes   | `file`                                               | `count`                                 |
 | `GET.NEXT`              |       |  yes¹   | `list_name` (defaults to `"DEFAULT"`)                | `results` + `count`, or `status: "EOF"` |
 | `CREATE.ACCOUNT`        |  yes  |    —    | `target_account`                                     | `status: "OK"`                          |
+| `CREATE.TEST.ACCOUNT`   |  yes  |    —    | `target_account`                                     | `record`                                |
 | `DELETE.ACCOUNT`        |  yes  |    —    | `target_account`                                     | `status: "OK"`                          |
 | `CREATE.FILE`           |  yes  |   yes   | `account`, `file`                                    | `status: "OK"`                          |
 | `SET.FILE`              |  yes  |   yes   | `account`, `file`, `durable`                         | `record`                                |
@@ -175,6 +176,8 @@ a `null` position. `positions` is omitted entirely when nothing was exploded.
 | `LIST.ACCOUNTS`         |       |    —    | —                                                    | `results` + `count`                     |
 | `LIST.FILES`            |       |   yes   | `account`                                            | `keys` + `results` + `count`            |
 | `FILE.STATS`            |       |   yes   | `account`, `file`                                    | `record`                                |
+| `LIST.DICT`             |       |   yes   | `account`, `file`                                    | `keys` + `results` + `count`            |
+| `SET.DICT`              |       |   yes   | `account`, `file`, `key`, `structured_data`          | `record`                                |
 | `SERVER.STATS`          |  yes  |    —    | —                                                    | `record`                                |
 
 ¹ `GET.NEXT` resolves its account from the select list created by `SELECT`, so it does not
@@ -307,6 +310,11 @@ Fetch the next batch of records from a select list. Advances the list's cursor.
 Create or drop an account. Names the account with `target_account`, not `account`.
 
 - Required: `target_account`. Admin only.
+- A created account comes with its `DIR` file, the listing that describes the files it holds
+  and carries their durability flags. Everything that reads one treats a missing `DIR` as an
+  error rather than as an empty account, so no client has to remember to create it.
+- Dropping an account takes every file in it. `SYSTEM` cannot be dropped: it holds the
+  account registry and the authorized clients.
 - Errors: `"Admin privileges required"`, `"Account name not specified"`, `"Error: <detail>"`.
 
 ```json
@@ -317,11 +325,37 @@ Create or drop an account. Names the account with `target_account`, not `account
 {"status": "OK"}
 ```
 
+### CREATE.TEST.ACCOUNT — admin
+
+Create an account already populated with the demo fixture — the same one the CLI's
+`CREATE.TEST.ACCOUNT` makes, so there is something to query without typing records in first.
+
+- Required: `target_account`. Admin only. The CLI restricts the command to the `SYSTEM`
+  account; over the wire an admin certificate is the equivalent gate.
+- The account gets a `DIR`, a `USERS` file and a `PRODUCTS` file, each with a dictionary and a
+  couple of records. Between them they reach every level of the hierarchy — `ROLES` is
+  multivalued and one of its values is sub-valued — and `PRODUCTS.PRICE` carries an `MD2`
+  conversion, so the fixture exercises multivalues and conversions rather than only flat text.
+- `record` names the account and the files it was given, read back after the fact rather than
+  listed from a constant, so it describes whatever the fixture creates today.
+- The account must not already exist; nothing is written when it does.
+- Errors: `"Admin privileges required"`, `"Account name not specified"`, `"Error: <detail>"`.
+
+```json
+{"command": "CREATE.TEST.ACCOUNT", "target_account": "DEMO"}
+```
+
+```json
+{"status": "OK", "record": {"account": "DEMO", "files": ["DIR", "PRODUCTS", "USERS"]}}
+```
+
 ### CREATE.FILE — admin
 
 Create a table (data and dictionary sections) in `account`.
 
 - Required: `account`, `file`. Optional: `durable`. Admin only.
+- The file is added to the account's `DIR` listing, which is created first if the account
+  has not got one.
 - With `durable: true` the file is marked mission critical in the account's `DIR` entry, so
   every write to it is flushed to disk before it is acknowledged while the rest of the
   database keeps buffering writes. See [Storage Engine](storage.md).
@@ -540,6 +574,70 @@ record is returned, and none is read to answer it unless the file is still in th
   "disk_bytes": 262144, "checksums": true, "legacy": false,
   "durable": false, "loaded": true, "modified_seconds_ago": 12
 }}
+```
+
+### LIST.DICT
+
+Every dictionary entry of one file, decomposed into the attributes
+[Data Structures](data_structures.md#dictionary-items) documents.
+
+- Required: `account` (or a single-account client), `file`.
+- A dictionary record is a record like any other, so `READ` with `is_dict` labels it with the
+  *data* file's field names — attribute 1 comes back under whatever attribute 1 of the file
+  is called. This reads the fixed dictionary positions instead. `definition` carries the raw
+  display string, so an entry using a position not named here is still visible.
+- `field` and `width` are `null` when the entry does not hold a number there.
+- Entries come back ordered by attribute number, then by name.
+- Errors: `"Account not specified"`, `"File not specified"`, `"Table error: <detail>"`,
+  access-denied.
+
+```json
+{"command": "LIST.DICT", "account": "SALES", "file": "USERS"}
+```
+
+```json
+{"status": "OK", "count": 2, "keys": ["NAME", "PRICE"], "results": [
+  ["NAME", {"field": 1, "heading": "NAME", "justification": "L", "width": 20,
+            "conversion": "", "definition": "1^NAME^L^20"}],
+  ["PRICE", {"field": 2, "heading": "PRICE", "justification": "R", "width": 10,
+             "conversion": "MD2", "definition": "2^PRICE^R^10^^^^MD2"}]
+]}
+```
+
+### SET.DICT
+
+Create or replace one dictionary entry, named by `key`, from the attributes in
+`structured_data`.
+
+- Required: `account` (or a single-account client), `file`, `key`, `structured_data`.
+- `structured_data` holds `field` (the 1-based attribute number, required), and optionally
+  `heading` (defaults to `key`), `justification` (`"L"` or `"R"`, defaults to `"L"`),
+  `width` (defaults to `10`) and `conversion`. Numbers may be sent as JSON numbers or as
+  strings, which is what an HTML form has to hand.
+- The rules are enforced here rather than by the caller: an entry with no attribute number is
+  invisible to every query, and one with a justification `LIST` does not understand lays out
+  wrongly — neither shows up until someone reads the file.
+- `record` is the stored entry in `LIST.DICT`'s shape, so a caller sees the defaults that
+  were filled in.
+- `WRITE` with `is_dict` still stores a dictionary entry from a display string. `SET.DICT` is
+  for a caller that has the attributes rather than the string, and wants them checked.
+- To remove an entry, use `DELETE` with `is_dict: true`.
+- Errors: `"Account not specified"`, `"File not specified"`, `"Key not specified"`,
+  `"Dictionary attributes not specified"`, `"Attribute number not specified"`,
+  `"Attribute number must be 1 or greater"`, `"Attribute number is not a whole number: <text>"`,
+  `"Display width must be 1 or greater"`, `"Display width is not a whole number: <text>"`,
+  `"Justification must be L or R"`, `"Table error: <detail>"`, access-denied.
+
+```json
+{"command": "SET.DICT", "account": "SALES", "file": "USERS", "key": "PRICE",
+ "structured_data": {"field": 2, "heading": "PRICE", "justification": "R",
+                     "width": 10, "conversion": "MD2"}}
+```
+
+```json
+{"status": "OK", "record": {"field": 2, "heading": "PRICE", "justification": "R",
+                            "width": 10, "conversion": "MD2",
+                            "definition": "2^PRICE^R^10^^^^MD2"}}
 ```
 
 ### SERVER.STATS — admin

@@ -25,6 +25,8 @@ dictionary definitions. This command is restricted to the `SYSTEM` account.
 
 - **Usage**: `CREATE.TEST.ACCOUNT <account name>`
 - **Example**: `CREATE.TEST.ACCOUNT TESTDB`
+- Also reachable over the [remote protocol](protocol.md#createtestaccount--admin) and from the
+  [web dashboard](web_dashboard.md#creating-and-dropping), where an admin certificate replaces the `SYSTEM` restriction.
 
 #### SET.FILE
 

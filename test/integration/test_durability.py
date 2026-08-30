@@ -16,7 +16,6 @@ BUFFERED_FILE = "SCRATCH"
 SETUP_COMMANDS = [
     "CREATE.ACCOUNT " + ACCOUNT,
     "LOGTO " + ACCOUNT,
-    "Y",  # answer the "DIR file missing. Create and populate?" prompt
     "SAVE",
 ]
 
@@ -58,6 +57,16 @@ def main():
 
             conn = harness.wait_for_client(port, client_crt, client_key, certs.ca_crt, process=cli)
             with conn:
+                # The account has to exist before a file can be created in it,
+                # and the CLI is still working through the setup script.
+                harness.wait_for_seed(
+                    conn,
+                    lambda resp: resp["status"] == "OK",
+                    process=cli,
+                    command="LIST.FILES",
+                    account=ACCOUNT,
+                )
+
                 resp = conn.request(
                     command="CREATE.FILE", file=DURABLE_FILE, account=ACCOUNT, durable=True
                 )

@@ -369,6 +369,35 @@ def wait_for_client(port, certfile, keyfile, cafile, timeout=STARTUP_TIMEOUT, pr
     raise TimeoutError(f"Could not establish a TLS session on port {port} (last error: {last_error})")
 
 
+def wait_for_seed(client, probe, timeout=STARTUP_TIMEOUT, process=None, **request):
+    """Wait until a fixture seeded through the CLI's stdin is visible over the protocol.
+
+    `wait_for_client` proves only that the listener accepts connections. When a
+    suite seeds by writing to an interactive CLI's stdin, the CLI is still
+    working through that script - and the protocol server shares its database,
+    so the suite's first request can arrive before the account or file it needs
+    exists. That surfaces as `Table 'X' not found`, which reads like a broken
+    feature rather than like a race, and it fires on a slow or busy machine long
+    before it fires on a developer's.
+
+    The CLI applies its script in order, so waiting for the last thing the seed
+    does covers everything before it. `probe` is handed each response and says
+    whether the fixture has arrived; a protocol error is part of waiting rather
+    than a failure, since "that file does not exist yet" is exactly what not
+    being ready looks like.
+    """
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(f"The seeding process exited with {process.returncode} before its fixture appeared")
+        last = client.request(**request)
+        if probe(last):
+            return last
+        time.sleep(0.05)
+    raise TimeoutError(f"The CLI's seed never became visible within {timeout}s (last response: {last})")
+
+
 def write_config(port, certs=None, extra="", web_port=None, web_token=None):
     """Write a config.toml into the current working directory.
 

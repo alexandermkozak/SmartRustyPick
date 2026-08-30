@@ -1,5 +1,5 @@
 import {call, encode, pairs, record} from '@shared/api/client'
-import type {AccountStats, FileEntry, FileStats} from './types'
+import type {AccountStats, DictionaryDraft, DictionaryEntry, FileEntry, FileStats} from './types'
 
 export const accountsApi = {
     /** `LIST.ACCOUNTS`: every account this client may reach. */
@@ -26,5 +26,53 @@ export const accountsApi = {
         call(`/api/accounts/${encode(account)}/files/${encode(file)}`, {
             method: 'POST',
             body: JSON.stringify({durable}),
+        }),
+
+    /**
+     * `CREATE.ACCOUNT`, or `CREATE.TEST.ACCOUNT` for the demo fixture. Admin
+     * only, and one endpoint for both: the page is asking for an account either
+     * way, and only the contents differ.
+     */
+    createAccount: (name: string, demo: boolean): Promise<unknown> =>
+        call('/api/accounts', {method: 'POST', body: JSON.stringify({name, demo})}),
+
+    /** `DELETE.ACCOUNT`: the account and every file in it. Admin only. */
+    deleteAccount: (name: string): Promise<unknown> =>
+        call(`/api/accounts/${encode(name)}`, {method: 'DELETE'}),
+
+    /** `CREATE.FILE`, optionally durable from the start. Admin only. */
+    createFile: (account: string, name: string, durable: boolean): Promise<unknown> =>
+        call(`/api/accounts/${encode(account)}/files`, {
+            method: 'POST',
+            body: JSON.stringify({name, durable}),
+        }),
+
+    /** `DELETE.FILE`: the file, its records and its dictionary. Admin only. */
+    deleteFile: (account: string, file: string): Promise<unknown> =>
+        call(`/api/accounts/${encode(account)}/files/${encode(file)}`, {method: 'DELETE'}),
+
+    /** `LIST.DICT`: every dictionary entry of one file, in attribute order. */
+    async dictionary(account: string, file: string): Promise<DictionaryEntry[]> {
+        const results = await pairs<Omit<DictionaryEntry, 'name'>>(
+            `/api/accounts/${encode(account)}/files/${encode(file)}/dictionary`,
+        )
+        return results.map(([name, entry]) => ({name, ...entry}))
+    },
+
+    /** `SET.DICT`: create or replace one entry. The database judges the attributes. */
+    saveDictionaryEntry: (
+        account: string,
+        file: string,
+        draft: DictionaryDraft,
+    ): Promise<unknown> =>
+        call(`/api/accounts/${encode(account)}/files/${encode(file)}/dictionary`, {
+            method: 'POST',
+            body: JSON.stringify(draft),
+        }),
+
+    /** `DELETE` with `is_dict`: remove one entry. */
+    deleteDictionaryEntry: (account: string, file: string, name: string): Promise<unknown> =>
+        call(`/api/accounts/${encode(account)}/files/${encode(file)}/dictionary/${encode(name)}`, {
+            method: 'DELETE',
         }),
 }

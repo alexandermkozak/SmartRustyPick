@@ -5,7 +5,8 @@ right now, and what the accounts and files look like. It starts with the databas
 run.
 
 It is a *management* interface, not a data browser. It reports how many records a file holds and how they are laid out;
-it never returns one.
+it never returns one. A file's dictionary is the exception that proves the rule: it is the file's shape rather than its
+contents, and maintaining it is why an operator opens a management interface at all.
 
 ## Starting it
 
@@ -62,7 +63,7 @@ by default), so they follow `ca_path` rather than littering the working director
 | Overview       | Uptime, listener, connection and request totals, pending writes, tables in memory, and every connection open right now.          |
 | Authorizations | Every authorized client: name, thumbprint, allowed accounts, admin flag. Authorize a thumbprint, add or remove accounts, revoke. |
 | Certificates   | Issue a certificate signed by the server's CA, authorized in the same step, with its key downloadable once.                      |
-| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Durable files are tagged in the listing, and the flag can be turned on or off there. |
+| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Accounts and files can be created and dropped, durable files are tagged in the listing and the flag can be turned on or off, and the selected file's dictionary is listed and edited below. |
 
 File statistics cover the record and dictionary counts, the hash modulus and group distribution, bytes on disk, the
 durability flag and whether the file is currently held in the server's cache. Record counts come from each file's
@@ -76,10 +77,50 @@ refused unless the dashboard's own certificate is an admin one, and the page re-
 than assuming the click took effect — a server running with `durable_writes = true` reports every file as durable
 whatever the button asked for. See [Storage Engine](storage.md).
 
+### Creating and dropping
+
+Under the account list is a field that creates one. **Create account** makes an empty one (`CREATE.ACCOUNT`) and
+**Create demo** makes the populated fixture (`CREATE.TEST.ACCOUNT`) — the same one the CLI creates, with `USERS` and
+`PRODUCTS` files, their dictionaries, a multivalued field whose values go one level deeper still, and a price carrying
+an `MD2` conversion. It is the quickest way to have something real to point the file statistics and the dictionary
+editor at. Each row carries a **Drop** (`DELETE.ACCOUNT`). The same pair sits under the file list: a name and a **Durable** tick create a file
+(`CREATE.FILE`, durable from its first write), and each file has its own **Drop** (`DELETE.FILE`). All four are admin
+commands, so a dashboard whose certificate is not an admin one is refused by the database and says so.
+
+Both drops confirm first, naming what goes with them — an account drop names the number of files it takes. Two things
+are deliberately not offered:
+
+- **`SYSTEM`** is listed like any other account and can be asked for, but the database refuses to drop it: it holds the
+  account registry and the authorized clients.
+- **`DIR`** has no Drop. It is the account's own record of its files and their durability flags, so removing it through
+  a file list would take the flags of every other file with it.
+
+A created account comes with its `DIR` file and every file created in it joins that listing, so an account made here is
+complete the moment it exists — there is nothing to finish off from the CLI.
+
+Whatever changes, the page re-reads the lists straight afterwards rather than editing what is on screen — the account
+listing is otherwise refreshed only every twenty seconds, which is a long time to look at a file that no longer exists.
+
+### The dictionary of a file
+
+Selecting a file lists its dictionary in full width beneath the three columns: the name a query uses, the attribute the
+field sits at, the heading and width `LIST` lays it out with, the justification, and the conversion. The raw definition
+— the whole truth about an entry, including anything at a position the table does not name — is the title of the name
+cell.
+
+**Add a dictionary entry** stores one (`SET.DICT`), suggesting the next free attribute number; **Edit** loads an
+existing entry into the same form, because storing an entry under a name that already exists is what replacing it
+means; **Delete** removes one (`DELETE` with `is_dict`) and leaves the field's data where it is. Selecting a different
+file abandons an open edit rather than carrying it across.
+
+Nothing in the page judges an attribute number or a justification. `SET.DICT` does, and it fills in the defaults for
+whatever the form left blank, so the page re-reads the dictionary after every change and shows what was actually
+stored — a refusal appears in the banner in the database's own words.
+
 ## Security
 
-The dashboard can authorize clients and hand out private keys, so treat reaching it as equivalent to holding an admin
-certificate.
+The dashboard can authorize clients, hand out private keys, and drop an account and everything in it, so treat reaching
+it as equivalent to holding an admin certificate.
 
 - It **binds to `127.0.0.1` by default**. Point `web_addr` elsewhere only behind a reverse proxy that terminates TLS;
   the dashboard itself serves plain HTTP and says so at startup when it is bound to a non-loopback address.
@@ -105,8 +146,16 @@ Each endpoint is one protocol command. Responses are the protocol's own JSON; fa
 | `POST`   | `/api/clients/{name}/accounts`         | `ADD.CLIENT.ACCOUNT` / `REMOVE.CLIENT.ACCOUNT` (`"remove": true`) |
 | `POST`   | `/api/certificates`                    | `GENERATE.CERT`                                                   |
 | `GET`    | `/api/accounts`                        | `LIST.ACCOUNTS`                                                   |
+| `POST`   | `/api/accounts`                        | `CREATE.ACCOUNT`, or `CREATE.TEST.ACCOUNT` (`"demo": true`)       |
+| `DELETE` | `/api/accounts/{account}`              | `DELETE.ACCOUNT`                                                  |
 | `GET`    | `/api/accounts/{account}/files`        | `LIST.FILES`                                                      |
+| `POST`   | `/api/accounts/{account}/files`        | `CREATE.FILE`                                                     |
 | `GET`    | `/api/accounts/{account}/files/{file}` | `FILE.STATS`                                                      |
+| `POST`   | `/api/accounts/{account}/files/{file}` | `SET.FILE`                                                        |
+| `DELETE` | `/api/accounts/{account}/files/{file}` | `DELETE.FILE`                                                     |
+| `GET`    | `/api/accounts/{account}/files/{file}/dictionary`        | `LIST.DICT`                                     |
+| `POST`   | `/api/accounts/{account}/files/{file}/dictionary`        | `SET.DICT`                                      |
+| `DELETE` | `/api/accounts/{account}/files/{file}/dictionary/{name}` | `DELETE` with `is_dict`                         |
 
 ```sh
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/stats
@@ -151,7 +200,9 @@ crates/core/src/web/ui/src/
 │   │   └── composables/     ┘ useServerStats
 │   ├── authorizations/      same shape: LIST.CONNS, AUTHORIZE.CONN, useClients, …
 │   ├── certificates/        GENERATE.CERT, useCertificateIssuing, …
-│   └── accounts/            LIST.ACCOUNTS, LIST.FILES, FILE.STATS, useAccountBrowser, …
+│   └── accounts/            LIST.ACCOUNTS, LIST.FILES, FILE.STATS, CREATE/DELETE.ACCOUNT,
+│                            CREATE/DELETE.FILE, SET.FILE, LIST.DICT, SET.DICT,
+│                            useAccountBrowser, useFileDictionary, …
 └── shared/                  the kernel every slice may use
     ├── api/client.ts        the transport: ApiError, call, record, pairs, keys
     ├── api/protocol.ts      the response envelope

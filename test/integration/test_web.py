@@ -30,7 +30,6 @@ def seed_database(thumbprint):
             f"AUTHORIZE.CONN {thumbprint} admin ADMIN",
             f"CREATE.ACCOUNT {ACCOUNT}",
             f"LOGTO {ACCOUNT}",
-            "Y",  # answer the "DIR file missing. Create and populate?" prompt
             f"CREATE.FILE {FILE}",
             f"SET {FILE} K1 Alice]alice@example.com",
             f"SET {FILE} K2 Bob]bob@example.com",
@@ -200,6 +199,149 @@ def main():
                 f"/api/accounts/{ACCOUNT}/files/{FILE}", method="POST", payload={}
             )
             suite.check_eq("A change with no flag is refused", status, 400)
+
+            # --- creating and dropping accounts and files -------------------
+            status, _, _ = dashboard.call("/api/accounts", method="POST", payload={"name": "WEB_MADE"})
+            suite.check_eq("An account can be created", status, 200)
+            _, payload, _ = dashboard.call("/api/accounts")
+            made = [name for name, _ in (payload or {}).get("results") or []]
+            suite.check(
+                "The new account is listed straight away",
+                "WEB_MADE" in made,
+                "" if "WEB_MADE" in made else json.dumps(made),
+            )
+
+            # An account describes its own files in DIR. Created over the
+            # protocol it used to have none until somebody logged into it from
+            # the CLI and answered a prompt.
+            _, payload, _ = dashboard.call("/api/accounts/WEB_MADE/files")
+            suite.check_eq(
+                "A new account comes with its DIR file", (payload or {}).get("keys"), ["DIR"]
+            )
+
+            status, _, _ = dashboard.call(
+                "/api/accounts/WEB_MADE/files", method="POST", payload={"name": "LEDGER", "durable": True}
+            )
+            suite.check_eq("A file can be created in it", status, 200)
+            _, payload, _ = dashboard.call("/api/accounts/WEB_MADE/files")
+            durability = {name: info.get("durable") for name, info in (payload or {}).get("results") or []}
+            suite.check_eq("The file is created durable when asked", durability.get("LEDGER"), True)
+            suite.check_eq(
+                "The new file joins the account's listing", (payload or {}).get("keys"), ["DIR", "LEDGER"]
+            )
+
+            status, _, _ = dashboard.call("/api/accounts/WEB_MADE/files/LEDGER", method="DELETE")
+            _, payload, _ = dashboard.call("/api/accounts/WEB_MADE/files")
+            gone = "LEDGER" not in ((payload or {}).get("keys") or [])
+            suite.check("A file can be dropped", status == 200 and gone)
+
+            status, _, _ = dashboard.call("/api/accounts/WEB_MADE", method="DELETE")
+            _, payload, _ = dashboard.call("/api/accounts")
+            remaining = [name for name, _ in (payload or {}).get("results") or []]
+            suite.check(
+                "An account can be dropped",
+                status == 200 and "WEB_MADE" not in remaining,
+                "" if "WEB_MADE" not in remaining else json.dumps(remaining),
+            )
+
+            # The demo fixture is the same endpoint with a flag, and the point
+            # of it is that the account arrives with something in it.
+            status, payload, _ = dashboard.call(
+                "/api/accounts", method="POST", payload={"name": "WEB_DEMO", "demo": True}
+            )
+            created = (payload or {}).get("record") or {}
+            suite.check(
+                "A demo account can be created",
+                status == 200 and created.get("files") == ["DIR", "PRODUCTS", "USERS"],
+                json.dumps(created),
+            )
+
+            _, payload, _ = dashboard.call("/api/accounts")
+            demo = {name: info for name, info in (payload or {}).get("results") or []}
+            suite.check(
+                "The demo account is listed with the records it came with",
+                demo.get("WEB_DEMO", {}).get("record_count", 0) > 0,
+                json.dumps(demo.get("WEB_DEMO", {})),
+            )
+
+            # Populated means dictionaries too, which is what makes it worth
+            # opening: the dashboard can show them the moment it is created.
+            _, payload, _ = dashboard.call("/api/accounts/WEB_DEMO/files/PRODUCTS/dictionary")
+            entries = {name: info for name, info in (payload or {}).get("results") or []}
+            suite.check_eq(
+                "Its files come with their dictionaries", entries.get("PRICE", {}).get("conversion"), "MD2"
+            )
+
+            dashboard.call("/api/accounts/WEB_DEMO", method="DELETE")
+
+            # SYSTEM holds the account registry and the authorized clients, so
+            # the database refuses to drop it however it is asked.
+            status, payload, _ = dashboard.call("/api/accounts/SYSTEM", method="DELETE")
+            suite.check(
+                "Dropping SYSTEM is refused",
+                status >= 400 and "SYSTEM" in json.dumps(payload),
+                json.dumps(payload),
+            )
+
+            # --- dictionary maintenance -------------------------------------
+            dict_path = f"/api/accounts/{ACCOUNT}/files/{FILE}/dictionary"
+
+            status, payload, _ = dashboard.call(
+                dict_path, method="POST", payload={"name": "NAME", "field": 1, "width": 20}
+            )
+            stored = (payload or {}).get("record") or {}
+            suite.check(
+                "A dictionary entry can be created, with the defaults filled in",
+                status == 200 and stored.get("definition") == "1^NAME^L^20",
+                json.dumps(stored),
+            )
+
+            status, payload, _ = dashboard.call(
+                dict_path,
+                method="POST",
+                payload={"name": "PRICE", "field": 3, "justification": "R", "width": 12, "conversion": "MD2"},
+            )
+            stored = (payload or {}).get("record") or {}
+            suite.check(
+                "An entry carries its justification and conversion",
+                status == 200 and stored.get("definition") == "3^PRICE^R^12^^^^MD2",
+                json.dumps(stored),
+            )
+
+            status, payload, _ = dashboard.call(dict_path)
+            listed = [name for name, _ in (payload or {}).get("results") or []]
+            entries = {name: info for name, info in (payload or {}).get("results") or []}
+            suite.check_eq("Entries come back in attribute order", listed, ["NAME", "PRICE"])
+            suite.check_eq("An entry is listed with its attributes", entries.get("PRICE", {}).get("field"), 3)
+            suite.check_eq("...and its conversion", entries.get("PRICE", {}).get("conversion"), "MD2")
+
+            # The dictionary the dashboard wrote is the one the engine reads
+            # with: a record that came back as nothing but a key now has a field.
+            response = protocol_call(
+                port,
+                admin_crt,
+                admin_key,
+                certs.ca_crt,
+                {"command": "READ", "account": ACCOUNT, "file": FILE, "key": "K1"},
+            )
+            record = response.get("record") or {}
+            suite.check(
+                "A record read afterwards is named by the new dictionary",
+                "name" in record,
+                json.dumps(record),
+            )
+
+            status, _, _ = dashboard.call(dict_path, method="POST", payload={"name": "PRICE", "field": 0})
+            suite.check_eq("A definition no query could use is refused", status, 400)
+
+            status, _, _ = dashboard.call(f"{dict_path}/PRICE", method="DELETE")
+            _, payload, _ = dashboard.call(dict_path)
+            left = [name for name, _ in (payload or {}).get("results") or []]
+            suite.check(
+                "A dictionary entry can be deleted, leaving the rest",
+                status == 200 and left == ["NAME"],
+                json.dumps(left),
+            )
 
             # --- certificates ----------------------------------------------
             status, payload, _ = dashboard.call(

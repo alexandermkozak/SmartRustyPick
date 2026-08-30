@@ -1,5 +1,7 @@
 <script lang="ts" setup>
-/** Every account, with the figures that say how big it is. */
+/** Every account, with the figures that say how big it is, and the two things
+ *  an operator does to the list itself: add one, drop one. */
+import {ref} from 'vue'
 import PanelState from '@shared/components/PanelState.vue'
 import {bytes, count} from '@shared/format'
 import type {AccountStats} from '../types'
@@ -9,17 +11,45 @@ defineProps<{
   loaded: boolean
   error: string | null
   selected: string | null
+  busy: boolean
 }>()
-defineEmits<{select: [name: string]}>()
+const emit = defineEmits<{
+  select: [name: string]
+  create: [name: string, demo: boolean]
+  drop: [name: string]
+}>()
+
+const draft = ref('')
+
+/**
+ * One name, two kinds of account. A demo account is the `CREATE.TEST.ACCOUNT`
+ * fixture the CLI makes: two files with dictionaries and a few records in them,
+ * which is enough to try a query or the dictionary editor against.
+ */
+function create(demo: boolean): void {
+  const name = draft.value.trim()
+  if (!name) return
+  draft.value = ''
+  emit('create', name, demo)
+}
+
+// Dropping an account takes every file in it, and nothing here can put them
+// back, so the confirmation says what actually goes.
+function drop(account: AccountStats): void {
+  const files = `${count(account.file_count)} file${account.file_count === 1 ? '' : 's'}`
+  if (!window.confirm(`Drop "${account.name}" and its ${files}? This cannot be undone.`)) return
+  emit('drop', account.name)
+}
 </script>
 
 <template>
   <h2>Accounts</h2>
   <PanelState :empty="!accounts.length" :error="error" :loaded="loaded" empty-text="No accounts." />
   <ul v-if="accounts.length" class="list">
-    <li v-for="account in accounts" :key="account.name">
+    <li v-for="account in accounts" :key="account.name" class="entry">
       <button
         :aria-current="selected === account.name"
+        class="select"
         type="button"
         @click="$emit('select', account.name)"
       >
@@ -30,6 +60,28 @@ defineEmits<{select: [name: string]}>()
         </span>
         <span class="meta">{{ account.directory }}</span>
       </button>
+      <button :disabled="busy" class="small danger" type="button" @click="drop(account)">
+        Drop
+      </button>
     </li>
   </ul>
+
+  <form class="inline-form spaced new-account" @submit.prevent="create(false)">
+    <input v-model="draft" aria-label="New account name" autocomplete="off" placeholder="SALES" />
+    <button :disabled="busy || !draft.trim()" class="small" type="submit">Create account</button>
+    <button
+      :disabled="busy || !draft.trim()"
+      class="small"
+      title="Creates the account populated with the CLI's CREATE.TEST.ACCOUNT fixture"
+      type="button"
+      @click="create(true)"
+    >
+      Create demo
+    </button>
+  </form>
+  <p class="note small-note">
+    A demo account arrives with <span class="mono">USERS</span> and
+    <span class="mono">PRODUCTS</span> — dictionaries, a multivalued field and a priced item — so
+    there is something to query and something to edit.
+  </p>
 </template>

@@ -1,9 +1,13 @@
 /**
- * Navigating accounts, their files and one file's statistics.
+ * Navigating accounts, their files and one file's statistics, and creating or
+ * dropping either.
  *
  * Three levels of selection with rules between them - picking an account clears
  * the file, an account that disappears clears everything - which is exactly the
- * state a template should not be juggling inline.
+ * state a template should not be juggling inline. Creating and dropping belong
+ * here for the same reason: each one changes what the selection above it is
+ * still pointing at, and a page that only re-read one of the three lists would
+ * leave the others describing something that is gone.
  */
 
 import {ref, watch} from 'vue'
@@ -25,6 +29,8 @@ export function useAccountBrowser() {
     const stats = ref<FileStats | null>(null)
     /** True while a durability change is in flight, so the button cannot be double-fired. */
     const changing = ref(false)
+    /** True while an account or file is being created or dropped. */
+    const maintaining = ref(false)
 
     function clearSelection(): void {
         selectedAccount.value = null
@@ -96,6 +102,62 @@ export function useAccountBrowser() {
         return true
     }
 
+    /**
+     * Runs one maintenance command and then re-reads what it could have
+     * changed, so the page never shows a file it has just dropped or misses one
+     * it has just made. The account list is polled rather than requested here;
+     * a create or a drop is exactly the moment not to wait up to twenty seconds
+     * for the next tick.
+     */
+    async function maintain(
+        action: () => Promise<unknown>,
+        reloadFiles: boolean,
+    ): Promise<boolean> {
+        if (maintaining.value) return false
+        maintaining.value = true
+        try {
+            const done = await alerts.attempt(action)
+            await accounts.refresh()
+            const account = selectedAccount.value
+            if (reloadFiles && account) await loadFiles(account)
+            return done
+        } finally {
+            maintaining.value = false
+        }
+    }
+
+    /**
+     * Creates an account, empty or populated with the demo fixture. Neither is
+     * selected afterwards: an empty one has nothing to show, and a demo account
+     * is worth arriving at deliberately.
+     */
+    const createAccount = (name: string, demo = false): Promise<boolean> =>
+        maintain(() => accountsApi.createAccount(name, demo), false)
+
+    /** Drops an account and everything in it, clearing the selection if it was this one. */
+    function deleteAccount(name: string): Promise<boolean> {
+        if (selectedAccount.value === name) clearSelection()
+        return maintain(() => accountsApi.deleteAccount(name), false)
+    }
+
+    async function createFile(name: string, durable: boolean): Promise<boolean> {
+        const account = selectedAccount.value
+        if (!account) return false
+        return maintain(() => accountsApi.createFile(account, name, durable), true)
+    }
+
+    async function deleteFile(name: string): Promise<boolean> {
+        const account = selectedAccount.value
+        if (!account) return false
+        // The statistics panel is describing a file that is about to stop
+        // existing, so it goes before the request rather than after it.
+        if (selectedFile.value === name) {
+            selectedFile.value = null
+            stats.value = null
+        }
+        return maintain(() => accountsApi.deleteFile(account, name), true)
+    }
+
     // An account dropped by someone else should not leave a dead selection behind.
     watch(accounts.data, (list) => {
         if (!list || !selectedAccount.value) return
@@ -110,8 +172,13 @@ export function useAccountBrowser() {
         filesLoaded,
         stats,
         changing,
+        maintaining,
         selectAccount,
         selectFile,
         setDurable,
+        createAccount,
+        deleteAccount,
+        createFile,
+        deleteFile,
     }
 }
