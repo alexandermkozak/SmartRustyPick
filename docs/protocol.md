@@ -4,11 +4,11 @@ SmartRustyPick exposes a TCP remote protocol secured with TLS and client-certifi
 authentication. This document is the client author's reference: every wire field, every
 command, its requirements, its response shape and its errors.
 
-> The field and command names below are pinned by
-> `crates/core/src/server/protocol_doc_tests.rs`. If the request/response structs in
-> `crates/core/src/server/models.rs` or the command list in
-> `crates/core/src/server/handler.rs` change without this file being updated, `cargo test`
-> fails.
+> The field names, the command list and the shape of every object returned in `record` or
+> `results` are pinned by `crates/core/src/server/protocol_doc_tests.rs`. If the
+> request/response structs in `crates/core/src/server/models.rs`, the commands dispatched by
+> `crates/core/src/server/handler.rs` or the structs behind those objects change without this
+> file being updated, `cargo test` fails.
 
 ## Transport and authentication
 
@@ -64,15 +64,15 @@ matched case-insensitively.
 Only `status` is always present. Every other field is present only when that command
 populates it.
 
-| Field     | Type                     | Populated by                                                      | Notes                                                                                                                                                                                                            |
-|-----------|--------------------------|-------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `status`  | string                   | all                                                               | `"OK"`, `"ERROR"` or `"EOF"`.                                                                                                                                                                                    |
-| `message` | string                   | errors                                                            | Human-readable error text; set whenever `status` is `"ERROR"`.                                                                                                                                                   |
-| `record`  | object                   | `READ`, `SET.FILE`, `FILE.STATS`, `SERVER.STATS`, `GENERATE.CERT` | For `READ`, the record as field-name → display-formatted string (see [Record shape](#record-shape)). The management commands use it for their single result object, whose shape is documented with each command. |
-| `results` | array of `[key, record]` | `QUERY`, `GET.NEXT`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES`  | Ordered `[string, object]` pairs. For `QUERY` and `GET.NEXT` each `record` has the same shape as `READ`; the management commands document their own.                                                             |
-| `keys`    | array of strings         | `LIST.FILES`                                                      | Plain list of names. `LIST.FILES` fills `results` as well, with what is known about each of them.                                                                                                                |
-| `count`   | integer                  | `SELECT`, `GET.NEXT`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES` | `SELECT`: number of keys selected into the list. `GET.NEXT`: number of records in the batch just returned. The list commands: number of entries returned.                                                        |
-| `positions` | array of objects or nulls | `QUERY`, `GET.NEXT`                                             | Present only for an exploded result. Index-aligned with `results`: the position within the exploded field that put each row there. See [Exploded results](#exploded-results).                                    |
+| Field       | Type                      | Populated by                                                                                         | Notes                                                                                                                                                                                                            |
+|-------------|---------------------------|------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `status`    | string                    | all                                                                                                  | `"OK"`, `"ERROR"` or `"EOF"`.                                                                                                                                                                                    |
+| `message`   | string                    | errors                                                                                               | Human-readable error text; set whenever `status` is `"ERROR"`.                                                                                                                                                   |
+| `record`    | object                    | `READ`, `CREATE.TEST.ACCOUNT`, `SET.FILE`, `FILE.STATS`, `SET.DICT`, `SERVER.STATS`, `GENERATE.CERT` | For `READ`, the record as field-name → display-formatted string (see [Record shape](#record-shape)). The management commands use it for their single result object, whose shape is documented with each command. |
+| `results`   | array of `[key, record]`  | `QUERY`, `GET.NEXT`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES`, `LIST.DICT`                        | Ordered `[string, object]` pairs. For `QUERY` and `GET.NEXT` each `record` has the same shape as `READ`; the management commands document their own.                                                             |
+| `keys`      | array of strings          | `LIST.FILES`, `LIST.DICT`                                                                            | Plain list of names: the files in the account, or the file's dictionary entries. Both commands fill `results` as well, with what is known about each name.                                                       |
+| `count`     | integer                   | `SELECT`, `GET.NEXT`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES`, `LIST.DICT`                       | `SELECT`: number of keys selected into the list. `GET.NEXT`: number of records in the batch just returned. The list commands: number of entries returned.                                                        |
+| `positions` | array of objects or nulls | `QUERY`, `GET.NEXT`                                                                                  | Present only for an exploded result. Index-aligned with `results`: the position within the exploded field that put each row there. See [Exploded results](#exploded-results).                                    |
 
 There is no `NOT_FOUND` status. A missing record, table or list yields
 `status: "ERROR"` with an explanatory `message`.

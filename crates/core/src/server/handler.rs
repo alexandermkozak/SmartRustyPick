@@ -44,7 +44,7 @@ const DICT_JUSTIFICATIONS: [&str; 2] = ["L", "R"];
 /// would come back as whatever attribute 1 of the file is called. This reads
 /// the fixed positions instead, and carries the raw display string alongside
 /// them so an entry using a position this does not name is still visible.
-fn dictionary_entry(record: &Record) -> serde_json::Value {
+pub(crate) fn dictionary_entry(record: &Record) -> serde_json::Value {
     let attribute = |idx: usize| record.get_field_display_string(idx);
     let number = |idx: usize| attribute(idx).trim().parse::<i64>().ok();
     serde_json::json!({
