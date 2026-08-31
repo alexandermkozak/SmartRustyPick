@@ -233,10 +233,14 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
         Ok(name) => name.to_string(),
         Err(resp) => return resp,
     };
-    // Load the file first, so its dictionary is available to deserialization.
-    if let Err(resp) = resolve_file(db, acc, &table_name) {
-        return resp;
-    }
+    // Resolved once, and held: deserialization needs the dictionary and the
+    // write needs the records. Resolving a second time would take this file's
+    // lock again - and on a file several connections are writing at once, that
+    // is the contended one.
+    let handle = match resolve_file(db, acc, &table_name) {
+        Ok(handle) => handle,
+        Err(resp) => return resp,
+    };
 
     let key = match req.key {
         Some(k) => k,
@@ -245,7 +249,7 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
     let is_dict = req.is_dict.unwrap_or(false);
 
     let record = if let Some(structured) = req.structured_data {
-        match db.deserialize_record_for_account(acc, &table_name, &structured) {
+        match db.deserialize_record_in(&handle.read(), &structured) {
             Some(r) => r,
             None => return error("Invalid structured data"),
         }
@@ -253,7 +257,7 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
         match data_val {
             serde_json::Value::String(s) => Record::from_display_string(&s),
             serde_json::Value::Object(_) => {
-                match db.deserialize_record_for_account(acc, &table_name, &data_val) {
+                match db.deserialize_record_in(&handle.read(), &data_val) {
                     Some(r) => r,
                     None => return error("Invalid structured data in data field"),
                 }
@@ -267,10 +271,6 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
     // The file's lock is dropped before the flush below: `note_write_for` may
     // decide to save, and a save locks every dirty file in turn.
     {
-        let handle = match resolve_file(db, acc, &table_name) {
-            Ok(handle) => handle,
-            Err(resp) => return resp,
-        };
         let mut table = handle.write();
         if is_dict {
             table.dictionary.insert(key, record);

@@ -2293,12 +2293,20 @@ impl Database {
     }
 
     pub fn deserialize_record_for_account(&self, account: &str, table_name: &str, data: &serde_json::Value) -> Option<Record> {
+        let handle = self.get_table_read_only_for_account(account, table_name)?;
+        let table = handle.read();
+        self.deserialize_record_in(&table, data)
+    }
+
+    /// Same, from a file the caller has already resolved.
+    ///
+    /// The write path holds the handle already, and on a file several
+    /// connections are writing at once, looking it up again is not free: every
+    /// resolution takes that contended lock once more, on top of the `stat`
+    /// calls of the freshness check.
+    pub fn deserialize_record_in(&self, table: &Table, data: &serde_json::Value) -> Option<Record> {
         let obj = data.as_object()?;
         let mut record = Record::new();
-        let handle = self.get_table_read_only_for_account(account, table_name)?;
-        // One guard for the whole walk: taking the table's lock again per field
-        // would let a writer waiting in between deadlock the second attempt.
-        let table = handle.read();
 
         // Inverse mapping of camelCase or original dictionary keys to attribute indices and conversion codes
         let mut attr_map = HashMap::new();
