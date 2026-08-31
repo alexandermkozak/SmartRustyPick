@@ -51,13 +51,15 @@ impl TableHandle {
     }
 
     /// Reads the table. Any number of readers may hold this at once.
-    pub fn read(&self) -> RwLockReadGuard<'_, Table> {
-        rlock(&self.0)
+    pub fn read(&self) -> TableRead<'_> {
+        note_guard_taken();
+        TableRead(rlock(&self.0))
     }
 
     /// Takes the table exclusively, for a write or a flush.
-    pub fn write(&self) -> RwLockWriteGuard<'_, Table> {
-        wlock(&self.0)
+    pub fn write(&self) -> TableWrite<'_> {
+        note_guard_taken();
+        TableWrite(wlock(&self.0))
     }
 
     /// How many handles to this table exist, the cache's own included. The
@@ -65,6 +67,93 @@ impl TableHandle {
     fn refs(&self) -> usize {
         Arc::strong_count(&self.0)
     }
+}
+
+/// A shared borrow of a table's contents. Behaves as a `&Table`.
+pub struct TableRead<'a>(RwLockReadGuard<'a, Table>);
+
+impl std::ops::Deref for TableRead<'_> {
+    type Target = Table;
+
+    fn deref(&self) -> &Table {
+        &self.0
+    }
+}
+
+impl Drop for TableRead<'_> {
+    fn drop(&mut self) {
+        note_guard_released();
+    }
+}
+
+/// An exclusive borrow of a table's contents. Behaves as a `&mut Table`.
+pub struct TableWrite<'a>(RwLockWriteGuard<'a, Table>);
+
+impl std::ops::Deref for TableWrite<'_> {
+    type Target = Table;
+
+    fn deref(&self) -> &Table {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for TableWrite<'_> {
+    fn deref_mut(&mut self) -> &mut Table {
+        &mut self.0
+    }
+}
+
+impl Drop for TableWrite<'_> {
+    fn drop(&mut self) {
+        note_guard_released();
+    }
+}
+
+// A debug build counts the table guards each thread is holding, so that
+// breaking the locking rule below is a panic naming the rule rather than a
+// process that stops and says nothing. Nothing is counted in a release build:
+// the two calls compile away and the guards are their inner locks.
+#[cfg(debug_assertions)]
+thread_local! {
+    static HELD_TABLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+fn note_guard_taken() {
+    HELD_TABLES.with(|held| held.set(held.get() + 1));
+}
+
+#[cfg(not(debug_assertions))]
+fn note_guard_taken() {}
+
+#[cfg(debug_assertions)]
+fn note_guard_released() {
+    HELD_TABLES.with(|held| held.set(held.get().saturating_sub(1)));
+}
+
+#[cfg(not(debug_assertions))]
+fn note_guard_released() {}
+
+/// Panics, in a debug build, if the calling thread is holding a table guard.
+///
+/// A flush locks every dirty file in turn, so starting one while holding a file
+/// means waiting for a lock this thread already holds. That is a hang, and a
+/// hang is the one failure that arrives with nothing to read - no assertion, no
+/// stack, just a test that never finishes. Checking it where the flush starts
+/// turns it into a panic that names the caller and the rule it broke.
+fn assert_no_table_guard_held(what: &str) {
+    #[cfg(debug_assertions)]
+    HELD_TABLES.with(|held| {
+        let count = held.get();
+        assert_eq!(
+            count, 0,
+            "{what} started while this thread holds {count} table guard(s). \
+             A flush locks each dirty file in turn and would wait for a lock it \
+             already holds; release the table before flushing. See the locking \
+             rules on `Database`.",
+        );
+    });
+    let _ = what;
 }
 
 /// What one file has buffered since it was last written out.
@@ -120,6 +209,12 @@ struct ClientRegistry {
 /// order. In particular [`Database::save`] must never be called while a table
 /// guard is held: it locks each dirty table in turn and would deadlock on the
 /// one already held.
+///
+/// That last rule is checked rather than merely written down. A debug build
+/// counts the table guards each thread holds and panics where a flush starts if
+/// any is outstanding, so breaking it fails with a message naming the rule
+/// instead of stopping the process and saying nothing. The count and the check
+/// compile out of a release build.
 pub struct Database {
     pub storage_dir: String,
     session_account: RwLock<String>,
@@ -1199,6 +1294,7 @@ impl Database {
     /// locks tables, it must not be called while a table guard is held - see
     /// the locking rules on [`Database`].
     pub fn save(&self) -> io::Result<()> {
+        assert_no_table_guard_held("A full flush");
         let snapshot: Vec<(TableKey, TableHandle)> = rlock(&self.tables)
             .iter()
             .map(|(key, handle)| (key.clone(), handle.clone()))
@@ -1298,6 +1394,7 @@ impl Database {
     /// Writes out one file and clears its batch, leaving every other file's
     /// buffer, and every other file's lock, untouched.
     fn flush_table(&self, key: &TableKey) -> io::Result<()> {
+        assert_no_table_guard_held("A flush of one file");
         if let Some(handle) = self.get_table_read_only_for_account(&key.0, &key.1) {
             if handle.read().is_dirty() {
                 self.flush_handle(key, &handle)?;

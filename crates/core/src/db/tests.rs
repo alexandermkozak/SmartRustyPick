@@ -331,16 +331,18 @@ mod tests {
             db.logto("SYSTEM")?;
             assert!(db.is_table_available("DIR"), "DIR table should be automatically created in SYSTEM account");
 
-            let dir_table_handle = db.get_table("DIR").unwrap();
-            let dir_table = dir_table_handle.read();
-            assert!(dir_table.records.contains_key("$LOGS"));
-            assert!(dir_table.records.contains_key("$ACCOUNTS"));
-            assert!(dir_table.records.contains_key("$CLIENTS"));
-            assert!(dir_table.records.contains_key("$SAVEDLISTS"));
+            {
+                let dir_table_handle = db.get_table("DIR").unwrap();
+                let dir_table = dir_table_handle.read();
+                assert!(dir_table.records.contains_key("$LOGS"));
+                assert!(dir_table.records.contains_key("$ACCOUNTS"));
+                assert!(dir_table.records.contains_key("$CLIENTS"));
+                assert!(dir_table.records.contains_key("$SAVEDLISTS"));
 
-            // Check record content
-            let logs_dir_rec = dir_table.records.get("$LOGS").unwrap();
-            assert_eq!(logs_dir_rec.fields[0].values[0].sub_values[0], "F");
+                // Check record content
+                let logs_dir_rec = dir_table.records.get("$LOGS").unwrap();
+                assert_eq!(logs_dir_rec.fields[0].values[0].sub_values[0], "F");
+            }
 
             // Test create_test_account
             db.create_test_account("TEST_DIR")?;

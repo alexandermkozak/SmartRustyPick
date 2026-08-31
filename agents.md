@@ -81,6 +81,10 @@ AI agents have been responsible for several critical improvements and fixes in t
   two takes them in `(account, file)` order. Never start a full flush while holding a file's lock: the flush locks each
   dirty file in turn and will deadlock on the one already held. `docs/storage.md` and the module documentation on
   `Database` say the same thing at more length; the tests learned it the hard way, by hanging.
+- **The rule is checked, not just written down:** a debug build counts the file locks each thread holds and panics where
+  a flush starts if any is outstanding, so a violation fails with a message naming the rule rather than stopping the
+  process silently. It earned its place on the first run, catching a flush under a held lock that had survived only
+  because the file happened to be clean at that moment. The counting compiles out of a release build.
 - **Batching per file:** an ordinary buffered write flushes the file it touched, not the whole database, so a burst on
   one file no longer drags every other file through a flush with it. The connection-close, ticker and shutdown paths
   still flush everything, which is what bounds how long any change can stay in memory.

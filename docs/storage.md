@@ -196,6 +196,10 @@ take them in `(account, file)` order. In particular, a full flush must not be st
 each dirty file in turn, and would deadlock on the one already held. The same rule is why a report renders from the file
 its caller has already locked rather than looking the dictionary up again per column.
 
+That last rule is checked, not merely written down. A debug build counts the file locks each thread holds and panics
+where a flush starts if any is outstanding. Breaking it is otherwise a hang, which is the one failure that arrives with
+nothing to read — no assertion, no stack, just a run that never finishes. The counting compiles out of a release build.
+
 ### Cache Eviction
 
 Once more than `max_loaded_tables` files are in memory, the coldest are written out and dropped. A file another
