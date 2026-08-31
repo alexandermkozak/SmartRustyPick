@@ -31,7 +31,7 @@ pub fn bench_config() -> Config {
 
 /// A `Database` rooted in `dir` with the bench account created and logged into.
 pub fn new_db(dir: &str) -> Database {
-    let mut db = Database::new(dir, Some(bench_config())).unwrap();
+    let db = Database::new(dir, Some(bench_config())).unwrap();
     if db.get_account_dir(ACCOUNT).is_none() {
         db.create_account(ACCOUNT, None).unwrap();
     }

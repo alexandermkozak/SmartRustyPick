@@ -33,9 +33,9 @@ fn bench_save(c: &mut Criterion) {
 
     group.bench_function("load_from_disk", |b| {
         b.iter(|| {
-            let mut db = common::new_db(black_box(dir.path()));
+            let db = common::new_db(black_box(dir.path()));
             let table_handle = db.get_table_mut_for_account(common::ACCOUNT, TABLE).unwrap();
-            let mut table = table_handle.write();
+            let table = table_handle.write();
             black_box(table.records.len())
         })
     });

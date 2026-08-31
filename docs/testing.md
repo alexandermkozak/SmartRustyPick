@@ -77,9 +77,11 @@ about the host than about the code.
   (including a lost-update check), per-file locking, and per-connection memory.
 
   Per-file locking is checked two ways, because the throughput a Python client can drive is the ceiling here, not the
-  server: 8 writers on 8 files must beat a single writer (`SRP_CONC_MIN_WRITE_SCALING`), and the same 8 writers must see
-  a shorter tail on 8 files than on one (`SRP_CONC_MIN_WRITE_SPREAD`). The second is the sharper of the two - same
-  clients, same requests, same work for the server, differing only in whether the writes queue behind one lock.
+  server: N writers on N files must beat a single writer (`SRP_CONC_MIN_WRITE_SCALING`), and the same N writers must see
+  a shorter tail on N files than on one (`SRP_CONC_MIN_WRITE_SPREAD`). The second is the sharper of the two - same
+  clients, same requests, same work for the server, differing only in whether the writes queue behind one lock - but it
+  needs writers enough to collide, so it is recorded and not asserted below `SRP_CONC_SPREAD_MIN_CLIENTS` (8) of them.
+  CI runs four clients, where the scaling check is the one carrying the weight.
 
 Each measurement is guarded in up to three ways, in increasing order of trustworthiness:
 

@@ -9,7 +9,7 @@ use crate::test_support::{isolated_config, TempDir};
 /// long as they use it.
 fn report_db(label: &str) -> (TempDir, Database) {
     let dir = TempDir::new(label);
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("ACC", None).unwrap();
     db.logto("ACC").unwrap();
     db.create_table("USERS").unwrap();

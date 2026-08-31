@@ -49,7 +49,7 @@ fn test_lru_eviction() {
 fn test_delete_table_and_account() {
     let dir = TempDir::new("delete");
     let base_dir = dir.path();
-    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let db = Database::new(base_dir, Some(isolated_config())).unwrap();
 
     db.create_account("DEL_ACC", None).unwrap();
     db.logto("DEL_ACC").unwrap();
@@ -69,8 +69,8 @@ fn test_account_registry_reloads_when_another_process_writes() {
     let dir = TempDir::new("stale_registry");
     let base_dir = dir.path();
 
-    let mut writer = Database::new(base_dir, Some(isolated_config())).unwrap();
-    let mut reader = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let writer = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let reader = Database::new(base_dir, Some(isolated_config())).unwrap();
 
     // The other process registers a brand new account.
     writer.create_account("NEWACC", None).unwrap();
@@ -81,7 +81,7 @@ fn test_account_registry_reloads_when_another_process_writes() {
 
     // The reader creating its own account must not erase the other one.
     reader.create_account("OWNACC", None).unwrap();
-    let mut third = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let third = Database::new(base_dir, Some(isolated_config())).unwrap();
     assert!(third.get_account_dir("NEWACC").is_some(), "registry lost an account on write");
     assert!(third.get_account_dir("OWNACC").is_some());
     let _ = third.logto("SYSTEM");
@@ -92,8 +92,8 @@ fn test_authorized_clients_refresh_across_processes() {
     let dir = TempDir::new("stale_clients");
     let base_dir = dir.path();
 
-    let mut writer = Database::new(base_dir, Some(isolated_config())).unwrap();
-    let mut reader = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let writer = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let reader = Database::new(base_dir, Some(isolated_config())).unwrap();
 
     let tp = "aabbccdd";
     writer.add_authorized_client("CLIENT1", tp, vec!["SYSTEM".to_string()], false).unwrap();
@@ -123,7 +123,7 @@ fn test_apply_conversion() {
 fn test_sync_dir_file() {
     let dir = TempDir::new("sync");
     let base_dir = dir.path();
-    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let db = Database::new(base_dir, Some(isolated_config())).unwrap();
     db.create_account("SYNC_ACC", None).unwrap();
     db.logto("SYNC_ACC").unwrap();
 
@@ -152,7 +152,7 @@ fn test_sync_dir_file() {
 fn test_directory_traversal_vulnerability() {
     let dir = TempDir::new("traversal");
     let base_dir = dir.path();
-    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let db = Database::new(base_dir, Some(isolated_config())).unwrap();
 
     // Create a "secret" account
     db.create_account("SECRET", None).unwrap();
@@ -190,7 +190,7 @@ fn test_cache_reloads_when_another_process_writes() {
     let base_dir = dir.path();
 
     // "Server" instance creates the table and one record.
-    let mut writer = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let writer = Database::new(base_dir, Some(isolated_config())).unwrap();
     writer.create_account("SHARED", None).unwrap();
     writer.logto("SHARED").unwrap();
     writer.create_table("ENTITIES").unwrap();
@@ -203,7 +203,7 @@ fn test_cache_reloads_when_another_process_writes() {
     writer.save().unwrap();
 
     // "Local CLI" instance reads it, populating its own cache.
-    let mut reader = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let reader = Database::new(base_dir, Some(isolated_config())).unwrap();
     reader.logto("SHARED").unwrap();
     assert!(reader.get_table("ENTITIES").unwrap().read().records.contains_key("E1"));
 
@@ -229,7 +229,7 @@ fn test_listed_table_still_refreshes_after_save() {
     let dir = TempDir::new("stale_after_save");
     let base_dir = dir.path();
 
-    let mut writer = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let writer = Database::new(base_dir, Some(isolated_config())).unwrap();
     writer.create_account("SHARED3", None).unwrap();
     writer.logto("SHARED3").unwrap();
     writer.create_table("ENTITIES").unwrap();
@@ -242,7 +242,7 @@ fn test_listed_table_still_refreshes_after_save() {
     writer.save().unwrap();
 
     // Local CLI lists the file, caching a clean snapshot.
-    let mut reader = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let reader = Database::new(base_dir, Some(isolated_config())).unwrap();
     reader.logto("SHARED3").unwrap();
     assert!(reader.list_tables().contains(&"ENTITIES".to_string()));
     assert!(reader.get_table("ENTITIES").unwrap().read().records.contains_key("E1"));
@@ -270,13 +270,13 @@ fn test_local_changes_survive_staleness_check() {
     let dir = TempDir::new("stale_dirty");
     let base_dir = dir.path();
 
-    let mut writer = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let writer = Database::new(base_dir, Some(isolated_config())).unwrap();
     writer.create_account("SHARED2", None).unwrap();
     writer.logto("SHARED2").unwrap();
     writer.create_table("ENTITIES").unwrap();
     writer.save().unwrap();
 
-    let mut reader = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let reader = Database::new(base_dir, Some(isolated_config())).unwrap();
     reader.logto("SHARED2").unwrap();
     {
         let t_handle = reader.get_table_mut("ENTITIES").unwrap();
@@ -304,7 +304,7 @@ fn test_local_changes_survive_staleness_check() {
 fn test_all_dict_fields() {
     let dir = TempDir::new("dict_fields");
     let base_dir = dir.path();
-    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let db = Database::new(base_dir, Some(isolated_config())).unwrap();
     db.logto("SYSTEM").unwrap();
 
     db.create_table("USERS").unwrap();
@@ -336,7 +336,7 @@ fn test_all_dict_fields() {
 /// the database so callers keep the directory alive for as long as they use it.
 fn json_shape_db(label: &str) -> (TempDir, Database) {
     let dir = TempDir::new(label);
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("ACC", None).unwrap();
     db.logto("ACC").unwrap();
     db.create_table("USERS").unwrap();

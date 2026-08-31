@@ -52,6 +52,13 @@ MIN_WRITE_SCALING = float(os.environ.get("SRP_CONC_MIN_WRITE_SCALING", "1.25"))
 # rather than throughput, because aggregate throughput here is capped by the test
 # client while what a shared lock does is make a request wait its turn.
 MIN_WRITE_SPREAD = float(os.environ.get("SRP_CONC_MIN_WRITE_SPREAD", "1.15"))
+# ...but only asserted with enough writers to make them collide. Below this, each
+# client largely gets a core to itself, requests rarely overlap on the file at all,
+# and the ratio measures scheduling noise rather than the lock: at four writers it
+# sits around 1.1x whether the lock is per file or database-wide. The ratio is
+# always recorded; a run with fewer writers than this reports it without asserting
+# on it, and leans on the scaling check above, which does hold at four.
+SPREAD_MIN_CLIENTS = int(os.environ.get("SRP_CONC_SPREAD_MIN_CLIENTS", "8"))
 # Writes per connection in the distinct-file comparison. Long enough to span several
 # flush intervals - a run shorter than that measures whichever flush happened to land
 # inside it - and short enough to stay a quick check.
@@ -417,13 +424,21 @@ def main():
                     "minimum": MIN_WRITE_SPREAD,
                 },
             )
-            suite.check(
-                "A writer waits for the file it writes, not for the database",
-                spread_ratio >= MIN_WRITE_SPREAD or not harness.ENFORCE_BUDGETS,
+            spread_detail = (
                 f"{CLIENTS} writers sharing one file see a p95 of {shared.p95:.2f}ms against "
-                f"{spread.p95:.2f}ms on {CLIENTS} files; {spread_ratio:.2f}x "
-                f"(minimum {MIN_WRITE_SPREAD:.2f}x)",
+                f"{spread.p95:.2f}ms on {CLIENTS} files; {spread_ratio:.2f}x"
             )
+            if CLIENTS >= SPREAD_MIN_CLIENTS:
+                suite.check(
+                    "A writer waits for the file it writes, not for the database",
+                    spread_ratio >= MIN_WRITE_SPREAD or not harness.ENFORCE_BUDGETS,
+                    f"{spread_detail} (minimum {MIN_WRITE_SPREAD:.2f}x)",
+                )
+            else:
+                print(
+                    f"  [Skipped] A writer waits for the file it writes, not for the database: "
+                    f"{spread_detail}, not asserted below {SPREAD_MIN_CLIENTS} writers"
+                )
 
             with make_client() as verifier:
                 # A full scan rather than a criterion: these files were created

@@ -175,7 +175,7 @@ fn test_legacy_flat_file_is_migrated_on_first_write() {
     fs::write(format!("{}/data", table_dir), &flat).unwrap();
     fs::write(format!("{}/dict", table_dir), b"").unwrap();
 
-    let mut db = Database::new(base, Some(isolated_config())).unwrap();
+    let db = Database::new(base, Some(isolated_config())).unwrap();
     db.create_account("LEG", Some(base)).unwrap();
     db.logto("LEG").unwrap();
 
@@ -195,7 +195,7 @@ fn test_legacy_flat_file_is_migrated_on_first_write() {
     // Re-read through a second handle to prove the data survived the move.
     db.clear_loaded_tables();
     let table_handle = db.get_table_mut("LEGACY").unwrap();
-    let mut table = table_handle.write();
+    let table = table_handle.write();
     assert_eq!(table.records.len(), 51);
     assert_eq!(table.records["OLD7"], record("LEGACY7"));
     assert_eq!(table.records["NEW"], record("FRESH"));
@@ -437,14 +437,14 @@ fn test_a_group_without_a_trailer_still_loads_before_the_first_full_rewrite() {
 fn test_another_process_sees_flushed_changes() {
     let guard = fresh_dir("hashfile_visibility");
     let base = guard.path();
-    let mut writer = Database::new(base, Some(isolated_config())).unwrap();
+    let writer = Database::new(base, Some(isolated_config())).unwrap();
     writer.create_account("VIS", Some(base)).unwrap();
     writer.logto("VIS").unwrap();
     writer.create_table("T").unwrap();
     writer.get_table_mut("T").unwrap().write().insert_record("K1", record("FIRST"));
     writer.save().unwrap();
 
-    let mut reader = Database::new(base, Some(isolated_config())).unwrap();
+    let reader = Database::new(base, Some(isolated_config())).unwrap();
     reader.logto("VIS").unwrap();
     assert_eq!(reader.get_table_mut("T").unwrap().write().records.len(), 1);
 
@@ -455,7 +455,7 @@ fn test_another_process_sees_flushed_changes() {
     // cached snapshot is detected as stale even within a filesystem timestamp
     // granularity.
     let table_handle = reader.get_table_mut("T").unwrap();
-    let mut table = table_handle.write();
+    let table = table_handle.write();
     assert_eq!(table.records.len(), 2);
     assert_eq!(table.records["K2"], record("SECOND"));
 }

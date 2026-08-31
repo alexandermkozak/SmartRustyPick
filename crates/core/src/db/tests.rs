@@ -10,7 +10,7 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
 
             // Verify $LOGS dictionary
@@ -61,7 +61,7 @@ mod tests {
 
         // Restart and check for self-healing
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
 
             let logs_handle = db.get_table("$LOGS").unwrap();
@@ -97,7 +97,7 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             // Check if $LOGS file exists in SYSTEM account
             db.logto("SYSTEM")?;
             assert!(db.is_table_available("$LOGS"), "$LOGS table should be automatically created in SYSTEM account");
@@ -146,7 +146,7 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.add_authorized_client("CLIENT1", "aabbccdd", vec!["ACC1".to_string()], false)?;
             db.add_authorized_client("CLIENT2", "11223344", vec![], true)?; // ADMIN
 
@@ -229,7 +229,7 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
             db.create_account("USER1", None)?;
             db.create_account("USER2", Some(&format!("{}/custom_path/user2", base_dir)))?;
@@ -262,7 +262,7 @@ mod tests {
 
         // Test auto-population on restart
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
             let accounts_table_handle = db.get_table("$ACCOUNTS").unwrap();
             let accounts_table = accounts_table_handle.read();
@@ -278,7 +278,7 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.create_account("ACC1", None)?;
             db.create_account("ACC2", None)?;
 
@@ -305,7 +305,7 @@ mod tests {
 
         // Re-open and verify isolation
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("ACC1")?;
             let t1_handle = db.get_table("T1").unwrap();
             let t1 = t1_handle.read();
@@ -327,7 +327,7 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
             assert!(db.is_table_available("DIR"), "DIR table should be automatically created in SYSTEM account");
 
@@ -364,7 +364,7 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.create_test_account("DICT_TEST")?;
             db.logto("DICT_TEST")?;
 
@@ -437,7 +437,7 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.create_test_account("SERIAL_TEST")?;
             db.logto("SERIAL_TEST")?;
 

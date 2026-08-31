@@ -14,7 +14,7 @@ fn record(value: &str) -> Record {
 }
 
 fn open_account(base: &str, account: &str) -> Database {
-    let mut db = Database::new(base, Some(isolated_config())).unwrap();
+    let db = Database::new(base, Some(isolated_config())).unwrap();
     db.create_account(account, Some(base)).unwrap();
     db.logto(account).unwrap();
     // DIR comes with the account; nothing here has to ask for it.
@@ -68,7 +68,7 @@ fn test_durable_flag_survives_reopen_and_can_be_cleared() {
     let guard = fresh_dir("durability_reopen");
     let base = guard.path();
     {
-        let mut db = open_account(base, "DUR3");
+        let db = open_account(base, "DUR3");
         db.create_table_durable("CRITICAL", true).unwrap();
         db.save().unwrap();
     }
@@ -168,10 +168,10 @@ fn test_durable_write_survives_sigkill() {
         .collect();
     assert!(leftovers.is_empty(), "a crash left a temporary file behind: {:?}", leftovers);
 
-    let mut db = Database::new(base, Some(isolated_config())).unwrap();
+    let db = Database::new(base, Some(isolated_config())).unwrap();
     db.logto("KILL").unwrap();
     let table_handle = db.get_table_mut("LEDGER").unwrap();
-    let mut table = table_handle.write();
+    let table = table_handle.write();
     assert_eq!(table.records.len(), 1, "the acknowledged write did not survive the kill");
     assert_eq!(table.records["K1"], record("ACKED"));
 }
@@ -255,7 +255,7 @@ fn test_demoting_a_file_returns_it_to_the_buffered_policy() {
 fn test_the_durability_flag_is_only_settable_on_a_file_that_can_carry_one() {
     let guard = fresh_dir("durability_refusals");
     let base = guard.path();
-    let mut db = open_account(base, "DUR7");
+    let db = open_account(base, "DUR7");
     db.create_table("LEDGER").unwrap();
 
     let missing = db.set_table_durable("NOPE", true).unwrap_err();
