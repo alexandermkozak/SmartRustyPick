@@ -116,11 +116,29 @@ impl Drop for TableWrite<'_> {
 #[cfg(debug_assertions)]
 thread_local! {
     static HELD_TABLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Every file lock this thread has ever taken. A request on a hot path is
+    /// meant to take a fixed, small number of these, and a lookup added to one
+    /// of those paths costs a lock on the file every connection is contending
+    /// for - which is a few percent of throughput, not a test failure, unless
+    /// something counts it. See `table_locks_taken`.
+    static TAKEN_TABLES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many file locks this thread has taken since it started.
+///
+/// Debug builds only, and only meaningful as a difference across a request.
+/// The hot-path tests use it to count the work one request does, because that
+/// count is a property a test can pin exactly, where the throughput it governs
+/// is far too noisy to assert on.
+#[cfg(debug_assertions)]
+pub fn table_locks_taken() -> u64 {
+    TAKEN_TABLES.with(|taken| taken.get())
 }
 
 #[cfg(debug_assertions)]
 fn note_guard_taken() {
     HELD_TABLES.with(|held| held.set(held.get() + 1));
+    TAKEN_TABLES.with(|taken| taken.set(taken.get() + 1));
 }
 
 #[cfg(not(debug_assertions))]

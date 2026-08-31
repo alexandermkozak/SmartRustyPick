@@ -1099,3 +1099,93 @@ fn test_the_demo_account_is_admin_only_and_needs_a_name() {
     );
     assert_eq!(resp.message.unwrap(), "Account name not specified");
 }
+
+/// Each hot path takes a fixed, small number of file locks per request.
+///
+/// This pins the shape of a regression nothing else here would catch. An extra
+/// `get_table_mut` in a command handler is free under one database-wide lock -
+/// it runs inside a lock already held - but with a lock per file it is another
+/// acquisition of the very lock every connection writing that file is queueing
+/// for. It cost about 20% of the throughput of eight writers on one file, and
+/// no threshold in the performance suite could have caught it: run-to-run
+/// variance there is several times wider than the regression, and the
+/// distinct-versus-shared ratio recorded beside it would have *improved*,
+/// because the arm that got slower is its denominator.
+///
+/// The count, unlike the throughput it governs, is exact. These are upper
+/// bounds: taking fewer locks passes, and taking more is a failure to argue
+/// with rather than a number to nudge.
+///
+/// Debug builds only - the counter compiles out of a release build.
+#[cfg(debug_assertions)]
+#[test]
+fn the_hot_paths_lock_a_file_a_fixed_number_of_times() {
+    use crate::db::engine::table_locks_taken;
+
+    let dir = TempDir::new("hot_path_locks");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_test_account("HOT").unwrap();
+    // Nothing may flush mid-request: a flush legitimately takes the file again,
+    // and this is measuring the request, not the flush.
+    db.flush_interval = std::time::Duration::from_secs(3_600);
+    db.flush_max_pending = 1_000_000;
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let client_info = ClientInfo {
+        name: "hot_client".to_string(),
+        thumbprint: "hot_tp".to_string(),
+        allowed_accounts: vec!["HOT".to_string()],
+        is_admin: false,
+    };
+
+    let request = |command: &str, key: &str| Request {
+        command: command.to_string(),
+        account: Some("HOT".to_string()),
+        file: Some("USERS".to_string()),
+        key: Some(key.to_string()),
+        ..Default::default()
+    };
+    let write = |key: &str| Request {
+        data: Some(serde_json::Value::String("Alice^alice@example.com".to_string())),
+        ..request("WRITE", key)
+    };
+
+    // Steady state is what the counts describe: the first write to a file also
+    // loads it and reads the account's durability flags out of DIR.
+    for i in 0..3 {
+        assert_eq!(handle_request(write(&format!("warm{i}")), &db_arc, &client_info).status, "OK");
+    }
+
+    let structured = Request {
+        structured_data: Some(serde_json::json!({ "name": "Bob" })),
+        ..request("WRITE", "structured")
+    };
+    let query = Request { key: None, ..request("QUERY", "") };
+
+    // (what it does, the request, how many times it may lock the file, why)
+    let budgets: Vec<(&str, Request, u64, &str)> = vec![
+        ("WRITE", write("written"), 2,
+         "the freshness check, then the write itself"),
+        ("WRITE with structured data", structured, 3,
+         "the same two, plus reading the dictionary to deserialize the record"),
+        ("READ", request("READ", "warm0"), 2,
+         "the freshness check, then serving the record"),
+        ("QUERY", query, 2,
+         "the freshness check, then the scan"),
+        ("DELETE", request("DELETE", "warm1"), 2,
+         "the freshness check, then the removal"),
+    ];
+
+    for (what, req, budget, why) in budgets {
+        let before = table_locks_taken();
+        let response = handle_request(req, &db_arc, &client_info);
+        let taken = table_locks_taken() - before;
+        assert_eq!(response.status, "OK", "{what} did not succeed: {:?}", response.message);
+        assert!(
+            taken <= budget,
+            "{what} locked the file {taken} times, over its budget of {budget} ({why}). \
+             Every acquisition beyond the budget is one more turn in the queue for a file \
+             other connections are working on. Resolve the file once and reuse the handle.",
+        );
+    }
+}
