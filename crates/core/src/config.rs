@@ -153,9 +153,10 @@ impl Config {
         let config_path = Path::new("config.toml");
         if config_path.exists()
             && let Ok(content) = fs::read_to_string(config_path)
-                && let Ok(config) = toml::from_str::<Config>(&content) {
-                    return config;
-                }
+            && let Ok(config) = toml::from_str::<Config>(&content)
+        {
+            return config;
+        }
         // No file, or one that does not parse: run on the defaults rather than
         // refusing to start.
         Config::default()

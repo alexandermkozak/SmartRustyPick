@@ -128,7 +128,11 @@ async fn read_line_limited<R: AsyncBufRead + Unpin>(reader: &mut R, max: usize) 
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            return if line.is_empty() { Ok(None) } else { Ok(Some(finish_line(line))) };
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(finish_line(line)))
+            };
         }
         match available.iter().position(|b| *b == b'\n') {
             Some(index) => {
@@ -167,7 +171,9 @@ pub fn percent_decode(value: &str, plus_is_space: bool) -> String {
     while i < bytes.len() {
         match bytes[i] {
             b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok());
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
+                    .ok()
+                    .and_then(|h| u8::from_str_radix(h, 16).ok());
                 match hex {
                     Some(byte) => {
                         out.push(byte);
@@ -234,7 +240,11 @@ where
 
     let mut parts = request_line.split_whitespace();
     let (method, target, version) = match (parts.next(), parts.next(), parts.next()) {
-        (Some(method), Some(target), version) => (method.to_string(), target.to_string(), version.unwrap_or("HTTP/1.1").to_string()),
+        (Some(method), Some(target), version) => (
+            method.to_string(),
+            target.to_string(),
+            version.unwrap_or("HTTP/1.1").to_string(),
+        ),
         _ => return Ok(Incoming::Rejected(Response::error(400, "Malformed request line"))),
     };
 
@@ -269,8 +279,14 @@ where
     }
     // Chunked bodies would need a second framing to be implemented; nothing the
     // dashboard sends uses one, so it is refused rather than mis-read.
-    if headers.get("transfer-encoding").is_some_and(|value| value.to_ascii_lowercase().contains("chunked")) {
-        return Ok(Incoming::Rejected(Response::error(400, "Chunked request bodies are not supported")));
+    if headers
+        .get("transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        return Ok(Incoming::Rejected(Response::error(
+            400,
+            "Chunked request bodies are not supported",
+        )));
     }
 
     let mut body = vec![0u8; content_length];
@@ -300,11 +316,18 @@ where
 ///
 /// The page is served from the same origin it talks to, so a strict policy
 /// costs nothing and keeps an injected string from pulling in anything remote.
-pub async fn write_response<W: AsyncWrite + Unpin>(writer: &mut W, response: &Response, keep_alive: bool) -> std::io::Result<()> {
+pub async fn write_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &Response,
+    keep_alive: bool,
+) -> std::io::Result<()> {
     let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason(response.status));
     head.push_str(&format!("Content-Type: {}\r\n", response.content_type));
     head.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
-    head.push_str(&format!("Connection: {}\r\n", if keep_alive { "keep-alive" } else { "close" }));
+    head.push_str(&format!(
+        "Connection: {}\r\n",
+        if keep_alive { "keep-alive" } else { "close" }
+    ));
     head.push_str("Cache-Control: no-store\r\n");
     head.push_str("X-Content-Type-Options: nosniff\r\n");
     head.push_str("Referrer-Policy: no-referrer\r\n");
@@ -345,7 +368,8 @@ mod tests {
 
     #[tokio::test]
     async fn parses_a_get_with_a_query_string() {
-        let request = expect_request(parse("GET /api/accounts?token=abc&x=a%20b HTTP/1.1\r\nHost: localhost\r\n\r\n").await);
+        let request =
+            expect_request(parse("GET /api/accounts?token=abc&x=a%20b HTTP/1.1\r\nHost: localhost\r\n\r\n").await);
         assert_eq!(request.method, "GET");
         assert_eq!(request.path, "/api/accounts");
         assert_eq!(request.query.get("token").unwrap(), "abc");
@@ -363,14 +387,19 @@ mod tests {
     #[tokio::test]
     async fn reads_a_json_body_of_the_declared_length() {
         let body = r#"{"name":"REPORTS"}"#;
-        let raw = format!("POST /api/clients HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+        let raw = format!(
+            "POST /api/clients HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
         let request = expect_request(parse(&raw).await);
         assert_eq!(request.json().unwrap()["name"], "REPORTS");
     }
 
     #[tokio::test]
     async fn reads_one_cookie_out_of_several() {
-        let request = expect_request(parse("GET / HTTP/1.1\r\nCookie: theme=dark; srp_token=secret; other=1\r\n\r\n").await);
+        let request =
+            expect_request(parse("GET / HTTP/1.1\r\nCookie: theme=dark; srp_token=secret; other=1\r\n\r\n").await);
         assert_eq!(request.cookie("srp_token").unwrap(), "secret");
         assert_eq!(request.cookie("missing"), None);
     }
@@ -418,7 +447,8 @@ mod tests {
     #[tokio::test]
     async fn a_response_carries_its_length_and_the_security_headers() {
         let mut out = Vec::new();
-        let response = Response::json(200, &serde_json::json!({"status": "ok"})).with_header("Set-Cookie", "srp_token=x");
+        let response =
+            Response::json(200, &serde_json::json!({"status": "ok"})).with_header("Set-Cookie", "srp_token=x");
         write_response(&mut out, &response, false).await.unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));

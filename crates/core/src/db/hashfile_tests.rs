@@ -1,7 +1,7 @@
 use crate::db::engine::Database;
 use crate::db::hashfile;
 use crate::db::models::*;
-use crate::test_support::{isolated_config, TempDir};
+use crate::test_support::{TempDir, isolated_config};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -63,7 +63,11 @@ fn test_round_trip_and_incremental_write() {
     let mut map = sample_map(500);
     let meta = hashfile::save(&section, &map, hashfile::SectionMeta::empty(), None, 16).unwrap();
     assert_eq!(meta.records, 500);
-    assert!(meta.modulus >= 32, "modulus should scale with the table: {}", meta.modulus);
+    assert!(
+        meta.modulus >= 32,
+        "modulus should scale with the table: {}",
+        meta.modulus
+    );
 
     let mut loaded = HashMap::new();
     let loaded_meta = hashfile::load(&section, &mut loaded).unwrap();
@@ -217,7 +221,10 @@ fn test_deferred_flush_batches_writes() {
     db.flush_interval = std::time::Duration::from_secs(3_600);
 
     for i in 0..10 {
-        db.get_table_mut("T").unwrap().write().insert_record(&format!("K{i}"), record("V"));
+        db.get_table_mut("T")
+            .unwrap()
+            .write()
+            .insert_record(&format!("K{i}"), record("V"));
         db.note_write().unwrap();
     }
     assert!(db.has_pending_writes(), "writes should still be buffered");
@@ -269,7 +276,10 @@ fn a_group(section: &str) -> std::path::PathBuf {
         .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with('g'))
         .collect();
     groups.sort();
-    groups.into_iter().next().expect("the section should have at least one group")
+    groups
+        .into_iter()
+        .next()
+        .expect("the section should have at least one group")
 }
 
 fn truncate(path: &std::path::Path, drop_bytes: u64) {
@@ -337,7 +347,10 @@ fn test_truncated_meta_is_detected() {
 
     let mut loaded = HashMap::new();
     let err = hashfile::load(&section, &mut loaded).expect_err("a torn meta must not load");
-    assert!(err.to_string().contains("Corrupt section metadata"), "unhelpful error: {err}");
+    assert!(
+        err.to_string().contains("Corrupt section metadata"),
+        "unhelpful error: {err}"
+    );
 }
 
 #[test]
@@ -367,7 +380,11 @@ fn test_stale_tmp_file_is_cleaned_up_and_never_read() {
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|n| n.ends_with(".tmp"))
         .collect();
-    assert!(leftovers.is_empty(), "stale temporary files should be swept: {:?}", leftovers);
+    assert!(
+        leftovers.is_empty(),
+        "stale temporary files should be swept: {:?}",
+        leftovers
+    );
 }
 
 #[test]
@@ -384,7 +401,7 @@ fn test_meta_is_written_after_the_groups_it_describes() {
         16,
         hashfile::FsyncPolicy::Always,
     )
-        .unwrap();
+    .unwrap();
 
     // `meta` names the modulus the group files implement, so it must never be
     // the older file of the two: a `meta` from the future describes data that
@@ -423,7 +440,11 @@ fn test_a_group_without_a_trailer_still_loads_before_the_first_full_rewrite() {
         frames.extend_from_slice(&data);
     }
     for group in 0..hashfile::MIN_MODULUS {
-        fs::write(section_dir.join(format!("g{:08x}", group)), if group == 0 { &frames[..] } else { &[][..] }).unwrap();
+        fs::write(
+            section_dir.join(format!("g{:08x}", group)),
+            if group == 0 { &frames[..] } else { &[][..] },
+        )
+        .unwrap();
     }
     fs::write(section_dir.join("meta"), b"version=7\nmodulus=8\nrecords=3\n").unwrap();
 
@@ -441,14 +462,22 @@ fn test_another_process_sees_flushed_changes() {
     writer.create_account("VIS", Some(base)).unwrap();
     writer.logto("VIS").unwrap();
     writer.create_table("T").unwrap();
-    writer.get_table_mut("T").unwrap().write().insert_record("K1", record("FIRST"));
+    writer
+        .get_table_mut("T")
+        .unwrap()
+        .write()
+        .insert_record("K1", record("FIRST"));
     writer.save().unwrap();
 
     let reader = Database::new(base, Some(isolated_config())).unwrap();
     reader.logto("VIS").unwrap();
     assert_eq!(reader.get_table_mut("T").unwrap().write().records.len(), 1);
 
-    writer.get_table_mut("T").unwrap().write().insert_record("K2", record("SECOND"));
+    writer
+        .get_table_mut("T")
+        .unwrap()
+        .write()
+        .insert_record("K2", record("SECOND"));
     writer.save().unwrap();
 
     // The meta file's flush counter changes on every write, so the reader's

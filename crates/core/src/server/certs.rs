@@ -48,14 +48,24 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
         println!("Generating CA certificate...");
         let status = std::process::Command::new("openssl")
             .args([
-                "req", "-new", "-x509", "-days", "3650",
+                "req",
+                "-new",
+                "-x509",
+                "-days",
+                "3650",
                 "-nodes",
-                "-newkey", "rsa:2048",
-                "-keyout", ca_key_path.as_str(),
-                "-out", ca_path,
-                "-subj", "/CN=SmartRustyPick Root CA",
-                "-addext", "basicConstraints=critical,CA:TRUE",
-                "-addext", "keyUsage=critical,keyCertSign,cRLSign"
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                ca_key_path.as_str(),
+                "-out",
+                ca_path,
+                "-subj",
+                "/CN=SmartRustyPick Root CA",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-addext",
+                "keyUsage=critical,keyCertSign,cRLSign",
             ])
             .status()?;
         if !status.success() {
@@ -69,12 +79,17 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
         let csr_path = &sibling(cert_path, "csr");
         let status = std::process::Command::new("openssl")
             .args([
-                "req", "-new",
+                "req",
+                "-new",
                 "-nodes",
-                "-newkey", "rsa:2048",
-                "-keyout", key_path,
-                "-out", csr_path.as_str(),
-                "-subj", "/CN=localhost"
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                key_path,
+                "-out",
+                csr_path.as_str(),
+                "-subj",
+                "/CN=localhost",
             ])
             .status()?;
         if !status.success() {
@@ -83,19 +98,29 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
 
         // 3. Sign server certificate with CA
         let ext_path = &sibling(cert_path, "ext");
-        std::fs::write(ext_path, "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nsubjectAltName = DNS:localhost, IP:127.0.0.1")?;
+        std::fs::write(
+            ext_path,
+            "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nsubjectAltName = DNS:localhost, IP:127.0.0.1",
+        )?;
 
         let status = std::process::Command::new("openssl")
             .args([
-                "x509", "-req",
-                "-in", csr_path.as_str(),
-                "-CA", ca_path,
-                "-CAkey", ca_key_path.as_str(),
+                "x509",
+                "-req",
+                "-in",
+                csr_path.as_str(),
+                "-CA",
+                ca_path,
+                "-CAkey",
+                ca_key_path.as_str(),
                 "-CAcreateserial",
-                "-out", cert_path,
-                "-days", "365",
+                "-out",
+                cert_path,
+                "-days",
+                "365",
                 "-sha256",
-                "-extfile", ext_path.as_str()
+                "-extfile",
+                ext_path.as_str(),
             ])
             .status()?;
         // The CSR and the extension file are inputs to the signing step only; keeping
@@ -138,10 +163,17 @@ pub fn validate_common_name(common_name: &str) -> Result<(), String> {
     if common_name.len() > 64 {
         return Err("Common name must be 64 characters or fewer".to_string());
     }
-    if common_name.starts_with('-') || common_name.contains('/') || common_name.contains('\\') || common_name.contains("..") {
+    if common_name.starts_with('-')
+        || common_name.contains('/')
+        || common_name.contains('\\')
+        || common_name.contains("..")
+    {
         return Err("Invalid common name: must not start with '-' or contain path separators".to_string());
     }
-    if !common_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+    if !common_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
         return Err("Invalid common name: only letters, digits, '.', '-' and '_' are allowed".to_string());
     }
     Ok(())
@@ -188,7 +220,12 @@ fn cert_output_dir(ca_path: &str) -> PathBuf {
 /// still parses, but a client that picks its certificate by building a chain -
 /// Windows' Schannel does - will not offer one it cannot chain to the CA the
 /// server asked for, and the connection is then dropped as unauthenticated.
-pub fn generate_client_cert(config: &Config, common_name: &str, days: u32, write_pfx: bool) -> io::Result<GeneratedCert> {
+pub fn generate_client_cert(
+    config: &Config,
+    common_name: &str,
+    days: u32,
+    write_pfx: bool,
+) -> io::Result<GeneratedCert> {
     if let Err(message) = validate_common_name(common_name) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
     }
@@ -204,7 +241,12 @@ pub fn generate_client_cert(config: &Config, common_name: &str, days: u32, write
 
     let out_dir = cert_output_dir(&ca_file);
     std::fs::create_dir_all(&out_dir)?;
-    let out = |extension: &str| out_dir.join(format!("{}.{}", common_name, extension)).to_string_lossy().into_owned();
+    let out = |extension: &str| {
+        out_dir
+            .join(format!("{}.{}", common_name, extension))
+            .to_string_lossy()
+            .into_owned()
+    };
     let key_file = out("key");
     let csr_file = out("csr");
     let crt_file = out("crt");
@@ -215,7 +257,10 @@ pub fn generate_client_cert(config: &Config, common_name: &str, days: u32, write
     let ran = |result: io::Result<std::process::ExitStatus>| matches!(result, Ok(status) if status.success());
 
     // The private key never leaves this directory except through the caller.
-    if !ran(std::process::Command::new("openssl").args(["genrsa", "-out", &key_file, "2048"]).status()) {
+    if !ran(std::process::Command::new("openssl")
+        .args(["genrsa", "-out", &key_file, "2048"])
+        .status())
+    {
         return Err(failed("Generating the RSA key"));
     }
 
@@ -240,15 +285,22 @@ pub fn generate_client_cert(config: &Config, common_name: &str, days: u32, write
     let days = days.max(1).to_string();
     let signed = ran(std::process::Command::new("openssl")
         .args([
-            "x509", "-req",
-            "-in", &csr_file,
-            "-CA", &ca_file,
-            "-CAkey", &ca_key_file,
+            "x509",
+            "-req",
+            "-in",
+            &csr_file,
+            "-CA",
+            &ca_file,
+            "-CAkey",
+            &ca_key_file,
             "-CAcreateserial",
-            "-out", &crt_file,
-            "-days", &days,
+            "-out",
+            &crt_file,
+            "-days",
+            &days,
             "-sha256",
-            "-extfile", &ext_file,
+            "-extfile",
+            &ext_file,
         ])
         .status());
     // Inputs to the signing step only; leaving them behind is just litter.
@@ -260,8 +312,21 @@ pub fn generate_client_cert(config: &Config, common_name: &str, days: u32, write
 
     let pfx_path = if write_pfx
         && ran(std::process::Command::new("openssl")
-        .args(["pkcs12", "-export", "-out", &pfx_file, "-inkey", &key_file, "-in", &crt_file, "-certfile", &ca_file, "-passout", "pass:"])
-        .status())
+            .args([
+                "pkcs12",
+                "-export",
+                "-out",
+                &pfx_file,
+                "-inkey",
+                &key_file,
+                "-in",
+                &crt_file,
+                "-certfile",
+                &ca_file,
+                "-passout",
+                "pass:",
+            ])
+            .status())
     {
         Some(pfx_file)
     } else {

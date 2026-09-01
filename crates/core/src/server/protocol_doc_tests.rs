@@ -177,7 +177,8 @@ fn commands_in_handler() -> Vec<String> {
     // From `handle_request_locked` onwards: that function holds the one
     // complete dispatch, and the record commands are dispatched a second time,
     // at the same indent, by the helper the shared path shares with it.
-    let (_, dispatch) = HANDLER.split_once("pub fn handle_request_locked")
+    let (_, dispatch) = HANDLER
+        .split_once("pub fn handle_request_locked")
         .expect("handler.rs must still have a handle_request_locked");
     dispatch
         .lines()
@@ -193,7 +194,12 @@ fn commands_in_handler() -> Vec<String> {
 
 /// The keys of a JSON object a command returns inside `record` or `results`.
 fn value_keys(value: &serde_json::Value) -> Vec<String> {
-    value.as_object().expect("must be a JSON object").keys().cloned().collect()
+    value
+        .as_object()
+        .expect("must be a JSON object")
+        .keys()
+        .cloned()
+        .collect()
 }
 
 fn assert_documented_shape(what: &str, actual: Vec<String>, expected: &[&str]) {
@@ -201,7 +207,10 @@ fn assert_documented_shape(what: &str, actual: Vec<String>, expected: &[&str]) {
     actual.sort();
     let mut wanted: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
     wanted.sort();
-    assert_eq!(actual, wanted, "the {what} object changed. Update docs/protocol.md and this list.");
+    assert_eq!(
+        actual, wanted,
+        "the {what} object changed. Update docs/protocol.md and this list."
+    );
     for key in expected {
         assert!(
             PROTOCOL_DOC.contains(&format!("\"{key}\"")),

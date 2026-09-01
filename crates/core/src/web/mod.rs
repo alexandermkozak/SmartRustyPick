@@ -128,7 +128,9 @@ fn random_token() -> std::io::Result<String> {
             return Ok(hex::encode(bytes));
         }
     }
-    let output = std::process::Command::new("openssl").args(["rand", "-hex", "24"]).output()?;
+    let output = std::process::Command::new("openssl")
+        .args(["rand", "-hex", "24"])
+        .output()?;
     let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || token.len() < 32 {
         return Err(std::io::Error::other("Could not generate a dashboard token"));
@@ -180,10 +182,12 @@ async fn run(config: Arc<Config>, db: SharedDb, protocol_addr: String) -> std::i
             .map_err(std::io::Error::other)??
     };
 
-    let ca_path = config
-        .ca_path
-        .clone()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "ca_path is required for the dashboard"))?;
+    let ca_path = config.ca_path.clone().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ca_path is required for the dashboard",
+        )
+    })?;
     let client = Arc::new(ProtocolClient::new(
         &protocol_target,
         &generated.cert_path,
@@ -233,7 +237,11 @@ async fn run(config: Arc<Config>, db: SharedDb, protocol_addr: String) -> std::i
     }
 }
 
-async fn serve_connection(stream: tokio::net::TcpStream, client: Arc<ProtocolClient>, token: Arc<String>) -> std::io::Result<()> {
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    client: Arc<ProtocolClient>,
+    token: Arc<String>,
+) -> std::io::Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
 
@@ -275,7 +283,10 @@ fn authenticated(request: &http::Request, token: &str) -> bool {
     {
         return true;
     }
-    request.query.get("token").is_some_and(|value| tokens_match(token, value))
+    request
+        .query
+        .get("token")
+        .is_some_and(|value| tokens_match(token, value))
 }
 
 async fn handle(client: &Arc<ProtocolClient>, token: &str, request: &http::Request) -> Response {

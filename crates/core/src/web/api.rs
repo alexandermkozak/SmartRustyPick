@@ -36,7 +36,10 @@ async fn run(client: &ProtocolClient, payload: Value) -> Response {
             if status == "OK" {
                 Response::json(200, &response)
             } else {
-                let message = response.get("message").and_then(Value::as_str).unwrap_or("Request failed");
+                let message = response
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Request failed");
                 Response::error(status_for(message), message)
             }
         }
@@ -48,7 +51,10 @@ async fn run(client: &ProtocolClient, payload: Value) -> Response {
 
 /// A required string field of a JSON request body.
 fn field<'a>(body: &'a Value, name: &str) -> Option<&'a str> {
-    body.get(name).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty())
+    body.get(name)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// An account list, accepting both `["A","B"]` and `"A, B"` so the page can send
@@ -139,7 +145,7 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                     "is_admin": is_admin,
                 }),
             )
-                .await
+            .await
         }
         ("DELETE", ["api", "clients", name]) => {
             run(client, json!({ "command": "DEAUTHORIZE.CONN", "name": name })).await
@@ -149,8 +155,16 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
             if allowed.is_empty() {
                 return Response::error(400, "At least one account is required");
             }
-            let command = if flag(&body, "remove") { "REMOVE.CLIENT.ACCOUNT" } else { "ADD.CLIENT.ACCOUNT" };
-            run(client, json!({ "command": command, "name": name, "accounts_list": allowed })).await
+            let command = if flag(&body, "remove") {
+                "REMOVE.CLIENT.ACCOUNT"
+            } else {
+                "ADD.CLIENT.ACCOUNT"
+            };
+            run(
+                client,
+                json!({ "command": command, "name": name, "accounts_list": allowed }),
+            )
+            .await
         }
 
         // Certificates: issued, authorized and handed back in one step.
@@ -173,7 +187,7 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                     "is_admin": is_admin,
                 }),
             )
-                .await
+            .await
         }
 
         // Accounts and their files: what exists, how big it is, and how it is
@@ -191,13 +205,21 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                 Some(name) => name,
                 None => return Response::error(400, "An account name is required"),
             };
-            let command = if flag(&body, "demo") { "CREATE.TEST.ACCOUNT" } else { "CREATE.ACCOUNT" };
+            let command = if flag(&body, "demo") {
+                "CREATE.TEST.ACCOUNT"
+            } else {
+                "CREATE.ACCOUNT"
+            };
             run(client, json!({ "command": command, "target_account": name })).await
         }
         // Dropping an account deletes every file in it. The confirmation is the
         // page's job; the database refuses SYSTEM whatever is asked here.
         ("DELETE", ["api", "accounts", account]) => {
-            run(client, json!({ "command": "DELETE.ACCOUNT", "target_account": account })).await
+            run(
+                client,
+                json!({ "command": "DELETE.ACCOUNT", "target_account": account }),
+            )
+            .await
         }
         ("GET", ["api", "accounts", account, "files"]) => {
             run(client, json!({ "command": "LIST.FILES", "account": account })).await
@@ -216,10 +238,14 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                     "durable": flag(&body, "durable"),
                 }),
             )
-                .await
+            .await
         }
         ("GET", ["api", "accounts", account, "files", file]) => {
-            run(client, json!({ "command": "FILE.STATS", "account": account, "file": file })).await
+            run(
+                client,
+                json!({ "command": "FILE.STATS", "account": account, "file": file }),
+            )
+            .await
         }
         // The one thing about an existing file the dashboard changes rather
         // than reports: whether its writes are flushed before they are
@@ -233,16 +259,24 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                 client,
                 json!({ "command": "SET.FILE", "account": account, "file": file, "durable": durable }),
             )
-                .await
+            .await
         }
         ("DELETE", ["api", "accounts", account, "files", file]) => {
-            run(client, json!({ "command": "DELETE.FILE", "account": account, "file": file })).await
+            run(
+                client,
+                json!({ "command": "DELETE.FILE", "account": account, "file": file }),
+            )
+            .await
         }
 
         // A file's dictionary: the definitions that decide what its fields are
         // called, how they are laid out and how they convert.
         ("GET", ["api", "accounts", account, "files", file, "dictionary"]) => {
-            run(client, json!({ "command": "LIST.DICT", "account": account, "file": file })).await
+            run(
+                client,
+                json!({ "command": "LIST.DICT", "account": account, "file": file }),
+            )
+            .await
         }
         ("POST", ["api", "accounts", account, "files", file, "dictionary"]) => {
             let name = match field(&body, "name") {
@@ -262,7 +296,7 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                     "structured_data": dictionary_attributes(&body),
                 }),
             )
-                .await
+            .await
         }
         // `DELETE` with `is_dict` already removes one entry correctly, so there
         // is no separate command for it to duplicate.
@@ -271,7 +305,7 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                 client,
                 json!({ "command": "DELETE", "account": account, "file": file, "key": name, "is_dict": true }),
             )
-                .await
+            .await
         }
 
         ("GET", _) | ("HEAD", _) => Response::error(404, "No such endpoint"),
@@ -286,7 +320,10 @@ mod tests {
     #[test]
     fn protocol_errors_keep_their_meaning_in_the_status_code() {
         assert_eq!(status_for("Admin privileges required"), 403);
-        assert_eq!(status_for("Access denied for account PAYROLL: Not in allowed list"), 403);
+        assert_eq!(
+            status_for("Access denied for account PAYROLL: Not in allowed list"),
+            403
+        );
         assert_eq!(status_for("Table 'ORDERS' not found in account 'SALES'"), 404);
         assert_eq!(status_for("File not specified"), 400);
     }
@@ -342,7 +379,10 @@ mod tests {
 
         // An attribute left out stays out, so SET.DICT applies its own default
         // rather than being handed a null to interpret.
-        assert_eq!(dictionary_attributes(&json!({ "name": "NAME", "field": 1 })), json!({ "field": 1 }));
+        assert_eq!(
+            dictionary_attributes(&json!({ "name": "NAME", "field": 1 })),
+            json!({ "field": 1 })
+        );
     }
 
     #[test]

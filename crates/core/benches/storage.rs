@@ -83,11 +83,7 @@ fn bench_serialize(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     group.bench_function("serialize_record_for_account", |b| {
         b.iter(|| {
-            black_box(db.serialize_record_for_account(
-                black_box(common::ACCOUNT),
-                black_box(TABLE),
-                black_box(&record),
-            ))
+            black_box(db.serialize_record_for_account(black_box(common::ACCOUNT), black_box(TABLE), black_box(&record)))
         })
     });
     group.finish();

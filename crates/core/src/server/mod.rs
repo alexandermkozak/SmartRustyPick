@@ -1,11 +1,11 @@
-pub mod models;
 pub mod certs;
 pub mod handler;
-pub mod stats;
 #[cfg(test)]
 mod handler_tests;
+pub mod models;
 #[cfg(test)]
 mod protocol_doc_tests;
+pub mod stats;
 
 use crate::config::Config;
 pub use certs::{ensure_certificates, load_certs, load_key};
@@ -42,7 +42,13 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
     // Install default crypto provider for rustls
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 
-    let addr = override_addr.unwrap_or_else(|| format!("{}:{}", config.server_addr.as_ref().unwrap_or(&"0.0.0.0".to_string()), config.server_port.unwrap_or(8443)));
+    let addr = override_addr.unwrap_or_else(|| {
+        format!(
+            "{}:{}",
+            config.server_addr.as_ref().unwrap_or(&"0.0.0.0".to_string()),
+            config.server_port.unwrap_or(8443)
+        )
+    });
 
     ensure_certificates(&config)?;
     set_active_config(config.clone());
@@ -53,7 +59,9 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
 
     let mut root_cert_store = RootCertStore::empty();
     for cert in ca_certs {
-        root_cert_store.add(cert).map_err(|e| tokio::io::Error::new(tokio::io::ErrorKind::InvalidInput, e))?;
+        root_cert_store
+            .add(cert)
+            .map_err(|e| tokio::io::Error::new(tokio::io::ErrorKind::InvalidInput, e))?;
     }
 
     let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_cert_store))
@@ -87,7 +95,10 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
         let permit = match connection_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                let msg = format!("Connection limit ({}) reached; rejecting {}", max_connections, peer_addr);
+                let msg = format!(
+                    "Connection limit ({}) reached; rejecting {}",
+                    max_connections, peer_addr
+                );
                 eprintln!("{}", msg);
                 stats::note_rejected();
                 let db = db.clone();
@@ -98,7 +109,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                     let _ = tokio::task::spawn_blocking(move || {
                         let _ = write_lock(&db).log_error("SYSTEM", &msg);
                     })
-                        .await;
+                    .await;
                 });
                 continue;
             }
@@ -121,7 +132,10 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                     return;
                 }
                 Err(_) => {
-                    eprintln!("TLS handshake from {} did not complete within {:?}", peer_addr, handshake_timeout);
+                    eprintln!(
+                        "TLS handshake from {} did not complete within {:?}",
+                        peer_addr, handshake_timeout
+                    );
                     return;
                 }
             };
@@ -129,11 +143,12 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
             let (_, session) = tls_stream.get_ref();
             let mut client_cert_thumbprint = None;
             if let Some(certs) = session.peer_certificates()
-                && let Some(cert) = certs.first() {
-                    let mut hasher = Sha256::new();
-                    hasher.update(cert);
-                    client_cert_thumbprint = Some(hex::encode(hasher.finalize()));
-                }
+                && let Some(cert) = certs.first()
+            {
+                let mut hasher = Sha256::new();
+                hasher.update(cert);
+                client_cert_thumbprint = Some(hex::encode(hasher.finalize()));
+            }
 
             let thumbprint = match client_cert_thumbprint {
                 Some(t) => t,
@@ -146,7 +161,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                     let _ = tokio::task::spawn_blocking(move || {
                         let _ = write_lock(&db).log_error("SYSTEM", &msg);
                     })
-                        .await;
+                    .await;
                     return;
                 }
             };
@@ -158,9 +173,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                 // scheduled on this thread.
                 let db_for_task = db.clone();
                 let tp = thumbprint.clone();
-                let client = tokio::task::spawn_blocking(move || {
-                    read_lock(&db_for_task).client_for_thumbprint(&tp)
-                })
+                let client = tokio::task::spawn_blocking(move || read_lock(&db_for_task).client_for_thumbprint(&tp))
                     .await
                     .ok()
                     .flatten();
@@ -174,7 +187,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                         let _ = tokio::task::spawn_blocking(move || {
                             let _ = write_lock(&db).log_error("SYSTEM", &msg);
                         })
-                            .await;
+                        .await;
                         return;
                     }
                 }
@@ -201,7 +214,10 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                     Some(timeout) => match tokio::time::timeout(timeout, read).await {
                         Ok(result) => result,
                         Err(_) => {
-                            eprintln!("Connection from {} idle for more than {:?}; closing", peer_addr, timeout);
+                            eprintln!(
+                                "Connection from {} idle for more than {:?}; closing",
+                                peer_addr, timeout
+                            );
                             break;
                         }
                     },
@@ -217,7 +233,10 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                         // way, unread bytes may still be sitting on the socket,
                         // so the only safe response is to close the connection
                         // rather than try to resynchronise on the next line.
-                        eprintln!("Request from {} exceeded max_request_bytes ({} bytes); closing connection", peer_addr, max_request_bytes);
+                        eprintln!(
+                            "Request from {} exceeded max_request_bytes ({} bytes); closing connection",
+                            peer_addr, max_request_bytes
+                        );
                         let resp = Response {
                             status: "ERROR".to_string(),
                             message: Some(format!("Request too large (max {} bytes)", max_request_bytes)),
@@ -232,7 +251,11 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                         let req: Request = match serde_json::from_str(&line) {
                             Ok(r) => r,
                             Err(e) => {
-                                let resp = Response { status: "ERROR".to_string(), message: Some(format!("Invalid JSON: {}", e)), ..Default::default() };
+                                let resp = Response {
+                                    status: "ERROR".to_string(),
+                                    message: Some(format!("Invalid JSON: {}", e)),
+                                    ..Default::default()
+                                };
                                 if let Ok(resp_json) = serde_json::to_string(&resp) {
                                     let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
                                 }
@@ -253,7 +276,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                             let info = read_lock(&db_for_task).client_for_thumbprint(&tp);
                             info.map(|info| handle_request(req, &db_for_task, &info))
                         })
-                            .await;
+                        .await;
 
                         match handled {
                             Ok(Some(resp)) => {
@@ -264,14 +287,22 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                             }
                             Err(e) => {
                                 stats::note_request(connection_id, &command, true);
-                                let resp = Response { status: "ERROR".to_string(), message: Some(format!("Request failed: {}", e)), ..Default::default() };
+                                let resp = Response {
+                                    status: "ERROR".to_string(),
+                                    message: Some(format!("Request failed: {}", e)),
+                                    ..Default::default()
+                                };
                                 if let Ok(resp_json) = serde_json::to_string(&resp) {
                                     let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
                                 }
                             }
                             Ok(None) => {
                                 stats::note_request(connection_id, &command, true);
-                                let resp = Response { status: "ERROR".to_string(), message: Some("Client deauthorized".to_string()), ..Default::default() };
+                                let resp = Response {
+                                    status: "ERROR".to_string(),
+                                    message: Some("Client deauthorized".to_string()),
+                                    ..Default::default()
+                                };
                                 if let Ok(resp_json) = serde_json::to_string(&resp) {
                                     let _ = writer.write_all(format!("{}\n", resp_json).as_bytes()).await;
                                 }
@@ -295,7 +326,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                     let _ = write_lock(&db).save();
                 }
             })
-                .await;
+            .await;
         });
     }
 }
@@ -324,7 +355,7 @@ fn spawn_flusher(db: SharedDb) {
                     eprintln!("Background flush error: {}", e);
                 }
             })
-                .await;
+            .await;
         }
     });
 }

@@ -187,7 +187,10 @@ struct WriteMark {
 
 impl WriteMark {
     fn fresh() -> Self {
-        WriteMark { pending: 0, last_flush: Instant::now() }
+        WriteMark {
+            pending: 0,
+            last_flush: Instant::now(),
+        }
     }
 }
 
@@ -304,7 +307,9 @@ impl Table {
     /// unknown. Reading it off the table directly spares the caller a lookup in
     /// `loaded_tables`, which costs two string allocations per call.
     pub fn field_index(&self, field_name: &str) -> Option<usize> {
-        if field_name == "ID" { return Some(0); }
+        if field_name == "ID" {
+            return Some(0);
+        }
         let rec = self.dictionary.get(field_name)?;
         let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.first()?.sub_values.first()?;
         match idx_str.parse::<usize>() {
@@ -331,7 +336,9 @@ impl Table {
     /// The 0-based index and conversion code of a dictionary field in a single
     /// dictionary lookup, instead of one lookup per property.
     pub fn field_index_and_conversion(&self, field_name: &str) -> Option<(usize, Option<String>)> {
-        if field_name == "ID" { return Some((0, None)); }
+        if field_name == "ID" {
+            return Some((0, None));
+        }
         let rec = self.dictionary.get(field_name)?;
         let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.first()?.sub_values.first()?;
         let idx = match idx_str.parse::<usize>() {
@@ -354,7 +361,8 @@ impl Database {
             available_tables: RwLock::new(HashMap::new()),
             available_stamps: RwLock::new(HashMap::new()),
             lru_order: Mutex::new(VecDeque::new()),
-            max_loaded: config.max_loaded_tables
+            max_loaded: config
+                .max_loaded_tables
                 .filter(|n| *n > 0)
                 .unwrap_or(crate::config::DEFAULT_MAX_LOADED_TABLES),
             active_select_list: None,
@@ -364,7 +372,8 @@ impl Database {
             registry_stamp: Mutex::new(None),
             log_detail: config.log_detail.unwrap_or_else(|| "normal".to_string()),
             max_log_records: config.max_log_records.unwrap_or(100),
-            records_per_group: config.records_per_group
+            records_per_group: config
+                .records_per_group
                 .filter(|n| *n > 0)
                 .unwrap_or(hashfile::DEFAULT_RECORDS_PER_GROUP),
             durable_writes: config.durable_writes.unwrap_or(false),
@@ -470,15 +479,17 @@ impl Database {
         {
             let config = rlock(&self.accounts_config);
             if let Some(names_field) = config.fields.first()
-                && let Some(dirs_field) = config.fields.get(1) {
-                    for (i, v) in names_field.values.iter().enumerate() {
-                        if let Some(name) = v.sub_values.first()
-                            && name != "SYSTEM"
-                                && let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.first()) {
-                                    accounts_to_list.push((name.clone(), dir.clone()));
-                                }
+                && let Some(dirs_field) = config.fields.get(1)
+            {
+                for (i, v) in names_field.values.iter().enumerate() {
+                    if let Some(name) = v.sub_values.first()
+                        && name != "SYSTEM"
+                        && let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.first())
+                    {
+                        accounts_to_list.push((name.clone(), dir.clone()));
                     }
                 }
+            }
         }
 
         let handle = self.get_table_mut("$ACCOUNTS")?;
@@ -486,7 +497,9 @@ impl Database {
         for (name, dir) in accounts_to_list {
             let mut record = Record::new();
             record.fields.resize_with(SYS_ACCOUNTS_PATH_IDX + 1, Field::default);
-            record.fields[SYS_ACCOUNTS_PATH_IDX].values.push(Value { sub_values: vec![dir] });
+            record.fields[SYS_ACCOUNTS_PATH_IDX]
+                .values
+                .push(Value { sub_values: vec![dir] });
             accounts_table.records.insert(name, record);
         }
         accounts_table.touch_all();
@@ -502,38 +515,51 @@ impl Database {
         let mut map = HashMap::new();
         if Self::load_section(&mut map, &certs_path).is_ok()
             && let Some(certs_rec) = map.remove("certs")
-                && let Some(f) = certs_rec.fields.first() {
-                    let handle = self.get_table_mut("$CLIENTS")?;
-                    let mut table = handle.write();
-                    for v in &f.values {
-                        for sv in &v.sub_values {
-                            if !sv.is_empty() {
-                                let tp_lower = sv.to_lowercase();
-                                // Migrate if not already present
-                                let already_exists = table.records.values().any(|r| {
-                                    r.fields.first().and_then(|f| f.values.first()).and_then(|v| v.sub_values.first()) == Some(&tp_lower)
-                                });
-                                if !already_exists {
-                                    let mut rec = Record::new();
-                                    while rec.fields.len() <= SYS_CLIENTS_ADMIN_IDX {
-                                        rec.fields.push(Field::default());
-                                    }
-                                    rec.fields[SYS_CLIENTS_THUMBPRINT_IDX].values.push(Value { sub_values: vec![tp_lower] });
-                                    rec.fields[SYS_CLIENTS_ADMIN_IDX].values.push(Value { sub_values: vec!["Y".to_string()] });
-                                    table.insert_record(&format!("migrated_{}", &sv[..8]), rec);
-                                }
+            && let Some(f) = certs_rec.fields.first()
+        {
+            let handle = self.get_table_mut("$CLIENTS")?;
+            let mut table = handle.write();
+            for v in &f.values {
+                for sv in &v.sub_values {
+                    if !sv.is_empty() {
+                        let tp_lower = sv.to_lowercase();
+                        // Migrate if not already present
+                        let already_exists = table.records.values().any(|r| {
+                            r.fields
+                                .first()
+                                .and_then(|f| f.values.first())
+                                .and_then(|v| v.sub_values.first())
+                                == Some(&tp_lower)
+                        });
+                        if !already_exists {
+                            let mut rec = Record::new();
+                            while rec.fields.len() <= SYS_CLIENTS_ADMIN_IDX {
+                                rec.fields.push(Field::default());
                             }
+                            rec.fields[SYS_CLIENTS_THUMBPRINT_IDX].values.push(Value {
+                                sub_values: vec![tp_lower],
+                            });
+                            rec.fields[SYS_CLIENTS_ADMIN_IDX].values.push(Value {
+                                sub_values: vec!["Y".to_string()],
+                            });
+                            table.insert_record(&format!("migrated_{}", &sv[..8]), rec);
                         }
                     }
                 }
+            }
+        }
         let _ = fs::rename(&certs_path, format!("{}.migrated", certs_path));
         Ok(())
     }
 
     fn self_heal_system_dictionaries(&self) -> io::Result<()> {
         let account = self.current_account();
-        if account.is_empty() { return Ok(()); }
-        let table_names: Vec<String> = self.account_tables(&account)?.into_iter()
+        if account.is_empty() {
+            return Ok(());
+        }
+        let table_names: Vec<String> = self
+            .account_tables(&account)?
+            .into_iter()
             .filter(|n| n.starts_with('$') || n == "DIR")
             .collect();
 
@@ -557,51 +583,72 @@ impl Database {
         match table_name {
             "$LOGS" => {
                 if !table.dictionary.contains_key("MESSAGE") {
-                    table.dictionary.insert("MESSAGE".to_string(), Record::from_display_string("1^MESSAGE^L^60"));
+                    table
+                        .dictionary
+                        .insert("MESSAGE".to_string(), Record::from_display_string("1^MESSAGE^L^60"));
                     updated = true;
                 }
                 if !table.dictionary.contains_key("DETAIL") {
-                    table.dictionary.insert("DETAIL".to_string(), Record::from_display_string("2^DETAIL^L^40"));
+                    table
+                        .dictionary
+                        .insert("DETAIL".to_string(), Record::from_display_string("2^DETAIL^L^40"));
                     updated = true;
                 }
             }
             "$ACCOUNTS" => {
                 if !table.dictionary.contains_key("PATH") {
-                    table.dictionary.insert("PATH".to_string(), Record::from_display_string("1^PATH^L^50"));
+                    table
+                        .dictionary
+                        .insert("PATH".to_string(), Record::from_display_string("1^PATH^L^50"));
                     updated = true;
                 }
             }
             "$CLIENTS" => {
                 if !table.dictionary.contains_key("THUMBPRINT") {
-                    table.dictionary.insert("THUMBPRINT".to_string(), Record::from_display_string("1^THUMBPRINT^L^64"));
+                    table.dictionary.insert(
+                        "THUMBPRINT".to_string(),
+                        Record::from_display_string("1^THUMBPRINT^L^64"),
+                    );
                     updated = true;
                 }
                 if !table.dictionary.contains_key("ACCOUNTS") {
-                    table.dictionary.insert("ACCOUNTS".to_string(), Record::from_display_string("2^ACCOUNTS^L^30"));
+                    table
+                        .dictionary
+                        .insert("ACCOUNTS".to_string(), Record::from_display_string("2^ACCOUNTS^L^30"));
                     updated = true;
                 }
                 if !table.dictionary.contains_key("ADMIN") {
-                    table.dictionary.insert("ADMIN".to_string(), Record::from_display_string("3^ADMIN^L^5"));
+                    table
+                        .dictionary
+                        .insert("ADMIN".to_string(), Record::from_display_string("3^ADMIN^L^5"));
                     updated = true;
                 }
             }
             "$SAVEDLISTS" => {
                 if !table.dictionary.contains_key("TABLE") {
-                    table.dictionary.insert("TABLE".to_string(), Record::from_display_string("1^TABLE^L^20"));
+                    table
+                        .dictionary
+                        .insert("TABLE".to_string(), Record::from_display_string("1^TABLE^L^20"));
                     updated = true;
                 }
                 if !table.dictionary.contains_key("IS_DICT") {
-                    table.dictionary.insert("IS_DICT".to_string(), Record::from_display_string("2^IS_DICT^L^1"));
+                    table
+                        .dictionary
+                        .insert("IS_DICT".to_string(), Record::from_display_string("2^IS_DICT^L^1"));
                     updated = true;
                 }
             }
             "DIR" => {
                 if !table.dictionary.contains_key("TYPE") {
-                    table.dictionary.insert("TYPE".to_string(), Record::from_display_string("1^TYPE^L^1"));
+                    table
+                        .dictionary
+                        .insert("TYPE".to_string(), Record::from_display_string("1^TYPE^L^1"));
                     updated = true;
                 }
                 if !table.dictionary.contains_key("DURABLE") {
-                    table.dictionary.insert("DURABLE".to_string(), Record::from_display_string("2^DURABLE^L^7"));
+                    table
+                        .dictionary
+                        .insert("DURABLE".to_string(), Record::from_display_string("2^DURABLE^L^7"));
                     updated = true;
                 }
             }
@@ -620,18 +667,26 @@ impl Database {
         let table = handle.read();
         let mut clients = Vec::new();
         for (name, record) in table.records.iter() {
-            if let Some(tp) = record.fields.get(SYS_CLIENTS_THUMBPRINT_IDX).and_then(|f| f.values.first()).and_then(|v| v.sub_values.first()) {
+            if let Some(tp) = record
+                .fields
+                .get(SYS_CLIENTS_THUMBPRINT_IDX)
+                .and_then(|f| f.values.first())
+                .and_then(|v| v.sub_values.first())
+            {
                 let tp_lower = tp.to_lowercase();
                 let mut allowed_accounts = Vec::new();
                 if let Some(acc_field) = record.fields.get(SYS_CLIENTS_ACCOUNTS_IDX) {
                     for v in &acc_field.values {
                         if let Some(acc) = v.sub_values.first()
-                            && !acc.is_empty() {
-                                allowed_accounts.push(acc.clone());
-                            }
+                            && !acc.is_empty()
+                        {
+                            allowed_accounts.push(acc.clone());
+                        }
                     }
                 }
-                let is_admin = record.fields.get(SYS_CLIENTS_ADMIN_IDX)
+                let is_admin = record
+                    .fields
+                    .get(SYS_CLIENTS_ADMIN_IDX)
                     .and_then(|f| f.values.first())
                     .and_then(|v| v.sub_values.first())
                     .map(|s| s == "Y")
@@ -745,7 +800,8 @@ impl Database {
         if self.get_account_dir(account_name).is_none() {
             let _ = self.refresh_account_registry();
         }
-        let _account_dir = self.get_account_dir(account_name)
+        let _account_dir = self
+            .get_account_dir(account_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", account_name)))?;
 
         if !self.is_current_account(account_name) {
@@ -760,14 +816,16 @@ impl Database {
         if self.get_account_dir(account_name).is_none() {
             let _ = self.refresh_account_registry();
         }
-        let account_dir = self.get_account_dir(account_name)
+        let account_dir = self
+            .get_account_dir(account_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", account_name)))?;
 
         // Re-scan whenever the account directory changed on disk, so tables created
         // by another process (e.g. the server while a local CLI is attached) are visible.
         let dir_stamp = Self::dir_modified(&account_dir);
         if rlock(&self.available_tables).contains_key(account_name)
-            && rlock(&self.available_stamps).get(account_name) == Some(&dir_stamp) {
+            && rlock(&self.available_stamps).get(account_name) == Some(&dir_stamp)
+        {
             return Ok(());
         }
 
@@ -779,13 +837,17 @@ impl Database {
     /// borrow keeps the listing lock out of the caller's hands.
     fn account_has_table(&self, account: &str, name: &str) -> bool {
         self.ensure_available_tables(account).is_ok()
-            && rlock(&self.available_tables).get(account).map(|s| s.contains(name)).unwrap_or(false)
+            && rlock(&self.available_tables)
+                .get(account)
+                .map(|s| s.contains(name))
+                .unwrap_or(false)
     }
 
     /// Every file the account holds, unsorted.
     fn account_tables(&self, account: &str) -> io::Result<Vec<String>> {
         self.ensure_available_tables(account)?;
-        Ok(rlock(&self.available_tables).get(account)
+        Ok(rlock(&self.available_tables)
+            .get(account)
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default())
     }
@@ -794,7 +856,8 @@ impl Database {
     /// does not contain a requested table, because directory mtime resolution is
     /// coarse on some filesystems and may hide a freshly created table.
     fn scan_available_tables(&self, account_name: &str) -> io::Result<()> {
-        let account_dir = self.get_account_dir(account_name)
+        let account_dir = self
+            .get_account_dir(account_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", account_name)))?;
         let dir_stamp = Self::dir_modified(&account_dir);
 
@@ -802,9 +865,10 @@ impl Database {
         if let Ok(entries) = fs::read_dir(&account_dir) {
             for entry in entries.flatten() {
                 if entry.path().is_dir()
-                    && let Some(name) = entry.file_name().to_str() {
-                        tables.insert(name.to_string());
-                    }
+                    && let Some(name) = entry.file_name().to_str()
+                {
+                    tables.insert(name.to_string());
+                }
             }
         }
         wlock(&self.available_tables).insert(account_name.to_string(), tables);
@@ -831,13 +895,24 @@ impl Database {
         // a stronger signal than a timestamp whose resolution may be coarse.
         let (data_modified, data_len) = match hashfile::read_meta(&data_path) {
             Some(meta) => (
-                Self::file_stamp(hashfile::section_dir(&data_path).join("meta").to_str().unwrap_or_default()).0,
+                Self::file_stamp(
+                    hashfile::section_dir(&data_path)
+                        .join("meta")
+                        .to_str()
+                        .unwrap_or_default(),
+                )
+                .0,
                 meta.version,
             ),
             None => Self::file_stamp(&data_path),
         };
         let (dict_modified, dict_len) = Self::file_stamp(&format!("{}/{}/dict", storage, name));
-        TableStamp { data_modified, data_len, dict_modified, dict_len }
+        TableStamp {
+            data_modified,
+            data_len,
+            dict_modified,
+            dict_len,
+        }
     }
 
     /// The table, when it can be read through a shared reference alone: it is
@@ -919,10 +994,15 @@ impl Database {
         // snapshot of the registry would erase them.
         let _ = self.refresh_account_registry();
         if self.get_account_dir(name).is_some() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("Account '{}' already exists", name)));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("Account '{}' already exists", name),
+            ));
         }
 
-        let dir = directory.map(|s| s.to_string()).unwrap_or_else(|| format!("{}/{}", self.storage_dir, name));
+        let dir = directory
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{}/{}", self.storage_dir, name));
         if !Path::new(&dir).exists() {
             fs::create_dir_all(&dir)?;
         }
@@ -937,21 +1017,31 @@ impl Database {
             while config.fields.len() < 2 {
                 config.fields.push(Field::default());
             }
-            config.fields[0].values.push(Value { sub_values: vec![name.to_string()] });
-            config.fields[1].values.push(Value { sub_values: vec![dir.clone()] });
+            config.fields[0].values.push(Value {
+                sub_values: vec![name.to_string()],
+            });
+            config.fields[1].values.push(Value {
+                sub_values: vec![dir.clone()],
+            });
         }
 
         self.persist_account_registry()?;
 
         // Update $ACCOUNTS table if it exists
         self.run_in_system_account(|db| {
-            if rlock(&db.available_tables).get("SYSTEM").map(|s| s.contains("$ACCOUNTS")).unwrap_or(false) {
+            if rlock(&db.available_tables)
+                .get("SYSTEM")
+                .map(|s| s.contains("$ACCOUNTS"))
+                .unwrap_or(false)
+            {
                 {
                     let handle = db.get_table_mut("$ACCOUNTS")?;
                     let mut accounts_table = handle.write();
                     let mut record = Record::new();
                     record.fields.resize_with(SYS_ACCOUNTS_PATH_IDX + 1, Field::default);
-                    record.fields[SYS_ACCOUNTS_PATH_IDX].values.push(Value { sub_values: vec![dir] });
+                    record.fields[SYS_ACCOUNTS_PATH_IDX]
+                        .values
+                        .push(Value { sub_values: vec![dir] });
                     accounts_table.insert_record(name, record);
                 }
                 db.save()?;
@@ -990,14 +1080,18 @@ impl Database {
         }
 
         let _ = self.refresh_account_registry();
-        let dir = self.get_account_dir(name)
+        let dir = self
+            .get_account_dir(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", name)))?;
 
         // Remove from registry
         {
             let mut config = wlock(&self.accounts_config);
             let position = config.fields.first().and_then(|names| {
-                names.values.iter().position(|v| v.sub_values.first() == Some(&name.to_string()))
+                names
+                    .values
+                    .iter()
+                    .position(|v| v.sub_values.first() == Some(&name.to_string()))
             });
             if let Some(pos) = position {
                 config.fields[0].values.remove(pos);
@@ -1046,12 +1140,16 @@ impl Database {
         let config = rlock(&self.accounts_config);
         let names_field = config.fields.first()?;
         let dirs_field = config.fields.get(1)?;
-        let pos = names_field.values.iter().position(|v| v.sub_values.first() == Some(&account_name.to_string()))?;
+        let pos = names_field
+            .values
+            .iter()
+            .position(|v| v.sub_values.first() == Some(&account_name.to_string()))?;
         dirs_field.values.get(pos)?.sub_values.first().cloned()
     }
 
     pub fn current_storage_dir(&self) -> String {
-        self.get_account_dir(&self.current_account()).unwrap_or_else(|| self.storage_dir.clone())
+        self.get_account_dir(&self.current_account())
+            .unwrap_or_else(|| self.storage_dir.clone())
     }
 
     pub fn get_table_read_only(&self, name: &str) -> Option<TableHandle> {
@@ -1060,7 +1158,9 @@ impl Database {
 
     /// The table if it is already in memory, without loading or refreshing it.
     pub fn get_table_read_only_for_account(&self, account: &str, name: &str) -> Option<TableHandle> {
-        rlock(&self.tables).get(&(account.to_string(), name.to_string())).cloned()
+        rlock(&self.tables)
+            .get(&(account.to_string(), name.to_string()))
+            .cloned()
     }
 
     pub fn get_table(&self, name: &str) -> Option<TableHandle> {
@@ -1095,10 +1195,12 @@ impl Database {
     /// discards its own copy, which costs a duplicate read of a file nobody had
     /// written to yet, and is what keeps the map lock off the disk.
     fn resolve_table(&self, account: &str, name: &str, create_missing: bool) -> io::Result<TableHandle> {
-        let not_found = || io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Table '{}' not found in account '{}'", name, account),
-        );
+        let not_found = || {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Table '{}' not found in account '{}'", name, account),
+            )
+        };
 
         self.ensure_available_tables(account)?;
         if !self.account_has_table(account, name) {
@@ -1139,7 +1241,10 @@ impl Database {
 
         let handle = {
             let mut tables = wlock(&self.tables);
-            tables.entry(key.clone()).or_insert_with(|| TableHandle::new(table)).clone()
+            tables
+                .entry(key.clone())
+                .or_insert_with(|| TableHandle::new(table))
+                .clone()
         };
         self.touch_lru(&key);
         self.evict_if_over_budget();
@@ -1213,7 +1318,6 @@ impl Database {
         Self::load_section(&mut table.dictionary, &format!("{}/{}/dict", storage, name))?;
         Ok(table)
     }
-
 
     /// Writes the pending changes of one table and clears its dirty state.
     ///
@@ -1291,7 +1395,8 @@ impl Database {
     }
 
     pub fn account_storage_dir(&self, account_name: &str) -> String {
-        self.get_account_dir(account_name).unwrap_or_else(|| self.storage_dir.clone())
+        self.get_account_dir(account_name)
+            .unwrap_or_else(|| self.storage_dir.clone())
     }
 
     /// Writes every pending change to disk immediately.
@@ -1339,7 +1444,10 @@ impl Database {
 
     pub fn pending_write_count(&self) -> usize {
         self.pending_writes.load(Ordering::Relaxed)
-            + mlock(&self.write_marks).values().map(|mark| mark.pending).sum::<usize>()
+            + mlock(&self.write_marks)
+                .values()
+                .map(|mark| mark.pending)
+                .sum::<usize>()
     }
 
     /// Records a write that does not name the file it touched, and flushes the
@@ -1403,14 +1511,15 @@ impl Database {
     fn flush_table(&self, key: &TableKey) -> io::Result<()> {
         assert_no_table_guard_held("A flush of one file");
         if let Some(handle) = self.get_table_read_only_for_account(&key.0, &key.1)
-            && handle.read().is_dirty() {
-                self.flush_handle(key, &handle)?;
-                let stamp = self.disk_stamp(&key.0, &key.1);
-                handle.write().stamp = Some(stamp);
-                if key.0 == "SYSTEM" && key.1 == "$CLIENTS" {
-                    self.load_clients_from_table()?;
-                }
+            && handle.read().is_dirty()
+        {
+            self.flush_handle(key, &handle)?;
+            let stamp = self.disk_stamp(&key.0, &key.1);
+            handle.write().stamp = Some(stamp);
+            if key.0 == "SYSTEM" && key.1 == "$CLIENTS" {
+                self.load_clients_from_table()?;
             }
+        }
         mlock(&self.write_marks).insert(key.clone(), WriteMark::fresh());
         Ok(())
     }
@@ -1429,19 +1538,26 @@ impl Database {
     }
 
     fn load_section(map: &mut HashMap<String, Record>, path: &str) -> io::Result<()> {
-        if !Path::new(path).exists() { return Ok(()); }
+        if !Path::new(path).exists() {
+            return Ok(());
+        }
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
         loop {
             let mut len_bytes = [0u8; 8];
             if let Err(e) = reader.read_exact(&mut len_bytes) {
-                if e.kind() == io::ErrorKind::UnexpectedEof { break; }
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    break;
+                }
                 return Err(e);
             }
             let key_len = u64::from_le_bytes(len_bytes) as usize;
             if key_len > 1024 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Key too large: {} bytes in {}", key_len, path)));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Key too large: {} bytes in {}", key_len, path),
+                ));
             }
             let mut key_bytes = vec![0u8; key_len];
             reader.read_exact(&mut key_bytes)?;
@@ -1451,7 +1567,10 @@ impl Database {
             reader.read_exact(&mut data_len_bytes)?;
             let data_len = u64::from_le_bytes(data_len_bytes) as usize;
             if data_len > 100 * 1024 * 1024 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Record too large: {} bytes for key '{}' in {}", data_len, key, path)));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Record too large: {} bytes for key '{}' in {}", data_len, key, path),
+                ));
             }
 
             let mut data = vec![0u8; data_len];
@@ -1463,9 +1582,10 @@ impl Database {
 
     fn save_section(map: &HashMap<String, Record>, path: &str) -> io::Result<()> {
         if let Some(parent) = Path::new(path).parent()
-            && !parent.exists() {
-                fs::create_dir_all(parent)?;
-            }
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent)?;
+        }
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
 
@@ -1515,7 +1635,9 @@ impl Database {
     /// another process since the last look.
     pub fn list_accounts(&self) -> Vec<String> {
         let _ = self.refresh_account_registry();
-        let mut names: Vec<String> = rlock(&self.accounts_config).fields.first()
+        let mut names: Vec<String> = rlock(&self.accounts_config)
+            .fields
+            .first()
             .map(|f| f.values.iter().filter_map(|v| v.sub_values.first().cloned()).collect())
             .unwrap_or_default();
         names.sort();
@@ -1533,11 +1655,18 @@ impl Database {
             .map(|name| {
                 let directory = self.account_storage_dir(&name);
                 let files = self.list_tables_for_account(&name);
-                let record_count = files.iter()
+                let record_count = files
+                    .iter()
                     .map(|file| self.file_record_count(&directory, &name, file))
                     .sum();
                 let (disk_bytes, _) = Self::tree_stats(Path::new(&directory));
-                AccountStats { name, directory, file_count: files.len(), record_count, disk_bytes }
+                AccountStats {
+                    name,
+                    directory,
+                    file_count: files.len(),
+                    record_count,
+                    disk_bytes,
+                }
             })
             .collect()
     }
@@ -1694,7 +1823,10 @@ impl Database {
             let mut listings = wlock(&self.available_tables);
             let available = listings.entry(account.to_string()).or_default();
             if available.contains(name) {
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("Table '{}' already exists", name)));
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("Table '{}' already exists", name),
+                ));
             }
             available.insert(name.to_string());
             available.contains("DIR")
@@ -1738,7 +1870,10 @@ impl Database {
             return Err(io::Error::other("Not logged into an account"));
         }
         if !self.account_has_table(account, name) {
-            return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' not found", name)));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Table '{}' not found", name),
+            ));
         }
 
         let key = (account.to_string(), name.to_string());
@@ -1766,7 +1901,9 @@ impl Database {
         let mut dir_table = handle.write();
         // The listing is rebuilt from scratch, but the durability flag is not
         // derived from the filesystem, so it has to be carried over.
-        let durable: HashMap<String, bool> = dir_table.records.iter()
+        let durable: HashMap<String, bool> = dir_table
+            .records
+            .iter()
             .map(|(k, r)| (k.clone(), Self::record_is_durable(r)))
             .collect();
         dir_table.records.clear();
@@ -1786,7 +1923,9 @@ impl Database {
         while rec.fields.len() <= DIR_DURABLE_IDX {
             rec.fields.push(Field::default());
         }
-        rec.fields[DIR_TYPE_IDX].values = vec![Value { sub_values: vec!["F".to_string()] }];
+        rec.fields[DIR_TYPE_IDX].values = vec![Value {
+            sub_values: vec!["F".to_string()],
+        }];
         rec.fields[DIR_DURABLE_IDX].values = vec![Value {
             sub_values: vec![if durable { "Y".to_string() } else { String::new() }],
         }];
@@ -1795,17 +1934,23 @@ impl Database {
 
     fn ensure_dir_dictionary(dir_table: &mut Table) {
         if !dir_table.dictionary.contains_key("TYPE") {
-            dir_table.dictionary.insert("TYPE".to_string(), Record::from_display_string("1^TYPE^L^1"));
+            dir_table
+                .dictionary
+                .insert("TYPE".to_string(), Record::from_display_string("1^TYPE^L^1"));
             dir_table.mark_dict_dirty();
         }
         if !dir_table.dictionary.contains_key("DURABLE") {
-            dir_table.dictionary.insert("DURABLE".to_string(), Record::from_display_string("2^DURABLE^L^7"));
+            dir_table
+                .dictionary
+                .insert("DURABLE".to_string(), Record::from_display_string("2^DURABLE^L^7"));
             dir_table.mark_dict_dirty();
         }
     }
 
     fn record_is_durable(record: &Record) -> bool {
-        record.fields.get(DIR_DURABLE_IDX)
+        record
+            .fields
+            .get(DIR_DURABLE_IDX)
             .and_then(|f| f.values.first())
             .and_then(|v| v.sub_values.first())
             .map(|s| matches!(s.trim().to_uppercase().as_str(), "Y" | "YES" | "1" | "TRUE" | "DURABLE"))
@@ -1850,12 +1995,18 @@ impl Database {
         {
             let handle = self.get_table_mut_for_account(account, "DIR")?;
             let mut dir_table = handle.write();
-            let mut rec = dir_table.records.get(name).cloned().unwrap_or_else(|| Self::dir_entry(false));
+            let mut rec = dir_table
+                .records
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| Self::dir_entry(false));
             while rec.fields.len() <= DIR_DURABLE_IDX {
                 rec.fields.push(Field::default());
             }
             if rec.fields[DIR_TYPE_IDX].values.is_empty() {
-                rec.fields[DIR_TYPE_IDX].values = vec![Value { sub_values: vec!["F".to_string()] }];
+                rec.fields[DIR_TYPE_IDX].values = vec![Value {
+                    sub_values: vec!["F".to_string()],
+                }];
             }
             rec.fields[DIR_DURABLE_IDX].values = vec![Value {
                 sub_values: vec![if durable { "Y".to_string() } else { String::new() }],
@@ -1884,7 +2035,12 @@ impl Database {
         let has_dir = name != "DIR" && self.account_has_table(account, "DIR");
         let flag = if has_dir {
             match self.get_table_mut_for_account(account, "DIR") {
-                Ok(dir) => dir.read().records.get(name).map(Self::record_is_durable).unwrap_or(false),
+                Ok(dir) => dir
+                    .read()
+                    .records
+                    .get(name)
+                    .map(Self::record_is_durable)
+                    .unwrap_or(false),
                 Err(_) => false,
             }
         } else {
@@ -1918,9 +2074,10 @@ impl Database {
         let dirs_field = config.fields.get(1)?;
         for (i, v) in dirs_field.values.iter().enumerate() {
             if let Some(d) = v.sub_values.first()
-                && d == dir {
-                    return names_field.values.get(i)?.sub_values.first().cloned();
-                }
+                && d == dir
+            {
+                return names_field.values.get(i)?.sub_values.first().cloned();
+            }
         }
         None
     }
@@ -1929,8 +2086,15 @@ impl Database {
         self.get_conversion_code_read_only_for_account(&self.current_account(), table_name, field_name)
     }
 
-    pub fn get_conversion_code_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> Option<String> {
-        self.get_table_read_only_for_account(account, table_name)?.read().conversion_code(field_name)
+    pub fn get_conversion_code_read_only_for_account(
+        &self,
+        account: &str,
+        table_name: &str,
+        field_name: &str,
+    ) -> Option<String> {
+        self.get_table_read_only_for_account(account, table_name)?
+            .read()
+            .conversion_code(field_name)
     }
 
     pub fn get_conversion_code(&self, table_name: &str, field_name: &str) -> Option<String> {
@@ -1953,14 +2117,17 @@ impl Database {
     /// which is both wasteful and, with a writer waiting in between, a way to
     /// deadlock against ourselves.
     pub fn field_header_in(table: &Table, field_name: &str) -> String {
-        if field_name == "ID" { return "ID".to_string(); }
+        if field_name == "ID" {
+            return "ID".to_string();
+        }
         if let Some(rec) = table.dictionary.get(field_name)
             && let Some(f2) = rec.fields.get(DICT_NAME_IDX)
-                && let Some(v1) = f2.values.first()
-                    && let Some(header) = v1.sub_values.first()
-                        && !header.is_empty() {
-                            return header.clone();
-                        }
+            && let Some(v1) = f2.values.first()
+            && let Some(header) = v1.sub_values.first()
+            && !header.is_empty()
+        {
+            return header.clone();
+        }
         field_name.to_string()
     }
 
@@ -1973,18 +2140,26 @@ impl Database {
 
     /// The display width of a field. See [`field_header_in`](Self::field_header_in).
     pub fn field_width_in(table: &Table, field_name: &str) -> usize {
-        if field_name == "ID" { return DEFAULT_FIELD_WIDTH; }
+        if field_name == "ID" {
+            return DEFAULT_FIELD_WIDTH;
+        }
         if let Some(rec) = table.dictionary.get(field_name)
             && let Some(f4) = rec.fields.get(DICT_WIDTH_IDX)
-                && let Some(v1) = f4.values.first()
-                    && let Some(width_str) = v1.sub_values.first()
-                        && let Ok(width) = width_str.parse::<usize>() {
-                            return width;
-                        }
+            && let Some(v1) = f4.values.first()
+            && let Some(width_str) = v1.sub_values.first()
+            && let Ok(width) = width_str.parse::<usize>()
+        {
+            return width;
+        }
         DEFAULT_FIELD_WIDTH
     }
 
-    pub fn get_field_justification_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> String {
+    pub fn get_field_justification_read_only_for_account(
+        &self,
+        account: &str,
+        table_name: &str,
+        field_name: &str,
+    ) -> String {
         match self.get_table_read_only_for_account(account, table_name) {
             Some(handle) => Self::field_justification_in(&handle.read(), field_name),
             None => "L".to_string(),
@@ -1993,14 +2168,17 @@ impl Database {
 
     /// The justification of a field. See [`field_header_in`](Self::field_header_in).
     pub fn field_justification_in(table: &Table, field_name: &str) -> String {
-        if field_name == "ID" { return "L".to_string(); }
+        if field_name == "ID" {
+            return "L".to_string();
+        }
         if let Some(rec) = table.dictionary.get(field_name)
             && let Some(f3) = rec.fields.get(DICT_JUSTIFY_IDX)
-                && let Some(v1) = f3.values.first()
-                    && let Some(just) = v1.sub_values.first()
-                        && !just.is_empty() {
-                            return just.clone();
-                        }
+            && let Some(v1) = f3.values.first()
+            && let Some(just) = v1.sub_values.first()
+            && !just.is_empty()
+        {
+            return just.clone();
+        }
         "L".to_string()
     }
 
@@ -2020,48 +2198,61 @@ impl Database {
 
         for key in keys {
             if let Some(record) = table.dictionary.get(&key)
-                && let Some(field_idx_str) = record.fields.get(DICT_FIELD_IDX).and_then(|f| f.values.first()).and_then(|v| v.sub_values.first())
-                    && let Ok(idx) = field_idx_str.parse::<usize>()
-                        && idx > 0 && !fields_map.contains_key(&idx) {
-                            fields_map.insert(idx, key);
-                        }
+                && let Some(field_idx_str) = record
+                    .fields
+                    .get(DICT_FIELD_IDX)
+                    .and_then(|f| f.values.first())
+                    .and_then(|v| v.sub_values.first())
+                && let Ok(idx) = field_idx_str.parse::<usize>()
+                && idx > 0
+                && !fields_map.contains_key(&idx)
+            {
+                fields_map.insert(idx, key);
+            }
         }
 
         let mut sorted_indices: Vec<_> = fields_map.keys().cloned().collect();
         sorted_indices.sort();
 
-        sorted_indices.into_iter().map(|idx| fields_map.get(&idx).unwrap().clone()).collect()
+        sorted_indices
+            .into_iter()
+            .map(|idx| fields_map.get(&idx).unwrap().clone())
+            .collect()
     }
 
     pub fn apply_conversion(val: &str, code: &str) -> String {
-        if code.starts_with("MD") && code.len() > 2
-            && let Ok(decimals) = code[2..].parse::<usize>() {
-                let divisor = 10f64.powi(decimals as i32);
-                if let Ok(num) = val.parse::<i64>() {
-                    let mut s = format!("{:.width$}", num as f64 / divisor, width = decimals);
-                    if decimals == 0 {
-                        s = format!("{}", num);
-                    }
-                    return s;
-                } else if let Ok(f) = val.parse::<f64>() {
-                    // Robustness: handle cases where data might already be stored with a decimal point
-                    let mut s = format!("{:.width$}", f / divisor, width = decimals);
-                    if decimals == 0 {
-                        s = format!("{}", f.round() as i64);
-                    }
-                    return s;
+        if code.starts_with("MD")
+            && code.len() > 2
+            && let Ok(decimals) = code[2..].parse::<usize>()
+        {
+            let divisor = 10f64.powi(decimals as i32);
+            if let Ok(num) = val.parse::<i64>() {
+                let mut s = format!("{:.width$}", num as f64 / divisor, width = decimals);
+                if decimals == 0 {
+                    s = format!("{}", num);
                 }
+                return s;
+            } else if let Ok(f) = val.parse::<f64>() {
+                // Robustness: handle cases where data might already be stored with a decimal point
+                let mut s = format!("{:.width$}", f / divisor, width = decimals);
+                if decimals == 0 {
+                    s = format!("{}", f.round() as i64);
+                }
+                return s;
             }
+        }
         val.to_string()
     }
 
     pub fn apply_iconv(val: &str, code: &str) -> String {
-        if code.starts_with("MD") && code.len() > 2
+        if code.starts_with("MD")
+            && code.len() > 2
             && let Ok(decimals) = code[2..].parse::<usize>()
-                && let Ok(f) = val.parse::<f64>() {
-                    let multiplier = 10f64.powi(decimals as i32);
-                    return format!("{:.0}", (f * multiplier).round());
-                }
+            && let Ok(f) = val.parse::<f64>()
+        {
+            let multiplier = 10f64.powi(decimals as i32);
+            return format!("{:.0}", (f * multiplier).round());
+        }
         val.to_string()
     }
 
@@ -2093,7 +2284,13 @@ impl Database {
         self.format_record_field_for_account(&self.current_account(), table_name, record, field_name)
     }
 
-    pub fn format_record_field_for_account(&self, account: &str, table_name: &str, record: &Record, field_name: &str) -> String {
+    pub fn format_record_field_for_account(
+        &self,
+        account: &str,
+        table_name: &str,
+        record: &Record,
+        field_name: &str,
+    ) -> String {
         self.format_record_field_at_for_account(account, table_name, record, field_name, None)
     }
 
@@ -2101,11 +2298,24 @@ impl Database {
     /// position, so an exploded column shows only the value (or sub-value) that
     /// put the row there; `None` renders the whole field, which is what every
     /// unexploded row does.
-    pub fn format_record_field_at(&self, table_name: &str, record: &Record, field_name: &str, position: Option<ValuePosition>) -> String {
+    pub fn format_record_field_at(
+        &self,
+        table_name: &str,
+        record: &Record,
+        field_name: &str,
+        position: Option<ValuePosition>,
+    ) -> String {
         self.format_record_field_at_for_account(&self.current_account(), table_name, record, field_name, position)
     }
 
-    pub fn format_record_field_at_for_account(&self, account: &str, table_name: &str, record: &Record, field_name: &str, position: Option<ValuePosition>) -> String {
+    pub fn format_record_field_at_for_account(
+        &self,
+        account: &str,
+        table_name: &str,
+        record: &Record,
+        field_name: &str,
+        position: Option<ValuePosition>,
+    ) -> String {
         match self.get_table_read_only_for_account(account, table_name) {
             Some(handle) => Self::format_record_field_at_in(&handle.read(), record, field_name, position),
             None => String::new(),
@@ -2115,7 +2325,12 @@ impl Database {
     /// Renders one column of one row from a table the caller has already
     /// resolved, in a single dictionary lookup. See
     /// [`field_header_in`](Self::field_header_in).
-    pub fn format_record_field_at_in(table: &Table, record: &Record, field_name: &str, position: Option<ValuePosition>) -> String {
+    pub fn format_record_field_at_in(
+        table: &Table,
+        record: &Record,
+        field_name: &str,
+        position: Option<ValuePosition>,
+    ) -> String {
         let (field_idx, conv) = match table.field_index_and_conversion(field_name) {
             Some(resolved) => resolved,
             None => return String::new(),
@@ -2132,9 +2347,18 @@ impl Database {
         self.get_field_index_read_only_for_account(&self.current_account(), table_name, field_name)
     }
 
-    pub fn get_field_index_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> Option<usize> {
-        if field_name == "ID" { return Some(0); }
-        self.get_table_read_only_for_account(account, table_name)?.read().field_index(field_name)
+    pub fn get_field_index_read_only_for_account(
+        &self,
+        account: &str,
+        table_name: &str,
+        field_name: &str,
+    ) -> Option<usize> {
+        if field_name == "ID" {
+            return Some(0);
+        }
+        self.get_table_read_only_for_account(account, table_name)?
+            .read()
+            .field_index(field_name)
     }
 
     pub fn get_field_index(&self, table_name: &str, field_name: &str) -> Option<usize> {
@@ -2142,7 +2366,9 @@ impl Database {
     }
 
     pub fn get_field_index_for_account(&self, account: &str, table_name: &str, field_name: &str) -> Option<usize> {
-        if field_name == "ID" { return Some(0); }
+        if field_name == "ID" {
+            return Some(0);
+        }
         let _ = self.get_table_mut_for_account(account, table_name).ok();
         self.get_field_index_read_only_for_account(account, table_name, field_name)
     }
@@ -2166,7 +2392,9 @@ impl Database {
     pub fn record_schema(&self, table: &Table) -> RecordSchema {
         let mut fields = Vec::with_capacity(table.dictionary.len());
         for (dict_key, dict_rec) in &table.dictionary {
-            let idx = dict_rec.fields.get(DICT_FIELD_IDX)
+            let idx = dict_rec
+                .fields
+                .get(DICT_FIELD_IDX)
                 .and_then(|f| f.values.first())
                 .and_then(|v| v.sub_values.first())
                 .and_then(|s| s.parse::<usize>().ok())
@@ -2209,7 +2437,9 @@ impl Database {
             Some(code) => Self::apply_conversion(s, code),
             None => s.to_string(),
         };
-        let Some(field) = field else { return serde_json::Value::String(String::new()) };
+        let Some(field) = field else {
+            return serde_json::Value::String(String::new());
+        };
 
         match field.values.as_slice() {
             [] => return serde_json::Value::String(String::new()),
@@ -2221,13 +2451,17 @@ impl Database {
         }
 
         serde_json::Value::Array(
-            field.values.iter().map(|value| match value.sub_values.as_slice() {
-                [] => serde_json::Value::String(String::new()),
-                [only] => serde_json::Value::String(convert(only)),
-                subs => serde_json::Value::Array(
-                    subs.iter().map(|sub| serde_json::Value::String(convert(sub))).collect(),
-                ),
-            }).collect(),
+            field
+                .values
+                .iter()
+                .map(|value| match value.sub_values.as_slice() {
+                    [] => serde_json::Value::String(String::new()),
+                    [only] => serde_json::Value::String(convert(only)),
+                    subs => serde_json::Value::Array(
+                        subs.iter().map(|sub| serde_json::Value::String(convert(sub))).collect(),
+                    ),
+                })
+                .collect(),
         )
     }
 
@@ -2251,7 +2485,13 @@ impl Database {
             let text = match v {
                 serde_json::Value::String(s) => s.clone(),
                 serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
+                serde_json::Value::Bool(b) => {
+                    if *b {
+                        "1".to_string()
+                    } else {
+                        "0".to_string()
+                    }
+                }
                 other => other.to_string(),
             };
             match conversion {
@@ -2267,10 +2507,14 @@ impl Database {
                     serde_json::Value::Array(subs) => Value {
                         sub_values: subs.iter().map(&scalar).collect(),
                     },
-                    other => Value { sub_values: vec![scalar(other)] },
+                    other => Value {
+                        sub_values: vec![scalar(other)],
+                    },
                 })
                 .collect(),
-            other => vec![Value { sub_values: vec![scalar(other)] }],
+            other => vec![Value {
+                sub_values: vec![scalar(other)],
+            }],
         }
     }
 
@@ -2278,7 +2522,12 @@ impl Database {
         self.deserialize_record_for_account(&self.current_account(), table_name, data)
     }
 
-    pub fn deserialize_record_for_account(&self, account: &str, table_name: &str, data: &serde_json::Value) -> Option<Record> {
+    pub fn deserialize_record_for_account(
+        &self,
+        account: &str,
+        table_name: &str,
+        data: &serde_json::Value,
+    ) -> Option<Record> {
         let handle = self.get_table_read_only_for_account(account, table_name)?;
         let table = handle.read();
         self.deserialize_record_in(&table, data)
@@ -2300,19 +2549,20 @@ impl Database {
         for (dict_key, dict_rec) in &table.dictionary {
             if let Some(f1) = dict_rec.fields.get(DICT_FIELD_IDX)
                 && let Some(v1) = f1.values.first()
-                    && let Some(idx_str) = v1.sub_values.first()
-                        && let Ok(idx) = idx_str.parse::<usize>()
-                            && idx > 0 {
-                                let attr_idx = idx - 1;
-                                let camel_key = self.to_camel_case(dict_key);
-                                attr_map.insert(camel_key.clone(), attr_idx);
-                                attr_map.insert(dict_key.clone(), attr_idx);
+                && let Some(idx_str) = v1.sub_values.first()
+                && let Ok(idx) = idx_str.parse::<usize>()
+                && idx > 0
+            {
+                let attr_idx = idx - 1;
+                let camel_key = self.to_camel_case(dict_key);
+                attr_map.insert(camel_key.clone(), attr_idx);
+                attr_map.insert(dict_key.clone(), attr_idx);
 
-                                if let Some(code) = table.conversion_code(dict_key) {
-                                    conv_map.insert(camel_key, code.clone());
-                                    conv_map.insert(dict_key.clone(), code);
-                                }
-                            }
+                if let Some(code) = table.conversion_code(dict_key) {
+                    conv_map.insert(camel_key, code.clone());
+                    conv_map.insert(dict_key.clone(), code);
+                }
+            }
         }
 
         for (key, val) in obj {
@@ -2357,11 +2607,15 @@ impl Database {
             }
 
             // Field 1: Message
-            record.fields[SYS_LOGS_MESSAGE_IDX].values.push(Value { sub_values: vec![message.to_string()] });
+            record.fields[SYS_LOGS_MESSAGE_IDX].values.push(Value {
+                sub_values: vec![message.to_string()],
+            });
 
             // Field 2: Detail
             if db.log_detail == "detailed" {
-                record.fields[SYS_LOGS_DETAIL_IDX].values.push(Value { sub_values: vec![format!("UTC: {}", now)] });
+                record.fields[SYS_LOGS_DETAIL_IDX].values.push(Value {
+                    sub_values: vec![format!("UTC: {}", now)],
+                });
             }
 
             let max_records = db.max_log_records;
@@ -2385,7 +2639,13 @@ impl Database {
         })
     }
 
-    pub fn add_authorized_client(&self, name: &str, thumbprint: &str, allowed_accounts: Vec<String>, is_admin: bool) -> io::Result<()> {
+    pub fn add_authorized_client(
+        &self,
+        name: &str,
+        thumbprint: &str,
+        allowed_accounts: Vec<String>,
+        is_admin: bool,
+    ) -> io::Result<()> {
         self.run_in_system_account(|db| {
             let thumbprint_lower = thumbprint.to_lowercase();
 
@@ -2398,13 +2658,19 @@ impl Database {
                     record.fields.push(Field::default());
                 }
                 // Field 0: Thumbprint
-                record.fields[SYS_CLIENTS_THUMBPRINT_IDX].values.push(Value { sub_values: vec![thumbprint_lower] });
+                record.fields[SYS_CLIENTS_THUMBPRINT_IDX].values.push(Value {
+                    sub_values: vec![thumbprint_lower],
+                });
                 // Field 1: Allowed Accounts
                 for acc in &allowed_accounts {
-                    record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.push(Value { sub_values: vec![acc.clone()] });
+                    record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.push(Value {
+                        sub_values: vec![acc.clone()],
+                    });
                 }
                 // Field 2: Admin flag
-                record.fields[SYS_CLIENTS_ADMIN_IDX].values.push(Value { sub_values: vec![if is_admin { "Y".to_string() } else { "".to_string() }] });
+                record.fields[SYS_CLIENTS_ADMIN_IDX].values.push(Value {
+                    sub_values: vec![if is_admin { "Y".to_string() } else { "".to_string() }],
+                });
 
                 table.insert_record(name, record);
             }
@@ -2431,10 +2697,15 @@ impl Database {
                     }
 
                     // Check if account already exists in Field 1
-                    let already_exists = record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.iter().any(|v| v.sub_values.first() == Some(&account.to_string()));
+                    let already_exists = record.fields[SYS_CLIENTS_ACCOUNTS_IDX]
+                        .values
+                        .iter()
+                        .any(|v| v.sub_values.first() == Some(&account.to_string()));
 
                     if !already_exists {
-                        record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.push(Value { sub_values: vec![account.to_string()] });
+                        record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.push(Value {
+                            sub_values: vec![account.to_string()],
+                        });
                         table.mark_dirty(name);
                         success = true;
                     }
@@ -2457,15 +2728,18 @@ impl Database {
                 let handle = db.get_table_mut("$CLIENTS")?;
                 let mut table = handle.write();
                 if let Some(record) = table.records.get_mut(name)
-                    && record.fields.len() > SYS_CLIENTS_ACCOUNTS_IDX {
-                        let original_len = record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len();
-                        record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.retain(|v| v.sub_values.first().map(|s| s != account).unwrap_or(true));
+                    && record.fields.len() > SYS_CLIENTS_ACCOUNTS_IDX
+                {
+                    let original_len = record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len();
+                    record.fields[SYS_CLIENTS_ACCOUNTS_IDX]
+                        .values
+                        .retain(|v| v.sub_values.first().map(|s| s != account).unwrap_or(true));
 
-                        if record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len() < original_len {
-                            table.mark_dirty(name);
-                            success = true;
-                        }
+                    if record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len() < original_len {
+                        table.mark_dirty(name);
+                        success = true;
                     }
+                }
             }
 
             if success {
@@ -2493,7 +2767,9 @@ impl Database {
         let mut certs_rec = Record::new();
         certs_rec.fields.push(Field::default());
         for tp in rlock(&self.clients).certs.iter() {
-            certs_rec.fields[0].values.push(Value { sub_values: vec![tp.clone()] });
+            certs_rec.fields[0].values.push(Value {
+                sub_values: vec![tp.clone()],
+            });
         }
         let mut map = HashMap::new();
         map.insert("certs".to_string(), certs_rec);
@@ -2511,24 +2787,44 @@ impl Database {
         {
             let handle = self.get_table_mut("USERS")?;
             let mut table = handle.write();
-            table.dictionary.insert("NAME".to_string(), Record::from_display_string("1^NAME^L^15"));
-            table.dictionary.insert("EMAIL".to_string(), Record::from_display_string("2^EMAIL^L^20"));
+            table
+                .dictionary
+                .insert("NAME".to_string(), Record::from_display_string("1^NAME^L^15"));
+            table
+                .dictionary
+                .insert("EMAIL".to_string(), Record::from_display_string("2^EMAIL^L^20"));
             // ROLES is multivalued, and Jane's second role is sub-valued, so the
             // fixture exercises every level of the hierarchy rather than only
             // the flat one.
-            table.dictionary.insert("ROLES".to_string(), Record::from_display_string("3^ROLES^L^20"));
-            table.records.insert("1".to_string(), Record::from_display_string("John Doe^john@example.com^ADMIN]DEV]TEST"));
-            table.records.insert("2".to_string(), Record::from_display_string("Jane Smith^jane@example.com^DEV]TEST\\LAB"));
+            table
+                .dictionary
+                .insert("ROLES".to_string(), Record::from_display_string("3^ROLES^L^20"));
+            table.records.insert(
+                "1".to_string(),
+                Record::from_display_string("John Doe^john@example.com^ADMIN]DEV]TEST"),
+            );
+            table.records.insert(
+                "2".to_string(),
+                Record::from_display_string("Jane Smith^jane@example.com^DEV]TEST\\LAB"),
+            );
             table.touch_all();
             table.mark_dict_dirty();
         }
         {
             let handle = self.get_table_mut("PRODUCTS")?;
             let mut table = handle.write();
-            table.dictionary.insert("DESC".to_string(), Record::from_display_string("1^DESCRIPTION^L^20"));
-            table.dictionary.insert("PRICE".to_string(), Record::from_display_string("2^PRICE^R^10^^^^MD2"));
-            table.records.insert("P1".to_string(), Record::from_display_string("Laptop^120000"));
-            table.records.insert("P2".to_string(), Record::from_display_string("Mouse^2500"));
+            table
+                .dictionary
+                .insert("DESC".to_string(), Record::from_display_string("1^DESCRIPTION^L^20"));
+            table
+                .dictionary
+                .insert("PRICE".to_string(), Record::from_display_string("2^PRICE^R^10^^^^MD2"));
+            table
+                .records
+                .insert("P1".to_string(), Record::from_display_string("Laptop^120000"));
+            table
+                .records
+                .insert("P2".to_string(), Record::from_display_string("Mouse^2500"));
             table.touch_all();
             table.mark_dict_dirty();
         }

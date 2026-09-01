@@ -6,13 +6,19 @@ fn test_record_bytes_roundtrip() {
 
     // Field 0: Multiple values
     let mut f0 = Field::default();
-    f0.values.push(Value { sub_values: vec!["V1".to_string(), "V2".to_string()] });
-    f0.values.push(Value { sub_values: vec!["V3".to_string()] });
+    f0.values.push(Value {
+        sub_values: vec!["V1".to_string(), "V2".to_string()],
+    });
+    f0.values.push(Value {
+        sub_values: vec!["V3".to_string()],
+    });
     rec.fields.push(f0);
 
     // Field 1: Single value
     let mut f1 = Field::default();
-    f1.values.push(Value { sub_values: vec!["F2".to_string()] });
+    f1.values.push(Value {
+        sub_values: vec!["F2".to_string()],
+    });
     rec.fields.push(f1);
 
     let bytes = rec.to_bytes();
@@ -92,19 +98,34 @@ fn test_get_value_display_string() {
 
     // No position is the whole field, exactly as get_field_display_string.
     assert_eq!(record.get_value_display_string(1, None), "ADMIN]DEV]TEST\\LAB");
-    assert_eq!(record.get_value_display_string(1, None), record.get_field_display_string(1));
+    assert_eq!(
+        record.get_value_display_string(1, None),
+        record.get_field_display_string(1)
+    );
 
     // A value position takes one value, sub-values still joined.
-    assert_eq!(record.get_value_display_string(1, Some(ValuePosition::value(0))), "ADMIN");
-    assert_eq!(record.get_value_display_string(1, Some(ValuePosition::value(2))), "TEST\\LAB");
+    assert_eq!(
+        record.get_value_display_string(1, Some(ValuePosition::value(0))),
+        "ADMIN"
+    );
+    assert_eq!(
+        record.get_value_display_string(1, Some(ValuePosition::value(2))),
+        "TEST\\LAB"
+    );
 
     // A sub-value position reaches one level deeper.
-    assert_eq!(record.get_value_display_string(1, Some(ValuePosition::sub_value(2, 1))), "LAB");
+    assert_eq!(
+        record.get_value_display_string(1, Some(ValuePosition::sub_value(2, 1))),
+        "LAB"
+    );
 
     // Out of range renders empty rather than panicking, so a select list that
     // outlived an edit to its records degrades quietly.
     assert_eq!(record.get_value_display_string(1, Some(ValuePosition::value(9))), "");
-    assert_eq!(record.get_value_display_string(1, Some(ValuePosition::sub_value(0, 9))), "");
+    assert_eq!(
+        record.get_value_display_string(1, Some(ValuePosition::sub_value(0, 9))),
+        ""
+    );
     assert_eq!(record.get_value_display_string(9, Some(ValuePosition::value(0))), "");
     assert_eq!(record.get_value_display_string(9, None), "");
 }
@@ -144,6 +165,9 @@ fn attributes_survive_the_mark_characters_a_display_string_would_split_on() {
     assert_eq!(record.get_field_display_string(1), "PRICE ^ TAX");
 
     assert_ne!(record, Record::from_display_string(&record.to_display_string()));
-    assert_eq!(Record::from_display_string("1^NAME^L^20"), Record::from_attributes(["1", "NAME", "L", "20"]));
+    assert_eq!(
+        Record::from_display_string("1^NAME^L^20"),
+        Record::from_attributes(["1", "NAME", "L", "20"])
+    );
     assert!(Record::from_attributes(Vec::<String>::new()).fields.is_empty());
 }

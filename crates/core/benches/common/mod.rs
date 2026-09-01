@@ -40,7 +40,11 @@ pub fn new_db(dir: &str) -> Database {
 }
 
 pub fn field(value: &str) -> Field {
-    Field { values: vec![Value { sub_values: vec![value.to_string()] }] }
+    Field {
+        values: vec![Value {
+            sub_values: vec![value.to_string()],
+        }],
+    }
 }
 
 /// Dictionary entry mapping `name` to the 1-based attribute `index`.
@@ -90,7 +94,9 @@ pub fn sample_mv_record(i: usize) -> Record {
     let mut rec = sample_record(i);
     let mut roles = Field::default();
     for k in 0..MV_VALUES - 1 {
-        roles.values.push(Value { sub_values: vec![format!("ROLE{}", (i + k) % 100)] });
+        roles.values.push(Value {
+            sub_values: vec![format!("ROLE{}", (i + k) % 100)],
+        });
     }
     roles.values.push(Value {
         sub_values: vec![format!("TEAM{}", i % 10), format!("SITE{}", i % 4)],

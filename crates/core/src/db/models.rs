@@ -49,11 +49,14 @@ impl Record {
         if data.is_empty() {
             return Record { fields: vec![] };
         }
-        let fields = data.split(|&b| b == FM)
+        let fields = data
+            .split(|&b| b == FM)
             .map(|f| {
-                let values = f.split(|&b| b == VM)
+                let values = f
+                    .split(|&b| b == VM)
                     .map(|v| {
-                        let sub_values = v.split(|&b| b == SVM)
+                        let sub_values = v
+                            .split(|&b| b == SVM)
                             .map(|sv| String::from_utf8_lossy(sv).to_string())
                             .collect();
                         Value { sub_values }
@@ -68,11 +71,17 @@ impl Record {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut res = Vec::new();
         for (i, f) in self.fields.iter().enumerate() {
-            if i > 0 { res.push(FM); }
+            if i > 0 {
+                res.push(FM);
+            }
             for (j, v) in f.values.iter().enumerate() {
-                if j > 0 { res.push(VM); }
+                if j > 0 {
+                    res.push(VM);
+                }
                 for (k, sv) in v.sub_values.iter().enumerate() {
-                    if k > 0 { res.push(SVM); }
+                    if k > 0 {
+                        res.push(SVM);
+                    }
                     res.extend_from_slice(sv.as_bytes());
                 }
             }
@@ -99,28 +108,40 @@ impl Record {
         Record {
             fields: attributes
                 .into_iter()
-                .map(|text| Field { values: vec![Value { sub_values: vec![text.as_ref().to_string()] }] })
+                .map(|text| Field {
+                    values: vec![Value {
+                        sub_values: vec![text.as_ref().to_string()],
+                    }],
+                })
                 .collect(),
         }
     }
 
     pub fn from_display_string(s: &str) -> Self {
-        let translated_data: Vec<u8> = s.as_bytes().iter().map(|&b| match b {
-            b'^' => FM,
-            b']' => VM,
-            b'\\' => SVM,
-            _ => b
-        }).collect();
+        let translated_data: Vec<u8> = s
+            .as_bytes()
+            .iter()
+            .map(|&b| match b {
+                b'^' => FM,
+                b']' => VM,
+                b'\\' => SVM,
+                _ => b,
+            })
+            .collect();
         Self::from_bytes(&translated_data)
     }
 
     pub fn to_edit_string(&self) -> String {
-        let display_bytes: Vec<u8> = self.to_bytes().iter().map(|&b| match b {
-            FM => b'\n',
-            VM => b']',
-            SVM => b'\\',
-            _ => b
-        }).collect();
+        let display_bytes: Vec<u8> = self
+            .to_bytes()
+            .iter()
+            .map(|&b| match b {
+                FM => b'\n',
+                VM => b']',
+                SVM => b'\\',
+                _ => b,
+            })
+            .collect();
         String::from_utf8_lossy(&display_bytes).to_string()
     }
 
@@ -129,12 +150,16 @@ impl Record {
         if content.ends_with('\n') {
             content = &content[..content.len() - 1];
         }
-        let translated_data: Vec<u8> = content.as_bytes().iter().map(|&b| match b {
-            b'\n' => FM,
-            b']' => VM,
-            b'\\' => SVM,
-            _ => b
-        }).collect();
+        let translated_data: Vec<u8> = content
+            .as_bytes()
+            .iter()
+            .map(|&b| match b {
+                b'\n' => FM,
+                b']' => VM,
+                b'\\' => SVM,
+                _ => b,
+            })
+            .collect();
         Self::from_bytes(&translated_data)
     }
 
@@ -146,9 +171,15 @@ impl Record {
     /// A position that is out of range renders empty rather than panicking, so
     /// a select list that outlived an edit to its records degrades quietly.
     pub fn get_value_display_string(&self, field_idx: usize, pos: Option<ValuePosition>) -> String {
-        let Some(pos) = pos else { return self.get_field_display_string(field_idx) };
-        let Some(field) = self.fields.get(field_idx) else { return String::new() };
-        let Some(value) = field.values.get(pos.value) else { return String::new() };
+        let Some(pos) = pos else {
+            return self.get_field_display_string(field_idx);
+        };
+        let Some(field) = self.fields.get(field_idx) else {
+            return String::new();
+        };
+        let Some(value) = field.values.get(pos.value) else {
+            return String::new();
+        };
         match pos.sub_value {
             Some(sv) => match value.sub_values.get(sv) {
                 Some(s) => to_display_chars(s.as_bytes()),
@@ -157,7 +188,9 @@ impl Record {
             None => {
                 let mut res = Vec::new();
                 for (k, sv) in value.sub_values.iter().enumerate() {
-                    if k > 0 { res.push(SVM); }
+                    if k > 0 {
+                        res.push(SVM);
+                    }
                     res.extend_from_slice(sv.as_bytes());
                 }
                 to_display_chars(&res)
@@ -169,9 +202,13 @@ impl Record {
         if let Some(field) = self.fields.get(field_idx) {
             let mut res = Vec::new();
             for (j, v) in field.values.iter().enumerate() {
-                if j > 0 { res.push(VM); }
+                if j > 0 {
+                    res.push(VM);
+                }
                 for (k, sv) in v.sub_values.iter().enumerate() {
-                    if k > 0 { res.push(SVM); }
+                    if k > 0 {
+                        res.push(SVM);
+                    }
                     res.extend_from_slice(sv.as_bytes());
                 }
             }
@@ -185,12 +222,15 @@ impl Record {
 /// Replaces the FM/VM/SVM marks with the printable characters the CLI and the
 /// display-string format use for them.
 fn to_display_chars(bytes: &[u8]) -> String {
-    let display_bytes: Vec<u8> = bytes.iter().map(|&b| match b {
-        FM => b'^',
-        VM => b']',
-        SVM => b'\\',
-        _ => b
-    }).collect();
+    let display_bytes: Vec<u8> = bytes
+        .iter()
+        .map(|&b| match b {
+            FM => b'^',
+            VM => b']',
+            SVM => b'\\',
+            _ => b,
+        })
+        .collect();
     String::from_utf8_lossy(&display_bytes).to_string()
 }
 
@@ -303,7 +343,10 @@ impl ValuePosition {
     }
 
     pub fn sub_value(value: usize, sub_value: usize) -> Self {
-        ValuePosition { value, sub_value: Some(sub_value) }
+        ValuePosition {
+            value,
+            sub_value: Some(sub_value),
+        }
     }
 }
 
@@ -322,7 +365,10 @@ impl SelectEntry {
     }
 
     pub fn at(key: String, position: ValuePosition) -> Self {
-        SelectEntry { key, position: Some(position) }
+        SelectEntry {
+            key,
+            position: Some(position),
+        }
     }
 }
 

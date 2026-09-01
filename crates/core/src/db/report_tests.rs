@@ -1,7 +1,7 @@
 use crate::db::engine::{Database, TableHandle};
 use crate::db::models::*;
 use crate::db::report;
-use crate::test_support::{isolated_config, TempDir};
+use crate::test_support::{TempDir, isolated_config};
 
 /// A file with a multivalued ROLES column, a sub-valued role, and a
 /// right-justified numeric column carrying an MD2 conversion. The guard is
@@ -15,11 +15,22 @@ fn report_db(label: &str) -> (TempDir, Database) {
     db.create_table("USERS").unwrap();
     let table_handle = db.get_table_mut("USERS").unwrap();
     let mut table = table_handle.write();
-    table.dictionary.insert("NAME".to_string(), Record::from_display_string("1^NAME^L^10"));
-    table.dictionary.insert("ROLES".to_string(), Record::from_display_string("2^ROLES^L^12"));
-    table.dictionary.insert("PRICE".to_string(), Record::from_display_string("3^PRICE^R^12^^^^MD2"));
-    table.records.insert("1".to_string(), Record::from_display_string("John^ADMIN]DEV^120000]250"));
-    table.records.insert("2".to_string(), Record::from_display_string("Jane^TEST\\LAB^500"));
+    table
+        .dictionary
+        .insert("NAME".to_string(), Record::from_display_string("1^NAME^L^10"));
+    table
+        .dictionary
+        .insert("ROLES".to_string(), Record::from_display_string("2^ROLES^L^12"));
+    table
+        .dictionary
+        .insert("PRICE".to_string(), Record::from_display_string("3^PRICE^R^12^^^^MD2"));
+    table.records.insert(
+        "1".to_string(),
+        Record::from_display_string("John^ADMIN]DEV^120000]250"),
+    );
+    table
+        .records
+        .insert("2".to_string(), Record::from_display_string("Jane^TEST\\LAB^500"));
     table.mark_dict_dirty();
     table.touch_all();
     drop(table);
@@ -37,10 +48,13 @@ fn table(db: &Database) -> TableHandle {
 fn rows_for(db: &Database, entries: Vec<SelectEntry>) -> Vec<(SelectEntry, Record)> {
     let table_handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
     let table = table_handle.read();
-    entries.into_iter().map(|e| {
-        let record = table.records.get(&e.key).unwrap().clone();
-        (e, record)
-    }).collect()
+    entries
+        .into_iter()
+        .map(|e| {
+            let record = table.records.get(&e.key).unwrap().clone();
+            (e, record)
+        })
+        .collect()
 }
 
 #[test]
@@ -55,30 +69,34 @@ fn test_render_list_headers_and_widths() {
     assert_eq!(lines[0], "ID         NAME      ");
     assert_eq!(lines[1], "---------- ----------");
     assert_eq!(lines[2], "1          John      ");
-
 }
 
 #[test]
 fn test_render_list_joins_a_whole_multivalued_field() {
     let (_dir, db) = report_db("render_joined");
-    let rows = rows_for(&db, vec![SelectEntry::new("1".to_string()), SelectEntry::new("2".to_string())]);
+    let rows = rows_for(
+        &db,
+        vec![SelectEntry::new("1".to_string()), SelectEntry::new("2".to_string())],
+    );
 
     let lines = report::render_list(&table(&db).read(), &["ROLES".to_string()], None, &rows);
 
     // With no position, a multivalued field renders as it always has.
     assert_eq!(lines[2].trim_end(), "1          ADMIN]DEV");
     assert_eq!(lines[3].trim_end(), "2          TEST\\LAB");
-
 }
 
 #[test]
 fn test_render_list_explodes_only_the_exploded_column() {
     let (_dir, db) = report_db("render_exploded");
-    let rows = rows_for(&db, vec![
-        SelectEntry::at("1".to_string(), ValuePosition::value(0)),
-        SelectEntry::at("1".to_string(), ValuePosition::value(1)),
-        SelectEntry::at("2".to_string(), ValuePosition::sub_value(0, 1)),
-    ]);
+    let rows = rows_for(
+        &db,
+        vec![
+            SelectEntry::at("1".to_string(), ValuePosition::value(0)),
+            SelectEntry::at("1".to_string(), ValuePosition::value(1)),
+            SelectEntry::at("2".to_string(), ValuePosition::sub_value(0, 1)),
+        ],
+    );
 
     let lines = report::render_list(
         &table(&db).read(),
@@ -93,7 +111,6 @@ fn test_render_list_explodes_only_the_exploded_column() {
     assert_eq!(lines[2].trim_end(), "1          John       ADMIN");
     assert_eq!(lines[3].trim_end(), "1          John       DEV");
     assert_eq!(lines[4].trim_end(), "2          Jane       LAB");
-
 }
 
 #[test]
@@ -112,7 +129,6 @@ fn test_render_list_converts_each_value_of_a_multivalued_column() {
     let single = rows_for(&db, vec![SelectEntry::new("2".to_string())]);
     let lines = report::render_list(&table(&db).read(), &["PRICE".to_string()], None, &single);
     assert_eq!(lines[2], "2                  5.00");
-
 }
 
 #[test]
@@ -125,7 +141,6 @@ fn test_render_list_expands_the_wildcard_column() {
     // Every dictionary field, in attribute order, after the ID column.
     assert!(lines[0].starts_with("ID         NAME       ROLES        "));
     assert!(lines[0].contains("PRICE"));
-
 }
 
 #[test]
@@ -137,5 +152,4 @@ fn test_render_list_survives_a_stale_position() {
 
     let lines = report::render_list(&table(&db).read(), &["ROLES".to_string()], Some("ROLES"), &rows);
     assert_eq!(lines[2].trim_end(), "2");
-
 }

@@ -56,13 +56,31 @@ fn bench_sort(c: &mut Criterion) {
         .collect();
 
     let specs = [
-        ("by_name", vec![SortSpec { field_name: "NAME".to_string(), descending: false }]),
-        ("by_id_desc", vec![SortSpec { field_name: "ID".to_string(), descending: true }]),
+        (
+            "by_name",
+            vec![SortSpec {
+                field_name: "NAME".to_string(),
+                descending: false,
+            }],
+        ),
+        (
+            "by_id_desc",
+            vec![SortSpec {
+                field_name: "ID".to_string(),
+                descending: true,
+            }],
+        ),
         (
             "by_city_then_amount",
             vec![
-                SortSpec { field_name: "CITY".to_string(), descending: false },
-                SortSpec { field_name: "AMOUNT".to_string(), descending: true },
+                SortSpec {
+                    field_name: "CITY".to_string(),
+                    descending: false,
+                },
+                SortSpec {
+                    field_name: "AMOUNT".to_string(),
+                    descending: true,
+                },
             ],
         ),
     ];
@@ -96,7 +114,10 @@ fn bench_explode(c: &mut Criterion) {
     common::build_mv_table(&mut db, TABLE, RECORDS);
 
     let node = db.parse_query(TABLE, &["WITH", "ROLES", "=", "ROLE42"]).unwrap();
-    let explode = ExplodeSpec { field_name: "ROLES".to_string(), condition: None };
+    let explode = ExplodeSpec {
+        field_name: "ROLES".to_string(),
+        condition: None,
+    };
     let table_handle = db.get_table_read_only_for_account(common::ACCOUNT, TABLE).unwrap();
     let table = &*table_handle.read();
 
@@ -133,7 +154,10 @@ fn bench_explode(c: &mut Criterion) {
     // do extra work.
     let base = Database::query_exploded_in(table, false, Some(&node), Some(&explode), None);
     let explode_idx = Database::explode_field_index(table, Some(&explode));
-    let specs = [SortSpec { field_name: "ROLES".to_string(), descending: false }];
+    let specs = [SortSpec {
+        field_name: "ROLES".to_string(),
+        descending: false,
+    }];
     group.bench_function("sort_entries_in/by_exploded_value", |b| {
         b.iter_batched_ref(
             || base.clone(),

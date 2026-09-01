@@ -1,7 +1,7 @@
 use crate::db::{ClientInfo, Database, ValuePosition};
 use crate::server::handler::handle_request;
 use crate::server::models::Request;
-use crate::test_support::{isolated_config, TempDir};
+use crate::test_support::{TempDir, isolated_config};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
@@ -44,8 +44,14 @@ fn test_handle_request_read_write() {
     // Verify record is now structured (Value::Object)
     let record = resp_read.record.unwrap();
     assert!(record.is_object());
-    assert_eq!(record.as_object().unwrap().get("name").unwrap().as_str().unwrap(), "Alice");
-    assert_eq!(record.as_object().unwrap().get("email").unwrap().as_str().unwrap(), "alice@example.com");
+    assert_eq!(
+        record.as_object().unwrap().get("name").unwrap().as_str().unwrap(),
+        "Alice"
+    );
+    assert_eq!(
+        record.as_object().unwrap().get("email").unwrap().as_str().unwrap(),
+        "alice@example.com"
+    );
 
     // Test Access Denied
     let req_denied = Request {
@@ -168,26 +174,44 @@ fn test_create_file_durable_flag_is_honoured() {
         assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
     }
 
-    let write = |file: &str| handle_request(
-        Request {
-            command: "WRITE".to_string(),
-            account: Some("DUR_TEST".to_string()),
-            file: Some(file.to_string()),
-            key: Some("K1".to_string()),
-            data: Some(serde_json::Value::String("V1".to_string())),
-            ..Default::default()
-        },
-        &db_arc,
-        &admin,
-    );
+    let write = |file: &str| {
+        handle_request(
+            Request {
+                command: "WRITE".to_string(),
+                account: Some("DUR_TEST".to_string()),
+                file: Some(file.to_string()),
+                key: Some("K1".to_string()),
+                data: Some(serde_json::Value::String("V1".to_string())),
+                ..Default::default()
+            },
+            &db_arc,
+            &admin,
+        )
+    };
 
     assert_eq!(write("SCRATCH").status, "OK");
-    assert!(db_arc.read().unwrap().has_pending_writes(), "a normal file should be buffered");
+    assert!(
+        db_arc.read().unwrap().has_pending_writes(),
+        "a normal file should be buffered"
+    );
 
     assert_eq!(write("LEDGER").status, "OK");
-    assert!(!db_arc.read().unwrap().has_pending_writes(), "a durable file must flush at once");
-    assert!(db_arc.write().unwrap().is_table_durable_for_account("DUR_TEST", "LEDGER"));
-    assert!(!db_arc.write().unwrap().is_table_durable_for_account("DUR_TEST", "SCRATCH"));
+    assert!(
+        !db_arc.read().unwrap().has_pending_writes(),
+        "a durable file must flush at once"
+    );
+    assert!(
+        db_arc
+            .write()
+            .unwrap()
+            .is_table_durable_for_account("DUR_TEST", "LEDGER")
+    );
+    assert!(
+        !db_arc
+            .write()
+            .unwrap()
+            .is_table_durable_for_account("DUR_TEST", "SCRATCH")
+    );
 }
 
 #[test]
@@ -216,17 +240,19 @@ fn test_set_file_promotes_and_demotes_an_existing_file() {
         is_admin: false,
     };
 
-    let set = |durable: Option<bool>, who: &ClientInfo| handle_request(
-        Request {
-            command: "SET.FILE".to_string(),
-            account: Some("SET_TEST".to_string()),
-            file: Some("LEDGER".to_string()),
-            durable,
-            ..Default::default()
-        },
-        &db_arc,
-        who,
-    );
+    let set = |durable: Option<bool>, who: &ClientInfo| {
+        handle_request(
+            Request {
+                command: "SET.FILE".to_string(),
+                account: Some("SET_TEST".to_string()),
+                file: Some("LEDGER".to_string()),
+                durable,
+                ..Default::default()
+            },
+            &db_arc,
+            who,
+        )
+    };
 
     let resp = handle_request(
         Request {
@@ -240,38 +266,62 @@ fn test_set_file_promotes_and_demotes_an_existing_file() {
     );
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
 
-    let write = || handle_request(
-        Request {
-            command: "WRITE".to_string(),
-            account: Some("SET_TEST".to_string()),
-            file: Some("LEDGER".to_string()),
-            key: Some("K1".to_string()),
-            data: Some(serde_json::Value::String("V1".to_string())),
-            ..Default::default()
-        },
-        &db_arc,
-        &admin,
-    );
+    let write = || {
+        handle_request(
+            Request {
+                command: "WRITE".to_string(),
+                account: Some("SET_TEST".to_string()),
+                file: Some("LEDGER".to_string()),
+                key: Some("K1".to_string()),
+                data: Some(serde_json::Value::String("V1".to_string())),
+                ..Default::default()
+            },
+            &db_arc,
+            &admin,
+        )
+    };
 
     assert_eq!(write().status, "OK");
-    assert!(db_arc.read().unwrap().has_pending_writes(), "the write should still be buffered");
+    assert!(
+        db_arc.read().unwrap().has_pending_writes(),
+        "the write should still be buffered"
+    );
 
     // Promoting flushes what the file had buffered, and every later write goes
     // to disk before it is acknowledged.
     let resp = set(Some(true), &admin);
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
     assert_eq!(resp.record.unwrap()["durable"], serde_json::json!(true));
-    assert!(!db_arc.read().unwrap().has_pending_writes(), "promoting must flush what was buffered");
-    assert!(db_arc.write().unwrap().is_table_durable_for_account("SET_TEST", "LEDGER"));
+    assert!(
+        !db_arc.read().unwrap().has_pending_writes(),
+        "promoting must flush what was buffered"
+    );
+    assert!(
+        db_arc
+            .write()
+            .unwrap()
+            .is_table_durable_for_account("SET_TEST", "LEDGER")
+    );
 
     assert_eq!(write().status, "OK");
-    assert!(!db_arc.read().unwrap().has_pending_writes(), "a promoted file must flush at once");
+    assert!(
+        !db_arc.read().unwrap().has_pending_writes(),
+        "a promoted file must flush at once"
+    );
 
     // And back again.
     assert_eq!(set(Some(false), &admin).status, "OK");
-    assert!(!db_arc.write().unwrap().is_table_durable_for_account("SET_TEST", "LEDGER"));
+    assert!(
+        !db_arc
+            .write()
+            .unwrap()
+            .is_table_durable_for_account("SET_TEST", "LEDGER")
+    );
     assert_eq!(write().status, "OK");
-    assert!(db_arc.read().unwrap().has_pending_writes(), "a demoted file buffers again");
+    assert!(
+        db_arc.read().unwrap().has_pending_writes(),
+        "a demoted file buffers again"
+    );
 
     // A request that names no flag must not be read as a demotion.
     let resp = set(None, &admin);
@@ -282,7 +332,12 @@ fn test_set_file_promotes_and_demotes_an_existing_file() {
     let resp = set(Some(true), &client);
     assert_eq!(resp.status, "ERROR");
     assert_eq!(resp.message.unwrap(), "Admin privileges required");
-    assert!(!db_arc.write().unwrap().is_table_durable_for_account("SET_TEST", "LEDGER"));
+    assert!(
+        !db_arc
+            .write()
+            .unwrap()
+            .is_table_durable_for_account("SET_TEST", "LEDGER")
+    );
 
     // A file that does not exist is a not-found error, not a silent success.
     let resp = handle_request(
@@ -330,7 +385,10 @@ fn test_handle_request_query_select() {
     assert_eq!(results[0].0, "1");
     // Verify results are now structured (Value::Object instead of Value::String)
     assert!(results[0].1.is_object());
-    assert_eq!(results[0].1.as_object().unwrap().get("name").unwrap().as_str().unwrap(), "John Doe");
+    assert_eq!(
+        results[0].1.as_object().unwrap().get("name").unwrap().as_str().unwrap(),
+        "John Doe"
+    );
 
     // Test SELECT and GET.NEXT
     let req_select = Request {
@@ -375,15 +433,29 @@ fn test_management_commands_report_accounts_files_and_statistics() {
         is_admin: true,
     };
 
-    let resp = handle_request(Request { command: "LIST.ACCOUNTS".to_string(), ..Default::default() }, &db_arc, &admin);
+    let resp = handle_request(
+        Request {
+            command: "LIST.ACCOUNTS".to_string(),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
     let accounts = resp.results.unwrap();
-    let account = accounts.iter().find(|(name, _)| name == "MGMT_TEST").expect("the created account is listed");
+    let account = accounts
+        .iter()
+        .find(|(name, _)| name == "MGMT_TEST")
+        .expect("the created account is listed");
     assert!(account.1["file_count"].as_u64().unwrap() > 0);
     assert!(account.1["directory"].as_str().unwrap().contains("MGMT_TEST"));
 
     let resp = handle_request(
-        Request { command: "LIST.FILES".to_string(), account: Some("MGMT_TEST".to_string()), ..Default::default() },
+        Request {
+            command: "LIST.FILES".to_string(),
+            account: Some("MGMT_TEST".to_string()),
+            ..Default::default()
+        },
         &db_arc,
         &admin,
     );
@@ -395,7 +467,10 @@ fn test_management_commands_report_accounts_files_and_statistics() {
     // not have to read the account's DIR file to find it.
     let listed = resp.results.unwrap();
     assert_eq!(listed.len(), files.len());
-    let users = listed.iter().find(|(name, _)| name == "USERS").expect("USERS is listed");
+    let users = listed
+        .iter()
+        .find(|(name, _)| name == "USERS")
+        .expect("USERS is listed");
     assert_eq!(users.1["durable"], serde_json::json!(false));
 
     let resp = handle_request(
@@ -415,7 +490,10 @@ fn test_management_commands_report_accounts_files_and_statistics() {
     assert_eq!(stats["record_count"].as_u64().unwrap(), 2);
     assert!(stats["dict_count"].as_u64().unwrap() > 0);
     assert!(stats["modulus"].as_u64().unwrap() > 0);
-    assert!(stats.get("records").is_none(), "statistics must not carry record contents");
+    assert!(
+        stats.get("records").is_none(),
+        "statistics must not carry record contents"
+    );
 
     // A file that does not exist is a not-found error, not an empty answer.
     let resp = handle_request(
@@ -449,13 +527,24 @@ fn test_management_commands_respect_the_clients_permissions() {
     };
 
     // An account the client cannot reach must not even be named to it.
-    let resp = handle_request(Request { command: "LIST.ACCOUNTS".to_string(), ..Default::default() }, &db_arc, &client_info);
+    let resp = handle_request(
+        Request {
+            command: "LIST.ACCOUNTS".to_string(),
+            ..Default::default()
+        },
+        &db_arc,
+        &client_info,
+    );
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
     let names: Vec<String> = resp.results.unwrap().into_iter().map(|(name, _)| name).collect();
     assert_eq!(names, vec!["VISIBLE".to_string()]);
 
     let resp = handle_request(
-        Request { command: "LIST.FILES".to_string(), account: Some("HIDDEN".to_string()), ..Default::default() },
+        Request {
+            command: "LIST.FILES".to_string(),
+            account: Some("HIDDEN".to_string()),
+            ..Default::default()
+        },
         &db_arc,
         &client_info,
     );
@@ -465,7 +554,11 @@ fn test_management_commands_respect_the_clients_permissions() {
     // The management views of the server itself are administrative.
     for command in ["SERVER.STATS", "LIST.CONNS", "GENERATE.CERT"] {
         let resp = handle_request(
-            Request { command: command.to_string(), name: Some("intruder".to_string()), ..Default::default() },
+            Request {
+                command: command.to_string(),
+                name: Some("intruder".to_string()),
+                ..Default::default()
+            },
             &db_arc,
             &client_info,
         );
@@ -478,7 +571,8 @@ fn test_management_commands_respect_the_clients_permissions() {
 fn test_list_conns_and_server_stats_describe_the_running_server() {
     let dir = TempDir::new("server_stats");
     let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
-    db.add_authorized_client("reporting-bot", "AB12CD", vec!["SALES".to_string()], false).unwrap();
+    db.add_authorized_client("reporting-bot", "AB12CD", vec!["SALES".to_string()], false)
+        .unwrap();
     db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
@@ -489,17 +583,34 @@ fn test_list_conns_and_server_stats_describe_the_running_server() {
         is_admin: true,
     };
 
-    let resp = handle_request(Request { command: "LIST.CONNS".to_string(), ..Default::default() }, &db_arc, &admin);
+    let resp = handle_request(
+        Request {
+            command: "LIST.CONNS".to_string(),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
     let clients = resp.results.unwrap();
-    let (name, info) = clients.iter().find(|(name, _)| name == "reporting-bot").expect("the authorized client is listed");
+    let (name, info) = clients
+        .iter()
+        .find(|(name, _)| name == "reporting-bot")
+        .expect("the authorized client is listed");
     assert_eq!(name, "reporting-bot");
     // Thumbprints are stored lowercase, whatever case they were given in.
     assert_eq!(info["thumbprint"].as_str().unwrap(), "ab12cd");
     assert_eq!(info["accounts"][0].as_str().unwrap(), "SALES");
     assert!(!info["is_admin"].as_bool().unwrap());
 
-    let resp = handle_request(Request { command: "SERVER.STATS".to_string(), ..Default::default() }, &db_arc, &admin);
+    let resp = handle_request(
+        Request {
+            command: "SERVER.STATS".to_string(),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
     let stats = resp.record.unwrap();
     assert!(stats["active_connections"].is_array());
@@ -549,7 +660,6 @@ fn test_query_returns_multivalued_fields_as_arrays() {
 
     let jane = &results.iter().find(|(k, _)| k == "2").unwrap().1;
     assert_eq!(jane["roles"], serde_json::json!(["DEV", ["TEST", "LAB"]]));
-
 }
 
 #[test]
@@ -588,11 +698,10 @@ fn test_query_explodes_and_reports_positions() {
     let resp = handle_request(req, &db_arc, &client_info);
     assert_eq!(resp.status, "OK");
     assert_eq!(resp.results.unwrap().len(), 2);
-    assert_eq!(resp.positions.unwrap(), vec![
-        Some(ValuePosition::value(2)),
-        Some(ValuePosition::sub_value(1, 0)),
-    ]);
-
+    assert_eq!(
+        resp.positions.unwrap(),
+        vec![Some(ValuePosition::value(2)), Some(ValuePosition::sub_value(1, 0)),]
+    );
 }
 
 #[test]
@@ -626,17 +735,21 @@ fn test_select_explodes_and_get_next_carries_the_positions() {
     let positions = resp.positions.unwrap();
     assert_eq!(results.len(), 5);
     assert_eq!(positions.len(), 5);
-    let seen: Vec<(&str, Option<ValuePosition>)> = results.iter()
+    let seen: Vec<(&str, Option<ValuePosition>)> = results
+        .iter()
         .map(|(k, _)| k.as_str())
         .zip(positions.iter().copied())
         .collect();
-    assert_eq!(seen, vec![
-        ("1", Some(ValuePosition::value(0))),
-        ("1", Some(ValuePosition::value(1))),
-        ("1", Some(ValuePosition::value(2))),
-        ("2", Some(ValuePosition::value(0))),
-        ("2", Some(ValuePosition::value(1))),
-    ]);
+    assert_eq!(
+        seen,
+        vec![
+            ("1", Some(ValuePosition::value(0))),
+            ("1", Some(ValuePosition::value(1))),
+            ("1", Some(ValuePosition::value(2))),
+            ("2", Some(ValuePosition::value(0))),
+            ("2", Some(ValuePosition::value(1))),
+        ]
+    );
 
     // The cursor is exhausted, so the list reports EOF as it always has.
     let req_next = Request {
@@ -646,7 +759,6 @@ fn test_select_explodes_and_get_next_carries_the_positions() {
         ..Default::default()
     };
     assert_eq!(handle_request(req_next, &db_arc, &client_info).status, "EOF");
-
 }
 
 #[test]
@@ -673,7 +785,6 @@ fn test_unexploded_select_sends_no_positions() {
     assert_eq!(resp.results.unwrap().len(), 2);
     // An ordinary list leaves the field out rather than sending a run of nulls.
     assert!(resp.positions.is_none());
-
 }
 
 /// A database with one account and one file, and a client that may reach it.
@@ -693,7 +804,12 @@ fn dictionary_test_db(name: &str) -> (TempDir, Arc<RwLock<Database>>, ClientInfo
     (dir, Arc::new(RwLock::new(db)), client_info)
 }
 
-fn set_dict(db: &Arc<RwLock<Database>>, client: &ClientInfo, key: &str, attributes: serde_json::Value) -> crate::server::models::Response {
+fn set_dict(
+    db: &Arc<RwLock<Database>>,
+    client: &ClientInfo,
+    key: &str,
+    attributes: serde_json::Value,
+) -> crate::server::models::Response {
     handle_request(
         Request {
             command: "SET.DICT".to_string(),
@@ -761,11 +877,26 @@ fn test_set_dict_refuses_a_definition_no_query_could_use() {
 
     let cases: Vec<(serde_json::Value, &str)> = vec![
         (serde_json::json!({}), "Attribute number not specified"),
-        (serde_json::json!({ "field": 0 }), "Attribute number must be 1 or greater"),
-        (serde_json::json!({ "field": "first" }), "Attribute number is not a whole number: first"),
-        (serde_json::json!({ "field": 1, "width": 0 }), "Display width must be 1 or greater"),
-        (serde_json::json!({ "field": 1, "width": "wide" }), "Display width is not a whole number: wide"),
-        (serde_json::json!({ "field": 1, "justification": "centre" }), "Justification must be L or R"),
+        (
+            serde_json::json!({ "field": 0 }),
+            "Attribute number must be 1 or greater",
+        ),
+        (
+            serde_json::json!({ "field": "first" }),
+            "Attribute number is not a whole number: first",
+        ),
+        (
+            serde_json::json!({ "field": 1, "width": 0 }),
+            "Display width must be 1 or greater",
+        ),
+        (
+            serde_json::json!({ "field": 1, "width": "wide" }),
+            "Display width is not a whole number: wide",
+        ),
+        (
+            serde_json::json!({ "field": 1, "justification": "centre" }),
+            "Justification must be L or R",
+        ),
     ];
     for (attributes, expected) in cases {
         let resp = set_dict(&db_arc, &client_info, "NAME", attributes.clone());
@@ -798,8 +929,18 @@ fn test_set_dict_refuses_a_definition_no_query_could_use() {
 fn test_list_dict_reads_the_dictionary_positions_rather_than_the_files_own_names() {
     let (_dir, db_arc, client_info) = dictionary_test_db("list_dict");
 
-    set_dict(&db_arc, &client_info, "PRICE", serde_json::json!({ "field": 2, "justification": "R", "conversion": "MD2" }));
-    set_dict(&db_arc, &client_info, "NAME", serde_json::json!({ "field": 1, "heading": "Item", "width": 20 }));
+    set_dict(
+        &db_arc,
+        &client_info,
+        "PRICE",
+        serde_json::json!({ "field": 2, "justification": "R", "conversion": "MD2" }),
+    );
+    set_dict(
+        &db_arc,
+        &client_info,
+        "NAME",
+        serde_json::json!({ "field": 1, "heading": "Item", "width": 20 }),
+    );
 
     let resp = list_dict(&db_arc, &client_info);
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
@@ -833,7 +974,10 @@ fn test_list_dict_reads_the_dictionary_positions_rather_than_the_files_own_names
     );
     assert_eq!(read.status, "OK");
     let record = read.record.unwrap();
-    assert_eq!(record["name"], "1", "attribute 1 of the entry read as the file's NAME field");
+    assert_eq!(
+        record["name"], "1",
+        "attribute 1 of the entry read as the file's NAME field"
+    );
     assert!(record.get("heading").is_none());
 }
 
@@ -865,7 +1009,11 @@ fn test_dictionary_commands_need_an_account_a_file_and_permission() {
     let (_dir, db_arc, client_info) = dictionary_test_db("dict_guards");
 
     let resp = handle_request(
-        Request { command: "LIST.DICT".to_string(), account: Some("DICT_TEST".to_string()), ..Default::default() },
+        Request {
+            command: "LIST.DICT".to_string(),
+            account: Some("DICT_TEST".to_string()),
+            ..Default::default()
+        },
         &db_arc,
         &client_info,
     );
@@ -917,16 +1065,27 @@ fn test_an_account_created_over_the_protocol_gets_a_dir_file() {
     };
 
     let resp = handle_request(
-        Request { command: "CREATE.ACCOUNT".to_string(), target_account: Some("NEW_ACC".to_string()), ..Default::default() },
+        Request {
+            command: "CREATE.ACCOUNT".to_string(),
+            target_account: Some("NEW_ACC".to_string()),
+            ..Default::default()
+        },
         &db_arc,
         &admin,
     );
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
-    assert!(Path::new(base_dir).join("NEW_ACC").join("DIR").exists(), "a new account has no DIR file");
+    assert!(
+        Path::new(base_dir).join("NEW_ACC").join("DIR").exists(),
+        "a new account has no DIR file"
+    );
 
     let listed = |db_arc: &Arc<RwLock<Database>>| {
         handle_request(
-            Request { command: "LIST.FILES".to_string(), account: Some("NEW_ACC".to_string()), ..Default::default() },
+            Request {
+                command: "LIST.FILES".to_string(),
+                account: Some("NEW_ACC".to_string()),
+                ..Default::default()
+            },
             db_arc,
             &admin,
         )
@@ -995,7 +1154,11 @@ fn test_a_file_created_in_an_account_that_lost_its_dir_brings_it_back() {
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
 
     let resp = handle_request(
-        Request { command: "LIST.FILES".to_string(), account: Some("OLD_ACC".to_string()), ..Default::default() },
+        Request {
+            command: "LIST.FILES".to_string(),
+            account: Some("OLD_ACC".to_string()),
+            ..Default::default()
+        },
         &db_arc,
         &admin,
     );
@@ -1021,7 +1184,11 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
     };
 
     let resp = handle_request(
-        Request { command: "CREATE.TEST.ACCOUNT".to_string(), target_account: Some("DEMO".to_string()), ..Default::default() },
+        Request {
+            command: "CREATE.TEST.ACCOUNT".to_string(),
+            target_account: Some("DEMO".to_string()),
+            ..Default::default()
+        },
         &db_arc,
         &admin,
     );
@@ -1057,7 +1224,11 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
 
     // Making it twice is refused rather than half-rebuilt over the first.
     let resp = handle_request(
-        Request { command: "CREATE.TEST.ACCOUNT".to_string(), target_account: Some("DEMO".to_string()), ..Default::default() },
+        Request {
+            command: "CREATE.TEST.ACCOUNT".to_string(),
+            target_account: Some("DEMO".to_string()),
+            ..Default::default()
+        },
         &db_arc,
         &admin,
     );
@@ -1080,7 +1251,11 @@ fn test_the_demo_account_is_admin_only_and_needs_a_name() {
         is_admin: false,
     };
     let resp = handle_request(
-        Request { command: "CREATE.TEST.ACCOUNT".to_string(), target_account: Some("DEMO".to_string()), ..Default::default() },
+        Request {
+            command: "CREATE.TEST.ACCOUNT".to_string(),
+            target_account: Some("DEMO".to_string()),
+            ..Default::default()
+        },
         &db_arc,
         &ordinary,
     );
@@ -1093,7 +1268,10 @@ fn test_the_demo_account_is_admin_only_and_needs_a_name() {
         is_admin: true,
     };
     let resp = handle_request(
-        Request { command: "CREATE.TEST.ACCOUNT".to_string(), ..Default::default() },
+        Request {
+            command: "CREATE.TEST.ACCOUNT".to_string(),
+            ..Default::default()
+        },
         &db_arc,
         &admin,
     );
@@ -1153,27 +1331,48 @@ fn the_hot_paths_lock_a_file_a_fixed_number_of_times() {
     // Steady state is what the counts describe: the first write to a file also
     // loads it and reads the account's durability flags out of DIR.
     for i in 0..3 {
-        assert_eq!(handle_request(write(&format!("warm{i}")), &db_arc, &client_info).status, "OK");
+        assert_eq!(
+            handle_request(write(&format!("warm{i}")), &db_arc, &client_info).status,
+            "OK"
+        );
     }
 
     let structured = Request {
         structured_data: Some(serde_json::json!({ "name": "Bob" })),
         ..request("WRITE", "structured")
     };
-    let query = Request { key: None, ..request("QUERY", "") };
+    let query = Request {
+        key: None,
+        ..request("QUERY", "")
+    };
 
     // (what it does, the request, how many times it may lock the file, why)
     let budgets: Vec<(&str, Request, u64, &str)> = vec![
-        ("WRITE", write("written"), 2,
-         "the freshness check, then the write itself"),
-        ("WRITE with structured data", structured, 3,
-         "the same two, plus reading the dictionary to deserialize the record"),
-        ("READ", request("READ", "warm0"), 2,
-         "the freshness check, then serving the record"),
-        ("QUERY", query, 2,
-         "the freshness check, then the scan"),
-        ("DELETE", request("DELETE", "warm1"), 2,
-         "the freshness check, then the removal"),
+        (
+            "WRITE",
+            write("written"),
+            2,
+            "the freshness check, then the write itself",
+        ),
+        (
+            "WRITE with structured data",
+            structured,
+            3,
+            "the same two, plus reading the dictionary to deserialize the record",
+        ),
+        (
+            "READ",
+            request("READ", "warm0"),
+            2,
+            "the freshness check, then serving the record",
+        ),
+        ("QUERY", query, 2, "the freshness check, then the scan"),
+        (
+            "DELETE",
+            request("DELETE", "warm1"),
+            2,
+            "the freshness check, then the removal",
+        ),
     ];
 
     for (what, req, budget, why) in budgets {

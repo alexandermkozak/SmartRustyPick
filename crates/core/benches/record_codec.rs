@@ -15,8 +15,12 @@ fn wide_record() -> Record {
         if i % 3 == 0 {
             rec.fields.push(Field {
                 values: vec![
-                    Value { sub_values: vec![format!("v{i}a"), format!("v{i}b")] },
-                    Value { sub_values: vec![format!("v{i}c")] },
+                    Value {
+                        sub_values: vec![format!("v{i}a"), format!("v{i}b")],
+                    },
+                    Value {
+                        sub_values: vec![format!("v{i}c")],
+                    },
                 ],
             });
         } else {

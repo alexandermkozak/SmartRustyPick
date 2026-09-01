@@ -1,5 +1,5 @@
 use crate::db::*;
-use crate::test_support::{isolated_config, TempDir};
+use crate::test_support::{TempDir, isolated_config};
 use std::io;
 
 #[test]
@@ -51,7 +51,10 @@ fn test_system_dictionary_auto_creation() -> io::Result<()> {
             let mut logs_mut = logs_mut_handle.write();
             logs_mut.dictionary.remove("MESSAGE");
             // Add an override
-            logs_mut.dictionary.insert("DETAIL".to_string(), Record::from_display_string("2^OVERRIDE_DETAIL^L^10"));
+            logs_mut.dictionary.insert(
+                "DETAIL".to_string(),
+                Record::from_display_string("2^OVERRIDE_DETAIL^L^10"),
+            );
             logs_mut.touch_all();
         }
         db.save()?;
@@ -65,11 +68,18 @@ fn test_system_dictionary_auto_creation() -> io::Result<()> {
         let logs_handle = db.get_table("$LOGS").unwrap();
         let logs = logs_handle.read();
         // Should be restored
-        assert!(logs.dictionary.contains_key("MESSAGE"), "MESSAGE dictionary should be restored");
+        assert!(
+            logs.dictionary.contains_key("MESSAGE"),
+            "MESSAGE dictionary should be restored"
+        );
         // Should NOT be overwritten
         let detail_dict = logs.dictionary.get("DETAIL").unwrap();
         let detail_val = detail_dict.get_field_display_string(1);
-        assert!(detail_val.contains("OVERRIDE_DETAIL"), "Existing dictionary entry should NOT be overwritten (got '{}')", detail_val);
+        assert!(
+            detail_val.contains("OVERRIDE_DETAIL"),
+            "Existing dictionary entry should NOT be overwritten (got '{}')",
+            detail_val
+        );
     }
 
     Ok(())
@@ -83,7 +93,10 @@ fn test_system_account_auto_creation() -> io::Result<()> {
     {
         let db = Database::new(base_dir, Some(isolated_config()))?;
         // Check if SYSTEM account exists
-        assert!(db.get_account_dir("SYSTEM").is_some(), "SYSTEM account should be automatically created");
+        assert!(
+            db.get_account_dir("SYSTEM").is_some(),
+            "SYSTEM account should be automatically created"
+        );
     }
 
     Ok(())
@@ -98,7 +111,10 @@ fn test_system_logs_auto_creation() -> io::Result<()> {
         let db = Database::new(base_dir, Some(isolated_config()))?;
         // Check if $LOGS file exists in SYSTEM account
         db.logto("SYSTEM")?;
-        assert!(db.is_table_available("$LOGS"), "$LOGS table should be automatically created in SYSTEM account");
+        assert!(
+            db.is_table_available("$LOGS"),
+            "$LOGS table should be automatically created in SYSTEM account"
+        );
     }
 
     Ok(())
@@ -150,13 +166,22 @@ fn test_system_clients_file() -> io::Result<()> {
 
         // Verify $CLIENTS exists and contains CLIENT1 and CLIENT2
         db.logto("SYSTEM")?;
-        assert!(db.is_table_available("$CLIENTS"), "$CLIENTS table should exist in SYSTEM account");
+        assert!(
+            db.is_table_available("$CLIENTS"),
+            "$CLIENTS table should exist in SYSTEM account"
+        );
 
         {
             let clients_table_handle = db.get_table("$CLIENTS").expect("$CLIENTS should be loadable");
             let clients_table = clients_table_handle.read();
-            assert!(clients_table.records.contains_key("CLIENT1"), "$CLIENTS should contain CLIENT1");
-            assert!(clients_table.records.contains_key("CLIENT2"), "$CLIENTS should contain CLIENT2");
+            assert!(
+                clients_table.records.contains_key("CLIENT1"),
+                "$CLIENTS should contain CLIENT1"
+            );
+            assert!(
+                clients_table.records.contains_key("CLIENT2"),
+                "$CLIENTS should contain CLIENT2"
+            );
 
             let rec1 = clients_table.records.get("CLIENT1").unwrap();
             assert_eq!(rec1.fields[0].values[0].sub_values[0], "aabbccdd");
@@ -170,7 +195,10 @@ fn test_system_clients_file() -> io::Result<()> {
 
         // Verify in-memory map
         assert!(db.client_for_thumbprint("aabbccdd").is_some());
-        assert_eq!(db.client_for_thumbprint("aabbccdd").unwrap().allowed_accounts, vec!["ACC1"]);
+        assert_eq!(
+            db.client_for_thumbprint("aabbccdd").unwrap().allowed_accounts,
+            vec!["ACC1"]
+        );
         assert!(!db.client_for_thumbprint("aabbccdd").unwrap().is_admin);
 
         assert!(db.client_for_thumbprint("11223344").is_some());
@@ -186,7 +214,12 @@ fn test_system_clients_file() -> io::Result<()> {
             assert_eq!(rec1_v2.fields[1].values.len(), 2);
             assert_eq!(rec1_v2.fields[1].values[1].sub_values[0], "ACC2");
         }
-        assert!(db.client_for_thumbprint("aabbccdd").unwrap().allowed_accounts.contains(&"ACC2".to_string()));
+        assert!(
+            db.client_for_thumbprint("aabbccdd")
+                .unwrap()
+                .allowed_accounts
+                .contains(&"ACC2".to_string())
+        );
 
         // Test remove_client_account
         db.remove_client_account("CLIENT1", "ACC1")?;
@@ -198,7 +231,12 @@ fn test_system_clients_file() -> io::Result<()> {
             assert_eq!(rec1_v3.fields[1].values.len(), 1);
             assert_eq!(rec1_v3.fields[1].values[0].sub_values[0], "ACC2");
         }
-        assert!(!db.client_for_thumbprint("aabbccdd").unwrap().allowed_accounts.contains(&"ACC1".to_string()));
+        assert!(
+            !db.client_for_thumbprint("aabbccdd")
+                .unwrap()
+                .allowed_accounts
+                .contains(&"ACC1".to_string())
+        );
 
         // Test removal of client
         db.remove_authorized_client("CLIENT1")?;
@@ -206,15 +244,24 @@ fn test_system_clients_file() -> io::Result<()> {
         {
             let clients_table_handle = db.get_table("$CLIENTS").unwrap();
             let clients_table = clients_table_handle.read();
-            assert!(!clients_table.records.contains_key("CLIENT1"), "$CLIENTS should not contain CLIENT1 after removal");
+            assert!(
+                !clients_table.records.contains_key("CLIENT1"),
+                "$CLIENTS should not contain CLIENT1 after removal"
+            );
         }
-        assert!(db.client_for_thumbprint("aabbccdd").is_none(), "In-memory map should be updated");
+        assert!(
+            db.client_for_thumbprint("aabbccdd").is_none(),
+            "In-memory map should be updated"
+        );
     }
 
     // Test auto-population on restart
     {
         let db = Database::new(base_dir, Some(isolated_config()))?;
-        assert!(db.client_for_thumbprint("11223344").is_some(), "Should load CLIENT2 from $CLIENTS on restart");
+        assert!(
+            db.client_for_thumbprint("11223344").is_some(),
+            "Should load CLIENT2 from $CLIENTS on restart"
+        );
         assert!(db.client_for_thumbprint("11223344").unwrap().is_admin);
     }
 
@@ -234,20 +281,35 @@ fn test_system_accounts_file() -> io::Result<()> {
 
         // Verify $ACCOUNTS exists and contains USER1 and USER2
         db.logto("SYSTEM")?;
-        assert!(db.is_table_available("$ACCOUNTS"), "$ACCOUNTS table should exist in SYSTEM account");
+        assert!(
+            db.is_table_available("$ACCOUNTS"),
+            "$ACCOUNTS table should exist in SYSTEM account"
+        );
 
         {
             let accounts_table_handle = db.get_table("$ACCOUNTS").expect("$ACCOUNTS should be loadable");
             let accounts_table = accounts_table_handle.read();
-            assert!(accounts_table.records.contains_key("USER1"), "$ACCOUNTS should contain USER1");
-            assert!(accounts_table.records.contains_key("USER2"), "$ACCOUNTS should contain USER2");
-            assert!(!accounts_table.records.contains_key("SYSTEM"), "$ACCOUNTS should NOT contain SYSTEM");
+            assert!(
+                accounts_table.records.contains_key("USER1"),
+                "$ACCOUNTS should contain USER1"
+            );
+            assert!(
+                accounts_table.records.contains_key("USER2"),
+                "$ACCOUNTS should contain USER2"
+            );
+            assert!(
+                !accounts_table.records.contains_key("SYSTEM"),
+                "$ACCOUNTS should NOT contain SYSTEM"
+            );
 
             let rec1 = accounts_table.records.get("USER1").unwrap();
             assert!(rec1.fields[0].values[0].sub_values[0].contains("USER1"));
 
             let rec2 = accounts_table.records.get("USER2").unwrap();
-            assert_eq!(rec2.fields[0].values[0].sub_values[0], format!("{}/custom_path/user2", base_dir));
+            assert_eq!(
+                rec2.fields[0].values[0].sub_values[0],
+                format!("{}/custom_path/user2", base_dir)
+            );
         }
 
         // Test deletion
@@ -255,7 +317,10 @@ fn test_system_accounts_file() -> io::Result<()> {
         db.logto("SYSTEM")?;
         let accounts_table_handle = db.get_table("$ACCOUNTS").unwrap();
         let accounts_table = accounts_table_handle.read();
-        assert!(!accounts_table.records.contains_key("USER1"), "$ACCOUNTS should not contain USER1 after deletion");
+        assert!(
+            !accounts_table.records.contains_key("USER1"),
+            "$ACCOUNTS should not contain USER1 after deletion"
+        );
     }
 
     // Test auto-population on restart
@@ -264,7 +329,10 @@ fn test_system_accounts_file() -> io::Result<()> {
         db.logto("SYSTEM")?;
         let accounts_table_handle = db.get_table("$ACCOUNTS").unwrap();
         let accounts_table = accounts_table_handle.read();
-        assert!(accounts_table.records.contains_key("USER2"), "$ACCOUNTS should contain USER2 after restart");
+        assert!(
+            accounts_table.records.contains_key("USER2"),
+            "$ACCOUNTS should contain USER2 after restart"
+        );
     }
 
     Ok(())
@@ -307,13 +375,19 @@ fn test_accounts() -> io::Result<()> {
         db.logto("ACC1")?;
         let t1_handle = db.get_table("T1").unwrap();
         let t1 = t1_handle.read();
-        assert_eq!(String::from_utf8_lossy(&t1.records.get("K1").unwrap().to_bytes()), "VAL1");
+        assert_eq!(
+            String::from_utf8_lossy(&t1.records.get("K1").unwrap().to_bytes()),
+            "VAL1"
+        );
         drop(t1);
 
         db.logto("ACC2")?;
         let t1_handle = db.get_table("T1").unwrap();
         let t1 = t1_handle.read();
-        assert_eq!(String::from_utf8_lossy(&t1.records.get("K1").unwrap().to_bytes()), "VAL2");
+        assert_eq!(
+            String::from_utf8_lossy(&t1.records.get("K1").unwrap().to_bytes()),
+            "VAL2"
+        );
     }
 
     Ok(())
@@ -327,7 +401,10 @@ fn test_dir_file_auto_creation() -> io::Result<()> {
     {
         let db = Database::new(base_dir, Some(isolated_config()))?;
         db.logto("SYSTEM")?;
-        assert!(db.is_table_available("DIR"), "DIR table should be automatically created in SYSTEM account");
+        assert!(
+            db.is_table_available("DIR"),
+            "DIR table should be automatically created in SYSTEM account"
+        );
 
         {
             let dir_table_handle = db.get_table("DIR").unwrap();
@@ -345,7 +422,10 @@ fn test_dir_file_auto_creation() -> io::Result<()> {
         // Test create_test_account
         db.create_test_account("TEST_DIR")?;
         db.logto("TEST_DIR")?;
-        assert!(db.is_table_available("DIR"), "DIR table should be created in test account");
+        assert!(
+            db.is_table_available("DIR"),
+            "DIR table should be created in test account"
+        );
         let dir_table_test_handle = db.get_table("DIR").unwrap();
         let dir_table_test = dir_table_test_handle.read();
         assert!(dir_table_test.records.contains_key("USERS"));
@@ -444,10 +524,19 @@ fn test_record_serialization() -> io::Result<()> {
         {
             let table_handle = db.get_table_mut("CUSTOM").unwrap();
             let mut table = table_handle.write();
-            table.dictionary.insert("FIRST.NAME".to_string(), Record::from_display_string("1^First Name^L^15"));
-            table.dictionary.insert("LAST.NAME".to_string(), Record::from_display_string("2^Last Name^L^15"));
-            table.dictionary.insert("AGE".to_string(), Record::from_display_string("3^Age^R^3"));
-            table.records.insert("K1".to_string(), Record::from_display_string("John^Doe^30"));
+            table.dictionary.insert(
+                "FIRST.NAME".to_string(),
+                Record::from_display_string("1^First Name^L^15"),
+            );
+            table
+                .dictionary
+                .insert("LAST.NAME".to_string(), Record::from_display_string("2^Last Name^L^15"));
+            table
+                .dictionary
+                .insert("AGE".to_string(), Record::from_display_string("3^Age^R^3"));
+            table
+                .records
+                .insert("K1".to_string(), Record::from_display_string("John^Doe^30"));
             table.touch_all();
         }
         db.save()?;

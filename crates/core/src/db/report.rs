@@ -103,7 +103,9 @@ pub fn render_list<T: std::borrow::Borrow<Record>>(
             let value = if fmt.name == "ID" {
                 entry.key.clone()
             } else {
-                let position = (Some(fmt.name.as_str()) == explode_field).then_some(entry.position).flatten();
+                let position = (Some(fmt.name.as_str()) == explode_field)
+                    .then_some(entry.position)
+                    .flatten();
                 Database::format_record_field_at_in(table, record.borrow(), &fmt.name, position)
             };
             row_line.push_str(&fmt.cell(&value));
