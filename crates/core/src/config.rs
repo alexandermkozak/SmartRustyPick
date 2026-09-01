@@ -15,6 +15,10 @@ pub struct Config {
     /// Target number of records per hashfile group. Lower means smaller, faster
     /// group rewrites but more files; higher means the opposite.
     pub records_per_group: Option<usize>,
+    /// How many files may be held in memory at once. Each is locked
+    /// individually, so a larger cache is what lets writers to different files
+    /// run in parallel instead of taking turns being loaded and evicted.
+    pub max_loaded_tables: Option<usize>,
     /// Flush every write to disk before acknowledging it. Safest, slowest.
     pub durable_writes: Option<bool>,
     /// How much of a flush is forced to the platter: `"always"`, `"meta"` or
@@ -61,6 +65,11 @@ pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 0; // disabled
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
+/// Files kept in memory at once. Generous, because eviction is what forces two
+/// connections working on different files to interfere with each other, and a
+/// cached table is only as large as the records that have been read into it.
+pub const DEFAULT_MAX_LOADED_TABLES: usize = 64;
 
 /// Dashboard defaults, applied wherever the config leaves them unset.
 pub const DEFAULT_WEB_ADDR: &str = "127.0.0.1";
@@ -122,6 +131,7 @@ impl Default for Config {
             log_detail: Some("normal".to_string()),
             max_log_records: Some(100),
             records_per_group: None,
+            max_loaded_tables: None,
             durable_writes: None,
             fsync: None,
             flush_interval_ms: None,

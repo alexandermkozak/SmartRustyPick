@@ -174,12 +174,16 @@ fn every_command_is_documented() {
 /// hand could never do.
 fn commands_in_handler() -> Vec<String> {
     const HANDLER: &str = include_str!("handler.rs");
-    HANDLER
+    // From `handle_request_locked` onwards: that function holds the one
+    // complete dispatch, and the record commands are dispatched a second time,
+    // at the same indent, by the helper the shared path shares with it.
+    let (_, dispatch) = HANDLER.split_once("pub fn handle_request_locked")
+        .expect("handler.rs must still have a handle_request_locked");
+    dispatch
         .lines()
         .filter_map(|line| {
             // The arms of that `match`, and only those: they sit at one indent
-            // inside `handle_request_locked`, unlike the read-only fast path's
-            // more deeply nested `"READ" =>`.
+            // inside `handle_request_locked`.
             let arm = line.strip_prefix("        \"")?;
             let (command, rest) = arm.split_once('"')?;
             rest.trim_start().starts_with("=>").then(|| command.to_string())

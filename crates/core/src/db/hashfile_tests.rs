@@ -175,12 +175,13 @@ fn test_legacy_flat_file_is_migrated_on_first_write() {
     fs::write(format!("{}/data", table_dir), &flat).unwrap();
     fs::write(format!("{}/dict", table_dir), b"").unwrap();
 
-    let mut db = Database::new(base, Some(isolated_config())).unwrap();
+    let db = Database::new(base, Some(isolated_config())).unwrap();
     db.create_account("LEG", Some(base)).unwrap();
     db.logto("LEG").unwrap();
 
     {
-        let table = db.get_table_mut("LEGACY").unwrap();
+        let table_handle = db.get_table_mut("LEGACY").unwrap();
+        let mut table = table_handle.write();
         assert_eq!(table.records.len(), 50, "legacy records must still be readable");
         assert!(table.legacy_data);
         table.insert_record("NEW", record("FRESH"));
@@ -192,9 +193,9 @@ fn test_legacy_flat_file_is_migrated_on_first_write() {
     assert!(!Path::new(&section).is_file(), "the flat file should be gone");
 
     // Re-read through a second handle to prove the data survived the move.
-    db.loaded_tables.clear();
-    db.lru_order.clear();
-    let table = db.get_table_mut("LEGACY").unwrap();
+    db.clear_loaded_tables();
+    let table_handle = db.get_table_mut("LEGACY").unwrap();
+    let table = table_handle.write();
     assert_eq!(table.records.len(), 51);
     assert_eq!(table.records["OLD7"], record("LEGACY7"));
     assert_eq!(table.records["NEW"], record("FRESH"));
@@ -216,7 +217,7 @@ fn test_deferred_flush_batches_writes() {
     db.flush_interval = std::time::Duration::from_secs(3_600);
 
     for i in 0..10 {
-        db.get_table_mut("T").unwrap().insert_record(&format!("K{i}"), record("V"));
+        db.get_table_mut("T").unwrap().write().insert_record(&format!("K{i}"), record("V"));
         db.note_write().unwrap();
     }
     assert!(db.has_pending_writes(), "writes should still be buffered");
@@ -229,7 +230,7 @@ fn test_deferred_flush_batches_writes() {
 
     // Hitting the batch size flushes.
     db.flush_max_pending = 11;
-    db.get_table_mut("T").unwrap().insert_record("K10", record("V"));
+    db.get_table_mut("T").unwrap().write().insert_record("K10", record("V"));
     db.note_write().unwrap();
     assert!(!db.has_pending_writes());
     assert_eq!(db.pending_write_count(), 0);
@@ -249,7 +250,7 @@ fn test_durable_writes_flush_immediately() {
     db.create_table("T").unwrap();
     db.durable_writes = true;
 
-    db.get_table_mut("T").unwrap().insert_record("K1", record("V1"));
+    db.get_table_mut("T").unwrap().write().insert_record("K1", record("V1"));
     db.note_write().unwrap();
     assert!(!db.has_pending_writes());
 
@@ -436,24 +437,25 @@ fn test_a_group_without_a_trailer_still_loads_before_the_first_full_rewrite() {
 fn test_another_process_sees_flushed_changes() {
     let guard = fresh_dir("hashfile_visibility");
     let base = guard.path();
-    let mut writer = Database::new(base, Some(isolated_config())).unwrap();
+    let writer = Database::new(base, Some(isolated_config())).unwrap();
     writer.create_account("VIS", Some(base)).unwrap();
     writer.logto("VIS").unwrap();
     writer.create_table("T").unwrap();
-    writer.get_table_mut("T").unwrap().insert_record("K1", record("FIRST"));
+    writer.get_table_mut("T").unwrap().write().insert_record("K1", record("FIRST"));
     writer.save().unwrap();
 
-    let mut reader = Database::new(base, Some(isolated_config())).unwrap();
+    let reader = Database::new(base, Some(isolated_config())).unwrap();
     reader.logto("VIS").unwrap();
-    assert_eq!(reader.get_table_mut("T").unwrap().records.len(), 1);
+    assert_eq!(reader.get_table_mut("T").unwrap().write().records.len(), 1);
 
-    writer.get_table_mut("T").unwrap().insert_record("K2", record("SECOND"));
+    writer.get_table_mut("T").unwrap().write().insert_record("K2", record("SECOND"));
     writer.save().unwrap();
 
     // The meta file's flush counter changes on every write, so the reader's
     // cached snapshot is detected as stale even within a filesystem timestamp
     // granularity.
-    let table = reader.get_table_mut("T").unwrap();
+    let table_handle = reader.get_table_mut("T").unwrap();
+    let table = table_handle.write();
     assert_eq!(table.records.len(), 2);
     assert_eq!(table.records["K2"], record("SECOND"));
 }

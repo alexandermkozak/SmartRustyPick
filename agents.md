@@ -69,6 +69,26 @@ AI agents have been responsible for several critical improvements and fixes in t
 - **Certificate Management:** Implemented `GENERATE.CERT` in the `SYSTEM` account, allowing users to create signed
   client certificates and PKCS#12 (.pfx) files directly from the database CLI for simplified secure remote access setup.
 
+### 5. Concurrency
+
+- **Per-file locking:** The database-wide write lock is gone. Each loaded file carries its own lock, and every other
+  piece of shared state - the account registry, the file listings, the client authorizations, the flush accounting -
+  has one of its own, so `READ`, `WRITE`, `DELETE` and `QUERY` need only a shared borrow of the database and lock the
+  one file they name. Writers to different files no longer exclude each other, and a flush excludes the file being
+  flushed rather than every writer in the system.
+- **The rule to keep:** locks go **outer database lock → account registry → file listings → table map → eviction order
+  → one file → the small caches**, and a thread holds **at most one file lock at a time**. A command that ever needs
+  two takes them in `(account, file)` order. Never start a full flush while holding a file's lock: the flush locks each
+  dirty file in turn and will deadlock on the one already held. `docs/storage.md` and the module documentation on
+  `Database` say the same thing at more length; the tests learned it the hard way, by hanging.
+- **The rule is checked, not just written down:** a debug build counts the file locks each thread holds and panics where
+  a flush starts if any is outstanding, so a violation fails with a message naming the rule rather than stopping the
+  process silently. It earned its place on the first run, catching a flush under a held lock that had survived only
+  because the file happened to be clean at that moment. The counting compiles out of a release build.
+- **Batching per file:** an ordinary buffered write flushes the file it touched, not the whole database, so a burst on
+  one file no longer drags every other file through a flush with it. The connection-close, ticker and shutdown paths
+  still flush everything, which is what bounds how long any change can stay in memory.
+
 ### TLS Troubleshooting
 
 - **UnknownIssuer error (on server logs)**: The client certificate is not signed by a CA the server trusts. Correct by

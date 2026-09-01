@@ -160,7 +160,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                 let db_for_task = db.clone();
                 let tp = thumbprint.clone();
                 let client = tokio::task::spawn_blocking(move || {
-                    read_lock(&db_for_task).authorized_clients.get(&tp).cloned()
+                    read_lock(&db_for_task).client_for_thumbprint(&tp)
                 })
                     .await
                     .ok()
@@ -251,7 +251,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                         let tp = thumbprint.clone();
                         let command = req.command.to_uppercase();
                         let handled = tokio::task::spawn_blocking(move || {
-                            let info = read_lock(&db_for_task).authorized_clients.get(&tp).cloned();
+                            let info = read_lock(&db_for_task).client_for_thumbprint(&tp);
                             info.map(|info| handle_request(req, &db_for_task, &info))
                         })
                             .await;

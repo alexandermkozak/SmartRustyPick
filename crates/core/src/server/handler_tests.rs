@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 #[test]
 fn test_handle_request_read_write() {
     let dir = TempDir::new("handler");
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("SERVER_TEST").unwrap();
 
     let db_arc = Arc::new(RwLock::new(db));
@@ -66,9 +66,9 @@ fn test_create_and_delete_file_target_the_requested_account() {
     // the account named in the request rather than on `current_account`.
     let dir = TempDir::new("server_create_file");
     let base_dir = dir.path();
-    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let db = Database::new(base_dir, Some(isolated_config())).unwrap();
     db.create_account("FILE_TEST", None).unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
@@ -140,7 +140,7 @@ fn test_create_file_durable_flag_is_honoured() {
     let dir = TempDir::new("server_durable_file");
     let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("DUR_TEST", None).unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
     db.durable_writes = false;
     db.flush_max_pending = 1_000;
     db.flush_interval = std::time::Duration::from_secs(3_600);
@@ -197,7 +197,7 @@ fn test_set_file_promotes_and_demotes_an_existing_file() {
     let dir = TempDir::new("server_set_file");
     let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("SET_TEST", None).unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
     db.durable_writes = false;
     db.flush_max_pending = 1_000;
     db.flush_interval = std::time::Duration::from_secs(3_600);
@@ -303,7 +303,7 @@ fn test_set_file_promotes_and_demotes_an_existing_file() {
 #[test]
 fn test_handle_request_query_select() {
     let dir = TempDir::new("server_query");
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("QUERY_TEST").unwrap();
     db.logto("QUERY_TEST").unwrap();
 
@@ -363,9 +363,9 @@ fn test_management_commands_report_accounts_files_and_statistics() {
     // between them they have to describe an account without ever handing back a
     // record.
     let dir = TempDir::new("server_management");
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("MGMT_TEST").unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
@@ -435,10 +435,10 @@ fn test_management_commands_report_accounts_files_and_statistics() {
 #[test]
 fn test_management_commands_respect_the_clients_permissions() {
     let dir = TempDir::new("server_management_perm");
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("VISIBLE").unwrap();
     db.create_test_account("HIDDEN").unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let client_info = ClientInfo {
@@ -477,9 +477,9 @@ fn test_management_commands_respect_the_clients_permissions() {
 #[test]
 fn test_list_conns_and_server_stats_describe_the_running_server() {
     let dir = TempDir::new("server_stats");
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.add_authorized_client("reporting-bot", "AB12CD", vec!["SALES".to_string()], false).unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
@@ -514,7 +514,7 @@ fn test_list_conns_and_server_stats_describe_the_running_server() {
 /// keep the directory alive for as long as they use it.
 fn exploded_test_db(label: &str) -> (TempDir, Arc<RwLock<Database>>, ClientInfo) {
     let dir = TempDir::new(label);
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("EXP_TEST").unwrap();
     db.logto("EXP_TEST").unwrap();
     let client_info = ClientInfo {
@@ -679,10 +679,10 @@ fn test_unexploded_select_sends_no_positions() {
 /// A database with one account and one file, and a client that may reach it.
 fn dictionary_test_db(name: &str) -> (TempDir, Arc<RwLock<Database>>, ClientInfo) {
     let dir = TempDir::new(name);
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("DICT_TEST", None).unwrap();
     db.create_table_for_account("DICT_TEST", "STOCK").unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let client_info = ClientInfo {
         name: "dict_client".to_string(),
@@ -905,8 +905,8 @@ fn test_an_account_created_over_the_protocol_gets_a_dir_file() {
     // prompt - and until then the per-file durability flags had nowhere to live.
     let dir = TempDir::new("protocol_dir_file");
     let base_dir = dir.path();
-    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
-    db.current_account = String::new();
+    let db = Database::new(base_dir, Some(isolated_config())).unwrap();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
@@ -952,9 +952,11 @@ fn test_an_account_created_over_the_protocol_gets_a_dir_file() {
     // Both files are in the account's own listing, not just on the filesystem.
     assert_eq!(listed(&db_arc), vec!["DIR", "LEDGER", "STOCK"]);
     let dir_entries = {
-        let mut db = crate::server::handler::write_lock(&db_arc);
-        let table = db.get_table_mut_for_account("NEW_ACC", "DIR").unwrap();
+        let db = crate::server::handler::write_lock(&db_arc);
+        let table_handle = db.get_table_mut_for_account("NEW_ACC", "DIR").unwrap();
+        let table = table_handle.write();
         let mut keys: Vec<String> = table.records.keys().cloned().collect();
+        drop(table);
         keys.sort();
         keys
     };
@@ -967,10 +969,10 @@ fn test_a_file_created_in_an_account_that_lost_its_dir_brings_it_back() {
     // was dropped, must not stay unlisted for the rest of their lives.
     let dir = TempDir::new("protocol_dir_recovery");
     let base_dir = dir.path();
-    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
+    let db = Database::new(base_dir, Some(isolated_config())).unwrap();
     db.create_account("OLD_ACC", None).unwrap();
     db.delete_table_for_account("OLD_ACC", "DIR").unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
@@ -1007,8 +1009,8 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
     // command has to work without any account context at all.
     let dir = TempDir::new("protocol_demo_account");
     let base_dir = dir.path();
-    let mut db = Database::new(base_dir, Some(isolated_config())).unwrap();
-    db.current_account = String::new();
+    let db = Database::new(base_dir, Some(isolated_config())).unwrap();
+    db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
     let admin = ClientInfo {
@@ -1051,7 +1053,7 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
     assert_eq!(read("PRODUCTS", "P1")["price"], "1200.00");
 
     // The account left no login behind on a server that had none.
-    assert_eq!(crate::server::handler::read_lock(&db_arc).current_account, "");
+    assert_eq!(crate::server::handler::read_lock(&db_arc).current_account(), "");
 
     // Making it twice is refused rather than half-rebuilt over the first.
     let resp = handle_request(
@@ -1066,9 +1068,9 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
 #[test]
 fn test_the_demo_account_is_admin_only_and_needs_a_name() {
     let dir = TempDir::new("protocol_demo_guards");
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("PLAIN", None).unwrap();
-    db.current_account = String::new();
+    db.set_current_account("");
     let db_arc = Arc::new(RwLock::new(db));
 
     let ordinary = ClientInfo {
@@ -1096,4 +1098,94 @@ fn test_the_demo_account_is_admin_only_and_needs_a_name() {
         &admin,
     );
     assert_eq!(resp.message.unwrap(), "Account name not specified");
+}
+
+/// Each hot path takes a fixed, small number of file locks per request.
+///
+/// This pins the shape of a regression nothing else here would catch. An extra
+/// `get_table_mut` in a command handler is free under one database-wide lock -
+/// it runs inside a lock already held - but with a lock per file it is another
+/// acquisition of the very lock every connection writing that file is queueing
+/// for. It cost about 20% of the throughput of eight writers on one file, and
+/// no threshold in the performance suite could have caught it: run-to-run
+/// variance there is several times wider than the regression, and the
+/// distinct-versus-shared ratio recorded beside it would have *improved*,
+/// because the arm that got slower is its denominator.
+///
+/// The count, unlike the throughput it governs, is exact. These are upper
+/// bounds: taking fewer locks passes, and taking more is a failure to argue
+/// with rather than a number to nudge.
+///
+/// Debug builds only - the counter compiles out of a release build.
+#[cfg(debug_assertions)]
+#[test]
+fn the_hot_paths_lock_a_file_a_fixed_number_of_times() {
+    use crate::db::engine::table_locks_taken;
+
+    let dir = TempDir::new("hot_path_locks");
+    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_test_account("HOT").unwrap();
+    // Nothing may flush mid-request: a flush legitimately takes the file again,
+    // and this is measuring the request, not the flush.
+    db.flush_interval = std::time::Duration::from_secs(3_600);
+    db.flush_max_pending = 1_000_000;
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let client_info = ClientInfo {
+        name: "hot_client".to_string(),
+        thumbprint: "hot_tp".to_string(),
+        allowed_accounts: vec!["HOT".to_string()],
+        is_admin: false,
+    };
+
+    let request = |command: &str, key: &str| Request {
+        command: command.to_string(),
+        account: Some("HOT".to_string()),
+        file: Some("USERS".to_string()),
+        key: Some(key.to_string()),
+        ..Default::default()
+    };
+    let write = |key: &str| Request {
+        data: Some(serde_json::Value::String("Alice^alice@example.com".to_string())),
+        ..request("WRITE", key)
+    };
+
+    // Steady state is what the counts describe: the first write to a file also
+    // loads it and reads the account's durability flags out of DIR.
+    for i in 0..3 {
+        assert_eq!(handle_request(write(&format!("warm{i}")), &db_arc, &client_info).status, "OK");
+    }
+
+    let structured = Request {
+        structured_data: Some(serde_json::json!({ "name": "Bob" })),
+        ..request("WRITE", "structured")
+    };
+    let query = Request { key: None, ..request("QUERY", "") };
+
+    // (what it does, the request, how many times it may lock the file, why)
+    let budgets: Vec<(&str, Request, u64, &str)> = vec![
+        ("WRITE", write("written"), 2,
+         "the freshness check, then the write itself"),
+        ("WRITE with structured data", structured, 3,
+         "the same two, plus reading the dictionary to deserialize the record"),
+        ("READ", request("READ", "warm0"), 2,
+         "the freshness check, then serving the record"),
+        ("QUERY", query, 2,
+         "the freshness check, then the scan"),
+        ("DELETE", request("DELETE", "warm1"), 2,
+         "the freshness check, then the removal"),
+    ];
+
+    for (what, req, budget, why) in budgets {
+        let before = table_locks_taken();
+        let response = handle_request(req, &db_arc, &client_info);
+        let taken = table_locks_taken() - before;
+        assert_eq!(response.status, "OK", "{what} did not succeed: {:?}", response.message);
+        assert!(
+            taken <= budget,
+            "{what} locked the file {taken} times, over its budget of {budget} ({why}). \
+             Every acquisition beyond the budget is one more turn in the queue for a file \
+             other connections are working on. Resolve the file once and reuse the handle.",
+        );
+    }
 }

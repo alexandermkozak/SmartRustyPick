@@ -9,6 +9,7 @@ editor = "nano"
 
 # Storage engine settings (optional)
 # records_per_group = 16
+# max_loaded_tables = 64
 # durable_writes = false
 # How much of a flush is forced to the disk: "never" (default), "meta" or
 # "always". Files marked DURABLE use "always" unless this is set explicitly.

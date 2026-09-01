@@ -14,7 +14,7 @@ fn record(value: &str) -> Record {
 }
 
 fn open_account(base: &str, account: &str) -> Database {
-    let mut db = Database::new(base, Some(isolated_config())).unwrap();
+    let db = Database::new(base, Some(isolated_config())).unwrap();
     db.create_account(account, Some(base)).unwrap();
     db.logto(account).unwrap();
     // DIR comes with the account; nothing here has to ask for it.
@@ -22,7 +22,7 @@ fn open_account(base: &str, account: &str) -> Database {
 }
 
 fn dir_flag(db: &mut Database, table: &str) -> String {
-    db.get_table_mut("DIR").unwrap().records[table]
+    db.get_table_mut("DIR").unwrap().write().records[table]
         .get_field_display_string(DIR_DURABLE_IDX)
 }
 
@@ -45,7 +45,7 @@ fn test_create_file_records_durable_flag_in_dir() {
     assert!(db.is_table_durable("CRITICAL"));
     assert!(!db.is_table_durable("NORMAL"));
     // The flag is described in the DIR dictionary, so it shows up in listings.
-    assert!(db.get_table_mut("DIR").unwrap().dictionary.contains_key("DURABLE"));
+    assert!(db.get_table_mut("DIR").unwrap().write().dictionary.contains_key("DURABLE"));
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn test_durable_flag_survives_reopen_and_can_be_cleared() {
     let guard = fresh_dir("durability_reopen");
     let base = guard.path();
     {
-        let mut db = open_account(base, "DUR3");
+        let db = open_account(base, "DUR3");
         db.create_table_durable("CRITICAL", true).unwrap();
         db.save().unwrap();
     }
@@ -132,7 +132,7 @@ fn write_then_die(base: &str) -> ! {
     db.flush_max_pending = 1_000_000;
     db.flush_interval = std::time::Duration::from_secs(3_600);
 
-    db.get_table_mut("LEDGER").unwrap().insert_record("K1", record("ACKED"));
+    db.get_table_mut("LEDGER").unwrap().write().insert_record("K1", record("ACKED"));
     db.note_write_for("KILL", "LEDGER").unwrap();
 
     let pid = std::process::id().to_string();
@@ -168,9 +168,10 @@ fn test_durable_write_survives_sigkill() {
         .collect();
     assert!(leftovers.is_empty(), "a crash left a temporary file behind: {:?}", leftovers);
 
-    let mut db = Database::new(base, Some(isolated_config())).unwrap();
+    let db = Database::new(base, Some(isolated_config())).unwrap();
     db.logto("KILL").unwrap();
-    let table = db.get_table_mut("LEDGER").unwrap();
+    let table_handle = db.get_table_mut("LEDGER").unwrap();
+    let table = table_handle.write();
     assert_eq!(table.records.len(), 1, "the acknowledged write did not survive the kill");
     assert_eq!(table.records["K1"], record("ACKED"));
 }
@@ -189,12 +190,12 @@ fn test_durable_file_flushes_while_others_stay_buffered() {
     db.flush_interval = std::time::Duration::from_secs(3_600);
     db.save().unwrap();
 
-    db.get_table_mut("NORMAL").unwrap().insert_record("K1", record("V1"));
+    db.get_table_mut("NORMAL").unwrap().write().insert_record("K1", record("V1"));
     db.note_write_for("DUR4", "NORMAL").unwrap();
     assert!(db.has_pending_writes(), "a normal file should still be buffered");
     assert_eq!(on_disk_count(base, "NORMAL"), 0);
 
-    db.get_table_mut("CRITICAL").unwrap().insert_record("K1", record("V1"));
+    db.get_table_mut("CRITICAL").unwrap().write().insert_record("K1", record("V1"));
     db.note_write_for("DUR4", "CRITICAL").unwrap();
     assert!(!db.has_pending_writes(), "a durable file must flush before acknowledging");
     assert_eq!(on_disk_count(base, "CRITICAL"), 1);
@@ -214,7 +215,7 @@ fn test_promoting_a_file_flushes_what_it_had_buffered() {
     db.flush_interval = std::time::Duration::from_secs(3_600);
     db.save().unwrap();
 
-    db.get_table_mut("LEDGER").unwrap().insert_record("K1", record("BUFFERED"));
+    db.get_table_mut("LEDGER").unwrap().write().insert_record("K1", record("BUFFERED"));
     db.note_write_for("DUR5", "LEDGER").unwrap();
     assert!(db.has_pending_writes(), "the write should still be buffered");
     assert_eq!(on_disk_count(base, "LEDGER"), 0);
@@ -225,7 +226,7 @@ fn test_promoting_a_file_flushes_what_it_had_buffered() {
     assert_eq!(dir_flag(&mut db, "LEDGER"), "Y");
 
     // And from here on every write goes straight to disk.
-    db.get_table_mut("LEDGER").unwrap().insert_record("K2", record("ACKED"));
+    db.get_table_mut("LEDGER").unwrap().write().insert_record("K2", record("ACKED"));
     db.note_write_for("DUR5", "LEDGER").unwrap();
     assert_eq!(on_disk_count(base, "LEDGER"), 2);
 }
@@ -244,7 +245,7 @@ fn test_demoting_a_file_returns_it_to_the_buffered_policy() {
     db.set_table_durable("LEDGER", false).unwrap();
     assert_eq!(dir_flag(&mut db, "LEDGER"), "");
 
-    db.get_table_mut("LEDGER").unwrap().insert_record("K1", record("V1"));
+    db.get_table_mut("LEDGER").unwrap().write().insert_record("K1", record("V1"));
     db.note_write_for("DUR6", "LEDGER").unwrap();
     assert!(db.has_pending_writes(), "a demoted file buffers like any other");
     assert_eq!(on_disk_count(base, "LEDGER"), 0);
@@ -254,7 +255,7 @@ fn test_demoting_a_file_returns_it_to_the_buffered_policy() {
 fn test_the_durability_flag_is_only_settable_on_a_file_that_can_carry_one() {
     let guard = fresh_dir("durability_refusals");
     let base = guard.path();
-    let mut db = open_account(base, "DUR7");
+    let db = open_account(base, "DUR7");
     db.create_table("LEDGER").unwrap();
 
     let missing = db.set_table_durable("NOPE", true).unwrap_err();

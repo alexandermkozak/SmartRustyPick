@@ -56,7 +56,7 @@ fn test_compare_values() {
 #[test]
 fn test_parse_query_trim() {
     let dir = TempDir::new("parse_query_trim");
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
 
     let q = db.parse_query("T1", &["WITH", "NAME", "=", "  John  "]).unwrap();
     if let QueryNode::Condition(c) = q {
@@ -67,7 +67,7 @@ fn test_parse_query_trim() {
 #[test]
 fn test_parse_query() {
     let dir = TempDir::new("parse_query");
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
 
     // Simple WITH
     let q1 = db.parse_query("T1", &["WITH", "NAME", "=", "John"]);
@@ -105,7 +105,7 @@ fn test_parse_query() {
 #[test]
 fn test_query_execution() {
     let dir = TempDir::new("query_exec");
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_test_account("QUERY_TEST").unwrap();
     db.logto("QUERY_TEST").unwrap();
 
@@ -141,10 +141,12 @@ fn test_query_execution() {
     // Multi-value match (if it was supported/tested)
     // Create a record with multi-values
     {
-        let users = db.get_table_mut("USERS").unwrap();
+        let users_handle = db.get_table_mut("USERS").unwrap();
+        let mut users = users_handle.write();
         let rec = Record::from_display_string("Skill]Rust]Go^rust@example.com");
         users.records.insert("3".to_string(), rec);
         users.touch_all();
+        drop(users);
         db.save().unwrap();
     }
 
@@ -157,14 +159,15 @@ fn test_query_execution() {
 #[test]
 fn test_query_with_conversion() {
     let dir = TempDir::new("query_conv");
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("ACC1", None).unwrap();
     db.logto("ACC1").unwrap();
 
     // 1. Create a table and dictionary entry for PRICE with MD2
     db.create_table("PRODUCTS").unwrap();
     {
-        let table = db.get_table_mut("PRODUCTS").unwrap();
+        let table_handle = db.get_table_mut("PRODUCTS").unwrap();
+        let mut table = table_handle.write();
 
         // PRICE dictionary entry
         let mut price_dict = Record::new();
@@ -182,7 +185,8 @@ fn test_query_with_conversion() {
 
     // 2. Add a record with PRICE = 200 (internal format for 2.00)
     {
-        let table = db.get_table_mut("PRODUCTS").unwrap();
+        let table_handle = db.get_table_mut("PRODUCTS").unwrap();
+        let mut table = table_handle.write();
         let mut record = Record::new();
         record.fields.push(Field { values: vec![Value { sub_values: vec!["200".to_string()] }] });
         table.records.insert("P1".to_string(), record);
@@ -207,13 +211,14 @@ fn test_query_with_conversion() {
 #[test]
 fn test_query_with_wildcards() {
     let dir = TempDir::new("query_wildcards");
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("ACC1", None).unwrap();
     db.logto("ACC1").unwrap();
 
     db.create_table("ITEMS").unwrap();
     {
-        let table = db.get_table_mut("ITEMS").unwrap();
+        let table_handle = db.get_table_mut("ITEMS").unwrap();
+        let mut table = table_handle.write();
 
         // Dictionary entry for DESC
         let mut desc_dict = Record::new();
@@ -315,12 +320,13 @@ fn test_parse_sort_specs() {
 /// the directory alive for as long as they use it.
 fn setup_sort_db(label: &str) -> (TempDir, Database) {
     let dir = TempDir::new(label);
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("ACC1", None).unwrap();
     db.logto("ACC1").unwrap();
     db.create_table("PRODUCTS").unwrap();
     {
-        let table = db.get_table_mut("PRODUCTS").unwrap();
+        let table_handle = db.get_table_mut("PRODUCTS").unwrap();
+        let mut table = table_handle.write();
         table.dictionary.insert("DESC".to_string(), Record::from_display_string("1^DESCRIPTION^L^20"));
         table.dictionary.insert("PRICE".to_string(), Record::from_display_string("2^PRICE^R^10"));
         table.dictionary.insert("CREATE.DATE".to_string(), Record::from_display_string("3^CREATED^L^10"));
@@ -335,7 +341,7 @@ fn setup_sort_db(label: &str) -> (TempDir, Database) {
 
 #[test]
 fn test_sort_results_ascending_and_descending() {
-    let (_dir, mut db) = setup_sort_db("sort_asc_dsnd");
+    let (_dir, db) = setup_sort_db("sort_asc_dsnd");
 
     let ids = |res: &Vec<(String, Record)>| res.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
 
@@ -358,7 +364,7 @@ fn test_sort_results_ascending_and_descending() {
 
 #[test]
 fn test_sort_results_multiple_keys() {
-    let (_dir, mut db) = setup_sort_db("sort_multi");
+    let (_dir, db) = setup_sort_db("sort_multi");
 
     // BY PRICE BY.DSND CREATE.DATE
     let (clause, specs) = parse_sort_specs(&["WITH", "DESC", "=", "[new]", "BY", "PRICE", "BY.DSND", "CREATE.DATE"]);
@@ -373,9 +379,10 @@ fn test_sort_results_multiple_keys() {
 
 #[test]
 fn test_sort_text_is_case_insensitive() {
-    let (_dir, mut db) = setup_sort_db("sort_case");
+    let (_dir, db) = setup_sort_db("sort_case");
     {
-        let table = db.get_table_mut("PRODUCTS").unwrap();
+        let table_handle = db.get_table_mut("PRODUCTS").unwrap();
+        let mut table = table_handle.write();
         table.records.insert("P5".to_string(), Record::from_display_string("Ztest^2^2024-06-01"));
         table.records.insert("P10".to_string(), Record::from_display_string("test!^2^2024-06-01"));
     }
@@ -393,7 +400,7 @@ fn test_sort_text_is_case_insensitive() {
 
 #[test]
 fn test_sort_keys_and_unknown_field() {
-    let (_dir, mut db) = setup_sort_db("sort_keys");
+    let (_dir, db) = setup_sort_db("sort_keys");
 
     let (_, specs) = parse_sort_specs(&["BY.DSND", "DESC"]);
     let keys = vec!["P1".to_string(), "P2".to_string(), "P3".to_string(), "P4".to_string()];
@@ -542,11 +549,12 @@ fn test_parse_query_consuming_reports_its_end() {
 /// for as long as they use it.
 fn roles_db(label: &str) -> (TempDir, Database) {
     let dir = TempDir::new(label);
-    let mut db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
     db.create_account("ACC", None).unwrap();
     db.logto("ACC").unwrap();
     db.create_table("USERS").unwrap();
-    let table = db.get_table_mut("USERS").unwrap();
+    let table_handle = db.get_table_mut("USERS").unwrap();
+    let mut table = table_handle.write();
     table.dictionary.insert("NAME".to_string(), Record::from_display_string("1^NAME^L^15"));
     table.dictionary.insert("ROLES".to_string(), Record::from_display_string("2^ROLES^L^20"));
     table.records.insert("1".to_string(), Record::from_display_string("John^ADMIN]DEV]TEST"));
@@ -554,18 +562,20 @@ fn roles_db(label: &str) -> (TempDir, Database) {
     table.records.insert("3".to_string(), Record::from_display_string("Zed^SALES"));
     table.mark_dict_dirty();
     table.touch_all();
+    drop(table);
     (dir, db)
 }
 
 #[test]
 fn test_query_exploded_matches_every_position() {
-    let (_dir, mut db) = roles_db("exploded_positions");
+    let (_dir, db) = roles_db("exploded_positions");
 
     let query = db.parse_query("USERS", &["WITH", "ROLES", "=", "[TEST]"]).unwrap();
     let explode = ExplodeSpec { field_name: "ROLES".to_string(), condition: None };
-    let table = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table_handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table = table_handle.read();
 
-    let rows = Database::query_exploded_in(table, false, Some(&query), Some(&explode), None);
+    let rows = Database::query_exploded_in(&table, false, Some(&query), Some(&explode), None);
     let seen: Vec<(&str, Option<ValuePosition>)> =
         rows.iter().map(|(e, _)| (e.key.as_str(), e.position)).collect();
 
@@ -582,9 +592,10 @@ fn test_query_exploded_matches_every_position() {
 fn test_query_exploded_without_criterion_is_one_row_per_value() {
     let (_dir, db) = roles_db("exploded_bare");
     let explode = ExplodeSpec { field_name: "ROLES".to_string(), condition: None };
-    let table = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table_handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table = table_handle.read();
 
-    let rows = Database::query_exploded_in(table, false, None, Some(&explode), None);
+    let rows = Database::query_exploded_in(&table, false, None, Some(&explode), None);
     let seen: Vec<(&str, Option<ValuePosition>)> =
         rows.iter().map(|(e, _)| (e.key.as_str(), e.position)).collect();
 
@@ -603,14 +614,15 @@ fn test_query_exploded_without_criterion_is_one_row_per_value() {
 
 #[test]
 fn test_query_exploded_unions_positions_across_conditions() {
-    let (_dir, mut db) = roles_db("exploded_union");
+    let (_dir, db) = roles_db("exploded_union");
 
     // Two conditions on the exploded field: both their positions become rows.
     let query = db.parse_query("USERS", &["WITH", "ROLES", "=", "DEV", "OR", "ROLES", "=", "ADMIN"]).unwrap();
     let explode = ExplodeSpec { field_name: "ROLES".to_string(), condition: None };
-    let table = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table_handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table = table_handle.read();
 
-    let rows = Database::query_exploded_in(table, false, Some(&query), Some(&explode), None);
+    let rows = Database::query_exploded_in(&table, false, Some(&query), Some(&explode), None);
     let seen: Vec<(&str, Option<ValuePosition>)> =
         rows.iter().map(|(e, _)| (e.key.as_str(), e.position)).collect();
     assert_eq!(seen, vec![
@@ -623,15 +635,16 @@ fn test_query_exploded_unions_positions_across_conditions() {
 
 #[test]
 fn test_query_exploded_keeps_records_matched_on_another_field() {
-    let (_dir, mut db) = roles_db("exploded_other_field");
+    let (_dir, db) = roles_db("exploded_other_field");
 
     // The criterion names NAME, not the exploded ROLES. Inclusion is still the
     // query's decision, so the record survives - as one unexploded row.
     let query = db.parse_query("USERS", &["WITH", "NAME", "=", "Zed"]).unwrap();
     let explode = ExplodeSpec { field_name: "ROLES".to_string(), condition: None };
-    let table = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table_handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table = table_handle.read();
 
-    let rows = Database::query_exploded_in(table, false, Some(&query), Some(&explode), None);
+    let rows = Database::query_exploded_in(&table, false, Some(&query), Some(&explode), None);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0.key, "3");
     assert_eq!(rows[0].0.position, Some(ValuePosition::value(0)));
@@ -640,17 +653,18 @@ fn test_query_exploded_keeps_records_matched_on_another_field() {
 
 #[test]
 fn test_query_exploded_without_spec_is_an_ordinary_selection() {
-    let (_dir, mut db) = roles_db("exploded_none");
+    let (_dir, db) = roles_db("exploded_none");
     let query = db.parse_query("USERS", &["WITH", "ROLES", "=", "[TEST]"]).unwrap();
-    let table = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table_handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table = table_handle.read();
 
-    let rows = Database::query_exploded_in(table, false, Some(&query), None, None);
+    let rows = Database::query_exploded_in(&table, false, Some(&query), None, None);
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|(e, _)| e.position.is_none()));
 
     // An unknown explode field is no explode at all rather than an error.
     let unknown = ExplodeSpec { field_name: "NOPE".to_string(), condition: None };
-    let rows = Database::query_exploded_in(table, false, Some(&query), Some(&unknown), None);
+    let rows = Database::query_exploded_in(&table, false, Some(&query), Some(&unknown), None);
     assert!(rows.iter().all(|(e, _)| e.position.is_none()));
 
 }
@@ -659,13 +673,14 @@ fn test_query_exploded_without_spec_is_an_ordinary_selection() {
 fn test_sort_entries_uses_the_exploded_value() {
     let (_dir, db) = roles_db("sort_entries");
     let explode = ExplodeSpec { field_name: "ROLES".to_string(), condition: None };
-    let table = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table_handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table = table_handle.read();
 
-    let mut rows = Database::query_exploded_in(table, false, None, Some(&explode), None);
-    let explode_idx = Database::explode_field_index(table, Some(&explode));
+    let mut rows = Database::query_exploded_in(&table, false, None, Some(&explode), None);
+    let explode_idx = Database::explode_field_index(&table, Some(&explode));
     assert_eq!(explode_idx, Some(1));
     let specs = vec![SortSpec { field_name: "ROLES".to_string(), descending: false }];
-    Database::sort_entries_in(table, &mut rows, &specs, explode_idx);
+    Database::sort_entries_in(&table, &mut rows, &specs, explode_idx);
 
     // Ordered by each row's own value, not by the whole joined field - which
     // would have kept every one of record 1's rows together.

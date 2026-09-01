@@ -97,7 +97,8 @@ fn bench_explode(c: &mut Criterion) {
 
     let node = db.parse_query(TABLE, &["WITH", "ROLES", "=", "ROLE42"]).unwrap();
     let explode = ExplodeSpec { field_name: "ROLES".to_string(), condition: None };
-    let table = db.get_table_read_only_for_account(common::ACCOUNT, TABLE).unwrap();
+    let table_handle = db.get_table_read_only_for_account(common::ACCOUNT, TABLE).unwrap();
+    let table = &*table_handle.read();
 
     // A bare explode gives every value a row; the criterion matches one
     // position in `MV_VALUES - 1` records per hundred.
@@ -158,7 +159,8 @@ fn bench_serialize(c: &mut Criterion) {
     let mut group = c.benchmark_group("serialize");
     group.throughput(Throughput::Elements(RECORDS as u64));
     for (name, table_name) in [("single_valued", "PLAIN"), ("multivalued", "MULTI")] {
-        let table = db.get_table_read_only_for_account(common::ACCOUNT, table_name).unwrap();
+        let table_handle = db.get_table_read_only_for_account(common::ACCOUNT, table_name).unwrap();
+        let table = &*table_handle.read();
         let schema = db.record_schema(table);
         let records: Vec<&Record> = table.records.values().collect();
 

@@ -33,8 +33,9 @@ fn bench_save(c: &mut Criterion) {
 
     group.bench_function("load_from_disk", |b| {
         b.iter(|| {
-            let mut db = common::new_db(black_box(dir.path()));
-            let table = db.get_table_mut_for_account(common::ACCOUNT, TABLE).unwrap();
+            let db = common::new_db(black_box(dir.path()));
+            let table_handle = db.get_table_mut_for_account(common::ACCOUNT, TABLE).unwrap();
+            let table = table_handle.write();
             black_box(table.records.len())
         })
     });
@@ -59,8 +60,10 @@ fn bench_incremental_write(c: &mut Criterion) {
             let mut counter = 0usize;
             b.iter(|| {
                 counter += 1;
-                let table = db.get_table_mut_for_account(common::ACCOUNT, TABLE).unwrap();
+                let table_handle = db.get_table_mut_for_account(common::ACCOUNT, TABLE).unwrap();
+                let mut table = table_handle.write();
                 table.insert_record(&format!("K{:06}", counter % records), common::sample_record(counter));
+                drop(table);
                 db.save().unwrap();
                 black_box(counter)
             })

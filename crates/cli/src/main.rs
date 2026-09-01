@@ -73,7 +73,7 @@ fn main() -> io::Result<()> {
     loop {
         {
             let db_lock = db.read().unwrap();
-            if !db_lock.current_account.is_empty() {
+            if !db_lock.has_no_current_account() {
                 break;
             }
         }
@@ -120,7 +120,7 @@ fn main() -> io::Result<()> {
     loop {
         let prompt = {
             let db_lock = db.read().unwrap();
-            let acc = db_lock.current_account.clone();
+            let acc = db_lock.current_account();
             if acc.is_empty() {
                 "PICK> ".to_string()
             } else {
@@ -186,7 +186,7 @@ fn main() -> io::Result<()> {
             }
             "CREATE.ACCOUNT" => {
                 let mut db_lock = db.write().unwrap();
-                if db_lock.current_account == "SYSTEM" {
+                if db_lock.is_current_account("SYSTEM") {
                     handle_create_account(&mut db_lock, &parts);
                 } else {
                     println!("Unknown command: {}", command);
@@ -194,7 +194,7 @@ fn main() -> io::Result<()> {
             }
             "CREATE.TEST.ACCOUNT" => {
                 let mut db_lock = db.write().unwrap();
-                if db_lock.current_account == "SYSTEM" {
+                if db_lock.is_current_account("SYSTEM") {
                     handle_create_test_account(&mut db_lock, &parts);
                 } else {
                     println!("Unknown command: {}", command);
@@ -202,7 +202,7 @@ fn main() -> io::Result<()> {
             }
             "DELETE.ACCOUNT" => {
                 let mut db_lock = db.write().unwrap();
-                if db_lock.current_account == "SYSTEM" {
+                if db_lock.is_current_account("SYSTEM") {
                     handle_delete_account(&mut db_lock, &parts);
                 } else {
                     println!("Unknown command: {}", command);
@@ -218,7 +218,7 @@ fn main() -> io::Result<()> {
             }
             "AUTHORIZE.CONN" => {
                 let mut db_lock = db.write().unwrap();
-                if db_lock.current_account == "SYSTEM" {
+                if db_lock.is_current_account("SYSTEM") {
                     handle_authorize_conn(&mut db_lock, &parts);
                 } else {
                     println!("Unknown command: {}", command);
@@ -226,7 +226,7 @@ fn main() -> io::Result<()> {
             }
             "ADD.CLIENT.ACCOUNT" => {
                 let mut db_lock = db.write().unwrap();
-                if db_lock.current_account == "SYSTEM" {
+                if db_lock.is_current_account("SYSTEM") {
                     handle_add_client_account(&mut db_lock, &parts);
                 } else {
                     println!("Unknown command: {}", command);
@@ -234,7 +234,7 @@ fn main() -> io::Result<()> {
             }
             "REMOVE.CLIENT.ACCOUNT" => {
                 let mut db_lock = db.write().unwrap();
-                if db_lock.current_account == "SYSTEM" {
+                if db_lock.is_current_account("SYSTEM") {
                     handle_remove_client_account(&mut db_lock, &parts);
                 } else {
                     println!("Unknown command: {}", command);
@@ -242,7 +242,7 @@ fn main() -> io::Result<()> {
             }
             "DEAUTHORIZE.CONN" => {
                 let mut db_lock = db.write().unwrap();
-                if db_lock.current_account == "SYSTEM" {
+                if db_lock.is_current_account("SYSTEM") {
                     handle_deauthorize_conn(&mut db_lock, &parts);
                 } else {
                     println!("Unknown command: {}", command);
@@ -250,7 +250,7 @@ fn main() -> io::Result<()> {
             }
             "LIST.CONNS" => {
                 let mut db_lock = db.write().unwrap();
-                if db_lock.current_account == "SYSTEM" {
+                if db_lock.is_current_account("SYSTEM") {
                     handle_list_conns(&mut db_lock);
                 } else {
                     println!("Unknown command: {}", command);
@@ -258,7 +258,7 @@ fn main() -> io::Result<()> {
             }
             "GENERATE.CERT" => {
                 let mut db_lock = db.write().unwrap();
-                if db_lock.current_account == "SYSTEM" {
+                if db_lock.is_current_account("SYSTEM") {
                     handle_generate_cert(&mut db_lock, &parts, &config);
                 } else {
                     println!("Unknown command: {}", command);
@@ -273,7 +273,7 @@ fn main() -> io::Result<()> {
             }
             "HELP" => {
                 let db_lock = db.read().unwrap();
-                print_help(&db_lock.current_account);
+                print_help(&db_lock.current_account());
             }
             "EXIT" | "QUIT" => break,
             _ => println!("Unknown command: {}", command),
@@ -304,20 +304,25 @@ fn handle_set(db: &mut Database, parts: &[&str]) {
     let key = parts[offset + 1].to_string();
     let data = parts[offset + 2..].join(" ");
 
-    let table = match db.get_table_mut(table_name) {
-        Ok(t) => t,
+    let handle = match db.get_table_mut(table_name) {
+        Ok(handle) => handle,
         Err(e) => {
             println!("Error: {}", e);
             return;
         }
     };
-    let record = Record::from_display_string(&data);
-    if is_dict {
-        table.dictionary.insert(key, record);
-        table.mark_dict_dirty();
-    } else {
-        table.insert_record(&key, record);
+    {
+        let mut table = handle.write();
+        let record = Record::from_display_string(&data);
+        if is_dict {
+            table.dictionary.insert(key, record);
+            table.mark_dict_dirty();
+        } else {
+            table.insert_record(&key, record);
+        }
     }
+    // The file's lock goes before the flush: a flush locks each dirty file in
+    // turn, and would wait here for a lock this thread is holding.
     if table_name == "$CLIENTS" {
         let _ = db.save();
     }
@@ -351,7 +356,8 @@ fn handle_get(db: &mut Database, parts: &[&str]) {
         }
 
         if let Some(keys) = keys_from_list {
-            if let Some(table) = db.get_table(table_name) {
+            if let Some(handle) = db.get_table(table_name) {
+                let table = handle.read();
                 let map = if is_dict { &table.dictionary } else { &table.records };
                 for key in &keys {
                     if let Some(record) = map.get(key) {
@@ -369,7 +375,8 @@ fn handle_get(db: &mut Database, parts: &[&str]) {
 
     let key = parts[offset + 1];
 
-    if let Some(table) = db.get_table(table_name) {
+    if let Some(handle) = db.get_table(table_name) {
+        let table = handle.read();
         let map = if is_dict { &table.dictionary } else { &table.records };
         if let Some(record) = map.get(key) {
             println!("{}", record.to_display_string());
@@ -410,13 +417,14 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
         }
 
         if used_list {
-            let table = match db.get_table_mut(table_name) {
-                Ok(t) => t,
+            let handle = match db.get_table_mut(table_name) {
+                Ok(handle) => handle,
                 Err(e) => {
                     println!("Error: {}", e);
                     return;
                 }
             };
+            let mut table = handle.write();
             let mut count = 0;
             for key in keys_to_delete {
                 let removed = if is_dict {
@@ -444,21 +452,26 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
 
     let key = parts[offset + 1];
 
-    let table = match db.get_table_mut(table_name) {
-        Ok(t) => t,
+    let handle = match db.get_table_mut(table_name) {
+        Ok(handle) => handle,
         Err(e) => {
             println!("Error: {}", e);
             return;
         }
     };
-    let removed = if is_dict {
-        let removed = table.dictionary.remove(key).is_some();
-        if removed { table.mark_dict_dirty(); }
-        removed
-    } else {
-        table.remove_record(key).is_some()
+    let removed = {
+        let mut table = handle.write();
+        if is_dict {
+            let removed = table.dictionary.remove(key).is_some();
+            if removed { table.mark_dict_dirty(); }
+            removed
+        } else {
+            table.remove_record(key).is_some()
+        }
     };
     if removed {
+        // Flushing locks each dirty file in turn, so the file's own lock has to
+        // be released before asking for one.
         if table_name == "$CLIENTS" {
             let _ = db.save();
         }
@@ -538,12 +551,12 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
     let use_select_list = from_list.is_some();
 
     let lines = {
-        let account = db.current_account.clone();
-        let _ = db.get_table_mut_for_account(&account, table_name);
-        let Some(table) = db.get_table_read_only_for_account(&account, table_name) else {
+        let account = db.current_account();
+        let Ok(handle) = db.get_table_mut_for_account(&account, table_name) else {
             println!("TABLE NOT FOUND");
             return;
         };
+        let table = &*handle.read();
 
         let mut rows: Vec<(SelectEntry, &Record)> = match &from_list {
             // The list already decided which rows exist, positions included;
@@ -569,7 +582,7 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
             let explode_field = explode.as_ref()
                 .map(|e| e.field_name.clone())
                 .or(list_explode_field.clone());
-            report::render_list(db, table_name, &columns, explode_field.as_deref(), &rows)
+            report::render_list(table, &columns, explode_field.as_deref(), &rows)
         }
     };
 
@@ -647,12 +660,12 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
     }
 
     let entries: Vec<SelectEntry> = {
-        let account = db.current_account.clone();
-        let _ = db.get_table_mut_for_account(&account, table_name);
-        let Some(table) = db.get_table_read_only_for_account(&account, table_name) else {
+        let account = db.current_account();
+        let Ok(handle) = db.get_table_mut_for_account(&account, table_name) else {
             println!("TABLE NOT FOUND");
             return;
         };
+        let table = &*handle.read();
         let mut rows = Database::query_exploded_in(table, is_dict, query.as_ref(), explode.as_ref(), keys_to_filter.as_deref());
         let explode_idx = Database::explode_field_index(table, explode.as_ref());
         Database::sort_entries_in(table, &mut rows, &sort_specs, explode_idx);
@@ -692,7 +705,8 @@ fn handle_edit(db: &mut Database, parts: &[&str], config: &Config) {
     let key = parts[offset + 1];
 
     // Get current record content or empty string
-    let current_content = if let Some(table) = db.get_table(table_name) {
+    let current_content = if let Some(handle) = db.get_table(table_name) {
+        let table = handle.read();
         let map = if is_dict { &table.dictionary } else { &table.records };
         if let Some(record) = map.get(key) {
             record.to_edit_string()
@@ -733,21 +747,25 @@ fn handle_edit(db: &mut Database, parts: &[&str], config: &Config) {
             // Read back the content
             match std::fs::read_to_string(&temp_file_path) {
                 Ok(new_content) => {
-                    let table = match db.get_table_mut(table_name) {
-                        Ok(t) => t,
+                    let handle = match db.get_table_mut(table_name) {
+                        Ok(handle) => handle,
                         Err(e) => {
                             println!("Error: {}", e);
                             return;
                         }
                     };
-                    let record = Record::from_edit_string(&new_content);
-                    let key_str = key.to_string();
-                    if is_dict {
-                        table.dictionary.insert(key_str, record);
-                        table.mark_dict_dirty();
-                    } else {
-                        table.insert_record(&key_str, record);
+                    {
+                        let mut table = handle.write();
+                        let record = Record::from_edit_string(&new_content);
+                        let key_str = key.to_string();
+                        if is_dict {
+                            table.dictionary.insert(key_str, record);
+                            table.mark_dict_dirty();
+                        } else {
+                            table.insert_record(&key_str, record);
+                        }
                     }
+                    // Released before the flush: a flush wants this file's lock too.
                     if table_name == "$CLIENTS" {
                         let _ = db.save();
                     }
@@ -791,7 +809,8 @@ fn handle_ct(db: &mut Database, parts: &[&str]) {
         }
 
         if let Some(keys) = keys_from_list {
-            if let Some(table) = db.get_table(table_name) {
+            if let Some(handle) = db.get_table(table_name) {
+                let table = handle.read();
                 let map = if is_dict { &table.dictionary } else { &table.records };
                 for (idx, key) in keys.iter().enumerate() {
                     if let Some(record) = map.get(key) {
@@ -813,7 +832,8 @@ fn handle_ct(db: &mut Database, parts: &[&str]) {
 
     let key = parts[offset + 1];
 
-    if let Some(table) = db.get_table(table_name) {
+    if let Some(handle) = db.get_table(table_name) {
+        let table = handle.read();
         let map = if is_dict { &table.dictionary } else { &table.records };
         if let Some(record) = map.get(key) {
             print_record_fields(record);
@@ -939,14 +959,14 @@ fn handle_save_list(db: &mut Database, parts: &[&str]) {
     let record = Record::from_bytes(&data);
     // `$SAVEDLISTS` lives in SYSTEM, so this is a missing file rather than an
     // impossibility - report it instead of taking the whole CLI down.
-    let table = match db.get_table_mut("$SAVEDLISTS") {
-        Ok(t) => t,
+    let handle = match db.get_table_mut("$SAVEDLISTS") {
+        Ok(handle) => handle,
         Err(e) => {
             println!("Error: {}", e);
             return;
         }
     };
-    table.insert_record(list_name, record);
+    handle.write().insert_record(list_name, record);
 
     db.active_select_list = None;
     println!("List '{}' saved", list_name);
@@ -974,13 +994,14 @@ fn handle_get_list(db: &mut Database, parts: &[&str]) {
 
     let list_name = parts[1];
 
-    let table = match db.get_table_mut("$SAVEDLISTS") {
-        Ok(t) => t,
+    let handle = match db.get_table_mut("$SAVEDLISTS") {
+        Ok(handle) => handle,
         Err(e) => {
             println!("Error: {}", e);
             return;
         }
     };
+    let table = handle.read();
     if let Some(record) = table.records.get(list_name) {
         let data = record.to_bytes();
         let fields: Vec<&[u8]> = data.split(|&b| b == smart_rusty_pick_core::db::FM).collect();
@@ -1084,7 +1105,7 @@ fn handle_create_account(db: &mut Database, parts: &[&str]) {
 }
 
 fn handle_create_test_account(db: &mut Database, parts: &[&str]) {
-    if db.current_account != "SYSTEM" {
+    if !db.is_current_account("SYSTEM") {
         println!("Error: CREATE.TEST.ACCOUNT can only be executed from the SYSTEM account");
         return;
     }
@@ -1124,7 +1145,7 @@ fn handle_logto(db: &mut Database, parts: &[&str]) {
 }
 
 fn handle_list_files(db: &mut Database) {
-    if db.current_account.is_empty() {
+    if db.has_no_current_account() {
         println!("Error: Not logged into an account");
         return;
     }
@@ -1132,7 +1153,8 @@ fn handle_list_files(db: &mut Database) {
     // Collected first: reading each file's durability needs the database again,
     // and the DIR table is borrowed from it here.
     let listed: Vec<String> = match db.get_table("DIR") {
-        Some(table) => {
+        Some(handle) => {
+            let table = handle.read();
             let mut files: Vec<_> = table.records.iter()
                 .filter(|(_, record)| {
                     record.fields.get(0)
@@ -1259,7 +1281,8 @@ fn handle_list_conns(db: &mut Database) {
     println!("{:-<20} {:-<64}", "", "");
 
     let _ = db.run_in_system_account(|db| {
-        let table = db.get_table_mut("$CLIENTS")?;
+        let handle = db.get_table_mut("$CLIENTS")?;
+        let table = handle.read();
         let mut names: Vec<_> = table.records.keys().cloned().collect();
         names.sort();
 

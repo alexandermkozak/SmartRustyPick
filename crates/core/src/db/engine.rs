@@ -4,24 +4,251 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime};
 
+/// How a table is addressed in the cache: the account it belongs to and its
+/// name, because two accounts may each have a file of the same name.
+pub type TableKey = (String, String);
+
+/// Takes a shared lock, ignoring poisoning.
+///
+/// A panic in one request leaves the state it was reading no less readable than
+/// it was, so refusing every later request would turn one failed command into a
+/// dead server. Every lock in the engine is taken through these three helpers,
+/// so that decision is made once.
+pub(crate) fn rlock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Takes an exclusive lock, ignoring poisoning. See [`rlock`].
+pub(crate) fn wlock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Takes a mutex, ignoring poisoning. See [`rlock`].
+pub(crate) fn mlock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A loaded table together with the lock that guards it.
+///
+/// Handing this out rather than a borrow of the database is what lets two
+/// connections write to two different files at the same time: the caller locks
+/// the one table it names, and everybody else is only ever blocked by somebody
+/// working on that same table. A handle is cheap to clone and keeps the table
+/// alive even if the cache evicts it in the meantime.
+///
+/// See the module documentation on [`Database`] for the order locks have to be
+/// taken in.
+#[derive(Clone)]
+pub struct TableHandle(Arc<RwLock<Table>>);
+
+impl TableHandle {
+    fn new(table: Table) -> Self {
+        TableHandle(Arc::new(RwLock::new(table)))
+    }
+
+    /// Reads the table. Any number of readers may hold this at once.
+    pub fn read(&self) -> TableRead<'_> {
+        note_guard_taken();
+        TableRead(rlock(&self.0))
+    }
+
+    /// Takes the table exclusively, for a write or a flush.
+    pub fn write(&self) -> TableWrite<'_> {
+        note_guard_taken();
+        TableWrite(wlock(&self.0))
+    }
+
+    /// How many handles to this table exist, the cache's own included. The
+    /// cache uses it to leave a table somebody is working on alone.
+    fn refs(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+}
+
+/// A shared borrow of a table's contents. Behaves as a `&Table`.
+pub struct TableRead<'a>(RwLockReadGuard<'a, Table>);
+
+impl std::ops::Deref for TableRead<'_> {
+    type Target = Table;
+
+    fn deref(&self) -> &Table {
+        &self.0
+    }
+}
+
+impl Drop for TableRead<'_> {
+    fn drop(&mut self) {
+        note_guard_released();
+    }
+}
+
+/// An exclusive borrow of a table's contents. Behaves as a `&mut Table`.
+pub struct TableWrite<'a>(RwLockWriteGuard<'a, Table>);
+
+impl std::ops::Deref for TableWrite<'_> {
+    type Target = Table;
+
+    fn deref(&self) -> &Table {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for TableWrite<'_> {
+    fn deref_mut(&mut self) -> &mut Table {
+        &mut self.0
+    }
+}
+
+impl Drop for TableWrite<'_> {
+    fn drop(&mut self) {
+        note_guard_released();
+    }
+}
+
+// A debug build counts the table guards each thread is holding, so that
+// breaking the locking rule below is a panic naming the rule rather than a
+// process that stops and says nothing. Nothing is counted in a release build:
+// the two calls compile away and the guards are their inner locks.
+#[cfg(debug_assertions)]
+thread_local! {
+    static HELD_TABLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Every file lock this thread has ever taken. A request on a hot path is
+    /// meant to take a fixed, small number of these, and a lookup added to one
+    /// of those paths costs a lock on the file every connection is contending
+    /// for - which is a few percent of throughput, not a test failure, unless
+    /// something counts it. See `table_locks_taken`.
+    static TAKEN_TABLES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many file locks this thread has taken since it started.
+///
+/// Debug builds only, and only meaningful as a difference across a request.
+/// The hot-path tests use it to count the work one request does, because that
+/// count is a property a test can pin exactly, where the throughput it governs
+/// is far too noisy to assert on.
+#[cfg(debug_assertions)]
+pub fn table_locks_taken() -> u64 {
+    TAKEN_TABLES.with(|taken| taken.get())
+}
+
+#[cfg(debug_assertions)]
+fn note_guard_taken() {
+    HELD_TABLES.with(|held| held.set(held.get() + 1));
+    TAKEN_TABLES.with(|taken| taken.set(taken.get() + 1));
+}
+
+#[cfg(not(debug_assertions))]
+fn note_guard_taken() {}
+
+#[cfg(debug_assertions)]
+fn note_guard_released() {
+    HELD_TABLES.with(|held| held.set(held.get().saturating_sub(1)));
+}
+
+#[cfg(not(debug_assertions))]
+fn note_guard_released() {}
+
+/// Panics, in a debug build, if the calling thread is holding a table guard.
+///
+/// A flush locks every dirty file in turn, so starting one while holding a file
+/// means waiting for a lock this thread already holds. That is a hang, and a
+/// hang is the one failure that arrives with nothing to read - no assertion, no
+/// stack, just a test that never finishes. Checking it where the flush starts
+/// turns it into a panic that names the caller and the rule it broke.
+fn assert_no_table_guard_held(what: &str) {
+    #[cfg(debug_assertions)]
+    HELD_TABLES.with(|held| {
+        let count = held.get();
+        assert_eq!(
+            count, 0,
+            "{what} started while this thread holds {count} table guard(s). \
+             A flush locks each dirty file in turn and would wait for a lock it \
+             already holds; release the table before flushing. See the locking \
+             rules on `Database`.",
+        );
+    });
+    let _ = what;
+}
+
+/// What one file has buffered since it was last written out.
+///
+/// Batching per file rather than per database is what keeps a burst on one file
+/// from dragging every other file through a flush - and through that file's
+/// lock - with it.
+#[derive(Clone, Copy)]
+struct WriteMark {
+    pending: usize,
+    last_flush: Instant,
+}
+
+impl WriteMark {
+    fn fresh() -> Self {
+        WriteMark { pending: 0, last_flush: Instant::now() }
+    }
+}
+
+/// The client authorizations, kept together because they are read on every
+/// request and rewritten as a unit whenever `SYSTEM/$CLIENTS` changes.
+#[derive(Default)]
+struct ClientRegistry {
+    certs: HashSet<String>,
+    clients: HashMap<String, ClientInfo>,
+    stamp: Option<TableStamp>,
+}
+
+/// The database: a set of accounts, each holding files, cached in memory and
+/// flushed to disk in batches.
+///
+/// # Locking
+///
+/// A `Database` is shared between every connection, and all of its mutable
+/// state sits behind interior locks so that ordinary record work - `READ`,
+/// `WRITE`, `DELETE`, `QUERY` - needs nothing more than `&self`. Writers to
+/// *different* files therefore never exclude each other, and a flush only
+/// excludes the file being flushed.
+///
+/// Locks must be acquired in this order, and never the other way round:
+///
+/// 1. the outer `RwLock` a server wraps the database in, if any
+///    ([`crate::server::SharedDb`]);
+/// 2. `accounts_config` / `registry_stamp` - the account registry;
+/// 3. `available_tables` / `available_stamps` - which files each account has;
+/// 4. `tables` - the map of loaded tables;
+/// 5. `lru_order`;
+/// 6. a single table, through its [`TableHandle`];
+/// 7. `durable_tables`, `clients`, `pending_writes`, `last_flush`.
+///
+/// A thread holds **at most one table lock at a time**. Nothing in the engine
+/// needs two, and a command that ever does must take them in `(account, name)`
+/// order. In particular [`Database::save`] must never be called while a table
+/// guard is held: it locks each dirty table in turn and would deadlock on the
+/// one already held.
+///
+/// That last rule is checked rather than merely written down. A debug build
+/// counts the table guards each thread holds and panics where a flush starts if
+/// any is outstanding, so breaking it fails with a message naming the rule
+/// instead of stopping the process and saying nothing. The count and the check
+/// compile out of a release build.
 pub struct Database {
     pub storage_dir: String,
-    pub current_account: String,
-    pub accounts_config: Record,
-    pub loaded_tables: HashMap<(String, String), Table>,
-    pub available_tables: HashMap<String, HashSet<String>>,
-    pub available_stamps: HashMap<String, Option<SystemTime>>,
-    pub lru_order: VecDeque<(String, String)>,
+    session_account: RwLock<String>,
+    accounts_config: RwLock<Record>,
+    /// Tables in memory, each behind its own lock. The map lock guards
+    /// membership only; the tables themselves are locked individually.
+    tables: RwLock<HashMap<TableKey, TableHandle>>,
+    available_tables: RwLock<HashMap<String, HashSet<String>>>,
+    available_stamps: RwLock<HashMap<String, Option<SystemTime>>>,
+    lru_order: Mutex<VecDeque<TableKey>>,
     pub max_loaded: usize,
     pub active_select_list: Option<SelectList>,
     pub remote_select_lists: HashMap<String, SelectList>,
     pub remote_select_cursors: HashMap<String, usize>,
-    pub authorized_certs: HashSet<String>,
-    pub authorized_clients: HashMap<String, ClientInfo>,
-    pub registry_stamp: Option<(Option<SystemTime>, u64)>,
-    pub clients_stamp: Option<TableStamp>,
+    clients: RwLock<ClientRegistry>,
+    registry_stamp: Mutex<Option<(Option<SystemTime>, u64)>>,
     pub log_detail: String,
     pub max_log_records: usize,
     /// Records each group aims to hold; drives the dynamic modulus.
@@ -43,12 +270,17 @@ pub struct Database {
     /// Flush once this many writes have accumulated, so a burst is batched but
     /// never grows without bound.
     pub flush_max_pending: usize,
-    pending_writes: usize,
-    last_flush: Instant,
+    pending_writes: AtomicUsize,
+    last_flush: Mutex<Instant>,
+    /// Per-file flush batching, for the writes that name the file they touch.
+    write_marks: Mutex<HashMap<TableKey, WriteMark>>,
     /// Per-file durability flags read from the DIR file, cached so the write
     /// path does not touch the filesystem on every request.
-    durable_tables: HashMap<(String, String), bool>,
+    durable_tables: RwLock<HashMap<TableKey, bool>>,
 }
+
+/// The display width a field without a dictionary width is rendered at.
+pub const DEFAULT_FIELD_WIDTH: usize = 10;
 
 /// A table's dictionary resolved to just what serialization emits, so a result
 /// set pays the dictionary walk once. Built by
@@ -114,22 +346,22 @@ impl Table {
 impl Database {
     pub fn new(base_storage_dir: &str, config: Option<crate::config::Config>) -> io::Result<Self> {
         let config = config.unwrap_or_else(crate::config::Config::load);
-        let mut db = Database {
+        let db = Database {
             storage_dir: base_storage_dir.to_string(),
-            current_account: String::new(),
-            accounts_config: Record::new(),
-            loaded_tables: HashMap::new(),
-            available_tables: HashMap::new(),
-            available_stamps: HashMap::new(),
-            lru_order: VecDeque::new(),
-            max_loaded: 10,
+            session_account: RwLock::new(String::new()),
+            accounts_config: RwLock::new(Record::new()),
+            tables: RwLock::new(HashMap::new()),
+            available_tables: RwLock::new(HashMap::new()),
+            available_stamps: RwLock::new(HashMap::new()),
+            lru_order: Mutex::new(VecDeque::new()),
+            max_loaded: config.max_loaded_tables
+                .filter(|n| *n > 0)
+                .unwrap_or(crate::config::DEFAULT_MAX_LOADED_TABLES),
             active_select_list: None,
             remote_select_lists: HashMap::new(),
             remote_select_cursors: HashMap::new(),
-            authorized_certs: HashSet::new(),
-            authorized_clients: HashMap::new(),
-            registry_stamp: None,
-            clients_stamp: None,
+            clients: RwLock::new(ClientRegistry::default()),
+            registry_stamp: Mutex::new(None),
             log_detail: config.log_detail.unwrap_or_else(|| "normal".to_string()),
             max_log_records: config.max_log_records.unwrap_or(100),
             records_per_group: config.records_per_group
@@ -143,9 +375,10 @@ impl Database {
             },
             flush_interval: Duration::from_millis(config.flush_interval_ms.unwrap_or(250)),
             flush_max_pending: config.flush_max_pending.unwrap_or(256).max(1),
-            pending_writes: 0,
-            last_flush: Instant::now(),
-            durable_tables: HashMap::new(),
+            pending_writes: AtomicUsize::new(0),
+            last_flush: Mutex::new(Instant::now()),
+            write_marks: Mutex::new(HashMap::new()),
+            durable_tables: RwLock::new(HashMap::new()),
         };
 
         if !Path::new(&db.storage_dir).exists() {
@@ -167,7 +400,7 @@ impl Database {
         Ok(db)
     }
 
-    fn load_account_registry(&mut self) -> io::Result<()> {
+    fn load_account_registry(&self) -> io::Result<()> {
         let registry_path = format!("{}/accounts.reg", self.storage_dir);
         // Stamp before reading, so a write racing with our read is caught next time.
         let stamp = Self::file_stamp(&registry_path);
@@ -175,19 +408,19 @@ impl Database {
             let mut map = HashMap::new();
             Self::load_section(&mut map, &registry_path)?;
             if let Some(reg_rec) = map.remove("registry") {
-                self.accounts_config = reg_rec;
+                *wlock(&self.accounts_config) = reg_rec;
             }
         }
-        self.registry_stamp = Some(stamp);
+        *mlock(&self.registry_stamp) = Some(stamp);
         Ok(())
     }
 
     /// Re-reads `accounts.reg` when it was modified by another process, so accounts
     /// created or deleted elsewhere are visible without restarting.
-    pub fn refresh_account_registry(&mut self) -> io::Result<()> {
+    pub fn refresh_account_registry(&self) -> io::Result<()> {
         let registry_path = format!("{}/accounts.reg", self.storage_dir);
         let stamp = Self::file_stamp(&registry_path);
-        if self.registry_stamp == Some(stamp) {
+        if *mlock(&self.registry_stamp) == Some(stamp) {
             return Ok(());
         }
         self.load_account_registry()
@@ -195,32 +428,31 @@ impl Database {
 
     /// Reloads the client authorization map when `SYSTEM/$CLIENTS` changed on disk,
     /// so authorizations and revocations made by another process take effect.
-    pub fn refresh_clients_if_stale(&mut self) -> io::Result<()> {
+    pub fn refresh_clients_if_stale(&self) -> io::Result<()> {
         let _ = self.refresh_account_registry();
         if self.get_account_dir("SYSTEM").is_none() {
             return Ok(());
         }
         let stamp = self.disk_stamp("SYSTEM", "$CLIENTS");
-        if self.clients_stamp == Some(stamp) {
+        if rlock(&self.clients).stamp == Some(stamp) {
             return Ok(());
         }
-        self.run_in_system_account(|db| db.load_clients_from_table())
+        self.load_clients_from_table()
     }
 
-    fn ensure_system_account(&mut self) -> io::Result<()> {
+    fn ensure_system_account(&self) -> io::Result<()> {
         if self.get_account_dir("SYSTEM").is_none() {
             self.create_account("SYSTEM", None)?;
         }
         Ok(())
     }
 
-    fn ensure_system_files(&mut self) -> io::Result<()> {
+    fn ensure_system_files(&self) -> io::Result<()> {
         let account = "SYSTEM".to_string();
         self.ensure_available_tables(&account)?;
-        let available = self.available_tables.get(&account).unwrap();
 
         // Ensure DIR file exists for SYSTEM account
-        if !available.contains("DIR") {
+        if !self.account_has_table(&account, "DIR") {
             self.create_table("DIR")?;
             self.sync_dir_file()?;
         }
@@ -228,20 +460,23 @@ impl Database {
         // Ensure mandatory system files exist
         let system_files = vec!["$LOGS", "$ACCOUNTS", "$CLIENTS", "$SAVEDLISTS"];
         for file in system_files {
-            if !self.available_tables.get(&account).unwrap().contains(file) {
+            if !self.account_has_table(&account, file) {
                 self.create_table(file)?;
             }
         }
 
         // Populate $ACCOUNTS with all non-SYSTEM accounts
         let mut accounts_to_list = Vec::new();
-        if let Some(names_field) = self.accounts_config.fields.get(0) {
-            if let Some(dirs_field) = self.accounts_config.fields.get(1) {
-                for (i, v) in names_field.values.iter().enumerate() {
-                    if let Some(name) = v.sub_values.get(0) {
-                        if name != "SYSTEM" {
-                            if let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.get(0)) {
-                                accounts_to_list.push((name.clone(), dir.clone()));
+        {
+            let config = rlock(&self.accounts_config);
+            if let Some(names_field) = config.fields.get(0) {
+                if let Some(dirs_field) = config.fields.get(1) {
+                    for (i, v) in names_field.values.iter().enumerate() {
+                        if let Some(name) = v.sub_values.get(0) {
+                            if name != "SYSTEM" {
+                                if let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.get(0)) {
+                                    accounts_to_list.push((name.clone(), dir.clone()));
+                                }
                             }
                         }
                     }
@@ -249,7 +484,8 @@ impl Database {
             }
         }
 
-        let accounts_table = self.get_table_mut("$ACCOUNTS")?;
+        let handle = self.get_table_mut("$ACCOUNTS")?;
+        let mut accounts_table = handle.write();
         for (name, dir) in accounts_to_list {
             let mut record = Record::new();
             while record.fields.len() <= SYS_ACCOUNTS_PATH_IDX {
@@ -262,7 +498,7 @@ impl Database {
         Ok(())
     }
 
-    fn migrate_legacy_certs(&mut self) -> io::Result<()> {
+    fn migrate_legacy_certs(&self) -> io::Result<()> {
         let certs_path = format!("{}/certs.reg", self.storage_dir);
         if !Path::new(&certs_path).exists() {
             return Ok(());
@@ -272,7 +508,8 @@ impl Database {
         if Self::load_section(&mut map, &certs_path).is_ok() {
             if let Some(certs_rec) = map.remove("certs") {
                 if let Some(f) = certs_rec.fields.get(0) {
-                    let table = self.get_table_mut("$CLIENTS")?;
+                    let handle = self.get_table_mut("$CLIENTS")?;
+                    let mut table = handle.write();
                     for v in &f.values {
                         for sv in &v.sub_values {
                             if !sv.is_empty() {
@@ -300,13 +537,11 @@ impl Database {
         Ok(())
     }
 
-    fn self_heal_system_dictionaries(&mut self) -> io::Result<()> {
-        let account = self.current_account.clone();
+    fn self_heal_system_dictionaries(&self) -> io::Result<()> {
+        let account = self.current_account();
         if account.is_empty() { return Ok(()); }
-        self.ensure_available_tables(&account)?;
-        let table_names: Vec<String> = self.available_tables.get(&account).unwrap().iter()
-            .filter(|n| n.starts_with('$') || *n == "DIR")
-            .cloned()
+        let table_names: Vec<String> = self.account_tables(&account)?.into_iter()
+            .filter(|n| n.starts_with('$') || n == "DIR")
             .collect();
 
         let mut any_updated = false;
@@ -322,9 +557,10 @@ impl Database {
         Ok(())
     }
 
-    fn ensure_default_dictionaries(&mut self, table_name: &str) -> io::Result<bool> {
+    fn ensure_default_dictionaries(&self, table_name: &str) -> io::Result<bool> {
         let mut updated = false;
-        let table = self.get_table_mut(table_name)?;
+        let handle = self.get_table_mut(table_name)?;
+        let mut table = handle.write();
         match table_name {
             "$LOGS" => {
                 if !table.dictionary.contains_key("MESSAGE") {
@@ -384,10 +620,11 @@ impl Database {
         Ok(updated)
     }
 
-    pub fn load_clients_from_table(&mut self) -> io::Result<()> {
+    pub fn load_clients_from_table(&self) -> io::Result<()> {
         // Stamp before reading, so a concurrent write is detected on the next check.
         let stamp = self.disk_stamp("SYSTEM", "$CLIENTS");
-        let table = self.get_table_mut("$CLIENTS")?;
+        let handle = self.get_table_mut_for_account("SYSTEM", "$CLIENTS")?;
+        let table = handle.read();
         let mut clients = Vec::new();
         for (name, record) in table.records.iter() {
             if let Some(tp) = record.fields.get(SYS_CLIENTS_THUMBPRINT_IDX).and_then(|f| f.values.get(0)).and_then(|v| v.sub_values.get(0)) {
@@ -415,22 +652,51 @@ impl Database {
                 });
             }
         }
-        self.clients_stamp = Some(stamp);
-        self.authorized_clients.clear();
-        self.authorized_certs.clear();
+        // The table lock goes before the registry lock is taken, so a reader of
+        // the authorizations never waits on a table read.
+        drop(table);
+        let mut registry = wlock(&self.clients);
+        registry.stamp = Some(stamp);
+        registry.clients.clear();
+        registry.certs.clear();
         for info in clients {
             let tp = info.thumbprint.clone();
-            self.authorized_clients.insert(tp.clone(), info);
-            self.authorized_certs.insert(tp);
+            registry.clients.insert(tp.clone(), info);
+            registry.certs.insert(tp);
         }
         Ok(())
     }
 
-    pub fn run_in_system_account<F, R>(&mut self, f: F) -> io::Result<R>
+    /// The client authorized to present `thumbprint`, if any. Cloned rather
+    /// than borrowed so the registry lock is released before the request that
+    /// asked runs.
+    pub fn client_for_thumbprint(&self, thumbprint: &str) -> Option<ClientInfo> {
+        rlock(&self.clients).clients.get(thumbprint).cloned()
+    }
+
+    /// Every authorized client, by name.
+    pub fn authorized_clients(&self) -> Vec<ClientInfo> {
+        let mut clients: Vec<ClientInfo> = rlock(&self.clients).clients.values().cloned().collect();
+        clients.sort_by(|a, b| a.name.cmp(&b.name));
+        clients
+    }
+
+    /// How many clients are authorized, for a management view that only wants
+    /// the number.
+    pub fn authorized_client_count(&self) -> usize {
+        rlock(&self.clients).clients.len()
+    }
+
+    /// The thumbprints of every authorized certificate.
+    pub fn authorized_certs(&self) -> HashSet<String> {
+        rlock(&self.clients).certs.clone()
+    }
+
+    pub fn run_in_system_account<F, R>(&self, f: F) -> io::Result<R>
     where
-        F: FnOnce(&mut Database) -> io::Result<R>,
+        F: FnOnce(&Database) -> io::Result<R>,
     {
-        let original_account = self.current_account.clone();
+        let original_account = self.current_account();
         let already_system = original_account == "SYSTEM";
 
         if !already_system {
@@ -449,27 +715,56 @@ impl Database {
         result
     }
 
-    pub fn logout(&mut self) {
-        let _ = self.save();
-        self.current_account = String::new();
+    /// The account this session is logged into.
+    ///
+    /// A session concept: the server names the account on every request and
+    /// never looks at this, so it exists for the CLI and for the `SYSTEM`
+    /// excursions [`run_in_system_account`](Self::run_in_system_account) makes.
+    pub fn current_account(&self) -> String {
+        rlock(&self.session_account).clone()
     }
 
-    pub fn logto(&mut self, account_name: &str) -> io::Result<()> {
+    /// True when this session is logged into `account`.
+    pub fn is_current_account(&self, account: &str) -> bool {
+        *rlock(&self.session_account) == account
+    }
+
+    /// True when no account is selected.
+    pub fn has_no_current_account(&self) -> bool {
+        rlock(&self.session_account).is_empty()
+    }
+
+    /// Points the session at `account` without flushing anything.
+    ///
+    /// [`logto`](Self::logto) is the ordinary way in, and saves the previous
+    /// account's pending changes first; this is for a caller that wants only
+    /// the label changed - clearing it to run as no-one in particular, or the
+    /// `SYSTEM` excursions that put it back afterwards.
+    pub fn set_current_account(&self, account: &str) {
+        *wlock(&self.session_account) = account.to_string();
+    }
+
+    pub fn logout(&self) {
+        let _ = self.save();
+        self.set_current_account("");
+    }
+
+    pub fn logto(&self, account_name: &str) -> io::Result<()> {
         if self.get_account_dir(account_name).is_none() {
             let _ = self.refresh_account_registry();
         }
         let _account_dir = self.get_account_dir(account_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", account_name)))?;
 
-        if self.current_account != account_name {
+        if !self.is_current_account(account_name) {
             self.save()?; // Save current account's dirty tables
-            self.current_account = account_name.to_string();
+            self.set_current_account(account_name);
             self.ensure_available_tables(account_name)?;
         }
         Ok(())
     }
 
-    fn ensure_available_tables(&mut self, account_name: &str) -> io::Result<()> {
+    fn ensure_available_tables(&self, account_name: &str) -> io::Result<()> {
         if self.get_account_dir(account_name).is_none() {
             let _ = self.refresh_account_registry();
         }
@@ -479,18 +774,34 @@ impl Database {
         // Re-scan whenever the account directory changed on disk, so tables created
         // by another process (e.g. the server while a local CLI is attached) are visible.
         let dir_stamp = Self::dir_modified(&account_dir);
-        if self.available_tables.contains_key(account_name)
-            && self.available_stamps.get(account_name) == Some(&dir_stamp) {
+        if rlock(&self.available_tables).contains_key(account_name)
+            && rlock(&self.available_stamps).get(account_name) == Some(&dir_stamp) {
             return Ok(());
         }
 
         self.scan_available_tables(account_name)
     }
 
+    /// True when the account is known to hold a file of this name, refreshing
+    /// the listing first. Reading through the lock rather than handing out a
+    /// borrow keeps the listing lock out of the caller's hands.
+    fn account_has_table(&self, account: &str, name: &str) -> bool {
+        self.ensure_available_tables(account).is_ok()
+            && rlock(&self.available_tables).get(account).map(|s| s.contains(name)).unwrap_or(false)
+    }
+
+    /// Every file the account holds, unsorted.
+    fn account_tables(&self, account: &str) -> io::Result<Vec<String>> {
+        self.ensure_available_tables(account)?;
+        Ok(rlock(&self.available_tables).get(account)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+
     /// Unconditionally re-reads the account directory. Used when the cached listing
     /// does not contain a requested table, because directory mtime resolution is
     /// coarse on some filesystems and may hide a freshly created table.
-    fn scan_available_tables(&mut self, account_name: &str) -> io::Result<()> {
+    fn scan_available_tables(&self, account_name: &str) -> io::Result<()> {
         let account_dir = self.get_account_dir(account_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", account_name)))?;
         let dir_stamp = Self::dir_modified(&account_dir);
@@ -505,8 +816,8 @@ impl Database {
                 }
             }
         }
-        self.available_tables.insert(account_name.to_string(), tables);
-        self.available_stamps.insert(account_name.to_string(), dir_stamp);
+        wlock(&self.available_tables).insert(account_name.to_string(), tables);
+        wlock(&self.available_stamps).insert(account_name.to_string(), dir_stamp);
         Ok(())
     }
 
@@ -544,10 +855,17 @@ impl Database {
     /// invalidate a table, so they use this to decide whether they have to fall
     /// back to an exclusive borrow. Returning the table itself saves them a
     /// second lookup.
-    pub fn table_ready_for_read(&self, account: &str, name: &str) -> Option<&Table> {
-        let table = self.get_table_read_only_for_account(account, name)?;
-        if table.is_dirty() || table.stamp == Some(self.disk_stamp(account, name)) {
-            Some(table)
+    pub fn table_ready_for_read(&self, account: &str, name: &str) -> Option<TableHandle> {
+        let handle = self.get_table_read_only_for_account(account, name)?;
+        let ready = {
+            let table = handle.read();
+            table.is_dirty() || table.stamp == Some(self.disk_stamp(account, name))
+        };
+        if ready {
+            // A table served through this path is still in use, so it must not
+            // look like the coldest one to the next eviction.
+            self.touch_lru(&(account.to_string(), name.to_string()));
+            Some(handle)
         } else {
             None
         }
@@ -556,21 +874,56 @@ impl Database {
     /// Drops a cached table whose backing files were modified by another process,
     /// forcing a fresh read on the next access. Locally modified (dirty) tables are
     /// kept untouched so that pending changes are never silently discarded.
-    fn invalidate_if_stale(&mut self, account: &str, name: &str) {
+    fn invalidate_if_stale(&self, account: &str, name: &str) {
         let key = (account.to_string(), name.to_string());
-        let stale = match self.loaded_tables.get(&key) {
-            Some(table) if !table.is_dirty() => table.stamp != Some(self.disk_stamp(account, name)),
-            _ => false,
+        let handle = match rlock(&self.tables).get(&key) {
+            Some(handle) => handle.clone(),
+            None => return,
         };
-        if stale {
-            self.loaded_tables.remove(&key);
-            if let Some(pos) = self.lru_order.iter().position(|x| x == &key) {
-                self.lru_order.remove(pos);
+        let stale = {
+            let table = handle.read();
+            !table.is_dirty() && table.stamp != Some(self.disk_stamp(account, name))
+        };
+        if !stale {
+            return;
+        }
+        // Re-check under the map lock: another thread may have replaced the
+        // entry, or made it dirty, since the check above.
+        let mut tables = wlock(&self.tables);
+        let still_stale = match tables.get(&key) {
+            Some(current) => {
+                let table = current.read();
+                !table.is_dirty() && table.stamp != Some(self.disk_stamp(account, name))
             }
+            None => false,
+        };
+        if still_stale {
+            tables.remove(&key);
+            drop(tables);
+            self.forget_lru(&key);
         }
     }
 
-    pub fn create_account(&mut self, name: &str, directory: Option<&str>) -> io::Result<()> {
+    /// Moves a table to the young end of the eviction order.
+    fn touch_lru(&self, key: &TableKey) {
+        let mut lru = mlock(&self.lru_order);
+        if let Some(pos) = lru.iter().position(|x| x == key) {
+            let entry = lru.remove(pos).unwrap();
+            lru.push_back(entry);
+        } else {
+            lru.push_back(key.clone());
+        }
+    }
+
+    /// Removes a table from the eviction order entirely.
+    fn forget_lru(&self, key: &TableKey) {
+        let mut lru = mlock(&self.lru_order);
+        if let Some(pos) = lru.iter().position(|x| x == key) {
+            lru.remove(pos);
+        }
+    }
+
+    pub fn create_account(&self, name: &str, directory: Option<&str>) -> io::Result<()> {
         // Pick up accounts registered by another process, otherwise persisting our own
         // snapshot of the registry would erase them.
         let _ = self.refresh_account_registry();
@@ -584,28 +937,34 @@ impl Database {
         }
 
         // Update registry
-        let prev_acc = self.current_account.clone();
-        self.current_account = "SYSTEM".to_string(); // Temporarily switch to SYSTEM context for registry
+        let prev_acc = self.current_account();
+        self.set_current_account("SYSTEM"); // Temporarily switch to SYSTEM context for registry
 
         // Add to accounts_config record
-        while self.accounts_config.fields.len() < 2 {
-            self.accounts_config.fields.push(Field::default());
+        {
+            let mut config = wlock(&self.accounts_config);
+            while config.fields.len() < 2 {
+                config.fields.push(Field::default());
+            }
+            config.fields[0].values.push(Value { sub_values: vec![name.to_string()] });
+            config.fields[1].values.push(Value { sub_values: vec![dir.clone()] });
         }
-        self.accounts_config.fields[0].values.push(Value { sub_values: vec![name.to_string()] });
-        self.accounts_config.fields[1].values.push(Value { sub_values: vec![dir.clone()] });
 
         self.persist_account_registry()?;
 
         // Update $ACCOUNTS table if it exists
         self.run_in_system_account(|db| {
-            if db.available_tables.get("SYSTEM").map(|s| s.contains("$ACCOUNTS")).unwrap_or(false) {
-                let accounts_table = db.get_table_mut("$ACCOUNTS")?;
-                let mut record = Record::new();
-                while record.fields.len() <= SYS_ACCOUNTS_PATH_IDX {
-                    record.fields.push(Field::default());
+            if rlock(&db.available_tables).get("SYSTEM").map(|s| s.contains("$ACCOUNTS")).unwrap_or(false) {
+                {
+                    let handle = db.get_table_mut("$ACCOUNTS")?;
+                    let mut accounts_table = handle.write();
+                    let mut record = Record::new();
+                    while record.fields.len() <= SYS_ACCOUNTS_PATH_IDX {
+                        record.fields.push(Field::default());
+                    }
+                    record.fields[SYS_ACCOUNTS_PATH_IDX].values.push(Value { sub_values: vec![dir] });
+                    accounts_table.insert_record(name, record);
                 }
-                record.fields[SYS_ACCOUNTS_PATH_IDX].values.push(Value { sub_values: vec![dir] });
-                accounts_table.insert_record(name, record);
                 db.save()?;
             }
             Ok(())
@@ -622,21 +981,21 @@ impl Database {
         if !prev_acc.is_empty() && prev_acc != "SYSTEM" {
             let _ = self.logto(&prev_acc);
         } else if prev_acc.is_empty() {
-            self.current_account = String::new();
+            self.set_current_account("");
         }
         Ok(())
     }
 
-    fn persist_account_registry(&mut self) -> io::Result<()> {
+    fn persist_account_registry(&self) -> io::Result<()> {
         let mut map = HashMap::new();
-        map.insert("registry".to_string(), self.accounts_config.clone());
+        map.insert("registry".to_string(), rlock(&self.accounts_config).clone());
         let path = format!("{}/accounts.reg", self.storage_dir);
         Self::save_section(&map, &path)?;
-        self.registry_stamp = Some(Self::file_stamp(&path));
+        *mlock(&self.registry_stamp) = Some(Self::file_stamp(&path));
         Ok(())
     }
 
-    pub fn delete_account(&mut self, name: &str) -> io::Result<()> {
+    pub fn delete_account(&self, name: &str) -> io::Result<()> {
         if name == "SYSTEM" {
             return Err(io::Error::new(io::ErrorKind::Other, "Cannot delete SYSTEM account"));
         }
@@ -646,10 +1005,14 @@ impl Database {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Account '{}' not found", name)))?;
 
         // Remove from registry
-        if let Some(names_field) = self.accounts_config.fields.get_mut(0) {
-            if let Some(pos) = names_field.values.iter().position(|v| v.sub_values.get(0) == Some(&name.to_string())) {
-                names_field.values.remove(pos);
-                if let Some(dirs_field) = self.accounts_config.fields.get_mut(1) {
+        {
+            let mut config = wlock(&self.accounts_config);
+            let position = config.fields.get(0).and_then(|names| {
+                names.values.iter().position(|v| v.sub_values.get(0) == Some(&name.to_string()))
+            });
+            if let Some(pos) = position {
+                config.fields[0].values.remove(pos);
+                if let Some(dirs_field) = config.fields.get_mut(1) {
                     dirs_field.values.remove(pos);
                 }
             }
@@ -660,8 +1023,7 @@ impl Database {
 
         // Remove from $ACCOUNTS table
         self.run_in_system_account(|db| {
-            let table = db.get_table_mut("$ACCOUNTS")?;
-            table.remove_record(name);
+            db.get_table_mut("$ACCOUNTS")?.write().remove_record(name);
             db.save()
         })?;
 
@@ -669,154 +1031,180 @@ impl Database {
         let _ = fs::remove_dir_all(dir);
 
         // Cleanup cache for this account
-        let keys_to_remove: Vec<(String, String)> = self.loaded_tables.keys()
-            .filter(|(acc, _)| acc == name)
-            .cloned()
-            .collect();
-        for key in keys_to_remove {
-            self.loaded_tables.remove(&key);
-            if let Some(pos) = self.lru_order.iter().position(|x| x == &key) {
-                self.lru_order.remove(pos);
+        let keys_to_remove: Vec<TableKey> = {
+            let mut tables = wlock(&self.tables);
+            let keys: Vec<TableKey> = tables.keys().filter(|(acc, _)| acc == name).cloned().collect();
+            for key in &keys {
+                tables.remove(key);
             }
+            keys
+        };
+        for key in keys_to_remove {
+            self.forget_lru(&key);
+            wlock(&self.durable_tables).remove(&key);
         }
-        self.available_tables.remove(name);
-        self.available_stamps.remove(name);
+        wlock(&self.available_tables).remove(name);
+        wlock(&self.available_stamps).remove(name);
 
-        if self.current_account == name {
-            self.current_account = String::new();
+        if self.is_current_account(name) {
+            self.set_current_account("");
         }
 
         Ok(())
     }
 
     pub fn get_account_dir(&self, account_name: &str) -> Option<String> {
-        let names_field = self.accounts_config.fields.get(0)?;
-        let dirs_field = self.accounts_config.fields.get(1)?;
+        let config = rlock(&self.accounts_config);
+        let names_field = config.fields.get(0)?;
+        let dirs_field = config.fields.get(1)?;
         let pos = names_field.values.iter().position(|v| v.sub_values.get(0) == Some(&account_name.to_string()))?;
         dirs_field.values.get(pos)?.sub_values.get(0).cloned()
     }
 
     pub fn current_storage_dir(&self) -> String {
-        self.get_account_dir(&self.current_account).unwrap_or_else(|| self.storage_dir.clone())
+        self.get_account_dir(&self.current_account()).unwrap_or_else(|| self.storage_dir.clone())
     }
 
-    pub fn get_table_read_only(&self, name: &str) -> Option<&Table> {
-        self.get_table_read_only_for_account(&self.current_account, name)
+    pub fn get_table_read_only(&self, name: &str) -> Option<TableHandle> {
+        self.get_table_read_only_for_account(&self.current_account(), name)
     }
 
-    pub fn get_table_read_only_for_account(&self, account: &str, name: &str) -> Option<&Table> {
-        self.loaded_tables.get(&(account.to_string(), name.to_string()))
+    /// The table if it is already in memory, without loading or refreshing it.
+    pub fn get_table_read_only_for_account(&self, account: &str, name: &str) -> Option<TableHandle> {
+        rlock(&self.tables).get(&(account.to_string(), name.to_string())).cloned()
     }
 
-    pub fn get_table(&mut self, name: &str) -> Option<&Table> {
-        let account = self.current_account.clone();
-        self.get_table_for_account(&account, name)
+    pub fn get_table(&self, name: &str) -> Option<TableHandle> {
+        self.get_table_for_account(&self.current_account(), name)
     }
 
-    pub fn get_table_for_account(&mut self, account: &str, name: &str) -> Option<&Table> {
-        self.ensure_available_tables(account).ok()?;
-        if !self.available_tables.get(account).map(|s| s.contains(name)).unwrap_or(false) {
-            // Might have been created by another process since the last scan.
-            self.scan_available_tables(account).ok()?;
-        }
-
-        // Strict validation: name must be in available_tables for this account
-        let available = self.available_tables.get(account)?;
-        if !available.contains(name) {
-            return None;
-        }
-
-        // Use the validated name from available_tables
-        let validated_name = available.get(name)?.clone();
-        let name_str = validated_name;
-
-        self.invalidate_if_stale(account, &name_str);
-
-        let key = (account.to_string(), name_str.clone());
-        if !self.loaded_tables.contains_key(&key) {
-            if let Ok(table) = self.load_table_for_account(account, &name_str) {
-                if self.loaded_tables.len() >= self.max_loaded {
-                    if let Some(oldest_key) = self.lru_order.pop_front() {
-                        let _ = self.save_table_for_account(&oldest_key.0, &oldest_key.1);
-                        self.loaded_tables.remove(&oldest_key);
-                    }
-                }
-                self.loaded_tables.insert(key.clone(), table);
-                self.lru_order.push_back(key.clone());
-            } else {
-                return None;
-            }
-        } else {
-            // Update LRU
-            if let Some(pos) = self.lru_order.iter().position(|x| x == &key) {
-                let n = self.lru_order.remove(pos).unwrap();
-                self.lru_order.push_back(n);
-            }
-        }
-
-        self.loaded_tables.get(&key)
+    pub fn get_table_for_account(&self, account: &str, name: &str) -> Option<TableHandle> {
+        self.resolve_table(account, name, false).ok()
     }
 
-    pub fn get_table_mut(&mut self, name: &str) -> io::Result<&mut Table> {
-        let account = self.current_account.clone();
-        self.get_table_mut_for_account(&account, name)
+    pub fn get_table_mut(&self, name: &str) -> io::Result<TableHandle> {
+        self.get_table_mut_for_account(&self.current_account(), name)
     }
 
-    pub fn get_table_mut_for_account(&mut self, account: &str, name: &str) -> io::Result<&mut Table> {
+    /// The table, loaded if it is not in memory yet.
+    ///
+    /// Named `_mut` for the callers that go on to write to it; the database
+    /// itself is only borrowed shared, because the table is locked separately
+    /// through the handle this returns.
+    pub fn get_table_mut_for_account(&self, account: &str, name: &str) -> io::Result<TableHandle> {
+        self.resolve_table(account, name, true)
+    }
+
+    /// Finds a table in the cache, loading it when it is not there.
+    ///
+    /// `create_missing` distinguishes the two callers: a reader wants `None`
+    /// for a file whose records cannot be read, while a writer wants an empty
+    /// table created for a directory that exists but holds no section yet.
+    ///
+    /// Two connections may load the same cold table at the same time. The
+    /// second one to finish finds the first one's entry already in the map and
+    /// discards its own copy, which costs a duplicate read of a file nobody had
+    /// written to yet, and is what keeps the map lock off the disk.
+    fn resolve_table(&self, account: &str, name: &str, create_missing: bool) -> io::Result<TableHandle> {
+        let not_found = || io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Table '{}' not found in account '{}'", name, account),
+        );
+
         self.ensure_available_tables(account)?;
-        if !self.available_tables.get(account).map(|s| s.contains(name)).unwrap_or(false) {
+        if !self.account_has_table(account, name) {
             // Might have been created by another process since the last scan.
             self.scan_available_tables(account)?;
         }
-        let available = self.available_tables.get_mut(account).unwrap();
-
-        // Strict validation: name must be in available_tables
-        if !available.contains(name) {
-            return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' not found in account '{}'", name, account)));
-        }
-
-        // Use the validated name from available_tables
-        let validated_name = available.get(name).unwrap().clone();
-        let name_str = validated_name;
+        // Strict validation: the name must be one the account listing knows,
+        // and the listing's spelling of it is the one used from here on.
+        let name_str = match rlock(&self.available_tables).get(account).and_then(|s| s.get(name)) {
+            Some(validated) => validated.clone(),
+            None => return Err(not_found()),
+        };
 
         self.invalidate_if_stale(account, &name_str);
 
         let key = (account.to_string(), name_str.clone());
-        if !self.loaded_tables.contains_key(&key) {
-            let table = match self.load_table_for_account(account, &name_str) {
-                Ok(table) => table,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    let storage = self.get_account_dir(account).unwrap_or_else(|| self.storage_dir.clone());
-                    let table_dir = format!("{}/{}", storage, name_str);
-                    if !Path::new(&table_dir).exists() {
-                        fs::create_dir_all(&table_dir)?;
-                    }
-                    let mut table = Table::new();
-                    table.data_meta = Self::init_data_section(&table_dir, self.records_per_group)?;
-                    File::create(format!("{}/dict", table_dir))?;
-                    table
-                }
-                Err(e) => return Err(e),
-            };
-
-            if self.loaded_tables.len() >= self.max_loaded {
-                if let Some(oldest_key) = self.lru_order.pop_front() {
-                    let _ = self.save_table_for_account(&oldest_key.0, &oldest_key.1);
-                    self.loaded_tables.remove(&oldest_key);
-                }
-            }
-            self.loaded_tables.insert(key.clone(), table);
-            self.lru_order.push_back(key.clone());
-        } else {
-            // Update LRU
-            if let Some(pos) = self.lru_order.iter().position(|x| x == &key) {
-                let n = self.lru_order.remove(pos).unwrap();
-                self.lru_order.push_back(n);
-            }
+        if let Some(handle) = rlock(&self.tables).get(&key).cloned() {
+            self.touch_lru(&key);
+            return Ok(handle);
         }
-        Ok(self.loaded_tables.get_mut(&key).unwrap())
+
+        // Loading touches the disk, so it happens without the map locked.
+        let table = match self.load_table_for_account(account, &name_str) {
+            Ok(table) => table,
+            Err(e) if e.kind() == io::ErrorKind::NotFound && create_missing => {
+                let storage = self.account_storage_dir(account);
+                let table_dir = format!("{}/{}", storage, name_str);
+                if !Path::new(&table_dir).exists() {
+                    fs::create_dir_all(&table_dir)?;
+                }
+                let mut table = Table::new();
+                table.data_meta = Self::init_data_section(&table_dir, self.records_per_group)?;
+                File::create(format!("{}/dict", table_dir))?;
+                table
+            }
+            Err(e) => return Err(e),
+        };
+
+        let handle = {
+            let mut tables = wlock(&self.tables);
+            tables.entry(key.clone()).or_insert_with(|| TableHandle::new(table)).clone()
+        };
+        self.touch_lru(&key);
+        self.evict_if_over_budget();
+        Ok(handle)
     }
 
+    /// Writes out and drops the coldest tables once the cache is over budget.
+    ///
+    /// A table another thread still holds a handle to is skipped rather than
+    /// evicted: dropping it from the map would let a third thread load a second
+    /// copy from disk and the two would overwrite each other. The flush happens
+    /// with the map still locked, for the same reason - nothing may reload the
+    /// table between it leaving the cache and its changes reaching the disk.
+    fn evict_if_over_budget(&self) {
+        if rlock(&self.tables).len() <= self.max_loaded {
+            return;
+        }
+        let mut tables = wlock(&self.tables);
+        let mut lru = mlock(&self.lru_order);
+        let mut skipped = Vec::new();
+        while tables.len() > self.max_loaded {
+            let key = match lru.pop_front() {
+                Some(key) => key,
+                None => break,
+            };
+            let handle = match tables.get(&key) {
+                Some(handle) => handle.clone(),
+                // Already gone; the order was just stale.
+                None => continue,
+            };
+            // The map's own handle, our clone, and nothing else.
+            if handle.refs() > 2 {
+                skipped.push(key);
+                continue;
+            }
+            let _ = self.flush_handle(&key, &handle);
+            tables.remove(&key);
+        }
+        for key in skipped {
+            lru.push_back(key);
+        }
+    }
+
+    /// Files currently held in memory.
+    pub fn loaded_table_count(&self) -> usize {
+        rlock(&self.tables).len()
+    }
+
+    /// Drops every cached table without writing it out. Test support: a caller
+    /// that wants to observe a load from disk needs the cache empty first.
+    pub fn clear_loaded_tables(&self) {
+        wlock(&self.tables).clear();
+        mlock(&self.lru_order).clear();
+    }
 
     fn load_table_for_account(&self, account: &str, name: &str) -> io::Result<Table> {
         let storage = self.account_storage_dir(account);
@@ -843,8 +1231,12 @@ impl Database {
     /// Only the groups holding changed keys are rewritten, unless the table was
     /// edited in bulk, is still in the legacy flat format, or the modulus has
     /// to change - all of which need a full rewrite anyway.
-    fn save_table_for_account(&mut self, account: &str, name: &str) -> io::Result<()> {
-        let key = (account.to_string(), name.to_string());
+    ///
+    /// Takes the handle rather than the name so it can run with the table map
+    /// locked - the eviction path needs exactly that - and so a flush of one
+    /// file never blocks work on another.
+    fn flush_handle(&self, key: &TableKey, handle: &TableHandle) -> io::Result<()> {
+        let (account, name) = (&key.0, &key.1);
         let storage = self.account_storage_dir(account);
         let per_group = self.records_per_group;
         let data_path = format!("{}/{}/data", storage, name);
@@ -854,16 +1246,17 @@ impl Database {
         // before the write is acknowledged" has to mean on disk, not merely in
         // the page cache. Read from the cache rather than the DIR file so the
         // flush path stays free of I/O.
-        let fsync = if self.durable_writes || self.durable_tables.get(&key).copied().unwrap_or(false) {
+        let fsync = if self.durable_writes || rlock(&self.durable_tables).get(key).copied().unwrap_or(false) {
             self.durable_fsync
         } else {
             self.fsync
         };
 
-        let table = match self.loaded_tables.get_mut(&key) {
-            Some(table) if table.is_dirty() => table,
-            _ => return Ok(()),
-        };
+        let mut table = handle.write();
+        if !table.is_dirty() {
+            return Ok(());
+        }
+        let table = &mut *table;
 
         if table.records_dirty() {
             let incremental = if table.dirty_all || table.legacy_data {
@@ -913,14 +1306,21 @@ impl Database {
     }
 
     /// Writes every pending change to disk immediately.
-    pub fn save(&mut self) -> io::Result<()> {
-        let keys: Vec<(String, String)> = self.loaded_tables.keys().cloned().collect();
+    ///
+    /// The tables are snapshotted first and then locked one at a time, so a
+    /// flush of a large file never holds up work on any other file. Because it
+    /// locks tables, it must not be called while a table guard is held - see
+    /// the locking rules on [`Database`].
+    pub fn save(&self) -> io::Result<()> {
+        assert_no_table_guard_held("A full flush");
+        let snapshot: Vec<(TableKey, TableHandle)> = rlock(&self.tables)
+            .iter()
+            .map(|(key, handle)| (key.clone(), handle.clone()))
+            .collect();
         let mut clients_updated = false;
-        for (account, name) in keys {
-            let was_dirty = self.loaded_tables.get(&(account.clone(), name.clone()))
-                .map(|t| t.is_dirty())
-                .unwrap_or(false);
-            if account == "SYSTEM" && name == "$CLIENTS" && was_dirty {
+        for (key, handle) in snapshot {
+            let was_dirty = handle.read().is_dirty();
+            if key.0 == "SYSTEM" && key.1 == "$CLIENTS" && was_dirty {
                 clients_updated = true;
             }
             if !was_dirty {
@@ -929,14 +1329,13 @@ impl Database {
                 // freshness check would stop reloading it.
                 continue;
             }
-            self.save_table_for_account(&account, &name)?;
-            let stamp = self.disk_stamp(&account, &name);
-            if let Some(t) = self.loaded_tables.get_mut(&(account, name)) {
-                t.stamp = Some(stamp);
-            }
+            self.flush_handle(&key, &handle)?;
+            let stamp = self.disk_stamp(&key.0, &key.1);
+            handle.write().stamp = Some(stamp);
         }
-        self.pending_writes = 0;
-        self.last_flush = Instant::now();
+        self.pending_writes.store(0, Ordering::Relaxed);
+        mlock(&self.write_marks).clear();
+        *mlock(&self.last_flush) = Instant::now();
         if clients_updated {
             self.load_clients_from_table()?;
         }
@@ -945,53 +1344,96 @@ impl Database {
 
     /// True while changes are held in memory and not yet on disk.
     pub fn has_pending_writes(&self) -> bool {
-        self.loaded_tables.values().any(|t| t.is_dirty())
+        let snapshot: Vec<TableHandle> = rlock(&self.tables).values().cloned().collect();
+        snapshot.iter().any(|handle| handle.read().is_dirty())
     }
 
     pub fn pending_write_count(&self) -> usize {
-        self.pending_writes
+        self.pending_writes.load(Ordering::Relaxed)
+            + mlock(&self.write_marks).values().map(|mark| mark.pending).sum::<usize>()
     }
 
-    /// Records that a write happened and flushes only when the batch is full
-    /// or the flush interval has elapsed.
+    /// Records a write that does not name the file it touched, and flushes the
+    /// whole database when the batch is full or the flush interval has elapsed.
     ///
-    /// This is the write path used by the server. Saving on every request meant
-    /// one disk write per record even when a client streamed thousands of them;
-    /// batching turns that into one write per group per interval. The cost is a
-    /// bounded window (`flush_interval`) in which an acknowledged write is only
-    /// in memory - set `durable_writes` to trade the throughput back for it.
-    pub fn note_write(&mut self) -> io::Result<()> {
+    /// Saving on every request meant one disk write per record even when a
+    /// client streamed thousands of them; batching turns that into one write per
+    /// group per interval. The cost is a bounded window (`flush_interval`) in
+    /// which an acknowledged write is only in memory - set `durable_writes` to
+    /// trade the throughput back for it.
+    ///
+    /// The server names the file on every write and so goes through
+    /// [`note_write_for`](Self::note_write_for) instead; this is for a caller
+    /// that has edited something without saying what.
+    pub fn note_write(&self) -> io::Result<()> {
         if self.durable_writes {
             return self.save();
         }
-        self.pending_writes += 1;
-        if self.pending_writes >= self.flush_max_pending
-            || self.last_flush.elapsed() >= self.flush_interval
-        {
+        let pending = self.pending_writes.fetch_add(1, Ordering::Relaxed) + 1;
+        let elapsed = mlock(&self.last_flush).elapsed();
+        if pending >= self.flush_max_pending || elapsed >= self.flush_interval {
             return self.save();
         }
         Ok(())
     }
 
-    /// Same as [`Database::note_write`], but honours the durability flag of the
-    /// file that was written: a file marked durable in its account's DIR entry
-    /// is flushed before the write is acknowledged, even when the rest of the
-    /// database is buffering. This lets mission critical files opt out of the
-    /// in-memory window without slowing everything else down.
-    pub fn note_write_for(&mut self, account: &str, name: &str) -> io::Result<()> {
+    /// Records a write to one named file, batching and flushing per file.
+    ///
+    /// This is the write path the server uses. Two things follow from naming the
+    /// file. A file marked durable in its account's DIR entry is flushed before
+    /// the write is acknowledged even when the rest of the database is
+    /// buffering, which lets mission critical files opt out of the in-memory
+    /// window without slowing everything else down. And an ordinary buffered
+    /// write is batched against that file's own counter and flushed on its own,
+    /// so a burst on one file neither writes out nor waits for any other.
+    pub fn note_write_for(&self, account: &str, name: &str) -> io::Result<()> {
         if self.is_table_durable_for_account(account, name) {
+            // A file promised to be durable is flushed before the write is
+            // acknowledged - and so is everything else buffered at the time,
+            // because a promise about the disk is not worth much if it leaves
+            // the rest of the database behind in memory.
             return self.save();
         }
-        self.note_write()
+        // Everything else batches per file, so two connections writing to two
+        // files never flush - or wait on - each other's.
+        let key = (account.to_string(), name.to_string());
+        let due = {
+            let mut marks = mlock(&self.write_marks);
+            let mark = marks.entry(key.clone()).or_insert_with(WriteMark::fresh);
+            mark.pending += 1;
+            mark.pending >= self.flush_max_pending || mark.last_flush.elapsed() >= self.flush_interval
+        };
+        if due {
+            self.flush_table(&key)?;
+        }
+        Ok(())
+    }
+
+    /// Writes out one file and clears its batch, leaving every other file's
+    /// buffer, and every other file's lock, untouched.
+    fn flush_table(&self, key: &TableKey) -> io::Result<()> {
+        assert_no_table_guard_held("A flush of one file");
+        if let Some(handle) = self.get_table_read_only_for_account(&key.0, &key.1) {
+            if handle.read().is_dirty() {
+                self.flush_handle(key, &handle)?;
+                let stamp = self.disk_stamp(&key.0, &key.1);
+                handle.write().stamp = Some(stamp);
+                if key.0 == "SYSTEM" && key.1 == "$CLIENTS" {
+                    self.load_clients_from_table()?;
+                }
+            }
+        }
+        mlock(&self.write_marks).insert(key.clone(), WriteMark::fresh());
+        Ok(())
     }
 
     /// Flushes if the interval has elapsed. Intended for a background ticker,
     /// so an idle server still persists the tail of a burst promptly.
-    pub fn flush_if_due(&mut self) -> io::Result<bool> {
-        if self.pending_writes == 0 && !self.has_pending_writes() {
+    pub fn flush_if_due(&self) -> io::Result<bool> {
+        if self.pending_write_count() == 0 && !self.has_pending_writes() {
             return Ok(false);
         }
-        if self.last_flush.elapsed() < self.flush_interval {
+        if mlock(&self.last_flush).elapsed() < self.flush_interval {
             return Ok(false);
         }
         self.save()?;
@@ -1057,16 +1499,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn list_tables(&mut self) -> Vec<String> {
-        let account = self.current_account.clone();
-        self.list_tables_for_account(&account)
+    pub fn list_tables(&self) -> Vec<String> {
+        self.list_tables_for_account(&self.current_account())
     }
 
-    pub fn list_tables_for_account(&mut self, account: &str) -> Vec<String> {
-        let _ = self.ensure_available_tables(account);
-        let mut tables: Vec<_> = self.available_tables.get(account)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default();
+    pub fn list_tables_for_account(&self, account: &str) -> Vec<String> {
+        let mut tables = self.account_tables(account).unwrap_or_default();
         tables.sort();
         tables
     }
@@ -1076,7 +1514,7 @@ impl Database {
     /// The flag is otherwise only readable by reading the account's `DIR` file,
     /// which is an obscure interface for something a client may reasonably want
     /// beside the name.
-    pub fn list_tables_with_durability_for_account(&mut self, account: &str) -> Vec<(String, bool)> {
+    pub fn list_tables_with_durability_for_account(&self, account: &str) -> Vec<(String, bool)> {
         self.list_tables_for_account(account)
             .into_iter()
             .map(|name| {
@@ -1088,9 +1526,9 @@ impl Database {
 
     /// Every account in the registry, sorted, picking up accounts created by
     /// another process since the last look.
-    pub fn list_accounts(&mut self) -> Vec<String> {
+    pub fn list_accounts(&self) -> Vec<String> {
         let _ = self.refresh_account_registry();
-        let mut names: Vec<String> = self.accounts_config.fields.get(0)
+        let mut names: Vec<String> = rlock(&self.accounts_config).fields.get(0)
             .map(|f| f.values.iter().filter_map(|v| v.sub_values.get(0).cloned()).collect())
             .unwrap_or_default();
         names.sort();
@@ -1102,7 +1540,7 @@ impl Database {
     ///
     /// Record counts come from each file's section metadata, so a large account
     /// is described without any of it being read into memory.
-    pub fn account_statistics(&mut self) -> Vec<AccountStats> {
+    pub fn account_statistics(&self) -> Vec<AccountStats> {
         self.list_accounts()
             .into_iter()
             .map(|name| {
@@ -1120,8 +1558,8 @@ impl Database {
     /// Records in one file, preferring the in-memory table when it is loaded so
     /// that writes not yet flushed are still counted.
     fn file_record_count(&self, directory: &str, account: &str, file: &str) -> u64 {
-        if let Some(table) = self.loaded_tables.get(&(account.to_string(), file.to_string())) {
-            return table.records.len() as u64;
+        if let Some(handle) = self.get_table_read_only_for_account(account, file) {
+            return handle.read().records.len() as u64;
         }
         let data_path = format!("{}/{}/data", directory, file);
         match hashfile::read_meta(&data_path) {
@@ -1170,12 +1608,11 @@ impl Database {
     /// Describes one file: how many records it holds, how they are spread over
     /// the hash groups and what it costs on disk. No record is returned, and
     /// none is loaded to answer this unless the file is in the legacy format.
-    pub fn file_statistics(&mut self, account: &str, name: &str) -> io::Result<FileStats> {
-        let _ = self.ensure_available_tables(account);
-        if !self.available_tables.get(account).map(|s| s.contains(name)).unwrap_or(false) {
+    pub fn file_statistics(&self, account: &str, name: &str) -> io::Result<FileStats> {
+        if !self.account_has_table(account, name) {
             self.scan_available_tables(account)?;
         }
-        if !self.available_tables.get(account).map(|s| s.contains(name)).unwrap_or(false) {
+        if !self.account_has_table(account, name) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Table '{}' not found in account '{}'", name, account),
@@ -1190,14 +1627,14 @@ impl Database {
         let group_sizes = hashfile::group_sizes(&data_path);
         let (disk_bytes, modified) = Self::tree_stats(Path::new(&file_dir));
 
-        let loaded_table = self.loaded_tables.get(&(account.to_string(), name.to_string()));
+        let loaded_table = self.get_table_read_only_for_account(account, name);
         let loaded = loaded_table.is_some();
-        let record_count = match loaded_table {
-            Some(table) => table.records.len() as u64,
+        let record_count = match &loaded_table {
+            Some(handle) => handle.read().records.len() as u64,
             None => self.file_record_count(&directory, account, name),
         };
-        let dict_count = match loaded_table {
-            Some(table) => table.dictionary.len(),
+        let dict_count = match &loaded_table {
+            Some(handle) => handle.read().dictionary.len(),
             None => {
                 let mut dictionary = HashMap::new();
                 let _ = Self::load_section(&mut dictionary, &format!("{}/dict", file_dir));
@@ -1226,31 +1663,25 @@ impl Database {
         })
     }
 
-    pub fn is_table_available(&mut self, name: &str) -> bool {
-        let account = self.current_account.clone();
-        let _ = self.ensure_available_tables(&account);
-        self.available_tables.get(&account)
-            .map(|s| s.contains(name))
-            .unwrap_or(false)
+    pub fn is_table_available(&self, name: &str) -> bool {
+        self.account_has_table(&self.current_account(), name)
     }
 
     pub fn is_table_loaded(&self, name: &str) -> bool {
-        self.loaded_tables.contains_key(&(self.current_account.clone(), name.to_string()))
+        rlock(&self.tables).contains_key(&(self.current_account(), name.to_string()))
     }
 
-    pub fn create_table(&mut self, name: &str) -> io::Result<()> {
-        let account = self.current_account.clone();
-        self.create_table_for_account(&account, name)
+    pub fn create_table(&self, name: &str) -> io::Result<()> {
+        self.create_table_for_account(&self.current_account(), name)
     }
 
     /// Creates a file and marks it durable, so every write to it is flushed
     /// before being acknowledged regardless of the global buffering settings.
-    pub fn create_table_durable(&mut self, name: &str, durable: bool) -> io::Result<()> {
-        let account = self.current_account.clone();
-        self.create_table_for_account_durable(&account, name, durable)
+    pub fn create_table_durable(&self, name: &str, durable: bool) -> io::Result<()> {
+        self.create_table_for_account_durable(&self.current_account(), name, durable)
     }
 
-    pub fn create_table_for_account_durable(&mut self, account: &str, name: &str, durable: bool) -> io::Result<()> {
+    pub fn create_table_for_account_durable(&self, account: &str, name: &str, durable: bool) -> io::Result<()> {
         self.create_table_for_account(account, name)?;
         if durable {
             self.set_table_durable_for_account(account, name, true)?;
@@ -1258,7 +1689,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn create_table_for_account(&mut self, account: &str, name: &str) -> io::Result<()> {
+    pub fn create_table_for_account(&self, account: &str, name: &str) -> io::Result<()> {
         if account.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
         }
@@ -1272,12 +1703,15 @@ impl Database {
         Self::init_data_section(&table_dir, self.records_per_group)?;
         File::create(format!("{}/dict", table_dir))?;
 
-        let available = self.available_tables.get_mut(account).unwrap();
-        if available.contains(name) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("Table '{}' already exists", name)));
-        }
-        available.insert(name.to_string());
-        let has_dir = available.contains("DIR");
+        let has_dir = {
+            let mut listings = wlock(&self.available_tables);
+            let available = listings.entry(account.to_string()).or_default();
+            if available.contains(name) {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("Table '{}' already exists", name)));
+            }
+            available.insert(name.to_string());
+            available.contains("DIR")
+        };
 
         // DIR is the account's own listing of its files, so a file created in
         // an account that has not got one brings it into being rather than
@@ -1301,34 +1735,32 @@ impl Database {
             // Every account's DIR describes the same two attributes, so name them
             // here too rather than only for SYSTEM.
             if let Ok(dir_table) = self.get_table_mut_for_account(account, "DIR") {
-                Self::ensure_dir_dictionary(dir_table);
+                Self::ensure_dir_dictionary(&mut dir_table.write());
             }
         }
 
         Ok(())
     }
 
-    pub fn delete_table(&mut self, name: &str) -> io::Result<()> {
-        let account = self.current_account.clone();
-        self.delete_table_for_account(&account, name)
+    pub fn delete_table(&self, name: &str) -> io::Result<()> {
+        self.delete_table_for_account(&self.current_account(), name)
     }
 
-    pub fn delete_table_for_account(&mut self, account: &str, name: &str) -> io::Result<()> {
+    pub fn delete_table_for_account(&self, account: &str, name: &str) -> io::Result<()> {
         if account.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
         }
-        self.ensure_available_tables(account)?;
-        if !self.available_tables.get(account).unwrap().contains(name) {
+        if !self.account_has_table(account, name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' not found", name)));
         }
 
         let key = (account.to_string(), name.to_string());
-        self.loaded_tables.remove(&key);
-        self.durable_tables.remove(&key);
-        self.available_tables.get_mut(account).unwrap().remove(name);
-        if let Some(pos) = self.lru_order.iter().position(|x| x == &key) {
-            self.lru_order.remove(pos);
+        wlock(&self.tables).remove(&key);
+        wlock(&self.durable_tables).remove(&key);
+        if let Some(available) = wlock(&self.available_tables).get_mut(account) {
+            available.remove(name);
         }
+        self.forget_lru(&key);
 
         let storage = self.account_storage_dir(account);
         let table_dir = format!("{}/{}", storage, name);
@@ -1337,14 +1769,14 @@ impl Database {
         Ok(())
     }
 
-    pub fn sync_dir_file(&mut self) -> io::Result<()> {
-        let account = self.current_account.clone();
-        self.sync_dir_file_for_account(&account)
+    pub fn sync_dir_file(&self) -> io::Result<()> {
+        self.sync_dir_file_for_account(&self.current_account())
     }
 
-    pub fn sync_dir_file_for_account(&mut self, account: &str) -> io::Result<()> {
+    pub fn sync_dir_file_for_account(&self, account: &str) -> io::Result<()> {
         let tables = self.list_tables_for_account(account);
-        let dir_table = self.get_table_mut_for_account(account, "DIR")?;
+        let handle = self.get_table_mut_for_account(account, "DIR")?;
+        let mut dir_table = handle.write();
         // The listing is rebuilt from scratch, but the durability flag is not
         // derived from the filesystem, so it has to be carried over.
         let durable: HashMap<String, bool> = dir_table.records.iter()
@@ -1393,9 +1825,8 @@ impl Database {
             .unwrap_or(false)
     }
 
-    pub fn set_table_durable(&mut self, name: &str, durable: bool) -> io::Result<()> {
-        let account = self.current_account.clone();
-        self.set_table_durable_for_account(&account, name, durable)
+    pub fn set_table_durable(&self, name: &str, durable: bool) -> io::Result<()> {
+        self.set_table_durable_for_account(&self.current_account(), name, durable)
     }
 
     /// Records the per-file durability flag in the account's DIR file, which is
@@ -1407,12 +1838,11 @@ impl Database {
     /// buffered reaches the disk under the durability being turned on, and the
     /// flag never gets ahead of the data it promises to protect. Demoting is
     /// safe either way - it only ever relaxes what a later write has to do.
-    pub fn set_table_durable_for_account(&mut self, account: &str, name: &str, durable: bool) -> io::Result<()> {
+    pub fn set_table_durable_for_account(&self, account: &str, name: &str, durable: bool) -> io::Result<()> {
         if account.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
         }
-        self.ensure_available_tables(account)?;
-        if !self.available_tables.get(account).map(|s| s.contains(name)).unwrap_or(false) {
+        if !self.account_has_table(account, name) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Table '{}' not found in account '{}'", name, account),
@@ -1430,81 +1860,75 @@ impl Database {
         // The flag lives in DIR, so an account without one gets it now rather
         // than silently losing the requested durability.
         self.ensure_dir_file_for_account(account)?;
-        let dir_table = self.get_table_mut_for_account(account, "DIR")?;
-        let mut rec = dir_table.records.get(name).cloned().unwrap_or_else(|| Self::dir_entry(false));
-        while rec.fields.len() <= DIR_DURABLE_IDX {
-            rec.fields.push(Field::default());
+        {
+            let handle = self.get_table_mut_for_account(account, "DIR")?;
+            let mut dir_table = handle.write();
+            let mut rec = dir_table.records.get(name).cloned().unwrap_or_else(|| Self::dir_entry(false));
+            while rec.fields.len() <= DIR_DURABLE_IDX {
+                rec.fields.push(Field::default());
+            }
+            if rec.fields[DIR_TYPE_IDX].values.is_empty() {
+                rec.fields[DIR_TYPE_IDX].values = vec![Value { sub_values: vec!["F".to_string()] }];
+            }
+            rec.fields[DIR_DURABLE_IDX].values = vec![Value {
+                sub_values: vec![if durable { "Y".to_string() } else { String::new() }],
+            }];
+            dir_table.insert_record(name, rec);
+            Self::ensure_dir_dictionary(&mut dir_table);
         }
-        if rec.fields[DIR_TYPE_IDX].values.is_empty() {
-            rec.fields[DIR_TYPE_IDX].values = vec![Value { sub_values: vec!["F".to_string()] }];
-        }
-        rec.fields[DIR_DURABLE_IDX].values = vec![Value {
-            sub_values: vec![if durable { "Y".to_string() } else { String::new() }],
-        }];
-        dir_table.insert_record(name, rec);
-        Self::ensure_dir_dictionary(dir_table);
-        self.durable_tables.insert((account.to_string(), name.to_string()), durable);
+        wlock(&self.durable_tables).insert((account.to_string(), name.to_string()), durable);
         self.save()
     }
 
-    pub fn is_table_durable(&mut self, name: &str) -> bool {
-        let account = self.current_account.clone();
-        self.is_table_durable_for_account(&account, name)
+    pub fn is_table_durable(&self, name: &str) -> bool {
+        self.is_table_durable_for_account(&self.current_account(), name)
     }
 
     /// True when this file must be flushed on every write, either because the
     /// whole database runs in durable mode or because its DIR entry says so.
-    pub fn is_table_durable_for_account(&mut self, account: &str, name: &str) -> bool {
+    pub fn is_table_durable_for_account(&self, account: &str, name: &str) -> bool {
         if self.durable_writes {
             return true;
         }
         let key = (account.to_string(), name.to_string());
-        if let Some(flag) = self.durable_tables.get(&key) {
+        if let Some(flag) = rlock(&self.durable_tables).get(&key) {
             return *flag;
         }
-        let has_dir = name != "DIR"
-            && self.ensure_available_tables(account).is_ok()
-            && self.available_tables.get(account).map(|s| s.contains("DIR")).unwrap_or(false);
+        let has_dir = name != "DIR" && self.account_has_table(account, "DIR");
         let flag = if has_dir {
             match self.get_table_mut_for_account(account, "DIR") {
-                Ok(dir) => dir.records.get(name).map(Self::record_is_durable).unwrap_or(false),
+                Ok(dir) => dir.read().records.get(name).map(Self::record_is_durable).unwrap_or(false),
                 Err(_) => false,
             }
         } else {
             false
         };
-        self.durable_tables.insert(key, flag);
+        wlock(&self.durable_tables).insert(key, flag);
         flag
     }
 
     /// Creates the account's DIR file if it does not have one yet.
-    pub fn ensure_dir_file_for_account(&mut self, account: &str) -> io::Result<()> {
-        self.ensure_available_tables(account)?;
-        if self.available_tables.get(account).map(|s| s.contains("DIR")).unwrap_or(false) {
+    pub fn ensure_dir_file_for_account(&self, account: &str) -> io::Result<()> {
+        if self.account_has_table(account, "DIR") {
             return Ok(());
         }
         self.create_table_for_account(account, "DIR")?;
         self.sync_dir_file_for_account(account)
     }
 
-    pub fn ensure_dir_file(&mut self) -> io::Result<bool> {
-        let account = self.current_account.clone();
-        self.ensure_available_tables(&account)?;
-        if self.available_tables.get(&account).unwrap().contains("DIR") {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+    pub fn ensure_dir_file(&self) -> io::Result<bool> {
+        Ok(self.account_has_table(&self.current_account(), "DIR"))
     }
 
-    pub fn create_dir_file(&mut self) -> io::Result<()> {
+    pub fn create_dir_file(&self) -> io::Result<()> {
         self.create_table("DIR")?;
         self.sync_dir_file()
     }
 
     pub fn get_account_for_dir(&self, dir: &str) -> Option<String> {
-        let names_field = self.accounts_config.fields.get(0)?;
-        let dirs_field = self.accounts_config.fields.get(1)?;
+        let config = rlock(&self.accounts_config);
+        let names_field = config.fields.get(0)?;
+        let dirs_field = config.fields.get(1)?;
         for (i, v) in dirs_field.values.iter().enumerate() {
             if let Some(d) = v.sub_values.get(0) {
                 if d == dir {
@@ -1516,23 +1940,33 @@ impl Database {
     }
 
     pub fn get_conversion_code_read_only(&self, table_name: &str, field_name: &str) -> Option<String> {
-        self.get_conversion_code_read_only_for_account(&self.current_account, table_name, field_name)
+        self.get_conversion_code_read_only_for_account(&self.current_account(), table_name, field_name)
     }
 
     pub fn get_conversion_code_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> Option<String> {
-        self.get_table_read_only_for_account(account, table_name)?.conversion_code(field_name)
+        self.get_table_read_only_for_account(account, table_name)?.read().conversion_code(field_name)
     }
 
-    pub fn get_conversion_code(&mut self, table_name: &str, field_name: &str) -> Option<String> {
-        let account = self.current_account.clone();
-        self.get_conversion_code_read_only_for_account(&account, table_name, field_name)
+    pub fn get_conversion_code(&self, table_name: &str, field_name: &str) -> Option<String> {
+        self.get_conversion_code_read_only_for_account(&self.current_account(), table_name, field_name)
     }
 
     pub fn get_field_header_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> String {
-        let table = match self.get_table_read_only_for_account(account, table_name) {
-            Some(t) => t,
-            None => return field_name.to_string(),
-        };
+        match self.get_table_read_only_for_account(account, table_name) {
+            Some(handle) => Self::field_header_in(&handle.read(), field_name),
+            None => field_name.to_string(),
+        }
+    }
+
+    /// The column heading of a field, read from a table the caller has already
+    /// resolved.
+    ///
+    /// The `_in` variants exist for a caller that is holding the table's lock
+    /// already - a report renderer walking every column of every row. Going
+    /// back through the database for each one would take that same lock again,
+    /// which is both wasteful and, with a writer waiting in between, a way to
+    /// deadlock against ourselves.
+    pub fn field_header_in(table: &Table, field_name: &str) -> String {
         if field_name == "ID" { return "ID".to_string(); }
         if let Some(rec) = table.dictionary.get(field_name) {
             if let Some(f2) = rec.fields.get(DICT_NAME_IDX) {
@@ -1549,11 +1983,15 @@ impl Database {
     }
 
     pub fn get_field_width_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> usize {
-        let table = match self.get_table_read_only_for_account(account, table_name) {
-            Some(t) => t,
-            None => return 10,
-        };
-        if field_name == "ID" { return 10; }
+        match self.get_table_read_only_for_account(account, table_name) {
+            Some(handle) => Self::field_width_in(&handle.read(), field_name),
+            None => DEFAULT_FIELD_WIDTH,
+        }
+    }
+
+    /// The display width of a field. See [`field_header_in`](Self::field_header_in).
+    pub fn field_width_in(table: &Table, field_name: &str) -> usize {
+        if field_name == "ID" { return DEFAULT_FIELD_WIDTH; }
         if let Some(rec) = table.dictionary.get(field_name) {
             if let Some(f4) = rec.fields.get(DICT_WIDTH_IDX) {
                 if let Some(v1) = f4.values.get(0) {
@@ -1565,14 +2003,18 @@ impl Database {
                 }
             }
         }
-        10
+        DEFAULT_FIELD_WIDTH
     }
 
     pub fn get_field_justification_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> String {
-        let table = match self.get_table_read_only_for_account(account, table_name) {
-            Some(t) => t,
-            None => return "L".to_string(),
-        };
+        match self.get_table_read_only_for_account(account, table_name) {
+            Some(handle) => Self::field_justification_in(&handle.read(), field_name),
+            None => "L".to_string(),
+        }
+    }
+
+    /// The justification of a field. See [`field_header_in`](Self::field_header_in).
+    pub fn field_justification_in(table: &Table, field_name: &str) -> String {
         if field_name == "ID" { return "L".to_string(); }
         if let Some(rec) = table.dictionary.get(field_name) {
             if let Some(f3) = rec.fields.get(DICT_JUSTIFY_IDX) {
@@ -1589,11 +2031,15 @@ impl Database {
     }
 
     pub fn get_all_dict_fields_read_only_for_account(&self, account: &str, table_name: &str) -> Vec<String> {
-        let table = match self.get_table_read_only_for_account(account, table_name) {
-            Some(t) => t,
-            None => return Vec::new(),
-        };
+        match self.get_table_read_only_for_account(account, table_name) {
+            Some(handle) => Self::all_dict_fields_in(&handle.read()),
+            None => Vec::new(),
+        }
+    }
 
+    /// Every dictionary field, in attribute order. See
+    /// [`field_header_in`](Self::field_header_in).
+    pub fn all_dict_fields_in(table: &Table) -> Vec<String> {
         let mut fields_map: HashMap<usize, String> = HashMap::new();
         let mut keys: Vec<_> = table.dictionary.keys().cloned().collect();
         keys.sort(); // Consistent order for "picking the first"
@@ -1676,8 +2122,7 @@ impl Database {
     }
 
     pub fn format_record_field(&self, table_name: &str, record: &Record, field_name: &str) -> String {
-        let account = self.current_account.clone();
-        self.format_record_field_for_account(&account, table_name, record, field_name)
+        self.format_record_field_for_account(&self.current_account(), table_name, record, field_name)
     }
 
     pub fn format_record_field_for_account(&self, account: &str, table_name: &str, record: &Record, field_name: &str) -> String {
@@ -1689,53 +2134,58 @@ impl Database {
     /// put the row there; `None` renders the whole field, which is what every
     /// unexploded row does.
     pub fn format_record_field_at(&self, table_name: &str, record: &Record, field_name: &str, position: Option<ValuePosition>) -> String {
-        let account = self.current_account.clone();
-        self.format_record_field_at_for_account(&account, table_name, record, field_name, position)
+        self.format_record_field_at_for_account(&self.current_account(), table_name, record, field_name, position)
     }
 
     pub fn format_record_field_at_for_account(&self, account: &str, table_name: &str, record: &Record, field_name: &str, position: Option<ValuePosition>) -> String {
-        let field_idx = match self.get_field_index_read_only_for_account(account, table_name, field_name) {
-            Some(idx) => idx,
+        match self.get_table_read_only_for_account(account, table_name) {
+            Some(handle) => Self::format_record_field_at_in(&handle.read(), record, field_name, position),
+            None => String::new(),
+        }
+    }
+
+    /// Renders one column of one row from a table the caller has already
+    /// resolved, in a single dictionary lookup. See
+    /// [`field_header_in`](Self::field_header_in).
+    pub fn format_record_field_at_in(table: &Table, record: &Record, field_name: &str, position: Option<ValuePosition>) -> String {
+        let (field_idx, conv) = match table.field_index_and_conversion(field_name) {
+            Some(resolved) => resolved,
             None => return String::new(),
         };
 
         let raw_val = record.get_value_display_string(field_idx, position);
-        let conv = self.get_conversion_code_read_only_for_account(account, table_name, field_name);
-
-        if let Some(code) = conv {
-            Self::convert_display_string(&raw_val, &code)
-        } else {
-            raw_val
+        match conv {
+            Some(code) => Self::convert_display_string(&raw_val, &code),
+            None => raw_val,
         }
     }
 
     pub fn get_field_index_read_only(&self, table_name: &str, field_name: &str) -> Option<usize> {
-        self.get_field_index_read_only_for_account(&self.current_account, table_name, field_name)
+        self.get_field_index_read_only_for_account(&self.current_account(), table_name, field_name)
     }
 
     pub fn get_field_index_read_only_for_account(&self, account: &str, table_name: &str, field_name: &str) -> Option<usize> {
         if field_name == "ID" { return Some(0); }
-        self.get_table_read_only_for_account(account, table_name)?.field_index(field_name)
+        self.get_table_read_only_for_account(account, table_name)?.read().field_index(field_name)
     }
 
-    pub fn get_field_index(&mut self, table_name: &str, field_name: &str) -> Option<usize> {
-        let account = self.current_account.clone();
-        self.get_field_index_for_account(&account, table_name, field_name)
+    pub fn get_field_index(&self, table_name: &str, field_name: &str) -> Option<usize> {
+        self.get_field_index_for_account(&self.current_account(), table_name, field_name)
     }
 
-    pub fn get_field_index_for_account(&mut self, account: &str, table_name: &str, field_name: &str) -> Option<usize> {
+    pub fn get_field_index_for_account(&self, account: &str, table_name: &str, field_name: &str) -> Option<usize> {
         if field_name == "ID" { return Some(0); }
         let _ = self.get_table_mut_for_account(account, table_name).ok();
         self.get_field_index_read_only_for_account(account, table_name, field_name)
     }
 
     pub fn serialize_record(&self, table_name: &str, record: &Record) -> serde_json::Value {
-        self.serialize_record_for_account(&self.current_account, table_name, record)
+        self.serialize_record_for_account(&self.current_account(), table_name, record)
     }
 
     pub fn serialize_record_for_account(&self, account: &str, table_name: &str, record: &Record) -> serde_json::Value {
         match self.get_table_read_only_for_account(account, table_name) {
-            Some(table) => self.serialize_record_in(table, record),
+            Some(handle) => self.serialize_record_in(&handle.read(), record),
             None => serde_json::Value::Object(serde_json::Map::new()),
         }
     }
@@ -1857,13 +2307,24 @@ impl Database {
     }
 
     pub fn deserialize_record(&self, table_name: &str, data: &serde_json::Value) -> Option<Record> {
-        self.deserialize_record_for_account(&self.current_account, table_name, data)
+        self.deserialize_record_for_account(&self.current_account(), table_name, data)
     }
 
     pub fn deserialize_record_for_account(&self, account: &str, table_name: &str, data: &serde_json::Value) -> Option<Record> {
+        let handle = self.get_table_read_only_for_account(account, table_name)?;
+        let table = handle.read();
+        self.deserialize_record_in(&table, data)
+    }
+
+    /// Same, from a file the caller has already resolved.
+    ///
+    /// The write path holds the handle already, and on a file several
+    /// connections are writing at once, looking it up again is not free: every
+    /// resolution takes that contended lock once more, on top of the `stat`
+    /// calls of the freshness check.
+    pub fn deserialize_record_in(&self, table: &Table, data: &serde_json::Value) -> Option<Record> {
         let obj = data.as_object()?;
         let mut record = Record::new();
-        let table = self.get_table_read_only_for_account(account, table_name)?;
 
         // Inverse mapping of camelCase or original dictionary keys to attribute indices and conversion codes
         let mut attr_map = HashMap::new();
@@ -1879,7 +2340,7 @@ impl Database {
                                 attr_map.insert(camel_key.clone(), attr_idx);
                                 attr_map.insert(dict_key.clone(), attr_idx);
 
-                                if let Some(code) = self.get_conversion_code_read_only_for_account(account, table_name, dict_key) {
+                                if let Some(code) = table.conversion_code(dict_key) {
                                     conv_map.insert(camel_key, code.clone());
                                     conv_map.insert(dict_key.clone(), code);
                                 }
@@ -1918,7 +2379,7 @@ impl Database {
         res
     }
 
-    pub fn log_error(&mut self, account: &str, message: &str) -> io::Result<()> {
+    pub fn log_error(&self, account: &str, message: &str) -> io::Result<()> {
         self.run_in_system_account(|db| {
             let now = time::OffsetDateTime::now_utc();
             let date_str = format!("{:04}{:02}{:02}", now.year(), now.month() as u8, now.day());
@@ -1941,7 +2402,8 @@ impl Database {
 
             let max_records = db.max_log_records;
             {
-                let table = db.get_table_mut("$LOGS")?;
+                let handle = db.get_table_mut("$LOGS")?;
+                let mut table = handle.write();
                 table.records.insert(key, record);
                 // Trimming below removes arbitrary keys, so this is a bulk change.
                 table.touch_all();
@@ -1959,13 +2421,14 @@ impl Database {
         })
     }
 
-    pub fn add_authorized_client(&mut self, name: &str, thumbprint: &str, allowed_accounts: Vec<String>, is_admin: bool) -> io::Result<()> {
+    pub fn add_authorized_client(&self, name: &str, thumbprint: &str, allowed_accounts: Vec<String>, is_admin: bool) -> io::Result<()> {
         self.run_in_system_account(|db| {
             let thumbprint_lower = thumbprint.to_lowercase();
 
             // Update $CLIENTS table
             {
-                let table = db.get_table_mut("$CLIENTS")?;
+                let handle = db.get_table_mut("$CLIENTS")?;
+                let mut table = handle.write();
                 let mut record = Record::new();
                 while record.fields.len() <= SYS_CLIENTS_ADMIN_IDX {
                     record.fields.push(Field::default());
@@ -1991,11 +2454,12 @@ impl Database {
         })
     }
 
-    pub fn add_client_account(&mut self, name: &str, account: &str) -> io::Result<bool> {
+    pub fn add_client_account(&self, name: &str, account: &str) -> io::Result<bool> {
         self.run_in_system_account(|db| {
             let mut success = false;
             {
-                let table = db.get_table_mut("$CLIENTS")?;
+                let handle = db.get_table_mut("$CLIENTS")?;
+                let mut table = handle.write();
                 if let Some(record) = table.records.get_mut(name) {
                     // Ensure mandatory fields exist
                     while record.fields.len() <= SYS_CLIENTS_ACCOUNTS_IDX {
@@ -2022,11 +2486,12 @@ impl Database {
         })
     }
 
-    pub fn remove_client_account(&mut self, name: &str, account: &str) -> io::Result<bool> {
+    pub fn remove_client_account(&self, name: &str, account: &str) -> io::Result<bool> {
         self.run_in_system_account(|db| {
             let mut success = false;
             {
-                let table = db.get_table_mut("$CLIENTS")?;
+                let handle = db.get_table_mut("$CLIENTS")?;
+                let mut table = handle.write();
                 if let Some(record) = table.records.get_mut(name) {
                     if record.fields.len() > SYS_CLIENTS_ACCOUNTS_IDX {
                         let original_len = record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len();
@@ -2048,16 +2513,9 @@ impl Database {
         })
     }
 
-    pub fn remove_authorized_client(&mut self, name: &str) -> io::Result<bool> {
+    pub fn remove_authorized_client(&self, name: &str) -> io::Result<bool> {
         self.run_in_system_account(|db| {
-            let found = {
-                let table = db.get_table_mut("$CLIENTS")?;
-                if table.remove_record(name).is_some() {
-                    true
-                } else {
-                    false
-                }
-            };
+            let found = db.get_table_mut("$CLIENTS")?.write().remove_record(name).is_some();
 
             if found {
                 db.save()?;
@@ -2071,7 +2529,7 @@ impl Database {
     pub fn save_certs(&self) -> io::Result<()> {
         let mut certs_rec = Record::new();
         certs_rec.fields.push(Field::default());
-        for tp in &self.authorized_certs {
+        for tp in rlock(&self.clients).certs.iter() {
             certs_rec.fields[0].values.push(Value { sub_values: vec![tp.clone()] });
         }
         let mut map = HashMap::new();
@@ -2079,8 +2537,8 @@ impl Database {
         Self::save_section(&map, &format!("{}/certs.reg", self.storage_dir))
     }
 
-    pub fn create_test_account(&mut self, name: &str) -> io::Result<()> {
-        let original_account = self.current_account.clone();
+    pub fn create_test_account(&self, name: &str) -> io::Result<()> {
+        let original_account = self.current_account();
         self.create_account(name, None)?;
         self.logto(name)?;
         // DIR comes with the account now; creating it again would be refused.
@@ -2088,7 +2546,8 @@ impl Database {
         self.create_table("PRODUCTS")?;
         self.sync_dir_file()?;
         {
-            let table = self.get_table_mut("USERS")?;
+            let handle = self.get_table_mut("USERS")?;
+            let mut table = handle.write();
             table.dictionary.insert("NAME".to_string(), Record::from_display_string("1^NAME^L^15"));
             table.dictionary.insert("EMAIL".to_string(), Record::from_display_string("2^EMAIL^L^20"));
             // ROLES is multivalued, and Jane's second role is sub-valued, so the
@@ -2101,7 +2560,8 @@ impl Database {
             table.mark_dict_dirty();
         }
         {
-            let table = self.get_table_mut("PRODUCTS")?;
+            let handle = self.get_table_mut("PRODUCTS")?;
+            let mut table = handle.write();
             table.dictionary.insert("DESC".to_string(), Record::from_display_string("1^DESCRIPTION^L^20"));
             table.dictionary.insert("PRICE".to_string(), Record::from_display_string("2^PRICE^R^10^^^^MD2"));
             table.records.insert("P1".to_string(), Record::from_display_string("Laptop^120000"));

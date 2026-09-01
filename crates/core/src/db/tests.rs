@@ -10,36 +10,47 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
 
             // Verify $LOGS dictionary
-            let logs = db.get_table("$LOGS").unwrap();
+            let logs_handle = db.get_table("$LOGS").unwrap();
+            let logs = logs_handle.read();
             assert!(logs.dictionary.contains_key("MESSAGE"));
             assert!(logs.dictionary.contains_key("DETAIL"));
+            drop(logs);
 
             // Verify $ACCOUNTS dictionary
-            let accounts = db.get_table("$ACCOUNTS").unwrap();
+            let accounts_handle = db.get_table("$ACCOUNTS").unwrap();
+            let accounts = accounts_handle.read();
             assert!(accounts.dictionary.contains_key("PATH"));
+            drop(accounts);
 
             // Verify $CLIENTS dictionary
-            let clients = db.get_table("$CLIENTS").unwrap();
+            let clients_handle = db.get_table("$CLIENTS").unwrap();
+            let clients = clients_handle.read();
             assert!(clients.dictionary.contains_key("THUMBPRINT"));
             assert!(clients.dictionary.contains_key("ACCOUNTS"));
             assert!(clients.dictionary.contains_key("ADMIN"));
+            drop(clients);
 
             // Verify $SAVEDLISTS dictionary
-            let savedlists = db.get_table("$SAVEDLISTS").unwrap();
+            let savedlists_handle = db.get_table("$SAVEDLISTS").unwrap();
+            let savedlists = savedlists_handle.read();
             assert!(savedlists.dictionary.contains_key("TABLE"));
             assert!(savedlists.dictionary.contains_key("IS_DICT"));
+            drop(savedlists);
 
             // Verify DIR dictionary
-            let dir_table = db.get_table("DIR").unwrap();
+            let dir_table_handle = db.get_table("DIR").unwrap();
+            let dir_table = dir_table_handle.read();
             assert!(dir_table.dictionary.contains_key("TYPE"));
+            drop(dir_table);
 
             // Manually corrupt dictionary for $LOGS
             {
-                let logs_mut = db.get_table_mut("$LOGS").unwrap();
+                let logs_mut_handle = db.get_table_mut("$LOGS").unwrap();
+                let mut logs_mut = logs_mut_handle.write();
                 logs_mut.dictionary.remove("MESSAGE");
                 // Add an override
                 logs_mut.dictionary.insert("DETAIL".to_string(), Record::from_display_string("2^OVERRIDE_DETAIL^L^10"));
@@ -50,10 +61,11 @@ mod tests {
 
         // Restart and check for self-healing
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
 
-            let logs = db.get_table("$LOGS").unwrap();
+            let logs_handle = db.get_table("$LOGS").unwrap();
+            let logs = logs_handle.read();
             // Should be restored
             assert!(logs.dictionary.contains_key("MESSAGE"), "MESSAGE dictionary should be restored");
             // Should NOT be overwritten
@@ -85,7 +97,7 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             // Check if $LOGS file exists in SYSTEM account
             db.logto("SYSTEM")?;
             assert!(db.is_table_available("$LOGS"), "$LOGS table should be automatically created in SYSTEM account");
@@ -109,7 +121,8 @@ mod tests {
             db.log_error("TEST_ACC", "Third error")?; // Should evict first
 
             db.logto("SYSTEM")?;
-            let logs = db.get_table("$LOGS").expect("$LOGS should exist");
+            let logs_handle = db.get_table("$LOGS").expect("$LOGS should exist");
+            let logs = logs_handle.read();
             assert_eq!(logs.records.len(), 2, "Should respect max_log_records");
 
             let mut keys: Vec<_> = logs.records.keys().cloned().collect();
@@ -133,7 +146,7 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.add_authorized_client("CLIENT1", "aabbccdd", vec!["ACC1".to_string()], false)?;
             db.add_authorized_client("CLIENT2", "11223344", vec![], true)?; // ADMIN
 
@@ -141,58 +154,70 @@ mod tests {
             db.logto("SYSTEM")?;
             assert!(db.is_table_available("$CLIENTS"), "$CLIENTS table should exist in SYSTEM account");
 
-            let clients_table = db.get_table("$CLIENTS").expect("$CLIENTS should be loadable");
-            assert!(clients_table.records.contains_key("CLIENT1"), "$CLIENTS should contain CLIENT1");
-            assert!(clients_table.records.contains_key("CLIENT2"), "$CLIENTS should contain CLIENT2");
+            {
+                let clients_table_handle = db.get_table("$CLIENTS").expect("$CLIENTS should be loadable");
+                let clients_table = clients_table_handle.read();
+                assert!(clients_table.records.contains_key("CLIENT1"), "$CLIENTS should contain CLIENT1");
+                assert!(clients_table.records.contains_key("CLIENT2"), "$CLIENTS should contain CLIENT2");
 
-            let rec1 = clients_table.records.get("CLIENT1").unwrap();
-            assert_eq!(rec1.fields[0].values[0].sub_values[0], "aabbccdd");
-            assert_eq!(rec1.fields[1].values[0].sub_values[0], "ACC1");
-            assert_eq!(rec1.fields[2].values[0].sub_values[0], "");
+                let rec1 = clients_table.records.get("CLIENT1").unwrap();
+                assert_eq!(rec1.fields[0].values[0].sub_values[0], "aabbccdd");
+                assert_eq!(rec1.fields[1].values[0].sub_values[0], "ACC1");
+                assert_eq!(rec1.fields[2].values[0].sub_values[0], "");
 
-            let rec2 = clients_table.records.get("CLIENT2").unwrap();
-            assert_eq!(rec2.fields[0].values[0].sub_values[0], "11223344");
-            assert_eq!(rec2.fields[2].values[0].sub_values[0], "Y");
+                let rec2 = clients_table.records.get("CLIENT2").unwrap();
+                assert_eq!(rec2.fields[0].values[0].sub_values[0], "11223344");
+                assert_eq!(rec2.fields[2].values[0].sub_values[0], "Y");
+            }
 
             // Verify in-memory map
-            assert!(db.authorized_clients.contains_key("aabbccdd"));
-            assert_eq!(db.authorized_clients.get("aabbccdd").unwrap().allowed_accounts, vec!["ACC1"]);
-            assert!(!db.authorized_clients.get("aabbccdd").unwrap().is_admin);
+            assert!(db.client_for_thumbprint("aabbccdd").is_some());
+            assert_eq!(db.client_for_thumbprint("aabbccdd").unwrap().allowed_accounts, vec!["ACC1"]);
+            assert!(!db.client_for_thumbprint("aabbccdd").unwrap().is_admin);
 
-            assert!(db.authorized_clients.contains_key("11223344"));
-            assert!(db.authorized_clients.get("11223344").unwrap().is_admin);
+            assert!(db.client_for_thumbprint("11223344").is_some());
+            assert!(db.client_for_thumbprint("11223344").unwrap().is_admin);
 
             // Test add_client_account
             db.add_client_account("CLIENT1", "ACC2")?;
             db.logto("SYSTEM")?;
-            let clients_table = db.get_table("$CLIENTS").unwrap();
-            let rec1_v2 = clients_table.records.get("CLIENT1").unwrap();
-            assert_eq!(rec1_v2.fields[1].values.len(), 2);
-            assert_eq!(rec1_v2.fields[1].values[1].sub_values[0], "ACC2");
-            assert!(db.authorized_clients.get("aabbccdd").unwrap().allowed_accounts.contains(&"ACC2".to_string()));
+            {
+                let clients_table_handle = db.get_table("$CLIENTS").unwrap();
+                let clients_table = clients_table_handle.read();
+                let rec1_v2 = clients_table.records.get("CLIENT1").unwrap();
+                assert_eq!(rec1_v2.fields[1].values.len(), 2);
+                assert_eq!(rec1_v2.fields[1].values[1].sub_values[0], "ACC2");
+            }
+            assert!(db.client_for_thumbprint("aabbccdd").unwrap().allowed_accounts.contains(&"ACC2".to_string()));
 
             // Test remove_client_account
             db.remove_client_account("CLIENT1", "ACC1")?;
             db.logto("SYSTEM")?;
-            let clients_table = db.get_table("$CLIENTS").unwrap();
-            let rec1_v3 = clients_table.records.get("CLIENT1").unwrap();
-            assert_eq!(rec1_v3.fields[1].values.len(), 1);
-            assert_eq!(rec1_v3.fields[1].values[0].sub_values[0], "ACC2");
-            assert!(!db.authorized_clients.get("aabbccdd").unwrap().allowed_accounts.contains(&"ACC1".to_string()));
+            {
+                let clients_table_handle = db.get_table("$CLIENTS").unwrap();
+                let clients_table = clients_table_handle.read();
+                let rec1_v3 = clients_table.records.get("CLIENT1").unwrap();
+                assert_eq!(rec1_v3.fields[1].values.len(), 1);
+                assert_eq!(rec1_v3.fields[1].values[0].sub_values[0], "ACC2");
+            }
+            assert!(!db.client_for_thumbprint("aabbccdd").unwrap().allowed_accounts.contains(&"ACC1".to_string()));
 
             // Test removal of client
             db.remove_authorized_client("CLIENT1")?;
             db.logto("SYSTEM")?;
-            let clients_table = db.get_table("$CLIENTS").unwrap();
-            assert!(!clients_table.records.contains_key("CLIENT1"), "$CLIENTS should not contain CLIENT1 after removal");
-            assert!(!db.authorized_clients.contains_key("aabbccdd"), "In-memory map should be updated");
+            {
+                let clients_table_handle = db.get_table("$CLIENTS").unwrap();
+                let clients_table = clients_table_handle.read();
+                assert!(!clients_table.records.contains_key("CLIENT1"), "$CLIENTS should not contain CLIENT1 after removal");
+            }
+            assert!(!db.client_for_thumbprint("aabbccdd").is_some(), "In-memory map should be updated");
         }
 
         // Test auto-population on restart
         {
             let db = Database::new(base_dir, Some(isolated_config()))?;
-            assert!(db.authorized_clients.contains_key("11223344"), "Should load CLIENT2 from $CLIENTS on restart");
-            assert!(db.authorized_clients.get("11223344").unwrap().is_admin);
+            assert!(db.client_for_thumbprint("11223344").is_some(), "Should load CLIENT2 from $CLIENTS on restart");
+            assert!(db.client_for_thumbprint("11223344").unwrap().is_admin);
         }
 
         Ok(())
@@ -204,7 +229,7 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
             db.create_account("USER1", None)?;
             db.create_account("USER2", Some(&format!("{}/custom_path/user2", base_dir)))?;
@@ -213,29 +238,34 @@ mod tests {
             db.logto("SYSTEM")?;
             assert!(db.is_table_available("$ACCOUNTS"), "$ACCOUNTS table should exist in SYSTEM account");
 
-            let accounts_table = db.get_table("$ACCOUNTS").expect("$ACCOUNTS should be loadable");
-            assert!(accounts_table.records.contains_key("USER1"), "$ACCOUNTS should contain USER1");
-            assert!(accounts_table.records.contains_key("USER2"), "$ACCOUNTS should contain USER2");
-            assert!(!accounts_table.records.contains_key("SYSTEM"), "$ACCOUNTS should NOT contain SYSTEM");
+            {
+                let accounts_table_handle = db.get_table("$ACCOUNTS").expect("$ACCOUNTS should be loadable");
+                let accounts_table = accounts_table_handle.read();
+                assert!(accounts_table.records.contains_key("USER1"), "$ACCOUNTS should contain USER1");
+                assert!(accounts_table.records.contains_key("USER2"), "$ACCOUNTS should contain USER2");
+                assert!(!accounts_table.records.contains_key("SYSTEM"), "$ACCOUNTS should NOT contain SYSTEM");
 
-            let rec1 = accounts_table.records.get("USER1").unwrap();
-            assert!(rec1.fields[0].values[0].sub_values[0].contains("USER1"));
+                let rec1 = accounts_table.records.get("USER1").unwrap();
+                assert!(rec1.fields[0].values[0].sub_values[0].contains("USER1"));
 
-            let rec2 = accounts_table.records.get("USER2").unwrap();
-            assert_eq!(rec2.fields[0].values[0].sub_values[0], format!("{}/custom_path/user2", base_dir));
+                let rec2 = accounts_table.records.get("USER2").unwrap();
+                assert_eq!(rec2.fields[0].values[0].sub_values[0], format!("{}/custom_path/user2", base_dir));
+            }
 
             // Test deletion
             db.delete_account("USER1")?;
             db.logto("SYSTEM")?;
-            let accounts_table = db.get_table("$ACCOUNTS").unwrap();
+            let accounts_table_handle = db.get_table("$ACCOUNTS").unwrap();
+            let accounts_table = accounts_table_handle.read();
             assert!(!accounts_table.records.contains_key("USER1"), "$ACCOUNTS should not contain USER1 after deletion");
         }
 
         // Test auto-population on restart
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
-            let accounts_table = db.get_table("$ACCOUNTS").unwrap();
+            let accounts_table_handle = db.get_table("$ACCOUNTS").unwrap();
+            let accounts_table = accounts_table_handle.read();
             assert!(accounts_table.records.contains_key("USER2"), "$ACCOUNTS should contain USER2 after restart");
         }
 
@@ -248,36 +278,43 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.create_account("ACC1", None)?;
             db.create_account("ACC2", None)?;
 
             // Log to ACC1 and create a table
             db.logto("ACC1")?;
             db.create_table("T1")?;
-            let t1 = db.get_table_mut("T1").unwrap();
+            let t1_handle = db.get_table_mut("T1").unwrap();
+            let mut t1 = t1_handle.write();
             t1.records.insert("K1".to_string(), Record::from_bytes(b"VAL1"));
             t1.touch_all();
+            drop(t1);
             db.save()?;
 
             // Log to ACC2 and create a table with same name but different content
             db.logto("ACC2")?;
             db.create_table("T1")?;
-            let t1_acc2 = db.get_table_mut("T1").unwrap();
+            let t1_acc2_handle = db.get_table_mut("T1").unwrap();
+            let mut t1_acc2 = t1_acc2_handle.write();
             t1_acc2.records.insert("K1".to_string(), Record::from_bytes(b"VAL2"));
             t1_acc2.touch_all();
+            drop(t1_acc2);
             db.save()?;
         }
 
         // Re-open and verify isolation
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("ACC1")?;
-            let t1 = db.get_table("T1").unwrap();
+            let t1_handle = db.get_table("T1").unwrap();
+            let t1 = t1_handle.read();
             assert_eq!(String::from_utf8_lossy(&t1.records.get("K1").unwrap().to_bytes()), "VAL1");
+            drop(t1);
 
             db.logto("ACC2")?;
-            let t1 = db.get_table("T1").unwrap();
+            let t1_handle = db.get_table("T1").unwrap();
+            let t1 = t1_handle.read();
             assert_eq!(String::from_utf8_lossy(&t1.records.get("K1").unwrap().to_bytes()), "VAL2");
         }
 
@@ -290,25 +327,29 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.logto("SYSTEM")?;
             assert!(db.is_table_available("DIR"), "DIR table should be automatically created in SYSTEM account");
 
-            let dir_table = db.get_table("DIR").unwrap();
-            assert!(dir_table.records.contains_key("$LOGS"));
-            assert!(dir_table.records.contains_key("$ACCOUNTS"));
-            assert!(dir_table.records.contains_key("$CLIENTS"));
-            assert!(dir_table.records.contains_key("$SAVEDLISTS"));
+            {
+                let dir_table_handle = db.get_table("DIR").unwrap();
+                let dir_table = dir_table_handle.read();
+                assert!(dir_table.records.contains_key("$LOGS"));
+                assert!(dir_table.records.contains_key("$ACCOUNTS"));
+                assert!(dir_table.records.contains_key("$CLIENTS"));
+                assert!(dir_table.records.contains_key("$SAVEDLISTS"));
 
-            // Check record content
-            let logs_dir_rec = dir_table.records.get("$LOGS").unwrap();
-            assert_eq!(logs_dir_rec.fields[0].values[0].sub_values[0], "F");
+                // Check record content
+                let logs_dir_rec = dir_table.records.get("$LOGS").unwrap();
+                assert_eq!(logs_dir_rec.fields[0].values[0].sub_values[0], "F");
+            }
 
             // Test create_test_account
             db.create_test_account("TEST_DIR")?;
             db.logto("TEST_DIR")?;
             assert!(db.is_table_available("DIR"), "DIR table should be created in test account");
-            let dir_table_test = db.get_table("DIR").unwrap();
+            let dir_table_test_handle = db.get_table("DIR").unwrap();
+            let dir_table_test = dir_table_test_handle.read();
             assert!(dir_table_test.records.contains_key("USERS"));
             assert!(dir_table_test.records.contains_key("PRODUCTS"));
             assert!(!dir_table_test.records.contains_key("DIR"));
@@ -323,7 +364,7 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.create_test_account("DICT_TEST")?;
             db.logto("DICT_TEST")?;
 
@@ -350,7 +391,8 @@ mod tests {
             let name_idx = db.get_field_index("USERS", "NAME").unwrap();
             let email_idx = db.get_field_index("USERS", "EMAIL").unwrap();
 
-            let users = db.get_table("USERS").unwrap();
+            let users_handle = db.get_table("USERS").unwrap();
+            let users = users_handle.read();
             let rec1 = users.records.get("1").unwrap();
 
             assert_eq!(rec1.get_field_display_string(name_idx), "John Doe");
@@ -366,7 +408,8 @@ mod tests {
             let price_idx = db.get_field_index("PRODUCTS", "PRICE").unwrap();
 
             let p1 = {
-                let products = db.get_table("PRODUCTS").unwrap();
+                let products_handle = db.get_table("PRODUCTS").unwrap();
+                let products = products_handle.read();
                 products.records.get("P1").unwrap().clone()
             };
 
@@ -394,14 +437,15 @@ mod tests {
         let base_dir = dir.path();
 
         {
-            let mut db = Database::new(base_dir, Some(isolated_config()))?;
+            let db = Database::new(base_dir, Some(isolated_config()))?;
             db.create_test_account("SERIAL_TEST")?;
             db.logto("SERIAL_TEST")?;
 
             // Setup a table with complex dictionary names
             db.create_table("CUSTOM")?;
             {
-                let table = db.get_table_mut("CUSTOM").unwrap();
+                let table_handle = db.get_table_mut("CUSTOM").unwrap();
+                let mut table = table_handle.write();
                 table.dictionary.insert("FIRST.NAME".to_string(), Record::from_display_string("1^First Name^L^15"));
                 table.dictionary.insert("LAST.NAME".to_string(), Record::from_display_string("2^Last Name^L^15"));
                 table.dictionary.insert("AGE".to_string(), Record::from_display_string("3^Age^R^3"));

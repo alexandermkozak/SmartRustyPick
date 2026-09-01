@@ -78,6 +78,8 @@ Currently supported settings:
 - `ca_path`: Path to the CA certificate for client authentication (default: `.local/certs/ca.crt`). The CA private key
   is kept next to it as `ca.key`, and `GENERATE.CERT` writes new client certificates into the same directory.
 - `records_per_group`: Target records per hashfile group (default: 16).
+- `max_loaded_tables`: How many files may be held in memory at once (default: 64). Each is locked individually, so a
+  larger cache is what lets writers to different files run in parallel rather than take turns being loaded and evicted.
 - `durable_writes`: Flush every write before acknowledging it (default: false). Individual files can opt in without this
   global switch, at creation with `CREATE.FILE <name> DURABLE` or at any time after it with `SET.FILE <name> DURABLE`
   (see [Storage Engine](docs/storage.md)).

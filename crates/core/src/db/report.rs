@@ -8,7 +8,7 @@
 //! it.
 
 use crate::db::engine::Database;
-use crate::db::models::{Record, SelectEntry};
+use crate::db::models::{Record, SelectEntry, Table};
 
 /// The `ID` column is not dictionary-driven; it is always first and always this
 /// wide.
@@ -34,11 +34,11 @@ impl FieldFormat {
 }
 
 /// Expands `*` to every dictionary field, keeping the caller's order otherwise.
-fn expand_columns(db: &Database, account: &str, table_name: &str, columns: &[String]) -> Vec<String> {
+fn expand_columns(table: &Table, columns: &[String]) -> Vec<String> {
     let mut expanded = Vec::with_capacity(columns.len());
     for name in columns {
         if name == "*" {
-            expanded.extend(db.get_all_dict_fields_read_only_for_account(account, table_name));
+            expanded.extend(Database::all_dict_fields_in(table));
         } else {
             expanded.push(name.clone());
         }
@@ -53,26 +53,28 @@ fn expand_columns(db: &Database, account: &str, table_name: &str, columns: &[Str
 /// value that matched, while every other column repeats the record's whole
 /// field. Applying it everywhere would blank out every single-valued column on
 /// any row past the first.
+///
+/// The table is passed in rather than looked up, because the caller is holding
+/// its lock already - a row's records are borrowed out of it. Resolving the
+/// dictionary from the table also means one lookup per column instead of one
+/// per column per row.
 pub fn render_list<T: std::borrow::Borrow<Record>>(
-    db: &Database,
-    table_name: &str,
+    table: &Table,
     columns: &[String],
     explode_field: Option<&str>,
     rows: &[(SelectEntry, T)],
 ) -> Vec<String> {
-    let account = db.current_account.clone();
-
     let mut formats = vec![FieldFormat {
         name: "ID".to_string(),
         header: "ID".to_string(),
         width: ID_WIDTH,
         justify: "L".to_string(),
     }];
-    for name in expand_columns(db, &account, table_name, columns) {
+    for name in expand_columns(table, columns) {
         formats.push(FieldFormat {
-            header: db.get_field_header_read_only_for_account(&account, table_name, &name),
-            width: db.get_field_width_read_only_for_account(&account, table_name, &name),
-            justify: db.get_field_justification_read_only_for_account(&account, table_name, &name),
+            header: Database::field_header_in(table, &name),
+            width: Database::field_width_in(table, &name),
+            justify: Database::field_justification_in(table, &name),
             name,
         });
     }
@@ -102,13 +104,7 @@ pub fn render_list<T: std::borrow::Borrow<Record>>(
                 entry.key.clone()
             } else {
                 let position = (Some(fmt.name.as_str()) == explode_field).then_some(entry.position).flatten();
-                db.format_record_field_at_for_account(
-                    &account,
-                    table_name,
-                    record.borrow(),
-                    &fmt.name,
-                    position,
-                )
+                Database::format_record_field_at_in(table, record.borrow(), &fmt.name, position)
             };
             row_line.push_str(&fmt.cell(&value));
         }

@@ -74,7 +74,14 @@ about the host than about the code.
   throughout the run.
 - **`test/performance/test_concurrency.py`** — mutual-TLS handshake cost, single-client vs. 8-client read throughput,
   tail latency under contention, handshake cost while a large buffered burst is flushed to disk, concurrent writers
-  (including a lost-update check), and per-connection memory.
+  (including a lost-update check), per-file locking, and per-connection memory.
+
+  Per-file locking is checked two ways, because the throughput a Python client can drive is the ceiling here, not the
+  server: N writers on N files must beat a single writer (`SRP_CONC_MIN_WRITE_SCALING`), and the same N writers must see
+  a shorter tail on N files than on one (`SRP_CONC_MIN_WRITE_SPREAD`). The second is the sharper of the two - same
+  clients, same requests, same work for the server, differing only in whether the writes queue behind one lock - but it
+  needs writers enough to collide, so it is recorded and not asserted below `SRP_CONC_SPREAD_MIN_CLIENTS` (8) of them.
+  CI runs four clients, where the scaling check is the one carrying the weight.
 
 Each measurement is guarded in up to three ways, in increasing order of trustworthiness:
 
@@ -173,6 +180,7 @@ you what to install if neither is present. Narrow it down with `make profile FIL
 | `SRP_PERF_ENFORCE`       | `1`      | Set to `0` to report budget violations without failing the suite. |
 | `SRP_CONC_CLIENTS`       | `8`      | Parallel clients in the concurrency suite.                        |
 | `SRP_CONC_OPS`           | `200`    | Operations each concurrent client performs.                       |
+| `SRP_CONC_DISTINCT_WRITES`| `400`   | Writes per client in the per-file locking comparison.             |
 | `SRP_STARTUP_TIMEOUT`    | `30`     | Seconds to wait for a server to accept connections.               |
 | `SRP_PROFILE`            | `debug`  | Which `target/<profile>` directory to take the binaries from.     |
 | `CARGO_TARGET_DIR`       | `target` | Where to look for the built binaries.                             |
