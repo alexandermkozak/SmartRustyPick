@@ -412,11 +412,10 @@ impl Database {
 
         if let Some(filter_keys) = keys_to_filter {
             for key in filter_keys {
-                if let Some(record) = source_map.get(key) {
-                    if Self::evaluate_node_static_with_id(key, record, query, &field_map) {
+                if let Some(record) = source_map.get(key)
+                    && Self::evaluate_node_static_with_id(key, record, query, &field_map) {
                         results.push((key.clone(), record));
                     }
-                }
             }
         } else {
             // Optimize: Filter before sorting.
@@ -598,11 +597,10 @@ impl Database {
         match node {
             QueryNode::Condition(cond) => {
                 if cond.field_name == "ID" { return; }
-                if !map.contains_key(&cond.field_name) {
-                    if let Some((idx, conversion)) = table.field_index_and_conversion(&cond.field_name) {
+                if !map.contains_key(&cond.field_name)
+                    && let Some((idx, conversion)) = table.field_index_and_conversion(&cond.field_name) {
                         map.insert(cond.field_name.clone(), FieldQueryInfo { index: idx, conversion });
                     }
-                }
             }
             QueryNode::Logical { left, right, .. } => {
                 Self::collect_field_indices(table, left, map);
@@ -633,9 +631,8 @@ impl Database {
                         return Self::compare_values("", &cond.op, &search_val);
                     }
                     for v in &field.values {
-                        if v.sub_values.is_empty() {
-                            if Self::compare_values("", &cond.op, &search_val) { return true; }
-                        }
+                        if v.sub_values.is_empty()
+                            && Self::compare_values("", &cond.op, &search_val) { return true; }
                         if v.sub_values.iter().any(|sv| Self::compare_values(sv, &cond.op, &search_val)) {
                             return true;
                         }

@@ -4,7 +4,7 @@ pub mod hashfile;
 pub mod query;
 pub mod report;
 #[cfg(test)]
-pub mod tests;
+mod db_tests;
 #[cfg(test)]
 mod model_tests;
 #[cfg(test)]

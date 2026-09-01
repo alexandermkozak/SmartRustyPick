@@ -673,11 +673,10 @@ fn remove_groups_beyond(dir: &Path, modulus: u64) -> io::Result<()> {
             None => continue,
         };
         if !name.starts_with('g') { continue; }
-        if let Ok(group) = u64::from_str_radix(&name[1..], 16) {
-            if group >= modulus {
+        if let Ok(group) = u64::from_str_radix(&name[1..], 16)
+            && group >= modulus {
                 let _ = fs::remove_file(entry.path());
             }
-        }
     }
     Ok(())
 }
@@ -691,11 +690,10 @@ pub fn group_sizes(section_path: &str) -> Vec<u64> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_str().unwrap_or_default().to_string();
-            if name.starts_with('g') && !name.ends_with(".tmp") {
-                if let Ok(meta) = entry.metadata() {
+            if name.starts_with('g') && !name.ends_with(".tmp")
+                && let Ok(meta) = entry.metadata() {
                     sizes.push(meta.len());
                 }
-            }
         }
     }
     sizes.sort();

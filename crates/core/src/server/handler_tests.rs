@@ -497,7 +497,7 @@ fn test_list_conns_and_server_stats_describe_the_running_server() {
     // Thumbprints are stored lowercase, whatever case they were given in.
     assert_eq!(info["thumbprint"].as_str().unwrap(), "ab12cd");
     assert_eq!(info["accounts"][0].as_str().unwrap(), "SALES");
-    assert_eq!(info["is_admin"].as_bool().unwrap(), false);
+    assert!(!info["is_admin"].as_bool().unwrap());
 
     let resp = handle_request(Request { command: "SERVER.STATS".to_string(), ..Default::default() }, &db_arc, &admin);
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);

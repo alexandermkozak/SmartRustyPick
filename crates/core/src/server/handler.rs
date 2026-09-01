@@ -185,12 +185,17 @@ fn record_command(command: &str, req: Request, db: &Database, acc: &str) -> Resp
 }
 
 /// Resolves the file a request names, loading it if it is not in memory.
+// The `Err` variant is a ready-to-send `Response`, which every caller returns as
+// its own value. Boxing it to shrink the `Result` would only add an allocation on
+// the error path and an unboxing at each call site.
+#[allow(clippy::result_large_err)]
 fn resolve_file(db: &Database, acc: &str, name: &str) -> Result<crate::db::TableHandle, Response> {
     db.get_table_mut_for_account(acc, name)
         .map_err(|e| error(format!("Table error: {}", e)))
 }
 
 /// The file a request names, or the error to send back when it names none.
+#[allow(clippy::result_large_err)]
 fn requested_file(req: &Request) -> Result<&str, Response> {
     req.file.as_deref().ok_or_else(|| error("File not specified"))
 }

@@ -213,6 +213,12 @@ pub struct Table {
     pub dict_dirty: bool,
 }
 
+impl Default for Table {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Table {
     pub fn new() -> Self {
         Table {

@@ -104,7 +104,7 @@ fn test_authorized_clients_refresh_across_processes() {
     // Deauthorization must be honoured too.
     assert!(writer.remove_authorized_client("CLIENT1").unwrap());
     reader.refresh_clients_if_stale().unwrap();
-    assert!(!reader.client_for_thumbprint(tp).is_some(), "deauthorized client still authorized");
+    assert!(reader.client_for_thumbprint(tp).is_none(), "deauthorized client still authorized");
 }
 
 #[test]

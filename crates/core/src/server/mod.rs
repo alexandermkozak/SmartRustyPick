@@ -128,13 +128,12 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
 
             let (_, session) = tls_stream.get_ref();
             let mut client_cert_thumbprint = None;
-            if let Some(certs) = session.peer_certificates() {
-                if let Some(cert) = certs.first() {
+            if let Some(certs) = session.peer_certificates()
+                && let Some(cert) = certs.first() {
                     let mut hasher = Sha256::new();
                     hasher.update(cert);
                     client_cert_thumbprint = Some(hex::encode(hasher.finalize()));
                 }
-            }
 
             let thumbprint = match client_cert_thumbprint {
                 Some(t) => t,

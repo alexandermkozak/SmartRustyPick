@@ -91,11 +91,10 @@ fn test_parse_query() {
     // OR with quotes
     let q3 = db.parse_query("T1", &["NAME", "=", "\"John Doe\"", "OR", "NAME", "=", "Jane"]);
     assert!(q3.is_some());
-    if let Some(QueryNode::Logical { right, .. }) = q3 {
-        if let QueryNode::Condition(c) = *right {
+    if let Some(QueryNode::Logical { right, .. }) = q3
+        && let QueryNode::Condition(c) = *right {
             assert_eq!(c.value, "Jane");
         }
-    }
 
     // Invalid
     assert!(db.parse_query("T1", &[]).is_none());
@@ -244,7 +243,7 @@ fn test_query_with_wildcards() {
     // DESC is field 0
 
     // 1. Contains "new": [new]
-    let query1 = db.parse_query("ITEMS", &vec!["WITH", "DESC", "=", "[new]"]).unwrap();
+    let query1 = db.parse_query("ITEMS", &["WITH", "DESC", "=", "[new]"]).unwrap();
     let res1 = db.query("ITEMS", false, &query1, None);
     // Should find "brand new item" and "newest thing"
     assert!(res1.iter().any(|(id, _)| id == "1"), "Should find 'brand new item'");
@@ -252,14 +251,14 @@ fn test_query_with_wildcards() {
     assert!(!res1.iter().any(|(id, _)| id == "2"), "Should NOT find 'old item'");
 
     // 2. Starts with "new": new]
-    let query2 = db.parse_query("ITEMS", &vec!["WITH", "DESC", "=", "new]"]).unwrap();
+    let query2 = db.parse_query("ITEMS", &["WITH", "DESC", "=", "new]"]).unwrap();
     let res2 = db.query("ITEMS", false, &query2, None);
     // Should find "newest thing"
     assert!(res2.iter().any(|(id, _)| id == "3"), "Should find 'newest thing'");
     assert!(!res2.iter().any(|(id, _)| id == "1"), "Should NOT find 'brand new item'");
 
     // 3. Ends with "item": [item
-    let query3 = db.parse_query("ITEMS", &vec!["WITH", "DESC", "=", "[item"]).unwrap();
+    let query3 = db.parse_query("ITEMS", &["WITH", "DESC", "=", "[item"]).unwrap();
     let res3 = db.query("ITEMS", false, &query3, None);
     // Should find "brand new item" and "old item"
     assert!(res3.iter().any(|(id, _)| id == "1"), "Should find 'brand new item'");

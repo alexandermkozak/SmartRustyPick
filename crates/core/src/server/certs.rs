@@ -47,7 +47,7 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
     if !Path::new(ca_key_path).exists() || !ca_exists {
         println!("Generating CA certificate...");
         let status = std::process::Command::new("openssl")
-            .args(&[
+            .args([
                 "req", "-new", "-x509", "-days", "3650",
                 "-nodes",
                 "-newkey", "rsa:2048",
@@ -59,7 +59,7 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
             ])
             .status()?;
         if !status.success() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to generate CA certificate"));
+            return Err(std::io::Error::other("Failed to generate CA certificate"));
         }
     }
 
@@ -68,7 +68,7 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
         println!("Generating server certificate...");
         let csr_path = &sibling(cert_path, "csr");
         let status = std::process::Command::new("openssl")
-            .args(&[
+            .args([
                 "req", "-new",
                 "-nodes",
                 "-newkey", "rsa:2048",
@@ -78,15 +78,15 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
             ])
             .status()?;
         if !status.success() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to generate server CSR"));
+            return Err(std::io::Error::other("Failed to generate server CSR"));
         }
 
         // 3. Sign server certificate with CA
         let ext_path = &sibling(cert_path, "ext");
-        std::fs::write(&ext_path, "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nsubjectAltName = DNS:localhost, IP:127.0.0.1")?;
+        std::fs::write(ext_path, "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nsubjectAltName = DNS:localhost, IP:127.0.0.1")?;
 
         let status = std::process::Command::new("openssl")
-            .args(&[
+            .args([
                 "x509", "-req",
                 "-in", csr_path.as_str(),
                 "-CA", ca_path,
@@ -103,7 +103,7 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
         let _ = std::fs::remove_file(csr_path);
         let _ = std::fs::remove_file(ext_path);
         if !status.success() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to sign server certificate"));
+            return Err(std::io::Error::other("Failed to sign server certificate"));
         }
     }
 
@@ -211,7 +211,7 @@ pub fn generate_client_cert(config: &Config, common_name: &str, days: u32, write
     let pfx_file = out("pfx");
     let ext_file = out("ext");
 
-    let failed = |step: &str| io::Error::new(io::ErrorKind::Other, format!("{} failed", step));
+    let failed = |step: &str| io::Error::other(format!("{} failed", step));
     let ran = |result: io::Result<std::process::ExitStatus>| matches!(result, Ok(status) if status.success());
 
     // The private key never leaves this directory except through the caller.

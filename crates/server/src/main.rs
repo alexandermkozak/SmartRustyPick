@@ -39,11 +39,10 @@ fn main() {
         // persist whatever has not been written out yet.
         // Flushing needs no more than a shared borrow now that each file
         // carries its own lock, so a shutdown does not queue behind a request.
-        if let Ok(db_lock) = db.read() {
-            if let Err(e) = db_lock.save() {
+        if let Ok(db_lock) = db.read()
+            && let Err(e) = db_lock.save() {
                 eprintln!("Failed to flush on shutdown: {}", e);
             }
-        }
     });
 }
 

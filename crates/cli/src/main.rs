@@ -10,18 +10,16 @@ const CLIENT_CERT_DAYS: u32 = 365;
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut initial_account = None;
-    if let Some(pos) = args.iter().position(|a| a == "--account") {
-        if pos + 1 < args.len() {
+    if let Some(pos) = args.iter().position(|a| a == "--account")
+        && pos + 1 < args.len() {
             initial_account = Some(args[pos + 1].clone());
         }
-    }
 
     let mut db_dir = "db_storage".to_string();
-    if let Some(pos) = args.iter().position(|a| a == "-d" || a == "--db-dir") {
-        if pos + 1 < args.len() {
+    if let Some(pos) = args.iter().position(|a| a == "-d" || a == "--db-dir")
+        && pos + 1 < args.len() {
             db_dir = args[pos + 1].clone();
         }
-    }
 
     let config = Config::load();
     let config_arc = Arc::new(config.clone());
@@ -349,11 +347,10 @@ fn handle_get(db: &mut Database, parts: &[&str]) {
     if parts.len() < offset + 2 {
         // Try to use active select list
         let mut keys_from_list = None;
-        if let Some(list) = &db.active_select_list {
-            if list.table_name == table_name && list.is_dict == is_dict {
+        if let Some(list) = &db.active_select_list
+            && list.table_name == table_name && list.is_dict == is_dict {
                 keys_from_list = Some(list.unique_keys());
             }
-        }
 
         if let Some(keys) = keys_from_list {
             if let Some(handle) = db.get_table(table_name) {
@@ -409,12 +406,11 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
         // Try to use active select list
         let mut keys_to_delete = Vec::new();
         let mut used_list = false;
-        if let Some(list) = &db.active_select_list {
-            if list.table_name == table_name && list.is_dict == is_dict {
+        if let Some(list) = &db.active_select_list
+            && list.table_name == table_name && list.is_dict == is_dict {
                 keys_to_delete = list.unique_keys();
                 used_list = true;
             }
-        }
 
         if used_list {
             let handle = match db.get_table_mut(table_name) {
@@ -802,11 +798,10 @@ fn handle_ct(db: &mut Database, parts: &[&str]) {
     if parts.len() < offset + 2 {
         // Try to use active select list
         let mut keys_from_list = None;
-        if let Some(list) = &db.active_select_list {
-            if list.table_name == table_name && list.is_dict == is_dict {
+        if let Some(list) = &db.active_select_list
+            && list.table_name == table_name && list.is_dict == is_dict {
                 keys_from_list = Some(list.unique_keys());
             }
-        }
 
         if let Some(keys) = keys_from_list {
             if let Some(handle) = db.get_table(table_name) {
@@ -1157,9 +1152,9 @@ fn handle_list_files(db: &mut Database) {
             let table = handle.read();
             let mut files: Vec<_> = table.records.iter()
                 .filter(|(_, record)| {
-                    record.fields.get(0)
-                        .and_then(|f| f.values.get(0))
-                        .and_then(|v| v.sub_values.get(0))
+                    record.fields.first()
+                        .and_then(|f| f.values.first())
+                        .and_then(|v| v.sub_values.first())
                         .map(|s| s.as_str())
                         .unwrap_or("") == "F"
                 })
@@ -1288,9 +1283,9 @@ fn handle_list_conns(db: &mut Database) {
 
         for name in names {
             if let Some(record) = table.records.get(&name) {
-                let thumbprint = record.fields.get(0)
-                    .and_then(|f| f.values.get(0))
-                    .and_then(|v| v.sub_values.get(0))
+                let thumbprint = record.fields.first()
+                    .and_then(|f| f.values.first())
+                    .and_then(|v| v.sub_values.first())
                     .cloned()
                     .unwrap_or_else(|| "N/A".to_string());
                 println!("{:<20} {:<64}", name, thumbprint);

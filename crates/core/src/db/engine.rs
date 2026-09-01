@@ -306,7 +306,7 @@ impl Table {
     pub fn field_index(&self, field_name: &str) -> Option<usize> {
         if field_name == "ID" { return Some(0); }
         let rec = self.dictionary.get(field_name)?;
-        let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.get(0)?.sub_values.get(0)?;
+        let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.first()?.sub_values.first()?;
         match idx_str.parse::<usize>() {
             // Pick attribute 1 is 0-indexed 0 in our internal fields vector
             Ok(idx) if idx > 0 => Some(idx - 1),
@@ -324,7 +324,7 @@ impl Table {
     /// dictionary record in hand, sparing a second lookup in `dictionary`.
     pub(crate) fn conversion_code_from_dict_record(dict_rec: &Record) -> Option<&str> {
         // Pick MDn conversion is in Field 8
-        let code = dict_rec.fields.get(DICT_CONV_IDX)?.values.get(0)?.sub_values.get(0)?;
+        let code = dict_rec.fields.get(DICT_CONV_IDX)?.values.first()?.sub_values.first()?;
         if code.is_empty() { None } else { Some(code.as_str()) }
     }
 
@@ -333,7 +333,7 @@ impl Table {
     pub fn field_index_and_conversion(&self, field_name: &str) -> Option<(usize, Option<String>)> {
         if field_name == "ID" { return Some((0, None)); }
         let rec = self.dictionary.get(field_name)?;
-        let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.get(0)?.sub_values.get(0)?;
+        let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.first()?.sub_values.first()?;
         let idx = match idx_str.parse::<usize>() {
             // Pick attribute 1 is 0-indexed 0 in our internal fields vector
             Ok(idx) if idx > 0 => idx - 1,
@@ -469,28 +469,23 @@ impl Database {
         let mut accounts_to_list = Vec::new();
         {
             let config = rlock(&self.accounts_config);
-            if let Some(names_field) = config.fields.get(0) {
-                if let Some(dirs_field) = config.fields.get(1) {
+            if let Some(names_field) = config.fields.first()
+                && let Some(dirs_field) = config.fields.get(1) {
                     for (i, v) in names_field.values.iter().enumerate() {
-                        if let Some(name) = v.sub_values.get(0) {
-                            if name != "SYSTEM" {
-                                if let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.get(0)) {
+                        if let Some(name) = v.sub_values.first()
+                            && name != "SYSTEM"
+                                && let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.first()) {
                                     accounts_to_list.push((name.clone(), dir.clone()));
                                 }
-                            }
-                        }
                     }
                 }
-            }
         }
 
         let handle = self.get_table_mut("$ACCOUNTS")?;
         let mut accounts_table = handle.write();
         for (name, dir) in accounts_to_list {
             let mut record = Record::new();
-            while record.fields.len() <= SYS_ACCOUNTS_PATH_IDX {
-                record.fields.push(Field::default());
-            }
+            record.fields.resize_with(SYS_ACCOUNTS_PATH_IDX + 1, Field::default);
             record.fields[SYS_ACCOUNTS_PATH_IDX].values.push(Value { sub_values: vec![dir] });
             accounts_table.records.insert(name, record);
         }
@@ -505,9 +500,9 @@ impl Database {
         }
 
         let mut map = HashMap::new();
-        if Self::load_section(&mut map, &certs_path).is_ok() {
-            if let Some(certs_rec) = map.remove("certs") {
-                if let Some(f) = certs_rec.fields.get(0) {
+        if Self::load_section(&mut map, &certs_path).is_ok()
+            && let Some(certs_rec) = map.remove("certs")
+                && let Some(f) = certs_rec.fields.first() {
                     let handle = self.get_table_mut("$CLIENTS")?;
                     let mut table = handle.write();
                     for v in &f.values {
@@ -516,7 +511,7 @@ impl Database {
                                 let tp_lower = sv.to_lowercase();
                                 // Migrate if not already present
                                 let already_exists = table.records.values().any(|r| {
-                                    r.fields.get(0).and_then(|f| f.values.get(0)).and_then(|v| v.sub_values.get(0)) == Some(&tp_lower)
+                                    r.fields.first().and_then(|f| f.values.first()).and_then(|v| v.sub_values.first()) == Some(&tp_lower)
                                 });
                                 if !already_exists {
                                     let mut rec = Record::new();
@@ -531,8 +526,6 @@ impl Database {
                         }
                     }
                 }
-            }
-        }
         let _ = fs::rename(&certs_path, format!("{}.migrated", certs_path));
         Ok(())
     }
@@ -627,21 +620,20 @@ impl Database {
         let table = handle.read();
         let mut clients = Vec::new();
         for (name, record) in table.records.iter() {
-            if let Some(tp) = record.fields.get(SYS_CLIENTS_THUMBPRINT_IDX).and_then(|f| f.values.get(0)).and_then(|v| v.sub_values.get(0)) {
+            if let Some(tp) = record.fields.get(SYS_CLIENTS_THUMBPRINT_IDX).and_then(|f| f.values.first()).and_then(|v| v.sub_values.first()) {
                 let tp_lower = tp.to_lowercase();
                 let mut allowed_accounts = Vec::new();
                 if let Some(acc_field) = record.fields.get(SYS_CLIENTS_ACCOUNTS_IDX) {
                     for v in &acc_field.values {
-                        if let Some(acc) = v.sub_values.get(0) {
-                            if !acc.is_empty() {
+                        if let Some(acc) = v.sub_values.first()
+                            && !acc.is_empty() {
                                 allowed_accounts.push(acc.clone());
                             }
-                        }
                     }
                 }
                 let is_admin = record.fields.get(SYS_CLIENTS_ADMIN_IDX)
-                    .and_then(|f| f.values.get(0))
-                    .and_then(|v| v.sub_values.get(0))
+                    .and_then(|f| f.values.first())
+                    .and_then(|v| v.sub_values.first())
                     .map(|s| s == "Y")
                     .unwrap_or(false);
                 clients.push(ClientInfo {
@@ -809,11 +801,10 @@ impl Database {
         let mut tables = HashSet::new();
         if let Ok(entries) = fs::read_dir(&account_dir) {
             for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    if let Some(name) = entry.file_name().to_str() {
+                if entry.path().is_dir()
+                    && let Some(name) = entry.file_name().to_str() {
                         tables.insert(name.to_string());
                     }
-                }
             }
         }
         wlock(&self.available_tables).insert(account_name.to_string(), tables);
@@ -959,9 +950,7 @@ impl Database {
                     let handle = db.get_table_mut("$ACCOUNTS")?;
                     let mut accounts_table = handle.write();
                     let mut record = Record::new();
-                    while record.fields.len() <= SYS_ACCOUNTS_PATH_IDX {
-                        record.fields.push(Field::default());
-                    }
+                    record.fields.resize_with(SYS_ACCOUNTS_PATH_IDX + 1, Field::default);
                     record.fields[SYS_ACCOUNTS_PATH_IDX].values.push(Value { sub_values: vec![dir] });
                     accounts_table.insert_record(name, record);
                 }
@@ -997,7 +986,7 @@ impl Database {
 
     pub fn delete_account(&self, name: &str) -> io::Result<()> {
         if name == "SYSTEM" {
-            return Err(io::Error::new(io::ErrorKind::Other, "Cannot delete SYSTEM account"));
+            return Err(io::Error::other("Cannot delete SYSTEM account"));
         }
 
         let _ = self.refresh_account_registry();
@@ -1007,8 +996,8 @@ impl Database {
         // Remove from registry
         {
             let mut config = wlock(&self.accounts_config);
-            let position = config.fields.get(0).and_then(|names| {
-                names.values.iter().position(|v| v.sub_values.get(0) == Some(&name.to_string()))
+            let position = config.fields.first().and_then(|names| {
+                names.values.iter().position(|v| v.sub_values.first() == Some(&name.to_string()))
             });
             if let Some(pos) = position {
                 config.fields[0].values.remove(pos);
@@ -1055,10 +1044,10 @@ impl Database {
 
     pub fn get_account_dir(&self, account_name: &str) -> Option<String> {
         let config = rlock(&self.accounts_config);
-        let names_field = config.fields.get(0)?;
+        let names_field = config.fields.first()?;
         let dirs_field = config.fields.get(1)?;
-        let pos = names_field.values.iter().position(|v| v.sub_values.get(0) == Some(&account_name.to_string()))?;
-        dirs_field.values.get(pos)?.sub_values.get(0).cloned()
+        let pos = names_field.values.iter().position(|v| v.sub_values.first() == Some(&account_name.to_string()))?;
+        dirs_field.values.get(pos)?.sub_values.first().cloned()
     }
 
     pub fn current_storage_dir(&self) -> String {
@@ -1413,8 +1402,8 @@ impl Database {
     /// buffer, and every other file's lock, untouched.
     fn flush_table(&self, key: &TableKey) -> io::Result<()> {
         assert_no_table_guard_held("A flush of one file");
-        if let Some(handle) = self.get_table_read_only_for_account(&key.0, &key.1) {
-            if handle.read().is_dirty() {
+        if let Some(handle) = self.get_table_read_only_for_account(&key.0, &key.1)
+            && handle.read().is_dirty() {
                 self.flush_handle(key, &handle)?;
                 let stamp = self.disk_stamp(&key.0, &key.1);
                 handle.write().stamp = Some(stamp);
@@ -1422,7 +1411,6 @@ impl Database {
                     self.load_clients_from_table()?;
                 }
             }
-        }
         mlock(&self.write_marks).insert(key.clone(), WriteMark::fresh());
         Ok(())
     }
@@ -1474,11 +1462,10 @@ impl Database {
     }
 
     fn save_section(map: &HashMap<String, Record>, path: &str) -> io::Result<()> {
-        if let Some(parent) = Path::new(path).parent() {
-            if !parent.exists() {
+        if let Some(parent) = Path::new(path).parent()
+            && !parent.exists() {
                 fs::create_dir_all(parent)?;
             }
-        }
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
 
@@ -1528,8 +1515,8 @@ impl Database {
     /// another process since the last look.
     pub fn list_accounts(&self) -> Vec<String> {
         let _ = self.refresh_account_registry();
-        let mut names: Vec<String> = rlock(&self.accounts_config).fields.get(0)
-            .map(|f| f.values.iter().filter_map(|v| v.sub_values.get(0).cloned()).collect())
+        let mut names: Vec<String> = rlock(&self.accounts_config).fields.first()
+            .map(|f| f.values.iter().filter_map(|v| v.sub_values.first().cloned()).collect())
             .unwrap_or_default();
         names.sort();
         names.dedup();
@@ -1691,7 +1678,7 @@ impl Database {
 
     pub fn create_table_for_account(&self, account: &str, name: &str) -> io::Result<()> {
         if account.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
+            return Err(io::Error::other("Not logged into an account"));
         }
         self.ensure_available_tables(account)?;
 
@@ -1748,7 +1735,7 @@ impl Database {
 
     pub fn delete_table_for_account(&self, account: &str, name: &str) -> io::Result<()> {
         if account.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
+            return Err(io::Error::other("Not logged into an account"));
         }
         if !self.account_has_table(account, name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' not found", name)));
@@ -1819,8 +1806,8 @@ impl Database {
 
     fn record_is_durable(record: &Record) -> bool {
         record.fields.get(DIR_DURABLE_IDX)
-            .and_then(|f| f.values.get(0))
-            .and_then(|v| v.sub_values.get(0))
+            .and_then(|f| f.values.first())
+            .and_then(|v| v.sub_values.first())
             .map(|s| matches!(s.trim().to_uppercase().as_str(), "Y" | "YES" | "1" | "TRUE" | "DURABLE"))
             .unwrap_or(false)
     }
@@ -1840,7 +1827,7 @@ impl Database {
     /// safe either way - it only ever relaxes what a later write has to do.
     pub fn set_table_durable_for_account(&self, account: &str, name: &str, durable: bool) -> io::Result<()> {
         if account.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Not logged into an account"));
+            return Err(io::Error::other("Not logged into an account"));
         }
         if !self.account_has_table(account, name) {
             return Err(io::Error::new(
@@ -1927,14 +1914,13 @@ impl Database {
 
     pub fn get_account_for_dir(&self, dir: &str) -> Option<String> {
         let config = rlock(&self.accounts_config);
-        let names_field = config.fields.get(0)?;
+        let names_field = config.fields.first()?;
         let dirs_field = config.fields.get(1)?;
         for (i, v) in dirs_field.values.iter().enumerate() {
-            if let Some(d) = v.sub_values.get(0) {
-                if d == dir {
-                    return names_field.values.get(i)?.sub_values.get(0).cloned();
+            if let Some(d) = v.sub_values.first()
+                && d == dir {
+                    return names_field.values.get(i)?.sub_values.first().cloned();
                 }
-            }
         }
         None
     }
@@ -1968,17 +1954,13 @@ impl Database {
     /// deadlock against ourselves.
     pub fn field_header_in(table: &Table, field_name: &str) -> String {
         if field_name == "ID" { return "ID".to_string(); }
-        if let Some(rec) = table.dictionary.get(field_name) {
-            if let Some(f2) = rec.fields.get(DICT_NAME_IDX) {
-                if let Some(v1) = f2.values.get(0) {
-                    if let Some(header) = v1.sub_values.get(0) {
-                        if !header.is_empty() {
+        if let Some(rec) = table.dictionary.get(field_name)
+            && let Some(f2) = rec.fields.get(DICT_NAME_IDX)
+                && let Some(v1) = f2.values.first()
+                    && let Some(header) = v1.sub_values.first()
+                        && !header.is_empty() {
                             return header.clone();
                         }
-                    }
-                }
-            }
-        }
         field_name.to_string()
     }
 
@@ -1992,17 +1974,13 @@ impl Database {
     /// The display width of a field. See [`field_header_in`](Self::field_header_in).
     pub fn field_width_in(table: &Table, field_name: &str) -> usize {
         if field_name == "ID" { return DEFAULT_FIELD_WIDTH; }
-        if let Some(rec) = table.dictionary.get(field_name) {
-            if let Some(f4) = rec.fields.get(DICT_WIDTH_IDX) {
-                if let Some(v1) = f4.values.get(0) {
-                    if let Some(width_str) = v1.sub_values.get(0) {
-                        if let Ok(width) = width_str.parse::<usize>() {
+        if let Some(rec) = table.dictionary.get(field_name)
+            && let Some(f4) = rec.fields.get(DICT_WIDTH_IDX)
+                && let Some(v1) = f4.values.first()
+                    && let Some(width_str) = v1.sub_values.first()
+                        && let Ok(width) = width_str.parse::<usize>() {
                             return width;
                         }
-                    }
-                }
-            }
-        }
         DEFAULT_FIELD_WIDTH
     }
 
@@ -2016,17 +1994,13 @@ impl Database {
     /// The justification of a field. See [`field_header_in`](Self::field_header_in).
     pub fn field_justification_in(table: &Table, field_name: &str) -> String {
         if field_name == "ID" { return "L".to_string(); }
-        if let Some(rec) = table.dictionary.get(field_name) {
-            if let Some(f3) = rec.fields.get(DICT_JUSTIFY_IDX) {
-                if let Some(v1) = f3.values.get(0) {
-                    if let Some(just) = v1.sub_values.get(0) {
-                        if !just.is_empty() {
+        if let Some(rec) = table.dictionary.get(field_name)
+            && let Some(f3) = rec.fields.get(DICT_JUSTIFY_IDX)
+                && let Some(v1) = f3.values.first()
+                    && let Some(just) = v1.sub_values.first()
+                        && !just.is_empty() {
                             return just.clone();
                         }
-                    }
-                }
-            }
-        }
         "L".to_string()
     }
 
@@ -2045,15 +2019,12 @@ impl Database {
         keys.sort(); // Consistent order for "picking the first"
 
         for key in keys {
-            if let Some(record) = table.dictionary.get(&key) {
-                if let Some(field_idx_str) = record.fields.get(DICT_FIELD_IDX).and_then(|f| f.values.get(0)).and_then(|v| v.sub_values.get(0)) {
-                    if let Ok(idx) = field_idx_str.parse::<usize>() {
-                        if idx > 0 && !fields_map.contains_key(&idx) {
+            if let Some(record) = table.dictionary.get(&key)
+                && let Some(field_idx_str) = record.fields.get(DICT_FIELD_IDX).and_then(|f| f.values.first()).and_then(|v| v.sub_values.first())
+                    && let Ok(idx) = field_idx_str.parse::<usize>()
+                        && idx > 0 && !fields_map.contains_key(&idx) {
                             fields_map.insert(idx, key);
                         }
-                    }
-                }
-            }
         }
 
         let mut sorted_indices: Vec<_> = fields_map.keys().cloned().collect();
@@ -2063,8 +2034,8 @@ impl Database {
     }
 
     pub fn apply_conversion(val: &str, code: &str) -> String {
-        if code.starts_with("MD") && code.len() > 2 {
-            if let Ok(decimals) = code[2..].parse::<usize>() {
+        if code.starts_with("MD") && code.len() > 2
+            && let Ok(decimals) = code[2..].parse::<usize>() {
                 let divisor = 10f64.powi(decimals as i32);
                 if let Ok(num) = val.parse::<i64>() {
                     let mut s = format!("{:.width$}", num as f64 / divisor, width = decimals);
@@ -2081,19 +2052,16 @@ impl Database {
                     return s;
                 }
             }
-        }
         val.to_string()
     }
 
     pub fn apply_iconv(val: &str, code: &str) -> String {
-        if code.starts_with("MD") && code.len() > 2 {
-            if let Ok(decimals) = code[2..].parse::<usize>() {
-                if let Ok(f) = val.parse::<f64>() {
+        if code.starts_with("MD") && code.len() > 2
+            && let Ok(decimals) = code[2..].parse::<usize>()
+                && let Ok(f) = val.parse::<f64>() {
                     let multiplier = 10f64.powi(decimals as i32);
                     return format!("{:.0}", (f * multiplier).round());
                 }
-            }
-        }
         val.to_string()
     }
 
@@ -2199,8 +2167,8 @@ impl Database {
         let mut fields = Vec::with_capacity(table.dictionary.len());
         for (dict_key, dict_rec) in &table.dictionary {
             let idx = dict_rec.fields.get(DICT_FIELD_IDX)
-                .and_then(|f| f.values.get(0))
-                .and_then(|v| v.sub_values.get(0))
+                .and_then(|f| f.values.first())
+                .and_then(|v| v.sub_values.first())
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|idx| *idx > 0);
             let Some(idx) = idx else { continue };
@@ -2330,11 +2298,11 @@ impl Database {
         let mut attr_map = HashMap::new();
         let mut conv_map = HashMap::new();
         for (dict_key, dict_rec) in &table.dictionary {
-            if let Some(f1) = dict_rec.fields.get(DICT_FIELD_IDX) {
-                if let Some(v1) = f1.values.get(0) {
-                    if let Some(idx_str) = v1.sub_values.get(0) {
-                        if let Ok(idx) = idx_str.parse::<usize>() {
-                            if idx > 0 {
+            if let Some(f1) = dict_rec.fields.get(DICT_FIELD_IDX)
+                && let Some(v1) = f1.values.first()
+                    && let Some(idx_str) = v1.sub_values.first()
+                        && let Ok(idx) = idx_str.parse::<usize>()
+                            && idx > 0 {
                                 let attr_idx = idx - 1;
                                 let camel_key = self.to_camel_case(dict_key);
                                 attr_map.insert(camel_key.clone(), attr_idx);
@@ -2345,10 +2313,6 @@ impl Database {
                                     conv_map.insert(dict_key.clone(), code);
                                 }
                             }
-                        }
-                    }
-                }
-            }
         }
 
         for (key, val) in obj {
@@ -2467,7 +2431,7 @@ impl Database {
                     }
 
                     // Check if account already exists in Field 1
-                    let already_exists = record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.iter().any(|v| v.sub_values.get(0) == Some(&account.to_string()));
+                    let already_exists = record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.iter().any(|v| v.sub_values.first() == Some(&account.to_string()));
 
                     if !already_exists {
                         record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.push(Value { sub_values: vec![account.to_string()] });
@@ -2492,17 +2456,16 @@ impl Database {
             {
                 let handle = db.get_table_mut("$CLIENTS")?;
                 let mut table = handle.write();
-                if let Some(record) = table.records.get_mut(name) {
-                    if record.fields.len() > SYS_CLIENTS_ACCOUNTS_IDX {
+                if let Some(record) = table.records.get_mut(name)
+                    && record.fields.len() > SYS_CLIENTS_ACCOUNTS_IDX {
                         let original_len = record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len();
-                        record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.retain(|v| v.sub_values.get(0).map(|s| s != account).unwrap_or(true));
+                        record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.retain(|v| v.sub_values.first().map(|s| s != account).unwrap_or(true));
 
                         if record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len() < original_len {
                             table.mark_dirty(name);
                             success = true;
                         }
                     }
-                }
             }
 
             if success {
