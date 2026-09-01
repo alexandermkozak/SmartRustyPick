@@ -1,4 +1,4 @@
-.PHONY: test-unit test-integration test-performance test-all bench bench-smoke perf-compare perf-report profile build run run-cli run-server container-build container-up container-down container-logs container-cli ui-install ui-dev ui-build ui-check ui-test ui-format install-hooks
+.PHONY: test-unit test-integration test-performance test-all bench bench-smoke perf-compare perf-report profile build run run-cli run-server container-build container-up container-down container-logs container-cli ui-install ui-dev ui-build ui-check ui-test ui-format install-hooks lint fmt fmt-check clippy audit
 
 CONTAINER_ENGINE ?= podman
 IMAGE ?= localhost/smart-rusty-pick:latest
@@ -60,6 +60,31 @@ run-cli: build
 
 run-server: build
 	./target/debug/smart-rusty-pick-server
+
+# --- Static analysis ---------------------------------------------------------
+# The same three gates the `lint` job runs in CI, in the same order and with the
+# same flags, so a green `make lint` here means a green lint job there.
+lint: fmt-check clippy audit
+
+# Rewrites; `fmt-check` only reports. rustfmt.toml holds the one setting that
+# differs from the default (max_width, to agree with .editorconfig).
+fmt:
+	cargo fmt --all
+
+fmt-check:
+	cargo fmt --all -- --check
+
+# --all-targets: tests, benches and examples are linted too.
+clippy:
+	cargo clippy --workspace --all-targets -- -D warnings
+
+audit:
+	@command -v cargo-audit >/dev/null 2>&1 || { \
+		echo "cargo-audit is not installed. Install it with:"; \
+		echo "    cargo install cargo-audit --locked"; \
+		exit 1; \
+	}
+	cargo audit
 
 test-unit:
 	cargo test --workspace

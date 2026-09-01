@@ -30,6 +30,50 @@ env:
   SRP_CONC_CLIENTS: 4
 
 jobs:
+  # Cheap, fails fast, and independent of the test job, so it runs beside it
+  # rather than in front of it. `cargo fmt` and `cargo audit` need no build at
+  # all; clippy needs a check build, which is why this is not folded into
+  # `test` - there it would have to wait for one.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+
+      # Formatting first: it is the fastest check and the one most likely to be
+      # the only thing wrong, so a failure here does not wait on clippy.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` so tests, benches and examples are linted too; they are
+      # where lint rot usually starts.
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # A prebuilt binary rather than `cargo install cargo-audit`, which is a
+      # three-minute compile the cache does not cover. Not rustsec/audit-check:
+      # that action still runs on Node 20 and would put the deprecation warning
+      # this repository just cleared (#30) straight back onto every run.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Fails on vulnerabilities. Unmaintained-crate warnings are printed but do
+      # not fail the job: they are a plan-a-replacement signal, not a stop-work
+      # one, and they appear without any change of ours having caused them.
+      - name: Audit dependencies
+        run: cargo audit
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -84,6 +128,50 @@ jobs:
       - name: Run performance tests
         run: make test-performance
 
+      # A pull request's numbers mean little on their own - shared runners vary
+      # far more than a real regression usually does - so compare them against
+      # the last run on `main`. The cache is the transport: a pull request can
+      # read entries written on its base branch, and `restore-keys` picks the
+      # newest one whose key starts with the prefix, so no run has to know which
+      # commit produced the baseline.
+      - name: Restore the performance baseline from the base branch
+        id: perf-baseline
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: target/perf-baseline
+          # Deliberately a key no run ever writes, so this always falls through
+          # to restore-keys and takes the most recent baseline rather than an
+          # exact-commit match that would almost never exist.
+          key: perf-baseline-${{ github.base_ref }}-${{ github.sha }}
+          restore-keys: |
+            perf-baseline-${{ github.base_ref }}-
+
+      # Advisory, by design. `compare_perf.py` exits non-zero past its tolerance,
+      # and `|| true` keeps that from failing the job: until the false-positive
+      # rate on these runners is known, the table is worth reading and the
+      # verdict is not worth blocking a merge on. Turning this into a gate later
+      # is deleting `|| true` and picking a threshold.
+      - name: Compare performance against the base branch
+        if: >-
+          always() && github.event_name == 'pull_request'
+          && hashFiles('target/perf-baseline/performance_metrics.json') != ''
+          && hashFiles('target/test-results/performance_metrics.json') != ''
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          {
+            echo "### Change against \`$BASE_REF\`"
+            echo
+            python3 scripts/compare_perf.py \
+              target/perf-baseline/performance_metrics.json \
+              target/test-results/performance_metrics.json \
+              --tolerance 50 2>&1 || true
+            echo
+            echo "_Advisory only: shared runners are noisy, so a verdict here does not fail the build._"
+          } > target/test-results/perf-delta.md
+          cat target/test-results/perf-delta.md
+
       # The suites already record every measurement to performance_metrics.json.
       # These two steps put that file where it can be read without opening the run:
       # the run summary, and a single comment on the pull request that is rewritten
@@ -95,6 +183,11 @@ jobs:
           python3 scripts/report_perf.py \
             --footer "[Full workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) - performance suite: ${{ job.status }}" \
             --output target/test-results/perf-report.md
+          # The delta against the base branch, when there was a baseline to compare
+          # against, goes into the same report: one thing to read, not two.
+          if [ -f target/test-results/perf-delta.md ]; then
+            { echo; cat target/test-results/perf-delta.md; } >> target/test-results/perf-report.md
+          fi
           cat target/test-results/perf-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment the performance report on the pull request
@@ -143,6 +236,25 @@ jobs:
       # benchmarks compiling and running, which is how benchmark suites usually rot.
       - name: Smoke-run the engine benchmarks
         run: make bench-smoke
+
+      # Only `main` writes a baseline, so a pull request always compares against
+      # its merge target rather than whatever branch happened to run last. The
+      # key carries the commit, which makes every push a new entry and lets the
+      # restore above take the newest. It is staged into its own directory
+      # because restoring it on a pull request must not land on top of that
+      # run's own metrics.
+      - name: Stage the performance baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('target/test-results/performance_metrics.json') != ''
+        run: |
+          mkdir -p target/perf-baseline
+          cp target/test-results/performance_metrics.json target/perf-baseline/
+
+      - name: Save the performance baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('target/perf-baseline/performance_metrics.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: target/perf-baseline
+          key: perf-baseline-${{ github.ref_name }}-${{ github.sha }}
 
       - name: Upload test results
         if: always()
