@@ -10,6 +10,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The default for every job below. `test` widens it by exactly the one scope it
+# needs; nothing here inherits whatever the repository default happens to be.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Keep the CI signal about correctness rather than raw throughput: a smaller
@@ -27,6 +32,7 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     # Needed only by the step that publishes the performance report onto the
     # pull request; everything else in this job reads.
@@ -35,7 +41,7 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -44,7 +50,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -140,7 +146,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-results
           path: target/test-results/
@@ -152,30 +158,55 @@ jobs:
   # differs from what is in the repository.
   dashboard-bundle:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      UI_DIR: crates/core/src/web/ui
+      DIST_DIR: crates/core/src/web/assets/dist
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
+      # The node version stays pinned rather than tracking 'lts/*'. This job
+      # asserts that the committed bundle is byte-for-byte what the sources
+      # build, so the toolchain that builds it is part of the comparison:
+      # floating it would turn a node release into a stale-bundle failure on an
+      # unrelated pull request.
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: crates/core/src/web/ui/package-lock.json
 
+      # The `ui-*` Makefile targets each run `npm ci` so that they work from a
+      # clean checkout, which is right locally and redundant here. CI installs
+      # once and calls the npm scripts those targets wrap.
+      - name: Install the dashboard's dependencies
+        run: npm ci
+        working-directory: crates/core/src/web/ui
+
       - name: Check the dashboard front end's formatting
-        run: cd crates/core/src/web/ui && npm ci && npm run format:check
+        run: npm run format:check
+        working-directory: crates/core/src/web/ui
 
       - name: Test the dashboard front end
-        run: make ui-test
+        run: npm test
+        working-directory: crates/core/src/web/ui
 
       - name: Rebuild the dashboard bundle
-        run: make ui-build
+        run: npm run build
+        working-directory: crates/core/src/web/ui
 
       - name: Fail if the committed bundle is stale
         run: |
-          if ! git diff --exit-code -- crates/core/src/web/assets/dist; then
-            echo "::error::The committed dashboard bundle does not match crates/core/src/web/ui."
-            echo "Run 'make ui-build' and commit crates/core/src/web/assets/dist."
+          # `git status --porcelain`, not `git diff`: a rebuild that emits a *new*
+          # file - a renamed hashed chunk, an added asset - leaves it untracked,
+          # and `git diff` compares only tracked files, so it would report clean.
+          changed=$(git status --porcelain -- "$DIST_DIR")
+          if [ -n "$changed" ]; then
+            echo "::error::The committed dashboard bundle does not match $UI_DIR."
+            echo "$changed"
+            echo "Run 'make ui-build' and commit $DIST_DIR."
             exit 1
           fi
