@@ -1,0 +1,4 @@
+# The line length the rest of the repository already declares for Rust in
+# .editorconfig. rustfmt's own default is 100, which would disagree with every
+# editor reading that file; this keeps the two saying the same thing.
+max_width = 120

@@ -11,6 +11,18 @@ on:
   pull_request_review:
     types: [ submitted ]
 
+# Not `github.ref`, which for an `issue_comment` event is the default branch:
+# grouping on that would put every Junie invocation in the repository into one
+# group, so a mention on one issue would cancel the agent working on another.
+# The issue or pull request number is what actually identifies the conversation.
+#
+# And not `cancel-in-progress` either, unlike the review workflow. Each run here
+# is an explicit `@junie-agent` request that may be part-way through pushing a
+# commit; a second mention should queue behind the first, not kill it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   junie:
     if: |
@@ -19,13 +31,14 @@ jobs:
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@junie-agent')) ||
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@junie-agent') || contains(github.event.issue.title, '@junie-agent')))
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
       pull-requests: write
       issues: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 

@@ -1,6 +1,6 @@
 use crate::db::engine::Database;
 use crate::db::models::*;
-use crate::test_support::{isolated_config, TempDir};
+use crate::test_support::{TempDir, isolated_config};
 use std::path::Path;
 
 #[test]
@@ -20,7 +20,11 @@ fn test_lru_eviction() {
     db.create_table("T3").unwrap();
 
     // Load T1 and T2
-    db.get_table_mut("T1").unwrap().write().records.insert("K1".to_string(), Record::from_display_string("V1"));
+    db.get_table_mut("T1")
+        .unwrap()
+        .write()
+        .records
+        .insert("K1".to_string(), Record::from_display_string("V1"));
     db.get_table_mut("T1").unwrap().write().touch_all();
     let _ = db.get_table_mut("T2");
 
@@ -76,13 +80,18 @@ fn test_account_registry_reloads_when_another_process_writes() {
     writer.create_account("NEWACC", None).unwrap();
 
     // Without reconnecting, the reader must be able to log to it.
-    reader.logto("NEWACC").expect("account created by another process is not visible");
+    reader
+        .logto("NEWACC")
+        .expect("account created by another process is not visible");
     assert!(reader.get_account_dir("NEWACC").is_some());
 
     // The reader creating its own account must not erase the other one.
     reader.create_account("OWNACC", None).unwrap();
     let third = Database::new(base_dir, Some(isolated_config())).unwrap();
-    assert!(third.get_account_dir("NEWACC").is_some(), "registry lost an account on write");
+    assert!(
+        third.get_account_dir("NEWACC").is_some(),
+        "registry lost an account on write"
+    );
     assert!(third.get_account_dir("OWNACC").is_some());
     let _ = third.logto("SYSTEM");
 }
@@ -96,15 +105,23 @@ fn test_authorized_clients_refresh_across_processes() {
     let reader = Database::new(base_dir, Some(isolated_config())).unwrap();
 
     let tp = "aabbccdd";
-    writer.add_authorized_client("CLIENT1", tp, vec!["SYSTEM".to_string()], false).unwrap();
+    writer
+        .add_authorized_client("CLIENT1", tp, vec!["SYSTEM".to_string()], false)
+        .unwrap();
 
     reader.refresh_clients_if_stale().unwrap();
-    assert!(reader.client_for_thumbprint(tp).is_some(), "client authorized elsewhere is not visible");
+    assert!(
+        reader.client_for_thumbprint(tp).is_some(),
+        "client authorized elsewhere is not visible"
+    );
 
     // Deauthorization must be honoured too.
     assert!(writer.remove_authorized_client("CLIENT1").unwrap());
     reader.refresh_clients_if_stale().unwrap();
-    assert!(!reader.client_for_thumbprint(tp).is_some(), "deauthorized client still authorized");
+    assert!(
+        reader.client_for_thumbprint(tp).is_none(),
+        "deauthorized client still authorized"
+    );
 }
 
 #[test]
@@ -211,7 +228,8 @@ fn test_cache_reloads_when_another_process_writes() {
     {
         let t_handle = writer.get_table_mut("ENTITIES").unwrap();
         let mut t = t_handle.write();
-        t.records.insert("E2".to_string(), Record::from_display_string("SECOND"));
+        t.records
+            .insert("E2".to_string(), Record::from_display_string("SECOND"));
         t.touch_all();
     }
     writer.create_table("NEWFILE").unwrap();
@@ -220,8 +238,14 @@ fn test_cache_reloads_when_another_process_writes() {
     // Without disconnecting, the reader must see the committed changes.
     let table_handle = reader.get_table("ENTITIES").expect("ENTITIES should be readable");
     let table = table_handle.read();
-    assert!(table.records.contains_key("E2"), "cached table was not refreshed from disk");
-    assert!(reader.get_table("NEWFILE").is_some(), "new table created by another process is not visible");
+    assert!(
+        table.records.contains_key("E2"),
+        "cached table was not refreshed from disk"
+    );
+    assert!(
+        reader.get_table("NEWFILE").is_some(),
+        "new table created by another process is not visible"
+    );
 }
 
 #[test]
@@ -251,7 +275,8 @@ fn test_listed_table_still_refreshes_after_save() {
     {
         let t_handle = writer.get_table_mut("ENTITIES").unwrap();
         let mut t = t_handle.write();
-        t.records.insert("E2".to_string(), Record::from_display_string("SECOND"));
+        t.records
+            .insert("E2".to_string(), Record::from_display_string("SECOND"));
         t.touch_all();
     }
     writer.save().unwrap();
@@ -262,7 +287,10 @@ fn test_listed_table_still_refreshes_after_save() {
 
     let table_handle = reader.get_table("ENTITIES").unwrap();
     let table = table_handle.read();
-    assert!(table.records.contains_key("E2"), "stale snapshot was frozen by an unrelated save");
+    assert!(
+        table.records.contains_key("E2"),
+        "stale snapshot was frozen by an unrelated save"
+    );
 }
 
 #[test]
@@ -281,7 +309,8 @@ fn test_local_changes_survive_staleness_check() {
     {
         let t_handle = reader.get_table_mut("ENTITIES").unwrap();
         let mut t = t_handle.write();
-        t.records.insert("LOCAL".to_string(), Record::from_display_string("PENDING"));
+        t.records
+            .insert("LOCAL".to_string(), Record::from_display_string("PENDING"));
         t.touch_all();
     }
 
@@ -289,7 +318,8 @@ fn test_local_changes_survive_staleness_check() {
     {
         let t_handle = writer.get_table_mut("ENTITIES").unwrap();
         let mut t = t_handle.write();
-        t.records.insert("REMOTE".to_string(), Record::from_display_string("COMMITTED"));
+        t.records
+            .insert("REMOTE".to_string(), Record::from_display_string("COMMITTED"));
         t.touch_all();
     }
     writer.save().unwrap();
@@ -312,13 +342,22 @@ fn test_all_dict_fields() {
         let table_handle = db.get_table_mut("USERS").unwrap();
         let mut table = table_handle.write();
         // EMAIL -> field 1
-        table.dictionary.insert("EMAIL".to_string(), Record::from_display_string("1^Email Address^L^15"));
+        table
+            .dictionary
+            .insert("EMAIL".to_string(), Record::from_display_string("1^Email Address^L^15"));
         // NAME -> field 2
-        table.dictionary.insert("NAME".to_string(), Record::from_display_string("2^User Name^L^15"));
+        table
+            .dictionary
+            .insert("NAME".to_string(), Record::from_display_string("2^User Name^L^15"));
         // ALT_NAME -> field 2
-        table.dictionary.insert("ALT_NAME".to_string(), Record::from_display_string("2^Alternate Name^L^15"));
+        table.dictionary.insert(
+            "ALT_NAME".to_string(),
+            Record::from_display_string("2^Alternate Name^L^15"),
+        );
         // ZIP -> field 3
-        table.dictionary.insert("ZIP".to_string(), Record::from_display_string("3^Zip Code^L^5"));
+        table
+            .dictionary
+            .insert("ZIP".to_string(), Record::from_display_string("3^Zip Code^L^5"));
     }
 
     let fields = db.get_all_dict_fields_read_only_for_account("SYSTEM", "USERS");
@@ -342,9 +381,15 @@ fn json_shape_db(label: &str) -> (TempDir, Database) {
     db.create_table("USERS").unwrap();
     let table_handle = db.get_table_mut("USERS").unwrap();
     let mut table = table_handle.write();
-    table.dictionary.insert("NAME".to_string(), Record::from_display_string("1^NAME^L^15"));
-    table.dictionary.insert("ROLES".to_string(), Record::from_display_string("2^ROLES^L^20"));
-    table.dictionary.insert("PRICE".to_string(), Record::from_display_string("3^PRICE^R^10^^^^MD2"));
+    table
+        .dictionary
+        .insert("NAME".to_string(), Record::from_display_string("1^NAME^L^15"));
+    table
+        .dictionary
+        .insert("ROLES".to_string(), Record::from_display_string("2^ROLES^L^20"));
+    table
+        .dictionary
+        .insert("PRICE".to_string(), Record::from_display_string("3^PRICE^R^10^^^^MD2"));
     table.mark_dict_dirty();
     drop(table);
     (dir, db)
@@ -373,7 +418,6 @@ fn test_serialize_record_shapes_multivalues_as_arrays() {
     let short = Record::from_display_string("Zed");
     let json = db.serialize_record("USERS", &short);
     assert_eq!(json["roles"], serde_json::json!(""));
-
 }
 
 #[test]
@@ -397,7 +441,6 @@ fn test_multivalue_record_survives_a_json_round_trip() {
             "PRICE did not survive the round trip of {display}"
         );
     }
-
 }
 
 #[test]
@@ -417,7 +460,6 @@ fn test_deserialize_does_not_resplit_a_plain_string() {
     assert_eq!(record.fields[2].values.len(), 2);
     assert_eq!(record.fields[2].values[0].sub_values[0], "100");
     assert_eq!(record.fields[2].values[1].sub_values[0], "400");
-
 }
 
 #[test]
@@ -441,5 +483,4 @@ fn test_format_record_field_at_narrows_to_a_position() {
     );
     // An unknown field is empty, as it always was.
     assert_eq!(db.format_record_field_at("USERS", &record, "NOPE", None), "");
-
 }

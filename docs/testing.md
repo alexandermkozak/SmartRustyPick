@@ -15,6 +15,21 @@ The project has five layers of tests, all runnable from the `Makefile` and all e
 the unit layer requires `cargo build` first; the Make targets
 take care of it.
 
+## Static analysis
+
+Three gates run beside the tests, in their own `lint` job, and `make lint` runs the same three locally with the same
+flags:
+
+| Check       | Command                                            | What it means                                                                   |
+|-------------|----------------------------------------------------|---------------------------------------------------------------------------------|
+| Formatting  | `make fmt-check` — `cargo fmt --all -- --check`     | `make fmt` rewrites. `rustfmt.toml` sets `max_width = 120`, the width `.editorconfig` already declares for `*.rs`. |
+| Lints       | `make clippy` — `cargo clippy --workspace --all-targets -- -D warnings` | `--all-targets`, so tests and benches are linted too: that is where lint rot starts. |
+| Advisories  | `make audit` — `cargo audit`                        | Fails on a RUSTSEC vulnerability. Needs `cargo install cargo-audit --locked`.     |
+
+`cargo audit` fails the build on vulnerabilities only. Unmaintained-crate warnings are printed and do not fail it -
+they arrive without any change of ours having caused them, and they call for planning a replacement rather than
+stopping work. One is currently outstanding: `rustls-pemfile` (RUSTSEC-2025-0134).
+
 ## Requirements
 
 - A Rust toolchain (for `cargo build` / `cargo test`).
@@ -104,6 +119,14 @@ make perf-compare BASE=/tmp/base.json
 ```
 
 `perf-compare` exits non-zero if any metric worsened by more than 25% (`--tolerance` to change it).
+
+CI does this comparison for you. Each run on `main` stores its `performance_metrics.json` in the Actions cache under a
+`perf-baseline-main-<sha>` key; a pull request restores the most recent one and runs `compare_perf.py` against it, so
+the delta lands in the report below without anyone downloading two artifacts. Both runs are on the same runner *type*
+rather than the same machine, so this is **advisory**: the table is printed and a verdict past the tolerance does not
+fail the build. Making it a gate is a matter of deleting one `|| true` in the workflow and picking a threshold, and is
+worth doing only once the false-positive rate on these runners is known. The ratio checks inside the suite remain the
+host-independent regression guards.
 
 The same file renders as a Markdown report with `make perf-report`, which is how the numbers reach a pull request
 without anyone opening the workflow run. CI writes that report to the run summary and to a single comment on the

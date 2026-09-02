@@ -112,7 +112,11 @@ const CRC32C_TABLE: [u32; 256] = {
         let mut crc = i as u32;
         let mut bit = 0;
         while bit < 8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
             bit += 1;
         }
         table[i] = crc;
@@ -178,7 +182,12 @@ pub struct SectionMeta {
 
 impl SectionMeta {
     pub fn empty() -> Self {
-        SectionMeta { version: 0, modulus: MIN_MODULUS, records: 0, checksums: false }
+        SectionMeta {
+            version: 0,
+            modulus: MIN_MODULUS,
+            records: 0,
+            checksums: false,
+        }
     }
 }
 
@@ -320,13 +329,18 @@ pub fn read_meta_checked(section_path: &str) -> io::Result<Option<SectionMeta>> 
     if let Some(expected) = stored_checksum {
         let actual = crc32c(body.as_bytes());
         if actual != expected {
-            return Err(corrupt(&format!("checksum mismatch ({:08x} != {:08x})", actual, expected)));
+            return Err(corrupt(&format!(
+                "checksum mismatch ({:08x} != {:08x})",
+                actual, expected
+            )));
         }
     } else if meta.checksums {
         return Err(corrupt("checksum line missing"));
     }
 
-    if meta.modulus == 0 { meta.modulus = MIN_MODULUS; }
+    if meta.modulus == 0 {
+        meta.modulus = MIN_MODULUS;
+    }
     Ok(Some(meta))
 }
 
@@ -367,7 +381,10 @@ struct CrcReader<R: Read> {
 
 impl<R: Read> CrcReader<R> {
     fn new(inner: R) -> Self {
-        CrcReader { inner, crc: 0xFFFF_FFFF }
+        CrcReader {
+            inner,
+            crc: 0xFFFF_FFFF,
+        }
     }
 
     fn finish(self) -> u32 {
@@ -468,7 +485,12 @@ pub fn read_group(map: &mut HashMap<String, Record>, path: &Path, require_traile
         if data_len > MAX_DATA_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Record too large: {} bytes for key '{}' in {}", data_len, key, path.display()),
+                format!(
+                    "Record too large: {} bytes for key '{}' in {}",
+                    data_len,
+                    key,
+                    path.display()
+                ),
             ));
         }
 
@@ -589,7 +611,14 @@ pub fn save(
     dirty_keys: Option<&HashSet<String>>,
     per_group: usize,
 ) -> io::Result<SectionMeta> {
-    save_with_fsync(section_path, map, previous, dirty_keys, per_group, FsyncPolicy::default())
+    save_with_fsync(
+        section_path,
+        map,
+        previous,
+        dirty_keys,
+        per_group,
+        FsyncPolicy::default(),
+    )
 }
 
 /// [`save`], with an explicit durability policy.
@@ -659,7 +688,12 @@ pub fn save_with_fsync(
     // section still holds groups from before the trailer existed and must be
     // read leniently.
     let checksums = previous.checksums || full_rewrite;
-    let meta = SectionMeta { version: previous.version + 1, modulus, records, checksums };
+    let meta = SectionMeta {
+        version: previous.version + 1,
+        modulus,
+        records,
+        checksums,
+    };
     write_meta(&dir, meta, fsync)?;
     Ok(meta)
 }
@@ -672,11 +706,13 @@ fn remove_groups_beyond(dir: &Path, modulus: u64) -> io::Result<()> {
             Some(name) => name,
             None => continue,
         };
-        if !name.starts_with('g') { continue; }
-        if let Ok(group) = u64::from_str_radix(&name[1..], 16) {
-            if group >= modulus {
-                let _ = fs::remove_file(entry.path());
-            }
+        if !name.starts_with('g') {
+            continue;
+        }
+        if let Ok(group) = u64::from_str_radix(&name[1..], 16)
+            && group >= modulus
+        {
+            let _ = fs::remove_file(entry.path());
         }
     }
     Ok(())
@@ -691,10 +727,11 @@ pub fn group_sizes(section_path: &str) -> Vec<u64> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_str().unwrap_or_default().to_string();
-            if name.starts_with('g') && !name.ends_with(".tmp") {
-                if let Ok(meta) = entry.metadata() {
-                    sizes.push(meta.len());
-                }
+            if name.starts_with('g')
+                && !name.ends_with(".tmp")
+                && let Ok(meta) = entry.metadata()
+            {
+                sizes.push(meta.len());
             }
         }
     }

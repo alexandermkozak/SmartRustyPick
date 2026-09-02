@@ -6,20 +6,35 @@ use std::sync::{Arc, RwLock};
 fn main() {
     let config = Config::load();
 
-    let _ = config.cert_path.clone().expect("headless mode requires cert_path in config.toml");
-    let _ = config.key_path.clone().expect("headless mode requires key_path in config.toml");
-    let _ = config.ca_path.clone().expect("headless mode requires ca_path in config.toml");
+    let _ = config
+        .cert_path
+        .clone()
+        .expect("headless mode requires cert_path in config.toml");
+    let _ = config
+        .key_path
+        .clone()
+        .expect("headless mode requires key_path in config.toml");
+    let _ = config
+        .ca_path
+        .clone()
+        .expect("headless mode requires ca_path in config.toml");
 
     if let Err(e) = server::ensure_certificates(&config) {
         eprintln!("Failed to ensure certificates: {}", e);
     }
 
     // We use a directory "db_storage" to hold our tables
-    let db = Arc::new(RwLock::new(Database::new("db_storage", Some(config.clone())).expect("Failed to initialize database")));
+    let db = Arc::new(RwLock::new(
+        Database::new("db_storage", Some(config.clone())).expect("Failed to initialize database"),
+    ));
 
     let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
     let port = config.server_port.unwrap_or(8443);
-    let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
+    let full_addr = if addr.contains(':') {
+        addr
+    } else {
+        format!("{}:{}", addr, port)
+    };
 
     println!("Starting headless database service on {}...", full_addr);
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -39,10 +54,10 @@ fn main() {
         // persist whatever has not been written out yet.
         // Flushing needs no more than a shared borrow now that each file
         // carries its own lock, so a shutdown does not queue behind a request.
-        if let Ok(db_lock) = db.read() {
-            if let Err(e) = db_lock.save() {
-                eprintln!("Failed to flush on shutdown: {}", e);
-            }
+        if let Ok(db_lock) = db.read()
+            && let Err(e) = db_lock.save()
+        {
+            eprintln!("Failed to flush on shutdown: {}", e);
         }
     });
 }

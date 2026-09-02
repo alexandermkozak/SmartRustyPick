@@ -112,19 +112,21 @@ All three are gitignored, so `make test-all` leaves `git status` clean.
 2. Run tests with `make test-unit` or `make test-all` (see [Testing](docs/testing.md)).
     - The integration and performance suites need `python3` and `openssl`; they run against the built binaries in
       isolated temporary directories, so they never touch your `db_storage/`.
-3. Run test coverage with `make test-coverage` (requires `cargo-llvm-cov`).
+3. Run the static-analysis gates with `make lint` — formatting, `clippy -D warnings` and a dependency audit, the same
+   three CI runs (see [Testing](docs/testing.md#static-analysis)). `make fmt` rewrites formatting.
+4. Run test coverage with `make test-coverage` (requires `cargo-llvm-cov`).
    - `make bench` runs the engine micro-benchmarks, `make profile` produces a flamegraph, `make perf-compare`
      diffs the metrics of two performance runs, and `make perf-report` renders the last run as Markdown - the same
      report CI posts to each pull request.
-4. Run the interactive "full stack" experience (CLI + background server): `make run` or
+5. Run the interactive "full stack" experience (CLI + background server): `make run` or
    `cargo run -p smart-rusty-pick-cli`.
    - The CLI will automatically log into an account if the current directory is associated with one.
    - The database server will start in the background if SSL certificates are configured in `config.toml`.
-5. Run specifically as a headless database service: `make run-server`.
+6. Run specifically as a headless database service: `make run-server`.
    - Requires SSL settings in `config.toml`.
    - Either way, the web dashboard starts alongside the server; open the `http://127.0.0.1:8080/?token=...` link it
      prints (see [Web Dashboard](docs/web_dashboard.md)).
-6. Type `HELP` in the CLI to see all commands.
+7. Type `HELP` in the CLI to see all commands.
 
 ## Workspace Structure
 

@@ -10,6 +10,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The default for every job below. `test` widens it by exactly the one scope it
+# needs; nothing here inherits whatever the repository default happens to be.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Keep the CI signal about correctness rather than raw throughput: a smaller
@@ -25,8 +30,53 @@ env:
   SRP_CONC_CLIENTS: 4
 
 jobs:
+  # Cheap, fails fast, and independent of the test job, so it runs beside it
+  # rather than in front of it. `cargo fmt` and `cargo audit` need no build at
+  # all; clippy needs a check build, which is why this is not folded into
+  # `test` - there it would have to wait for one.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+
+      # Formatting first: it is the fastest check and the one most likely to be
+      # the only thing wrong, so a failure here does not wait on clippy.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` so tests, benches and examples are linted too; they are
+      # where lint rot usually starts.
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # A prebuilt binary rather than `cargo install cargo-audit`, which is a
+      # three-minute compile the cache does not cover. Not rustsec/audit-check:
+      # that action still runs on Node 20 and would put the deprecation warning
+      # this repository just cleared (#30) straight back onto every run.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Fails on vulnerabilities. Unmaintained-crate warnings are printed but do
+      # not fail the job: they are a plan-a-replacement signal, not a stop-work
+      # one, and they appear without any change of ours having caused them.
+      - name: Audit dependencies
+        run: cargo audit
+
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     # Needed only by the step that publishes the performance report onto the
     # pull request; everything else in this job reads.
@@ -35,7 +85,7 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -44,7 +94,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -78,6 +128,50 @@ jobs:
       - name: Run performance tests
         run: make test-performance
 
+      # A pull request's numbers mean little on their own - shared runners vary
+      # far more than a real regression usually does - so compare them against
+      # the last run on `main`. The cache is the transport: a pull request can
+      # read entries written on its base branch, and `restore-keys` picks the
+      # newest one whose key starts with the prefix, so no run has to know which
+      # commit produced the baseline.
+      - name: Restore the performance baseline from the base branch
+        id: perf-baseline
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: target/perf-baseline
+          # Deliberately a key no run ever writes, so this always falls through
+          # to restore-keys and takes the most recent baseline rather than an
+          # exact-commit match that would almost never exist.
+          key: perf-baseline-${{ github.base_ref }}-${{ github.sha }}
+          restore-keys: |
+            perf-baseline-${{ github.base_ref }}-
+
+      # Advisory, by design. `compare_perf.py` exits non-zero past its tolerance,
+      # and `|| true` keeps that from failing the job: until the false-positive
+      # rate on these runners is known, the table is worth reading and the
+      # verdict is not worth blocking a merge on. Turning this into a gate later
+      # is deleting `|| true` and picking a threshold.
+      - name: Compare performance against the base branch
+        if: >-
+          always() && github.event_name == 'pull_request'
+          && hashFiles('target/perf-baseline/performance_metrics.json') != ''
+          && hashFiles('target/test-results/performance_metrics.json') != ''
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          {
+            echo "### Change against \`$BASE_REF\`"
+            echo
+            python3 scripts/compare_perf.py \
+              target/perf-baseline/performance_metrics.json \
+              target/test-results/performance_metrics.json \
+              --tolerance 50 2>&1 || true
+            echo
+            echo "_Advisory only: shared runners are noisy, so a verdict here does not fail the build._"
+          } > target/test-results/perf-delta.md
+          cat target/test-results/perf-delta.md
+
       # The suites already record every measurement to performance_metrics.json.
       # These two steps put that file where it can be read without opening the run:
       # the run summary, and a single comment on the pull request that is rewritten
@@ -89,6 +183,11 @@ jobs:
           python3 scripts/report_perf.py \
             --footer "[Full workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) - performance suite: ${{ job.status }}" \
             --output target/test-results/perf-report.md
+          # The delta against the base branch, when there was a baseline to compare
+          # against, goes into the same report: one thing to read, not two.
+          if [ -f target/test-results/perf-delta.md ]; then
+            { echo; cat target/test-results/perf-delta.md; } >> target/test-results/perf-report.md
+          fi
           cat target/test-results/perf-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment the performance report on the pull request
@@ -138,9 +237,28 @@ jobs:
       - name: Smoke-run the engine benchmarks
         run: make bench-smoke
 
+      # Only `main` writes a baseline, so a pull request always compares against
+      # its merge target rather than whatever branch happened to run last. The
+      # key carries the commit, which makes every push a new entry and lets the
+      # restore above take the newest. It is staged into its own directory
+      # because restoring it on a pull request must not land on top of that
+      # run's own metrics.
+      - name: Stage the performance baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('target/test-results/performance_metrics.json') != ''
+        run: |
+          mkdir -p target/perf-baseline
+          cp target/test-results/performance_metrics.json target/perf-baseline/
+
+      - name: Save the performance baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('target/perf-baseline/performance_metrics.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: target/perf-baseline
+          key: perf-baseline-${{ github.ref_name }}-${{ github.sha }}
+
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-results
           path: target/test-results/
@@ -152,30 +270,55 @@ jobs:
   # differs from what is in the repository.
   dashboard-bundle:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      UI_DIR: crates/core/src/web/ui
+      DIST_DIR: crates/core/src/web/assets/dist
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
+      # The node version stays pinned rather than tracking 'lts/*'. This job
+      # asserts that the committed bundle is byte-for-byte what the sources
+      # build, so the toolchain that builds it is part of the comparison:
+      # floating it would turn a node release into a stale-bundle failure on an
+      # unrelated pull request.
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: crates/core/src/web/ui/package-lock.json
 
+      # The `ui-*` Makefile targets each run `npm ci` so that they work from a
+      # clean checkout, which is right locally and redundant here. CI installs
+      # once and calls the npm scripts those targets wrap.
+      - name: Install the dashboard's dependencies
+        run: npm ci
+        working-directory: crates/core/src/web/ui
+
       - name: Check the dashboard front end's formatting
-        run: cd crates/core/src/web/ui && npm ci && npm run format:check
+        run: npm run format:check
+        working-directory: crates/core/src/web/ui
 
       - name: Test the dashboard front end
-        run: make ui-test
+        run: npm test
+        working-directory: crates/core/src/web/ui
 
       - name: Rebuild the dashboard bundle
-        run: make ui-build
+        run: npm run build
+        working-directory: crates/core/src/web/ui
 
       - name: Fail if the committed bundle is stale
         run: |
-          if ! git diff --exit-code -- crates/core/src/web/assets/dist; then
-            echo "::error::The committed dashboard bundle does not match crates/core/src/web/ui."
-            echo "Run 'make ui-build' and commit crates/core/src/web/assets/dist."
+          # `git status --porcelain`, not `git diff`: a rebuild that emits a *new*
+          # file - a renamed hashed chunk, an added asset - leaves it untracked,
+          # and `git diff` compares only tracked files, so it would report clean.
+          changed=$(git status --porcelain -- "$DIST_DIR")
+          if [ -n "$changed" ]; then
+            echo "::error::The committed dashboard bundle does not match $UI_DIR."
+            echo "$changed"
+            echo "Run 'make ui-build' and commit $DIST_DIR."
             exit 1
           fi

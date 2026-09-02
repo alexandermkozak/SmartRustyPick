@@ -1,22 +1,22 @@
-pub mod models;
+#[cfg(test)]
+mod db_tests;
+#[cfg(test)]
+mod durability_tests;
 pub mod engine;
-pub mod hashfile;
-pub mod query;
-pub mod report;
-#[cfg(test)]
-pub mod tests;
-#[cfg(test)]
-mod model_tests;
-#[cfg(test)]
-mod query_tests;
-#[cfg(test)]
-mod report_tests;
 #[cfg(test)]
 mod engine_tests;
+pub mod hashfile;
 #[cfg(test)]
 mod hashfile_tests;
 #[cfg(test)]
-mod durability_tests;
+mod model_tests;
+pub mod models;
+pub mod query;
+#[cfg(test)]
+mod query_tests;
+pub mod report;
+#[cfg(test)]
+mod report_tests;
 
 pub use engine::{Database, TableHandle, TableKey};
 pub use models::*;

@@ -25,7 +25,10 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 /// ceiling keeps a runaway response from being buffered without bound.
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
-type Session = (BufReader<tokio::io::ReadHalf<TlsStream<TcpStream>>>, tokio::io::WriteHalf<TlsStream<TcpStream>>);
+type Session = (
+    BufReader<tokio::io::ReadHalf<TlsStream<TcpStream>>>,
+    tokio::io::WriteHalf<TlsStream<TcpStream>>,
+);
 
 pub struct ProtocolClient {
     addr: String,
@@ -112,12 +115,21 @@ impl ProtocolClient {
         writer.flush().await?;
 
         let mut response = String::new();
-        let read = (&mut *reader).take(MAX_RESPONSE_BYTES as u64).read_line(&mut response).await?;
+        let read = (&mut *reader)
+            .take(MAX_RESPONSE_BYTES as u64)
+            .read_line(&mut response)
+            .await?;
         if read == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Server closed the connection"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Server closed the connection",
+            ));
         }
         if !response.ends_with('\n') {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Response exceeded the size limit"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Response exceeded the size limit",
+            ));
         }
         serde_json::from_str(&response).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }

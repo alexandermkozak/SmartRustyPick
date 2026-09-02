@@ -40,7 +40,11 @@ impl SortValue {
         // the same way Unicode orders its code points.
         let lower: String = text.chars().flat_map(char::to_lowercase).collect();
         let lower = if lower == text { None } else { Some(lower) };
-        SortValue { text: text.to_string(), number, lower }
+        SortValue {
+            text: text.to_string(),
+            number,
+            lower,
+        }
     }
 
     /// The form the case-insensitive comparison is made over.
@@ -81,11 +85,15 @@ impl Database {
     /// the criteria run out, and everything after them is a column list rather
     /// than a malformed condition.
     pub fn parse_query_consuming(&self, _table_name: &str, parts: &[&str]) -> (Option<QueryNode>, usize) {
-        if parts.is_empty() { return (None, 0); }
+        if parts.is_empty() {
+            return (None, 0);
+        }
         let mut i = if parts[0].to_uppercase() == "WITH" { 1 } else { 0 };
 
         // A condition is three tokens; anything shorter is not a clause.
-        if i + 3 > parts.len() { return (None, 0); }
+        if i + 3 > parts.len() {
+            return (None, 0);
+        }
 
         let mut current_node = QueryNode::Condition(QueryCondition {
             field_name: parts[i].to_string(),
@@ -215,8 +223,16 @@ impl Database {
         self.sort_results_for_account(&self.current_account(), table_name, results, specs);
     }
 
-    pub fn sort_results_for_account(&self, account: &str, table_name: &str, results: &mut Vec<(String, Record)>, specs: &[SortSpec]) {
-        if specs.is_empty() { return; }
+    pub fn sort_results_for_account(
+        &self,
+        account: &str,
+        table_name: &str,
+        results: &mut Vec<(String, Record)>,
+        specs: &[SortSpec],
+    ) {
+        if specs.is_empty() {
+            return;
+        }
         let handle = match self.get_table_mut_for_account(account, table_name) {
             Ok(handle) => handle,
             Err(_) => return,
@@ -231,8 +247,14 @@ impl Database {
     /// Generic over `T: Borrow<Record>` so it works both for owned results and
     /// for the borrowed records returned by [`query_in`](Self::query_in),
     /// without cloning.
-    pub fn sort_results_in<T: std::borrow::Borrow<Record>>(table: &Table, results: &mut Vec<(String, T)>, specs: &[SortSpec]) {
-        if specs.is_empty() { return; }
+    pub fn sort_results_in<T: std::borrow::Borrow<Record>>(
+        table: &Table,
+        results: &mut Vec<(String, T)>,
+        specs: &[SortSpec],
+    ) {
+        if specs.is_empty() {
+            return;
+        }
 
         let resolved = Self::resolve_sort_fields(table, specs);
 
@@ -288,9 +310,7 @@ impl Database {
                 // An unknown field compares equal, so `sorted_order` skips it
                 // entirely; there is nothing to resolve.
                 Some(i) if *i == usize::MAX => SortValue::default(),
-                Some(i) if Some(*i) == explode_idx => {
-                    SortValue::new(&record.get_value_display_string(*i, position))
-                }
+                Some(i) if Some(*i) == explode_idx => SortValue::new(&record.get_value_display_string(*i, position)),
                 Some(i) => SortValue::new(&record.get_field_display_string(*i)),
             })
             .collect()
@@ -305,7 +325,9 @@ impl Database {
         specs: &[SortSpec],
         explode_idx: Option<usize>,
     ) {
-        if specs.is_empty() { return; }
+        if specs.is_empty() {
+            return;
+        }
 
         let resolved = Self::resolve_sort_fields(table, specs);
 
@@ -323,11 +345,17 @@ impl Database {
     }
 
     /// Sorts indices `0..sort_keys.len()` by the pre-calculated values, falling back to the ID.
-    fn sorted_order<'a, F: Fn(usize) -> &'a str>(sort_keys: &[Vec<SortValue>], resolved: &[(Option<usize>, bool)], id_of: F) -> Vec<usize> {
+    fn sorted_order<'a, F: Fn(usize) -> &'a str>(
+        sort_keys: &[Vec<SortValue>],
+        resolved: &[(Option<usize>, bool)],
+        id_of: F,
+    ) -> Vec<usize> {
         let mut order: Vec<usize> = (0..sort_keys.len()).collect();
         order.sort_by(|&a, &b| {
             for (n, (idx, descending)) in resolved.iter().enumerate() {
-                if matches!(idx, Some(i) if *i == usize::MAX) { continue; }
+                if matches!(idx, Some(i) if *i == usize::MAX) {
+                    continue;
+                }
                 let mut ord = sort_keys[a][n].compare(&sort_keys[b][n]);
                 if *descending {
                     ord = ord.reverse();
@@ -345,8 +373,17 @@ impl Database {
         self.sort_keys_for_account(&self.current_account(), table_name, is_dict, keys, specs)
     }
 
-    pub fn sort_keys_for_account(&self, account: &str, table_name: &str, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
-        if specs.is_empty() { return keys; }
+    pub fn sort_keys_for_account(
+        &self,
+        account: &str,
+        table_name: &str,
+        is_dict: bool,
+        keys: Vec<String>,
+        specs: &[SortSpec],
+    ) -> Vec<String> {
+        if specs.is_empty() {
+            return keys;
+        }
         match self.get_table_mut_for_account(account, table_name) {
             Ok(handle) => Self::sort_keys_in(&handle.read(), is_dict, keys, specs),
             Err(_) => keys,
@@ -356,7 +393,9 @@ impl Database {
     /// Same as [`sort_keys_for_account`], but for a caller that has already
     /// resolved the table.
     pub fn sort_keys_in(table: &Table, is_dict: bool, keys: Vec<String>, specs: &[SortSpec]) -> Vec<String> {
-        if specs.is_empty() { return keys; }
+        if specs.is_empty() {
+            return keys;
+        }
 
         let resolved = Self::resolve_sort_fields(table, specs);
 
@@ -377,11 +416,30 @@ impl Database {
         order.into_iter().map(|i| taken[i].take().unwrap()).collect()
     }
 
-    pub fn query(&self, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
-        self.query_for_account(&self.current_account(), table_name, use_dict_section, query, keys_to_filter)
+    pub fn query(
+        &self,
+        table_name: &str,
+        use_dict_section: bool,
+        query: &QueryNode,
+        keys_to_filter: Option<&[String]>,
+    ) -> Vec<(String, Record)> {
+        self.query_for_account(
+            &self.current_account(),
+            table_name,
+            use_dict_section,
+            query,
+            keys_to_filter,
+        )
     }
 
-    pub fn query_for_account(&self, account: &str, table_name: &str, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, Record)> {
+    pub fn query_for_account(
+        &self,
+        account: &str,
+        table_name: &str,
+        use_dict_section: bool,
+        query: &QueryNode,
+        keys_to_filter: Option<&[String]>,
+    ) -> Vec<(String, Record)> {
         let handle = match self.get_table_mut_for_account(account, table_name) {
             Ok(handle) => handle,
             // Return empty results if table not found
@@ -397,7 +455,12 @@ impl Database {
     /// the table. Returns borrowed records, so a caller that already holds the
     /// database lock (e.g. serializing results immediately) does not pay for a
     /// clone of every matching record.
-    pub fn query_in<'a>(table: &'a Table, use_dict_section: bool, query: &QueryNode, keys_to_filter: Option<&[String]>) -> Vec<(String, &'a Record)> {
+    pub fn query_in<'a>(
+        table: &'a Table,
+        use_dict_section: bool,
+        query: &QueryNode,
+        keys_to_filter: Option<&[String]>,
+    ) -> Vec<(String, &'a Record)> {
         // Pre-calculate field indices and conversions to avoid repeated lookups per record
         let mut field_map = HashMap::new();
         Self::collect_field_indices(table, query, &mut field_map);
@@ -412,16 +475,17 @@ impl Database {
 
         if let Some(filter_keys) = keys_to_filter {
             for key in filter_keys {
-                if let Some(record) = source_map.get(key) {
-                    if Self::evaluate_node_static_with_id(key, record, query, &field_map) {
-                        results.push((key.clone(), record));
-                    }
+                if let Some(record) = source_map.get(key)
+                    && Self::evaluate_node_static_with_id(key, record, query, &field_map)
+                {
+                    results.push((key.clone(), record));
                 }
             }
         } else {
             // Optimize: Filter before sorting.
             // Avoid cloning the entire table by using an iterator.
-            results = source_map.iter()
+            results = source_map
+                .iter()
                 .filter(|(key, record)| Self::evaluate_node_static_with_id(key, record, query, &field_map))
                 .map(|(key, record)| (key.clone(), record))
                 .collect();
@@ -430,7 +494,6 @@ impl Database {
 
         results
     }
-
 
     /// Runs `query` (if any) and expands each surviving record into one entry
     /// per exploded position.
@@ -507,8 +570,16 @@ impl Database {
 
     /// Every key of the section, filtered to `keys_to_filter` when given, in the
     /// same key order [`query_in`](Self::query_in) produces.
-    fn all_in<'a>(table: &'a Table, use_dict_section: bool, keys_to_filter: Option<&[String]>) -> Vec<(String, &'a Record)> {
-        let source_map = if use_dict_section { &table.dictionary } else { &table.records };
+    fn all_in<'a>(
+        table: &'a Table,
+        use_dict_section: bool,
+        keys_to_filter: Option<&[String]>,
+    ) -> Vec<(String, &'a Record)> {
+        let source_map = if use_dict_section {
+            &table.dictionary
+        } else {
+            &table.records
+        };
         match keys_to_filter {
             Some(filter_keys) => filter_keys
                 .iter()
@@ -553,7 +624,9 @@ impl Database {
         field_map: &HashMap<String, FieldQueryInfo>,
         out: &mut Vec<ValuePosition>,
     ) {
-        let Some(field) = record.fields.get(field_idx) else { return };
+        let Some(field) = record.fields.get(field_idx) else {
+            return;
+        };
 
         if conditions.is_empty() {
             out.extend((0..field.values.len()).map(ValuePosition::value));
@@ -563,10 +636,12 @@ impl Database {
         // Input conversion of each search value is resolved once for the field.
         let search_vals: Vec<String> = conditions
             .iter()
-            .map(|cond| match field_map.get(&cond.field_name).and_then(|i| i.conversion.as_ref()) {
-                Some(code) => Self::apply_iconv(&cond.value, code),
-                None => cond.value.clone(),
-            })
+            .map(
+                |cond| match field_map.get(&cond.field_name).and_then(|i| i.conversion.as_ref()) {
+                    Some(code) => Self::apply_iconv(&cond.value, code),
+                    None => cond.value.clone(),
+                },
+            )
             .collect();
 
         for (v_idx, value) in field.values.iter().enumerate() {
@@ -597,11 +672,13 @@ impl Database {
     pub(crate) fn collect_field_indices(table: &Table, node: &QueryNode, map: &mut HashMap<String, FieldQueryInfo>) {
         match node {
             QueryNode::Condition(cond) => {
-                if cond.field_name == "ID" { return; }
-                if !map.contains_key(&cond.field_name) {
-                    if let Some((idx, conversion)) = table.field_index_and_conversion(&cond.field_name) {
-                        map.insert(cond.field_name.clone(), FieldQueryInfo { index: idx, conversion });
-                    }
+                if cond.field_name == "ID" {
+                    return;
+                }
+                if !map.contains_key(&cond.field_name)
+                    && let Some((idx, conversion)) = table.field_index_and_conversion(&cond.field_name)
+                {
+                    map.insert(cond.field_name.clone(), FieldQueryInfo { index: idx, conversion });
                 }
             }
             QueryNode::Logical { left, right, .. } => {
@@ -611,7 +688,12 @@ impl Database {
         }
     }
 
-    pub(crate) fn evaluate_node_static_with_id(key: &str, record: &Record, node: &QueryNode, field_map: &HashMap<String, FieldQueryInfo>) -> bool {
+    pub(crate) fn evaluate_node_static_with_id(
+        key: &str,
+        record: &Record,
+        node: &QueryNode,
+        field_map: &HashMap<String, FieldQueryInfo>,
+    ) -> bool {
         match node {
             QueryNode::Condition(cond) => {
                 if cond.field_name == "ID" {
@@ -633,10 +715,13 @@ impl Database {
                         return Self::compare_values("", &cond.op, &search_val);
                     }
                     for v in &field.values {
-                        if v.sub_values.is_empty() {
-                            if Self::compare_values("", &cond.op, &search_val) { return true; }
+                        if v.sub_values.is_empty() && Self::compare_values("", &cond.op, &search_val) {
+                            return true;
                         }
-                        if v.sub_values.iter().any(|sv| Self::compare_values(sv, &cond.op, &search_val)) {
+                        if v.sub_values
+                            .iter()
+                            .any(|sv| Self::compare_values(sv, &cond.op, &search_val))
+                        {
                             return true;
                         }
                     }
@@ -645,12 +730,16 @@ impl Database {
                 }
                 false
             }
-            QueryNode::Logical { op, left, right } => {
-                match op {
-                    LogicalOp::And => Self::evaluate_node_static_with_id(key, record, left, field_map) && Self::evaluate_node_static_with_id(key, record, right, field_map),
-                    LogicalOp::Or => Self::evaluate_node_static_with_id(key, record, left, field_map) || Self::evaluate_node_static_with_id(key, record, right, field_map),
+            QueryNode::Logical { op, left, right } => match op {
+                LogicalOp::And => {
+                    Self::evaluate_node_static_with_id(key, record, left, field_map)
+                        && Self::evaluate_node_static_with_id(key, record, right, field_map)
                 }
-            }
+                LogicalOp::Or => {
+                    Self::evaluate_node_static_with_id(key, record, left, field_map)
+                        || Self::evaluate_node_static_with_id(key, record, right, field_map)
+                }
+            },
         }
     }
 

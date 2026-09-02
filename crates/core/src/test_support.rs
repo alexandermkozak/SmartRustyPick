@@ -58,5 +58,8 @@ impl Drop for TempDir {
 /// a test or bench behaves the same wherever `cargo test`/`cargo bench` is
 /// invoked from.
 pub fn isolated_config() -> Config {
-    Config { web_enabled: Some(false), ..Config::default() }
+    Config {
+        web_enabled: Some(false),
+        ..Config::default()
+    }
 }

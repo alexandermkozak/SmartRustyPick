@@ -171,7 +171,11 @@ pub fn snapshot() -> ServerSnapshot {
 
     ServerSnapshot {
         uptime_seconds: now.saturating_duration_since(registry.started).as_secs(),
-        started_at: registry.started_at.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs(),
+        started_at: registry
+            .started_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs(),
         listen_addr: registry.listen_addr.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         total_connections: registry.total_connections.load(Ordering::Relaxed),
         rejected_connections: registry.rejected_connections.load(Ordering::Relaxed),
@@ -191,7 +195,11 @@ mod tests {
         let id = open("127.0.0.1:9999", "TEST.CLIENT", "abc123", true);
 
         let during = snapshot();
-        let mine = during.active_connections.iter().find(|c| c.id == id).expect("connection is listed while open");
+        let mine = during
+            .active_connections
+            .iter()
+            .find(|c| c.id == id)
+            .expect("connection is listed while open");
         assert_eq!(mine.client_name, "TEST.CLIENT");
         assert_eq!(mine.requests, 0);
         assert_eq!(during.total_connections, before.total_connections + 1);
@@ -205,7 +213,10 @@ mod tests {
 
         close(id);
         let after = snapshot();
-        assert!(after.active_connections.iter().all(|c| c.id != id), "closed connection is gone");
+        assert!(
+            after.active_connections.iter().all(|c| c.id != id),
+            "closed connection is gone"
+        );
         assert_eq!(after.total_requests, before.total_requests + 2);
         assert_eq!(after.failed_requests, before.failed_requests + 1);
     }

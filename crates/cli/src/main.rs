@@ -1,5 +1,5 @@
 use smart_rusty_pick_core::config::Config;
-use smart_rusty_pick_core::db::{report, Database, Record, SelectEntry, SelectList, ValuePosition};
+use smart_rusty_pick_core::db::{Database, Record, SelectEntry, SelectList, ValuePosition, report};
 use smart_rusty_pick_core::server;
 use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
@@ -10,17 +10,17 @@ const CLIENT_CERT_DAYS: u32 = 365;
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut initial_account = None;
-    if let Some(pos) = args.iter().position(|a| a == "--account") {
-        if pos + 1 < args.len() {
-            initial_account = Some(args[pos + 1].clone());
-        }
+    if let Some(pos) = args.iter().position(|a| a == "--account")
+        && pos + 1 < args.len()
+    {
+        initial_account = Some(args[pos + 1].clone());
     }
 
     let mut db_dir = "db_storage".to_string();
-    if let Some(pos) = args.iter().position(|a| a == "-d" || a == "--db-dir") {
-        if pos + 1 < args.len() {
-            db_dir = args[pos + 1].clone();
-        }
+    if let Some(pos) = args.iter().position(|a| a == "-d" || a == "--db-dir")
+        && pos + 1 < args.len()
+    {
+        db_dir = args[pos + 1].clone();
     }
 
     let config = Config::load();
@@ -42,9 +42,16 @@ fn main() -> io::Result<()> {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let addr = config_clone.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+                let addr = config_clone
+                    .server_addr
+                    .clone()
+                    .unwrap_or_else(|| "127.0.0.1".to_string());
                 let port = config_clone.server_port.unwrap_or(8443);
-                let full_addr = if addr.contains(':') { addr } else { format!("{}:{}", addr, port) };
+                let full_addr = if addr.contains(':') {
+                    addr
+                } else {
+                    format!("{}:{}", addr, port)
+                };
                 let _ = server::start_server(config_arc_clone, db_clone, Some(full_addr)).await;
             });
         });
@@ -64,7 +71,10 @@ fn main() -> io::Result<()> {
         let mut db_lock = db.write().unwrap();
         let acc_to_log = account_name.clone();
         if db_lock.logto(&acc_to_log).is_ok() {
-            println!("Auto-logged into account '{}' based on current directory.", account_name);
+            println!(
+                "Auto-logged into account '{}' based on current directory.",
+                account_name
+            );
             let _ = check_dir_file(&mut db_lock);
         }
     }
@@ -141,7 +151,9 @@ fn main() -> io::Result<()> {
         }
 
         let parts: Vec<&str> = input.split_whitespace().collect();
-        if parts.is_empty() { continue; }
+        if parts.is_empty() {
+            continue;
+        }
         let command = parts[0].to_uppercase();
 
         match command.as_str() {
@@ -349,10 +361,11 @@ fn handle_get(db: &mut Database, parts: &[&str]) {
     if parts.len() < offset + 2 {
         // Try to use active select list
         let mut keys_from_list = None;
-        if let Some(list) = &db.active_select_list {
-            if list.table_name == table_name && list.is_dict == is_dict {
-                keys_from_list = Some(list.unique_keys());
-            }
+        if let Some(list) = &db.active_select_list
+            && list.table_name == table_name
+            && list.is_dict == is_dict
+        {
+            keys_from_list = Some(list.unique_keys());
         }
 
         if let Some(keys) = keys_from_list {
@@ -409,11 +422,12 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
         // Try to use active select list
         let mut keys_to_delete = Vec::new();
         let mut used_list = false;
-        if let Some(list) = &db.active_select_list {
-            if list.table_name == table_name && list.is_dict == is_dict {
-                keys_to_delete = list.unique_keys();
-                used_list = true;
-            }
+        if let Some(list) = &db.active_select_list
+            && list.table_name == table_name
+            && list.is_dict == is_dict
+        {
+            keys_to_delete = list.unique_keys();
+            used_list = true;
         }
 
         if used_list {
@@ -437,7 +451,9 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
                 }
             }
             if count > 0 {
-                if is_dict { table.mark_dict_dirty(); }
+                if is_dict {
+                    table.mark_dict_dirty();
+                }
                 println!("[{}] records deleted", count);
             } else {
                 println!("NO RECORDS DELETED");
@@ -463,7 +479,9 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
         let mut table = handle.write();
         if is_dict {
             let removed = table.dictionary.remove(key).is_some();
-            if removed { table.mark_dict_dirty(); }
+            if removed {
+                table.mark_dict_dirty();
+            }
             removed
         } else {
             table.remove_record(key).is_some()
@@ -544,7 +562,9 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
     // An active list for this table stands in for a fresh scan, keeping the
     // positions - and the field they belong to - that a preceding
     // SELECT ... BY.EXP recorded.
-    let active = db.active_select_list.as_ref()
+    let active = db
+        .active_select_list
+        .as_ref()
         .filter(|l| l.table_name == table_name && l.is_dict == is_dict);
     let from_list = active.map(|l| l.entries.clone());
     let list_explode_field = active.and_then(|l| l.explode_field.clone());
@@ -563,7 +583,8 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
             // re-running the selection over it would only lose them.
             Some(entries) => {
                 let map = if is_dict { &table.dictionary } else { &table.records };
-                entries.iter()
+                entries
+                    .iter()
                     .filter_map(|e| Some((e.clone(), map.get(&e.key)?)))
                     .collect()
             }
@@ -579,7 +600,8 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
             rows.iter().map(|(entry, _)| entry.key.clone()).collect()
         } else {
             let columns: Vec<String> = field_names.iter().map(|s| s.to_string()).collect();
-            let explode_field = explode.as_ref()
+            let explode_field = explode
+                .as_ref()
                 .map(|e| e.field_name.clone())
                 .or(list_explode_field.clone());
             report::render_list(table, &columns, explode_field.as_deref(), &rows)
@@ -647,7 +669,9 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
             }
         }
     } else {
-        println!("Usage: SELECT [DICT] <table> [WITH <field> <op> <value>] [BY|BY.DSND <field> ...] [BY.EXP <field> [<op> <value>]]");
+        println!(
+            "Usage: SELECT [DICT] <table> [WITH <field> <op> <value>] [BY|BY.DSND <field> ...] [BY.EXP <field> [<op> <value>]]"
+        );
         return;
     };
     if let Some(condition) = explode.as_ref().and_then(|e| e.condition.clone()) {
@@ -666,7 +690,13 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
             return;
         };
         let table = &*handle.read();
-        let mut rows = Database::query_exploded_in(table, is_dict, query.as_ref(), explode.as_ref(), keys_to_filter.as_deref());
+        let mut rows = Database::query_exploded_in(
+            table,
+            is_dict,
+            query.as_ref(),
+            explode.as_ref(),
+            keys_to_filter.as_deref(),
+        );
         let explode_idx = Database::explode_field_index(table, explode.as_ref());
         Database::sort_entries_in(table, &mut rows, &sort_specs, explode_idx);
         rows.into_iter().map(|(entry, _)| entry).collect()
@@ -726,7 +756,9 @@ fn handle_edit(db: &mut Database, parts: &[&str], config: &Config) {
 
     // Launch editor
     // Priority: config.toml > EDITOR env var > nano
-    let editor = config.editor.clone()
+    let editor = config
+        .editor
+        .clone()
         .or_else(|| std::env::var("EDITOR").ok())
         .unwrap_or_else(|| "nano".to_string());
 
@@ -802,10 +834,11 @@ fn handle_ct(db: &mut Database, parts: &[&str]) {
     if parts.len() < offset + 2 {
         // Try to use active select list
         let mut keys_from_list = None;
-        if let Some(list) = &db.active_select_list {
-            if list.table_name == table_name && list.is_dict == is_dict {
-                keys_from_list = Some(list.unique_keys());
-            }
+        if let Some(list) = &db.active_select_list
+            && list.table_name == table_name
+            && list.is_dict == is_dict
+        {
+            keys_from_list = Some(list.unique_keys());
         }
 
         if let Some(keys) = keys_from_list {
@@ -849,17 +882,24 @@ fn print_record_fields(record: &Record) {
     for (i, field) in record.fields.iter().enumerate() {
         let mut res = Vec::new();
         for (j, v) in field.values.iter().enumerate() {
-            if j > 0 { res.push(smart_rusty_pick_core::db::VM); }
+            if j > 0 {
+                res.push(smart_rusty_pick_core::db::VM);
+            }
             for (k, sv) in v.sub_values.iter().enumerate() {
-                if k > 0 { res.push(smart_rusty_pick_core::db::SVM); }
+                if k > 0 {
+                    res.push(smart_rusty_pick_core::db::SVM);
+                }
                 res.extend_from_slice(sv.as_bytes());
             }
         }
-        let display_bytes: Vec<u8> = res.iter().map(|&b| match b {
-            smart_rusty_pick_core::db::VM => b']',
-            smart_rusty_pick_core::db::SVM => b'\\',
-            _ => b
-        }).collect();
+        let display_bytes: Vec<u8> = res
+            .iter()
+            .map(|&b| match b {
+                smart_rusty_pick_core::db::VM => b']',
+                smart_rusty_pick_core::db::SVM => b'\\',
+                _ => b,
+            })
+            .collect();
         println!("{:03} {}", i + 1, String::from_utf8_lossy(&display_bytes));
     }
 }
@@ -869,7 +909,9 @@ fn print_help(current_account: &str) {
     println!("  SET [DICT] <table> <key> <data>       - Store a record.");
     println!("  GET [DICT] <table> [<key>]             - Retrieve record(s). Uses SELECT list if key omitted.");
     println!("  DELETE [DICT] <table> [<key>]          - Remove record(s). Uses SELECT list if key omitted.");
-    println!("  LIST [DICT] [<table> [<fields>...]]   - List tables, keys, or records. Uses SELECT list if applicable.");
+    println!(
+        "  LIST [DICT] [<table> [<fields>...]]   - List tables, keys, or records. Uses SELECT list if applicable."
+    );
     println!("  SELECT [DICT] <table> [WITH <field> <op> <value>] - Create/refine active select list.");
     println!("    Operators: =, #, <>, <, >, <=, >=, EQ, NE, LT, GT, LE, GE");
     println!("    Wildcards (with = or #): [value (ends with), value] (starts with), [value] (contains)");
@@ -884,7 +926,9 @@ fn print_help(current_account: &str) {
     println!("      following LIST of the same file keeps them.");
     println!("      e.g. LIST $CLIENTS BY.EXP ACCOUNTS = \"TEST\" ACCOUNTS");
     println!("  EDIT [DICT] <table> <key>             - Edit a record using external editor.");
-    println!("  CT [DICT] <table> [<key>]             - Print record contents, field by field. Uses SELECT list if key omitted.");
+    println!(
+        "  CT [DICT] <table> [<key>]             - Print record contents, field by field. Uses SELECT list if key omitted."
+    );
     println!("  SAVE                                  - Save database to disk.");
     println!("  HELP                                  - Show this help.");
     println!("  SAVE-LIST <name>                      - Save active select list.");
@@ -981,7 +1025,13 @@ fn parse_saved_entry(field: &[u8]) -> SelectEntry {
     let number = |p: Option<&[u8]>| p.and_then(|b| String::from_utf8_lossy(b).parse::<usize>().ok());
 
     match number(parts.next()) {
-        Some(value) => SelectEntry::at(key, ValuePosition { value, sub_value: number(parts.next()) }),
+        Some(value) => SelectEntry::at(
+            key,
+            ValuePosition {
+                value,
+                sub_value: number(parts.next()),
+            },
+        ),
         None => SelectEntry::new(key),
     }
 }
@@ -1018,7 +1068,12 @@ fn handle_get_list(db: &mut Database, parts: &[&str]) {
         let entries: Vec<SelectEntry> = fields[2..].iter().map(|f| parse_saved_entry(f)).collect();
         let count = entries.len();
 
-        db.active_select_list = Some(SelectList { table_name, is_dict, explode_field, entries });
+        db.active_select_list = Some(SelectList {
+            table_name,
+            is_dict,
+            explode_field,
+            entries,
+        });
         println!("[{}] records retrieved", count);
     } else {
         println!("LIST '{}' NOT FOUND", list_name);
@@ -1063,7 +1118,10 @@ fn handle_set_file(db: &mut Database, parts: &[&str]) {
         "DURABLE" | "-D" => true,
         "BUFFERED" | "NODURABLE" | "-B" => false,
         other => {
-            println!("Unknown option '{}'. Usage: SET.FILE <file_name> DURABLE | BUFFERED", other);
+            println!(
+                "Unknown option '{}'. Usage: SET.FILE <file_name> DURABLE | BUFFERED",
+                other
+            );
             return;
         }
     };
@@ -1155,13 +1213,18 @@ fn handle_list_files(db: &mut Database) {
     let listed: Vec<String> = match db.get_table("DIR") {
         Some(handle) => {
             let table = handle.read();
-            let mut files: Vec<_> = table.records.iter()
+            let mut files: Vec<_> = table
+                .records
+                .iter()
                 .filter(|(_, record)| {
-                    record.fields.get(0)
-                        .and_then(|f| f.values.get(0))
-                        .and_then(|v| v.sub_values.get(0))
+                    record
+                        .fields
+                        .first()
+                        .and_then(|f| f.values.first())
+                        .and_then(|v| v.sub_values.first())
                         .map(|s| s.as_str())
-                        .unwrap_or("") == "F"
+                        .unwrap_or("")
+                        == "F"
                 })
                 .map(|(name, _)| name.clone())
                 .collect();
@@ -1199,7 +1262,13 @@ fn handle_authorize_conn(db: &mut Database, parts: &[&str]) {
     let (is_admin, accounts) = if arg3 == "ADMIN" {
         (true, Vec::new())
     } else {
-        (false, arg3.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        (
+            false,
+            arg3.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
     };
 
     if !is_admin && accounts.is_empty() {
@@ -1225,7 +1294,11 @@ fn handle_add_client_account(db: &mut Database, parts: &[&str]) {
         return;
     }
     let name = parts[1];
-    let accounts: Vec<&str> = parts[2].split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let accounts: Vec<&str> = parts[2]
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let mut count = 0;
     for acc in accounts {
@@ -1247,7 +1320,11 @@ fn handle_remove_client_account(db: &mut Database, parts: &[&str]) {
         return;
     }
     let name = parts[1];
-    let accounts: Vec<&str> = parts[2].split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let accounts: Vec<&str> = parts[2]
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let mut count = 0;
     for acc in accounts {
@@ -1288,9 +1365,11 @@ fn handle_list_conns(db: &mut Database) {
 
         for name in names {
             if let Some(record) = table.records.get(&name) {
-                let thumbprint = record.fields.get(0)
-                    .and_then(|f| f.values.get(0))
-                    .and_then(|v| v.sub_values.get(0))
+                let thumbprint = record
+                    .fields
+                    .first()
+                    .and_then(|f| f.values.first())
+                    .and_then(|v| v.sub_values.first())
                     .cloned()
                     .unwrap_or_else(|| "N/A".to_string());
                 println!("{:<20} {:<64}", name, thumbprint);
@@ -1332,7 +1411,11 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
     io::stdout().flush().unwrap();
     let mut auth_name = String::new();
     io::stdin().read_line(&mut auth_name).unwrap();
-    let auth_name = if auth_name.trim().is_empty() { cn.to_string() } else { auth_name.trim().to_string() };
+    let auth_name = if auth_name.trim().is_empty() {
+        cn.to_string()
+    } else {
+        auth_name.trim().to_string()
+    };
 
     print!("Is this an ADMIN connection? (Y/N) [N]: ");
     io::stdout().flush().unwrap();
@@ -1347,7 +1430,8 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
         io::stdout().flush().unwrap();
         let mut accs_input = String::new();
         io::stdin().read_line(&mut accs_input).unwrap();
-        accs_input.split(',')
+        accs_input
+            .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect()
@@ -1362,7 +1446,10 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
     match db.add_authorized_client(&auth_name, &generated.thumbprint, accounts, is_admin) {
         Ok(_) => {
             if is_admin {
-                println!("Successfully authorized: {} as {} (ADMIN)", generated.thumbprint, auth_name);
+                println!(
+                    "Successfully authorized: {} as {} (ADMIN)",
+                    generated.thumbprint, auth_name
+                );
             } else {
                 println!("Successfully authorized: {} as {}", generated.thumbprint, auth_name);
             }
@@ -1379,7 +1466,12 @@ fn handle_start_server(db: Arc<RwLock<Database>>, parts: &[&str], config: Arc<Co
     // but exclude cert/key filenames by checking for common extensions
     if parts.len() > offset {
         let first_arg = parts[offset];
-        if first_arg.contains(':') || (first_arg.contains('.') && !first_arg.ends_with(".crt") && !first_arg.ends_with(".key") && !first_arg.ends_with(".pem")) {
+        if first_arg.contains(':')
+            || (first_arg.contains('.')
+                && !first_arg.ends_with(".crt")
+                && !first_arg.ends_with(".key")
+                && !first_arg.ends_with(".pem"))
+        {
             addr = first_arg.to_string();
             offset += 1;
         }
@@ -1403,7 +1495,11 @@ fn handle_start_server(db: Arc<RwLock<Database>>, parts: &[&str], config: Arc<Co
 
     // Explicit paths are trusted to be exact: silently falling back to generating
     // fresh material at a mistyped path would hide the typo instead of failing on it.
-    for (label, path) in [("Certificate", &cert_path), ("Key", &key_path), ("CA certificate", &ca_path)] {
+    for (label, path) in [
+        ("Certificate", &cert_path),
+        ("Key", &key_path),
+        ("CA certificate", &ca_path),
+    ] {
         if !std::path::Path::new(path).exists() {
             println!("Error: {} file '{}' does not exist.", label, path);
             return;

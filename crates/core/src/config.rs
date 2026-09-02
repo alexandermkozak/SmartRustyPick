@@ -151,12 +151,11 @@ impl Default for Config {
 impl Config {
     pub fn load() -> Self {
         let config_path = Path::new("config.toml");
-        if config_path.exists() {
-            if let Ok(content) = fs::read_to_string(config_path) {
-                if let Ok(config) = toml::from_str::<Config>(&content) {
-                    return config;
-                }
-            }
+        if config_path.exists()
+            && let Ok(content) = fs::read_to_string(config_path)
+            && let Ok(config) = toml::from_str::<Config>(&content)
+        {
+            return config;
         }
         // No file, or one that does not parse: run on the defaults rather than
         // refusing to start.
