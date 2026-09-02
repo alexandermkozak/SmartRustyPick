@@ -171,6 +171,75 @@ fn bench_explode(c: &mut Criterion) {
     group.finish();
 }
 
+/// `SELECT` keeps keys and throws the records away, so what it costs should
+/// track the size of its answer, not the size of the records it read.
+///
+/// `owning_baseline` is the path the handler used to run: `query_for_account`,
+/// which clones every match, then the sort, then the keys taken off the clones.
+/// It is the number the keys-only path of the same shape is read against.
+/// `unsorted` never looks at a record at all; `sorted` borrows one per match to
+/// read the sort column from.
+///
+/// Measured over two record shapes on the same selective criterion, because
+/// the clone is what scales with the record and the scan is not: `narrow` is
+/// three single-valued fields, `wide` adds a field of eight values, so the gap
+/// between the baseline and the keys-only paths widens with the record while
+/// the work of finding the matches stays put.
+fn bench_select(c: &mut Criterion) {
+    let dir = common::TempDir::new("select");
+    let mut db = common::new_db(dir.path());
+    common::build_table(&mut db, "NARROW", RECORDS);
+    common::build_mv_table(&mut db, "WIDE", RECORDS);
+
+    let sort_specs = [SortSpec {
+        field_name: "NAME".to_string(),
+        descending: false,
+    }];
+    let shapes: [(&str, &[SortSpec]); 2] = [("unsorted", &[]), ("sorted", &sort_specs)];
+
+    let mut group = c.benchmark_group("select");
+    group.throughput(Throughput::Elements(RECORDS as u64));
+
+    for width in ["narrow", "wide"] {
+        let table_name = if width == "narrow" { "NARROW" } else { "WIDE" };
+        // Selective: one record in ten, out of a file of ten thousand.
+        let node = db.parse_query(table_name, &["WITH", "CITY", "=", "CITY3"]).unwrap();
+        let expected = RECORDS / 10;
+
+        for (name, specs) in shapes {
+            group.bench_function(format!("owning_baseline/{width}/{name}"), |b| {
+                b.iter(|| {
+                    let mut results =
+                        db.query_for_account(black_box(common::ACCOUNT), black_box(table_name), false, &node, None);
+                    db.sort_results_for_account(common::ACCOUNT, table_name, &mut results, black_box(specs));
+                    black_box(results.into_iter().map(|(key, _)| key).collect::<Vec<String>>())
+                })
+            });
+        }
+
+        let table_handle = db.get_table_read_only_for_account(common::ACCOUNT, table_name).unwrap();
+        let table = &*table_handle.read();
+        for (name, specs) in shapes {
+            let entries = Database::select_entries_in(table, false, Some(&node), None, None, specs);
+            assert_eq!(entries.len(), expected, "unexpected row count for {width}/{name}");
+
+            group.bench_function(format!("select_entries_in/{width}/{name}"), |b| {
+                b.iter(|| {
+                    black_box(Database::select_entries_in(
+                        black_box(table),
+                        false,
+                        black_box(Some(&node)),
+                        None,
+                        None,
+                        black_box(specs),
+                    ))
+                })
+            });
+        }
+    }
+    group.finish();
+}
+
 /// Record serialisation is on the READ, QUERY and GET.NEXT path for every
 /// client, exploded or not, so `single_valued` is the guard that shaping
 /// multivalues as JSON arrays did not cost the common case anything.
@@ -199,5 +268,12 @@ fn bench_serialize(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_query, bench_sort, bench_explode, bench_serialize);
+criterion_group!(
+    benches,
+    bench_query,
+    bench_sort,
+    bench_explode,
+    bench_select,
+    bench_serialize
+);
 criterion_main!(benches);

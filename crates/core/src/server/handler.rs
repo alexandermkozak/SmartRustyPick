@@ -565,14 +565,14 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 };
             }
             let entries = match db.get_table_read_only_for_account(acc, &table_name) {
-                Some(handle) => {
-                    let table = &*handle.read();
-                    let mut rows =
-                        Database::query_exploded_in(table, is_dict, query_node.as_ref(), explode.as_ref(), None);
-                    let explode_idx = Database::explode_field_index(table, explode.as_ref());
-                    Database::sort_entries_in(table, &mut rows, &sort_specs, explode_idx);
-                    rows.into_iter().map(|(entry, _)| entry).collect()
-                }
+                Some(handle) => Database::select_entries_in(
+                    &handle.read(),
+                    is_dict,
+                    query_node.as_ref(),
+                    explode.as_ref(),
+                    None,
+                    &sort_specs,
+                ),
                 None => return error(format!("Table error: {} not loaded", table_name)),
             };
 

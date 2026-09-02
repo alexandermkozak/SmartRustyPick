@@ -855,3 +855,117 @@ fn test_sort_entries_uses_the_exploded_value() {
         .collect();
     assert_eq!(values, vec!["ADMIN", "DEV", "DEV", "SALES", "TEST", "TEST\\LAB"]);
 }
+
+/// The keys `SELECT` produced when it cloned every match, spelled out through
+/// the owning path so the equivalence test below has something to compare
+/// against that does not share an implementation with what it is checking.
+fn keys_the_owning_way(
+    db: &Database,
+    table_name: &str,
+    query: Option<&QueryNode>,
+    specs: &[SortSpec],
+    keys_to_filter: Option<&[String]>,
+) -> Vec<String> {
+    let mut results: Vec<(String, Record)> = match query {
+        Some(node) => db.query(table_name, false, node, keys_to_filter),
+        None => {
+            let handle = db
+                .get_table_read_only_for_account(&db.current_account(), table_name)
+                .unwrap();
+            let table = handle.read();
+            let mut all: Vec<(String, Record)> = match keys_to_filter {
+                Some(filter) => filter
+                    .iter()
+                    .filter_map(|k| table.records.get_key_value(k))
+                    .map(|(k, r)| (k.clone(), r.clone()))
+                    .collect(),
+                None => table.records.iter().map(|(k, r)| (k.clone(), r.clone())).collect(),
+            };
+            if keys_to_filter.is_none() {
+                all.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            all
+        }
+    };
+    db.sort_results(table_name, &mut results, specs);
+    results.into_iter().map(|(k, _)| k).collect()
+}
+
+/// `SELECT` no longer clones a record to build its key list. This pins the
+/// result of not doing so: every shape of selection has to name the same keys
+/// in the same order the owning path named them.
+#[test]
+fn test_select_entries_match_the_owning_path() {
+    let (_dir, db) = setup_sort_db("select_keys_equivalence");
+
+    let filter: Vec<String> = vec!["P3".to_string(), "P1".to_string(), "P9".to_string()];
+    let clauses: [&[&str]; 7] = [
+        // Unsorted, so the records are never looked at at all.
+        &["WITH", "DESC", "=", "[new]"],
+        // Sorted on a value field, ascending and descending.
+        &["WITH", "DESC", "=", "[new]", "BY", "PRICE"],
+        &["WITH", "DESC", "=", "[new]", "BY.DSND", "PRICE"],
+        // Two sort fields, so a tie has to break the same way.
+        &["WITH", "DESC", "=", "[new]", "BY", "PRICE", "BY.DSND", "CREATE.DATE"],
+        // The ID sort field, which resolves to the key rather than a column.
+        &["WITH", "DESC", "!=", "", "BY.DSND", "ID"],
+        // An unknown field, which compares equal and leaves the order alone.
+        &["WITH", "DESC", "!=", "", "BY", "NOSUCHFIELD"],
+        // A full scan with no criterion at all.
+        &["BY", "PRICE"],
+    ];
+
+    for clause in clauses {
+        let (clause_parts, specs, _) = Database::parse_clause_specs(clause);
+        let query = if clause_parts.is_empty() {
+            None
+        } else {
+            Some(db.parse_query("PRODUCTS", &clause_parts).unwrap())
+        };
+
+        for keys_to_filter in [None, Some(filter.as_slice())] {
+            let expected = keys_the_owning_way(&db, "PRODUCTS", query.as_ref(), &specs, keys_to_filter);
+
+            let handle = db.get_table_read_only_for_account("ACC1", "PRODUCTS").unwrap();
+            let table = handle.read();
+            let entries = Database::select_entries_in(&table, false, query.as_ref(), None, keys_to_filter, &specs);
+            let actual: Vec<String> = entries.iter().map(|e| e.key.clone()).collect();
+
+            assert_eq!(actual, expected, "clause {clause:?}, filter {keys_to_filter:?}");
+            // Nothing exploded, so every entry is a plain key.
+            assert!(entries.iter().all(|e| e.position.is_none()), "clause {clause:?}");
+        }
+    }
+}
+
+/// The exploded path still carries records, because a position belongs to one;
+/// this checks that routing it through `select_entries_in` did not change what
+/// it produces.
+#[test]
+fn test_select_entries_explode_matches_the_sorted_rows() {
+    let (_dir, db) = roles_db("select_keys_explode");
+    let query = db.parse_query("USERS", &["WITH", "ROLES", "=", "[TEST]"]).unwrap();
+    let explode = ExplodeSpec {
+        field_name: "ROLES".to_string(),
+        condition: None,
+    };
+    let (_, specs) = parse_sort_specs(&["BY.DSND", "ROLES"]);
+
+    let handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
+    let table = handle.read();
+
+    let mut rows = Database::query_exploded_in(&table, false, Some(&query), Some(&explode), None);
+    let explode_idx = Database::explode_field_index(&table, Some(&explode));
+    Database::sort_entries_in(&table, &mut rows, &specs, explode_idx);
+    let expected: Vec<SelectEntry> = rows.into_iter().map(|(entry, _)| entry).collect();
+
+    let actual = Database::select_entries_in(&table, false, Some(&query), Some(&explode), None, &specs);
+
+    let shape = |entries: &[SelectEntry]| {
+        entries
+            .iter()
+            .map(|e| (e.key.clone(), e.position))
+            .collect::<Vec<(String, Option<ValuePosition>)>>()
+    };
+    assert_eq!(shape(&actual), shape(&expected));
+}

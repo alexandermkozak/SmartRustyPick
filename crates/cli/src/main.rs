@@ -689,17 +689,14 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
             println!("TABLE NOT FOUND");
             return;
         };
-        let table = &*handle.read();
-        let mut rows = Database::query_exploded_in(
-            table,
+        Database::select_entries_in(
+            &handle.read(),
             is_dict,
             query.as_ref(),
             explode.as_ref(),
             keys_to_filter.as_deref(),
-        );
-        let explode_idx = Database::explode_field_index(table, explode.as_ref());
-        Database::sort_entries_in(table, &mut rows, &sort_specs, explode_idx);
-        rows.into_iter().map(|(entry, _)| entry).collect()
+            &sort_specs,
+        )
     };
 
     if entries.is_empty() {
