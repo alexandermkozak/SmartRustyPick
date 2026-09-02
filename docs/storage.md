@@ -81,11 +81,147 @@ A damaged section is refused, not patched over:
 Sections written before checksums existed have no trailer and no `checksums` flag in `meta`; they are read leniently and
 gain their trailers on the first full rewrite, so an upgrade never declares an intact database corrupt.
 
+A damaged *index* section is the one exception, and deliberately so: an index is derived data, so it is rebuilt from the
+records rather than failing the load of a file whose records are perfectly intact. See
+[Secondary Indexes](#secondary-indexes).
+
 ### Automatic Migration
 
 SmartRustyPick automatically migrates data from the old flat file format. If a table contains a `data` file, it is read,
 converted to the `data.hf/` layout during the first flush, and the old `data` file is deleted. No manual export/import
 is required.
+
+## Secondary Indexes
+
+A keyed read is O(1): the key is hashed and one group is read. Every other retrieval used to be a full scan of a fully
+resident file, so `WITH CITY = "York"` cost the same whether it matched one record or a million. A secondary index
+closes that gap for the case it can be closed for cheaply — equality on a field the dictionary already describes.
+
+### Layout
+
+An index is a section beside the records, in exactly the format they use:
+
+```text
+db_storage/<account>/<file>/data.hf/          the records
+db_storage/<account>/<file>/index.CITY.hf/    an index on the CITY dictionary field
+```
+
+The section reuses the hashfile machinery whole — the same framing, the same per-group checksums, the same `.tmp` +
+rename, the same dynamic modulus — so an index inherits the crash-safety story of the data rather than inventing a
+second one. The key of an entry is an indexed *value*; the record it maps to holds the keys of every record carrying
+that value, one per value mark.
+
+Beside the section's own `meta`, an index carries a `state` file, checksummed the same way:
+
+- `field`: the dictionary field indexed.
+- `attribute`: the Pick attribute number that field resolved to when the index was written.
+- `data_version`: the `meta.version` of the data section the index was last written against.
+
+Which indexes a file has is read off its directory. There is no manifest, so there is no second list that can disagree
+with the sections after a crash or a manual removal.
+
+### What is indexed
+
+Every sub-value of the attribute, trimmed — which is exactly what a comparison looks at — plus the empty string for a
+record whose attribute is absent or empty, because `WITH FIELD = ""` matches such a record. A multivalued field
+therefore indexes each of its values, and a sub-valued one each sub-value.
+
+A value longer than 512 bytes is indexed under a truncated key, since a group file refuses to read back a key longer
+than its own limit. Several long values then share one entry, which costs a few extra candidates and never a missing
+one.
+
+`ID` cannot be indexed: it is the record key, already found in one hash lookup. Nor can a field whose name would not
+make a directory component — the name set is letters, digits and `. _ - $ # %`.
+
+### How a query uses one
+
+`query_in` gains one step in front of the scan. It walks the query tree and works out which keys an index can narrow it
+to:
+
+- An equality (`=` / `EQ`) on an indexed field resolves to that value's posting list, with the field's input conversion
+  applied first, so the index is looked up with the value that is actually stored.
+- `AND` intersects what its sides know, and keeps one side's answer when the other has none — narrowing by half a
+  condition is still narrowing.
+- `OR` needs both sides, since a side it cannot resolve could match anything at all.
+- Wildcards (`[value`, `value]`, `[value]`), inequalities and `ID` conditions resolve to nothing, and the scan behind
+  this handles them exactly as before.
+
+What comes back is a *superset* of the matches, never the answer. Every candidate is then put through the same
+evaluation a scan would have put it through, so an indexed query returns byte-identical results to the same query
+without the index — the index changes what is looked at, never what is decided. The candidate keys are walked in key
+order, which is the order the scan sorted its matches into, and a caller-supplied key list keeps its own order and is
+merely filtered by the candidate set.
+
+### Maintenance and staleness
+
+An index is held in memory beside the records and updated on the write path, in `Table::insert_record` and
+`Table::remove_record` — the one moment the record being replaced is still available, which is what a withdrawal of the
+old value needs. Only the values that actually moved are touched, so a write that leaves the indexed attribute alone
+costs a comparison of two short lists and no index work at all.
+
+A flush writes the records first, then each index, then that index's `state`. `state.data_version` therefore never
+names a data version that is not already on disk, and a crash anywhere in between leaves an index whose recorded
+version is behind the data's. That mismatch is the staleness signal. The same check catches an index whose field has
+been moved to a different attribute by a dictionary edit.
+
+Three more things mark an index stale rather than trusting it: a bulk change that names no keys (`touch_all`), a
+section that cannot be read at all, and an explicit `REBUILD.INDEX`. In every case the index is rebuilt from the records
+when the file is loaded, or at the start of the next flush, and **nothing consults an index in that state** — the query
+falls back to the scan it always had.
+
+An index is therefore never silently wrong. It is either consistent with the data, or detectably stale and rebuilt.
+
+### What an index costs
+
+Building one is a single pass over the file, which is the only cost an index has that grows with the file. After that a
+flush rewrites, per index, the groups holding the values the write moved — at most two — plus a small `state` file. The
+extra work is per index, not per record in the file.
+
+The one place the file's size does show through is the size of a posting list: an index on a field with ten values holds
+a tenth of the file's keys in each entry, and rewriting that entry writes them all. An index is worth most on a field
+with many values, which is also the field where it saves most.
+
+### Managing them
+
+- CLI: `CREATE.INDEX <file> <field>`, `LIST.INDEXES <file>`, `REBUILD.INDEX <file> <field>`,
+  `DELETE.INDEX <file> <field>` — see [General Use Commands](general_commands.md).
+- Remote protocol: the same four commands; the three that change something are admin-only, like `CREATE.FILE`. See
+  [Remote Connection Protocol](protocol.md).
+- Web dashboard: the Accounts tab, under the file's dictionary — create, rebuild and drop, with the counts each index is
+  judged on. See [Web Management Dashboard](web_dashboard.md).
+
+`FILE.STATS` reports a file's indexes alongside its layout, and `LIST.INDEXES` reports them on their own. Both carry the
+same three counts: `values` (distinct values held), `postings` (total value-to-key pairs) and `largest_postings` (the
+biggest posting list). `values` against the file's record count is how selective the field is, `postings` is what
+maintaining the index costs per write, and `largest_postings` is the skew the average hides — an index whose biggest
+value covers half the file saves nothing on that value.
+
+### Measurements
+
+Measured with `cargo bench -p smart-rusty-pick-core`, on a tmpfs so the numbers are about the engine rather than about
+the disk. These are measurements, not guarantees.
+
+Finding one record by a non-key value (`index/{scan,indexed}`), on a field distinct per record:
+
+| Plan                   | 1,000 records | 10,000 records |
+|------------------------|---------------|----------------|
+| Full scan              | 58 µs         | 1,350 µs       |
+| Through the index      | 6.7 µs        | 7.0 µs         |
+
+Ten times the file is twenty-three times the scan, and the same lookup through the index. That is the point of the
+feature: the cost of finding a record by a non-key value stops growing with the size of the file.
+
+One record updated and flushed (`storage/indexed_write`, against `storage/incremental_write` as the control):
+
+| Index on the file                  | 1,000 records | 10,000 records |
+|------------------------------------|---------------|----------------|
+| None                               | 49 µs         | 48 µs          |
+| One, on a field distinct per record | 77 µs         | 62 µs          |
+| One, on a field with ten values     | 63 µs         | 58 µs          |
+
+So an index costs roughly ten to thirty microseconds a write here — a fifth to a half again on top of the flush — and
+that cost does not grow with the file. The higher figure in the small-file column is the index's own modulus doubling
+during the run, amortised into the average; it is a property of a section that is still growing, not of the file size.
 
 ## Write Buffering and Durability
 

@@ -8,6 +8,9 @@ mod engine_tests;
 pub mod hashfile;
 #[cfg(test)]
 mod hashfile_tests;
+pub mod index;
+#[cfg(test)]
+mod index_tests;
 #[cfg(test)]
 mod model_tests;
 pub mod models;
@@ -19,4 +22,5 @@ pub mod report;
 mod report_tests;
 
 pub use engine::{Database, TableHandle, TableKey};
+pub use index::{FileIndex, IndexStats};
 pub use models::*;

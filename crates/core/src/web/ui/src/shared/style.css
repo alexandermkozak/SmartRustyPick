@@ -448,8 +448,29 @@ select {
 }
 
 /* The dictionary sits under the three columns and uses the whole width. */
-.dictionary .form {
+.dictionary .form,
+.indexes .form {
   margin-top: 1rem;
+}
+
+/* An index that no longer matches its records is the one thing in this table
+   worth reading before the numbers, so it is coloured like a warning. */
+.tag.stale {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+/* What the counts add up to, one line per index, under the table they explain. */
+.indexes .notes {
+  margin: 0.6rem 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.indexes .notes li + li {
+  margin-top: 0.25rem;
 }
 
 .dictionary tr[aria-current='true'] td {

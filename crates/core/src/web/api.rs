@@ -269,6 +269,47 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
             .await
         }
 
+        // A file's indexes: which fields resolve a `WITH <field> = ...` through
+        // an index instead of a scan, what each one costs, and how selective it
+        // is. Creating, rebuilding and dropping one are storage decisions about
+        // the file, which is why they are admin-only in the database; listing
+        // them is not.
+        ("GET", ["api", "accounts", account, "files", file, "indexes"]) => {
+            run(
+                client,
+                json!({ "command": "LIST.INDEXES", "account": account, "file": file }),
+            )
+            .await
+        }
+        ("POST", ["api", "accounts", account, "files", file, "indexes"]) => {
+            let field = match field(&body, "field") {
+                Some(field) => field,
+                None => return Response::error(400, "A dictionary field is required"),
+            };
+            run(
+                client,
+                json!({ "command": "CREATE.INDEX", "account": account, "file": file, "field": field }),
+            )
+            .await
+        }
+        // Rebuilding is its own endpoint rather than a flag on the one above:
+        // it acts on an index that already exists, and confusing the two would
+        // let a mistyped field name quietly create a second index.
+        ("POST", ["api", "accounts", account, "files", file, "indexes", field, "rebuild"]) => {
+            run(
+                client,
+                json!({ "command": "REBUILD.INDEX", "account": account, "file": file, "field": field }),
+            )
+            .await
+        }
+        ("DELETE", ["api", "accounts", account, "files", file, "indexes", field]) => {
+            run(
+                client,
+                json!({ "command": "DELETE.INDEX", "account": account, "file": file, "field": field }),
+            )
+            .await
+        }
+
         // A file's dictionary: the definitions that decide what its fields are
         // called, how they are laid out and how they convert.
         ("GET", ["api", "accounts", account, "files", file, "dictionary"]) => {

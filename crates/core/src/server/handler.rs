@@ -1,4 +1,4 @@
-use crate::db::{Database, ExplodeSpec, QueryNode, Record, SortSpec, Table};
+use crate::db::{Database, ExplodeSpec, IndexStats, QueryNode, Record, SortSpec, Table};
 use crate::server::models::{Request, Response};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -145,6 +145,52 @@ fn dictionary_record(key: &str, spec: &serde_json::Value) -> Result<Record, Stri
         attributes.pop();
     }
     Ok(Record::from_attributes(attributes))
+}
+
+/// The file and dictionary field an index command names.
+#[allow(clippy::result_large_err)]
+fn index_target(req: &Request) -> Result<(String, String), Response> {
+    let file = match req.file.as_deref().map(str::trim) {
+        Some(file) if !file.is_empty() => file.to_string(),
+        _ => return Err(error("File not specified")),
+    };
+    let field = match req.field.as_deref().map(str::trim) {
+        Some(field) if !field.is_empty() => field.to_string(),
+        _ => return Err(error("Field not specified")),
+    };
+    Ok((file, field))
+}
+
+/// One index, as the reply describes it.
+fn index_response(stats: IndexStats) -> Response {
+    Response {
+        status: "OK".to_string(),
+        record: Some(serde_json::to_value(stats).unwrap_or(serde_json::Value::Null)),
+        ..Default::default()
+    }
+}
+
+/// Every index of a file, paired with its field name the way the other listings
+/// pair a name with what is worth knowing about it.
+fn index_listing(indexes: Vec<IndexStats>) -> Response {
+    let keys: Vec<String> = indexes.iter().map(|stats| stats.field.clone()).collect();
+    let results: Vec<(String, serde_json::Value)> = indexes
+        .into_iter()
+        .map(|stats| {
+            (
+                stats.field.clone(),
+                serde_json::to_value(stats).unwrap_or(serde_json::Value::Null),
+            )
+        })
+        .collect();
+    let count = results.len();
+    Response {
+        status: "OK".to_string(),
+        keys: Some(keys),
+        results: Some(results),
+        count: Some(count),
+        ..Default::default()
+    }
 }
 
 /// The commands that work on the records of a single file.
@@ -889,6 +935,73 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     message: Some(format!("Error: {}", e)),
                     ..Default::default()
                 },
+            }
+        }
+        // Indexes. Creating, rebuilding and dropping one are storage decisions
+        // about a file, so they are gated exactly as creating the file is;
+        // listing them is not, any more than listing the files is.
+        "CREATE.INDEX" => {
+            if !client_info.is_admin {
+                return error("Admin privileges required");
+            }
+            if target_account.is_none() {
+                return error("Account not specified");
+            }
+            let (file, field) = match index_target(&req) {
+                Ok(target) => target,
+                Err(response) => return response,
+            };
+            match db.create_index_for_account(acc, &file, &field) {
+                Ok(stats) => index_response(stats),
+                Err(e) => error(format!("Error: {}", e)),
+            }
+        }
+        "REBUILD.INDEX" => {
+            if !client_info.is_admin {
+                return error("Admin privileges required");
+            }
+            if target_account.is_none() {
+                return error("Account not specified");
+            }
+            let (file, field) = match index_target(&req) {
+                Ok(target) => target,
+                Err(response) => return response,
+            };
+            match db.rebuild_index_for_account(acc, &file, &field) {
+                Ok(stats) => index_response(stats),
+                Err(e) => error(format!("Error: {}", e)),
+            }
+        }
+        "DELETE.INDEX" => {
+            if !client_info.is_admin {
+                return error("Admin privileges required");
+            }
+            if target_account.is_none() {
+                return error("Account not specified");
+            }
+            let (file, field) = match index_target(&req) {
+                Ok(target) => target,
+                Err(response) => return response,
+            };
+            match db.drop_index_for_account(acc, &file, &field) {
+                Ok(()) => Response {
+                    status: "OK".to_string(),
+                    ..Default::default()
+                },
+                Err(e) => error(format!("Error: {}", e)),
+            }
+        }
+        "LIST.INDEXES" => {
+            if target_account.is_none() {
+                return error("Account not specified");
+            }
+            let file = match req.file.as_deref().map(str::trim) {
+                Some(file) if !file.is_empty() => file.to_string(),
+                _ => return error("File not specified"),
+            };
+            match db.index_statistics(acc, &file) {
+                Ok(indexes) => index_listing(indexes),
+                Err(e) => error(format!("Error: {}", e)),
             }
         }
         "AUTHORIZE.CONN" => {

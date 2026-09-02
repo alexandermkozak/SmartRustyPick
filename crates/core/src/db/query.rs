@@ -1,6 +1,6 @@
 use crate::db::engine::Database;
 use crate::db::models::*;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Clone, Debug)]
 pub struct FieldQueryInfo {
@@ -506,7 +506,26 @@ impl Database {
             &table.records
         };
 
+        // The one step in front of the scan: a secondary index narrowing which
+        // records are worth looking at. It only ever produces a superset of the
+        // answer, and every candidate is then put through the same evaluation a
+        // scan would have put it through, so the result is what it always was.
+        let candidates = match use_dict_section {
+            true => None,
+            false => Self::index_candidates(table, query, &field_map),
+        };
+
         let Some(filter_keys) = keys_to_filter else {
+            if let Some(candidates) = candidates {
+                // A `BTreeSet` iterates in key order, which is the order a full
+                // scan sorts its matches into.
+                return candidates
+                    .iter()
+                    .filter_map(|key| source_map.get_key_value(key.as_str()))
+                    .filter(|(key, record)| Self::evaluate_node_static_with_id(key, record, query, &field_map))
+                    .map(|(key, record)| project(key, record))
+                    .collect();
+            }
             // Optimize: Filter before sorting.
             // Avoid cloning the entire table by using an iterator, and order the
             // borrowed keys rather than copies of them, so only the matches that
@@ -521,6 +540,11 @@ impl Database {
 
         let mut results = Vec::new();
         for key in filter_keys {
+            // The caller's order is the one that survives, so the candidate set
+            // is used as a filter here rather than as the thing iterated.
+            if candidates.as_ref().is_some_and(|keys| !keys.contains(key)) {
+                continue;
+            }
             if let Some(record) = source_map.get(key)
                 && Self::evaluate_node_static_with_id(key, record, query, &field_map)
             {
@@ -528,6 +552,63 @@ impl Database {
             }
         }
         results
+    }
+
+    /// The keys an index can narrow `query` down to, or `None` when no index
+    /// applies and the whole section has to be walked.
+    ///
+    /// The set returned is a *superset* of the matches, never an exact answer:
+    ///
+    /// * An equality on an indexed field resolves to that value's posting list.
+    /// * `AND` intersects what its sides know, and keeps one side's answer when
+    ///   the other has none - narrowing by half a condition is still narrowing.
+    /// * `OR` needs both sides, since a side it cannot resolve could match
+    ///   anything at all.
+    ///
+    /// Wildcards, inequalities and `ID` conditions resolve to nothing here. They
+    /// are not wrong to index, they are simply not what an equality index
+    /// answers, and the scan behind this handles them exactly as before.
+    fn index_candidates(
+        table: &Table,
+        node: &QueryNode,
+        field_map: &HashMap<String, FieldQueryInfo>,
+    ) -> Option<BTreeSet<String>> {
+        if table.indexes.is_empty() {
+            return None;
+        }
+        match node {
+            QueryNode::Condition(cond) => {
+                if !matches!(cond.op.to_uppercase().as_str(), "=" | "EQ") || cond.field_name == "ID" {
+                    return None;
+                }
+                if is_wildcard_value(&cond.value) {
+                    return None;
+                }
+                let info = field_map.get(&cond.field_name)?;
+                // The same input conversion the evaluation applies, so the
+                // index is looked up with the value that is actually stored.
+                let search = match &info.conversion {
+                    Some(code) => Self::apply_iconv(&cond.value, code),
+                    None => cond.value.clone(),
+                };
+                table.index_candidates(&cond.field_name, &search).cloned()
+            }
+            QueryNode::Logical { op, left, right } => {
+                let left = Self::index_candidates(table, left, field_map);
+                let right = Self::index_candidates(table, right, field_map);
+                match op {
+                    LogicalOp::And => match (left, right) {
+                        (Some(left), Some(right)) => Some(left.intersection(&right).cloned().collect()),
+                        (Some(only), None) | (None, Some(only)) => Some(only),
+                        (None, None) => None,
+                    },
+                    LogicalOp::Or => match (left, right) {
+                        (Some(left), Some(right)) => Some(left.union(&right).cloned().collect()),
+                        _ => None,
+                    },
+                }
+            }
+        }
     }
 
     /// Runs `query` (if any) and expands each surviving record into one entry
@@ -888,6 +969,13 @@ pub fn is_comparison_op(token: &str) -> bool {
         token.to_uppercase().as_str(),
         "=" | "EQ" | "!=" | "#" | "<>" | "NE" | "<" | "LT" | ">" | "GT" | "<=" | "LE" | ">=" | "GE"
     )
+}
+
+/// Whether a `=` or `#` value is one of the wildcard forms
+/// [`compare_values`](Database::compare_values) reads as starts-with, ends-with
+/// or contains. Those are matches an equality index cannot answer.
+fn is_wildcard_value(value: &str) -> bool {
+    value.starts_with('[') || value.ends_with(']')
 }
 
 /// Strips one layer of surrounding double quotes from a clause value.

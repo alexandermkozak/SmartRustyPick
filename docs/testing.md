@@ -186,6 +186,7 @@ or JSON in the way, and Criterion compares each run against the previous one sto
 | `select`       | `select_entries_in` against the owning path it replaced, over a narrow and a wide record.       |
 | `serialize`    | `serialize_record_with_schema` for a single-valued and a multivalued record.                    |
 | `storage`      | Saving 5 000 records, loading them back from disk, JSON serialisation, and `incremental_write`. |
+| `index`        | The same equality query scanned and resolved through a secondary index, at two file sizes.      |
 
 `select/owning_baseline/*` is kept beside `select/select_entries_in/*` deliberately: `SELECT` keeps keys and discards
 the records, so the baseline is what the same selection cost when it cloned every match first. The gap widens with the
@@ -196,6 +197,12 @@ record has found its way onto the path again.
 `storage/incremental_write/{1000,10000}_records` is the sharpest guard on write amplification: it updates a single
 record and flushes, on a small and on a large table. The two figures must match - 63 us and 61 us when this was written.
 A gap between them means a write has started scaling with the size of the table again.
+
+`index/{scan,indexed}/{1000,10000}_records` is the same guard for retrieval by a non-key value: the scan grows with the
+file and the indexed lookup does not. When this was written, 58 us and 1 350 us scanned against 6.7 us and 7.0 us
+indexed. An `indexed` figure that starts tracking the file size means the planner has stopped reaching the index.
+`storage/indexed_write/*` is the other side of that trade: what an index costs the write path, against
+`incremental_write` as the control.
 
 `make bench-smoke` (also a CI step) runs one iteration of each. It is not a timing gate; it keeps the benchmarks
 compiling and running, which is how benchmark suites usually rot.

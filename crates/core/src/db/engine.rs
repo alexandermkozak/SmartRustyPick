@@ -1,4 +1,5 @@
 use crate::db::hashfile::{self, FsyncPolicy, SectionMeta};
+use crate::db::index::{self, FileIndex, IndexStats};
 use crate::db::models::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
@@ -1316,7 +1317,42 @@ impl Database {
             table.legacy_data = !table.records.is_empty() || Path::new(&data_path).exists();
         }
         Self::load_section(&mut table.dictionary, &format!("{}/{}/dict", storage, name))?;
+        Self::load_indexes(&mut table, &format!("{}/{}", storage, name));
         Ok(table)
+    }
+
+    /// Attaches the index sections a file's directory holds.
+    ///
+    /// An index whose `state` does not name the data version now on disk, or
+    /// whose field has moved to a different attribute, is rebuilt here from the
+    /// records that were just read - which is the whole point of doing this at
+    /// load time, when they are in hand. A section that cannot be read at all is
+    /// treated the same way: an empty index marked for a rebuild, rather than a
+    /// failed load of a file whose *records* are perfectly intact.
+    fn load_indexes(table: &mut Table, file_dir: &str) {
+        let data_version = if table.legacy_data { 0 } else { table.data_meta.version };
+        for field in index::indexed_fields(file_dir) {
+            let attr = table.field_index(&field);
+            let path = index::section_path(file_dir, &field);
+            let mut entries: HashMap<String, Record> = HashMap::new();
+            let loaded = hashfile::load(&path, &mut entries);
+            let index = match (attr, loaded) {
+                (Some(attr), Ok(meta)) => FileIndex::loaded(
+                    &field,
+                    attr,
+                    entries,
+                    meta,
+                    index::read_state(&path).as_ref(),
+                    data_version,
+                ),
+                // Unreadable, or a field the dictionary no longer defines. Keep
+                // the index present and stale so it is visible and rebuildable,
+                // and never consulted in the meantime.
+                (attr, _) => FileIndex::new(&field, attr.unwrap_or(0)),
+            };
+            table.indexes.insert(field, index);
+        }
+        table.rebuild_stale_indexes();
     }
 
     /// Writes the pending changes of one table and clears its dirty state.
@@ -1350,6 +1386,10 @@ impl Database {
             return Ok(());
         }
         let table = &mut *table;
+        // An index that has fallen behind is reconciled before anything is
+        // written, so what lands on disk is an index that matches the records
+        // beside it rather than one that has to be caught up on the next load.
+        table.rebuild_stale_indexes();
 
         if table.records_dirty() {
             let incremental = if table.dirty_all || table.legacy_data {
@@ -1375,6 +1415,15 @@ impl Database {
             if fsync == FsyncPolicy::Always {
                 File::open(&dict_path)?.sync_all()?;
             }
+        }
+        // Indexes last, and each one's `state` last of all: `state.data_version`
+        // must never name a data version that is not already on disk. A crash
+        // anywhere in here leaves an index whose recorded version is behind the
+        // data's, which is exactly the mismatch the next load rebuilds on.
+        let file_dir = format!("{}/{}", storage, name);
+        let data_version = table.data_meta.version;
+        for (field, index) in table.indexes.iter_mut() {
+            index.save(&index::section_path(&file_dir, field), data_version, per_group, fsync)?;
         }
         table.clear_dirty();
         Ok(())
@@ -1759,6 +1808,7 @@ impl Database {
         };
 
         Ok(FileStats {
+            indexes: self.index_statistics(account, name).unwrap_or_default(),
             account: account.to_string(),
             name: name.to_string(),
             record_count,
@@ -1777,6 +1827,120 @@ impl Database {
                 .and_then(|time| SystemTime::now().duration_since(time).ok())
                 .map(|elapsed| elapsed.as_secs()),
         })
+    }
+
+    /// Creates an index on a dictionary field of one file and writes it out.
+    ///
+    /// Building it is a single pass over the records, which is the one O(file)
+    /// cost an index has; everything afterwards rides the ordinary write path.
+    pub fn create_index_for_account(&self, account: &str, file: &str, field: &str) -> io::Result<IndexStats> {
+        let handle = self.get_table_mut_for_account(account, file)?;
+        {
+            let mut table = handle.write();
+            if table.has_index(field.trim()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("'{}' is already indexed on file '{}'", field.trim(), file),
+                ));
+            }
+            table.create_index(field).map_err(io::Error::other)?;
+        }
+        // The file's lock is released first: a flush locks each dirty file in
+        // turn, and would wait on the one this thread is holding.
+        self.flush_table(&(account.to_string(), file.to_string()))?;
+        self.index_statistics_for_field(account, file, field.trim())
+    }
+
+    /// Drops an index and removes its section from disk.
+    pub fn drop_index_for_account(&self, account: &str, file: &str, field: &str) -> io::Result<()> {
+        let field = field.trim();
+        let handle = self.get_table_mut_for_account(account, file)?;
+        let dropped = handle.write().drop_index(field);
+        if !dropped
+            && !index::indexed_fields(&self.file_dir(account, file))
+                .iter()
+                .any(|f| f == field)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("'{}' is not indexed on file '{}'", field, file),
+            ));
+        }
+        index::remove_section(&index::section_path(&self.file_dir(account, file), field))
+    }
+
+    /// Derives an index from the records again and writes it out.
+    ///
+    /// The repair for an index that is stale, and the way to bring one back
+    /// after its section has been damaged or removed underneath the server.
+    pub fn rebuild_index_for_account(&self, account: &str, file: &str, field: &str) -> io::Result<IndexStats> {
+        let field = field.trim();
+        let handle = self.get_table_mut_for_account(account, file)?;
+        {
+            let mut table = handle.write();
+            if !table.has_index(field) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("'{}' is not indexed on file '{}'", field, file),
+                ));
+            }
+            table.rebuild_index(field).map_err(io::Error::other)?;
+        }
+        self.flush_table(&(account.to_string(), file.to_string()))?;
+        self.index_statistics_for_field(account, file, field)
+    }
+
+    /// The file's directory on disk.
+    fn file_dir(&self, account: &str, name: &str) -> String {
+        format!("{}/{}", self.account_storage_dir(account), name)
+    }
+
+    /// Every index of one file, with the counts a management view reports.
+    ///
+    /// Read from the loaded table when the file is in memory, so an index that
+    /// has been changed but not yet flushed is described as it now is. For a
+    /// file that is not loaded the index sections are read instead - they hold
+    /// values and keys rather than record bodies, so this is affordable where
+    /// reading the file would not be.
+    pub fn index_statistics(&self, account: &str, file: &str) -> io::Result<Vec<IndexStats>> {
+        if !self.account_has_table(account, file) {
+            self.scan_available_tables(account)?;
+        }
+        if !self.account_has_table(account, file) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Table '{}' not found in account '{}'", file, account),
+            ));
+        }
+        let file_dir = self.file_dir(account, file);
+        if let Some(handle) = self.get_table_read_only_for_account(account, file) {
+            let table = handle.read();
+            return Ok(table
+                .indexes
+                .values()
+                .map(|index| index.stats(&file_dir, true))
+                .collect());
+        }
+        let data_version = hashfile::read_meta(&format!("{}/data", file_dir))
+            .map(|meta| meta.version)
+            .unwrap_or(0);
+        Ok(index::indexed_fields(&file_dir)
+            .into_iter()
+            .map(|field| index::stats_from_disk(&file_dir, &field, data_version))
+            .collect())
+    }
+
+    /// One index's statistics, by field name.
+    fn index_statistics_for_field(&self, account: &str, file: &str, field: &str) -> io::Result<IndexStats> {
+        self.index_statistics(account, file)?
+            .into_iter()
+            .find(|stats| stats.field == field)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("'{}' is not indexed on file '{}'", field, file),
+                )
+            })
     }
 
     pub fn is_table_available(&self, name: &str) -> bool {
