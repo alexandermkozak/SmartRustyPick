@@ -13,7 +13,7 @@
 //! When the protocol genuinely changes: update `models.rs` / `handler.rs`, then
 //! `docs/protocol.md`, then the lists here.
 
-use crate::server::models::{Request, Response};
+use crate::server::models::{ErrorCode, Request, Response};
 
 const PROTOCOL_DOC: &str = include_str!("../../../../docs/protocol.md");
 
@@ -42,7 +42,16 @@ const REQUEST_FIELDS: &[&str] = &[
 ];
 
 /// Every JSON key a `Response` can carry.
-const RESPONSE_FIELDS: &[&str] = &["status", "message", "record", "results", "keys", "count", "positions"];
+const RESPONSE_FIELDS: &[&str] = &[
+    "status",
+    "message",
+    "code",
+    "record",
+    "results",
+    "keys",
+    "count",
+    "positions",
+];
 
 /// Every command string accepted by `handle_request_locked`.
 const COMMANDS: &[&str] = &[
@@ -105,6 +114,7 @@ fn response_struct_serializes_to_exactly_the_documented_fields() {
     let populated = Response {
         status: "OK".to_string(),
         message: Some(String::new()),
+        code: Some(ErrorCode::IoError),
         record: Some(serde_json::Value::Null),
         results: Some(Vec::new()),
         keys: Some(Vec::new()),
@@ -136,6 +146,7 @@ fn an_unpopulated_response_carries_only_status() {
 fn an_omitted_response_field_reads_back_as_unpopulated() {
     let response: Response = serde_json::from_str(r#"{"status": "OK"}"#).unwrap();
     assert!(response.message.is_none());
+    assert!(response.code.is_none());
     assert!(response.record.is_none());
     assert!(response.results.is_none());
     assert!(response.keys.is_none());
@@ -161,6 +172,52 @@ fn every_response_field_is_documented() {
             "response field `{field}` is not mentioned in docs/protocol.md"
         );
     }
+}
+
+/// The codes are the half of an error response a client is allowed to branch
+/// on, so every one of them has to be written up. A code added to the enum and
+/// left out of `docs/protocol.md` fails here.
+#[test]
+fn every_error_code_is_documented() {
+    for code in ErrorCode::ALL {
+        assert!(
+            PROTOCOL_DOC.contains(&format!("`{code}`")),
+            "error code `{code}` is not listed in docs/protocol.md"
+        );
+    }
+}
+
+/// The wire spelling is the interface: renaming one silently would break every
+/// client that branches on it, so the round trip is pinned rather than left to
+/// the enum's own ordering.
+#[test]
+fn every_error_code_round_trips_through_its_wire_string() {
+    for code in ErrorCode::ALL {
+        assert_eq!(ErrorCode::from_wire(code.as_str()), Some(*code));
+        assert_eq!(
+            serde_json::to_string(code).unwrap(),
+            format!("\"{}\"", code.as_str()),
+            "`{code}` is not sent as the string it names"
+        );
+    }
+    assert_eq!(ErrorCode::from_wire("NO_SUCH_CODE"), None);
+}
+
+/// Every error reply carries a code beside its message. A response without one
+/// is exactly what this whole field exists to stop.
+#[test]
+fn an_error_reply_carries_a_code() {
+    let refused: Response = serde_json::from_str(
+        r#"{"status": "ERROR", "message": "Table 'X' not found in account 'Y'", "code": "FILE_NOT_FOUND"}"#,
+    )
+    .unwrap();
+    assert_eq!(refused.code, Some(ErrorCode::FileNotFound));
+
+    // A code from a newer server leaves the rest of the response readable.
+    let newer: Response =
+        serde_json::from_str(r#"{"status": "ERROR", "message": "Something new", "code": "SOMETHING_NEW"}"#).unwrap();
+    assert_eq!(newer.code, None);
+    assert_eq!(newer.message.as_deref(), Some("Something new"));
 }
 
 #[test]

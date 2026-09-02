@@ -68,6 +68,14 @@ AI agents have been responsible for several critical improvements and fixes in t
   whose values is sub-valued, so the fixture reaches every level of the hierarchy.
 - **Certificate Management:** Implemented `GENERATE.CERT` in the `SYSTEM` account, allowing users to create signed
   client certificates and PKCS#12 (.pfx) files directly from the database CLI for simplified secure remote access setup.
+- **Typed errors:** The engine reports a `DbError` variant - `FileNotFound`, `AccountExists`, `IndexNotFound`, `Io` and
+  the rest - rather than an `io::Error` carrying English prose, and every protocol error reply carries a stable `code`
+  beside its `message`. The rule that keeps it honest: **the code is the interface, the message is for a person**. A
+  client branches on `FILE_NOT_FOUND`; nothing branches on wording, so a refusal can be reworded without breaking a
+  test or a caller. `docs/protocol.md` lists every code, a documentation test fails when one is added and not written
+  up, and a handler test fires a refusal at every command and fails on any that answers without a code. It paid for
+  itself immediately: a `query_string` the parser could not read used to come back as *the whole file* with
+  `status: "OK"`, because "not a query" and "no query" were the same `None`. It is now `INVALID_QUERY`.
 
 ### 5. Concurrency
 

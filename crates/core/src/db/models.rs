@@ -364,20 +364,21 @@ impl Table {
     /// saying rather than leaving an index that answers nothing: a name that
     /// cannot become a directory, a field the dictionary does not define, or
     /// `ID` - which is the record key, already found in one hash lookup.
-    pub fn create_index(&mut self, field: &str) -> Result<(), String> {
+    pub fn create_index(&mut self, field: &str) -> crate::db::DbResult<()> {
         let field = field.trim().to_string();
+        let refuse = |reason: &str| crate::db::DbError::InvalidField {
+            field: field.clone(),
+            reason: reason.to_string(),
+        };
         if field == "ID" {
-            return Err("ID is the record key and is already found without a scan".to_string());
+            return Err(refuse("it is the record key, already found without a scan"));
         }
         if !crate::db::index::is_valid_field_name(&field) {
-            return Err(format!(
-                "'{}' cannot name an index: use letters, digits and . _ - $ # %",
-                field
-            ));
+            return Err(refuse("an index name may hold only letters, digits and . _ - $ # %"));
         }
         let attr = self
             .field_index(&field)
-            .ok_or_else(|| format!("'{}' is not a dictionary field of this file", field))?;
+            .ok_or_else(|| refuse("it is not a dictionary field of this file"))?;
         let mut index = FileIndex::new(&field, attr);
         index.rebuild(&self.records, attr);
         self.indexes.insert(field, index);
@@ -391,14 +392,23 @@ impl Table {
     }
 
     /// Derives one index from the records again.
-    pub fn rebuild_index(&mut self, field: &str) -> Result<(), String> {
+    pub fn rebuild_index(&mut self, field: &str) -> crate::db::DbResult<()> {
         let field = field.trim();
+        // A table does not know which file it is, so this says only that the
+        // field is not indexed; the engine checks first and reports
+        // `IndexNotFound` naming the file.
         if !self.indexes.contains_key(field) {
-            return Err(format!("'{}' is not indexed on this file", field));
+            return Err(crate::db::DbError::InvalidField {
+                field: field.to_string(),
+                reason: "it is not indexed on this file".to_string(),
+            });
         }
         let attr = self
             .field_index(field)
-            .ok_or_else(|| format!("'{}' is not a dictionary field of this file", field))?;
+            .ok_or_else(|| crate::db::DbError::InvalidField {
+                field: field.to_string(),
+                reason: "it is not a dictionary field of this file".to_string(),
+            })?;
         // The indexes are moved aside rather than the records, so that reading
         // one while rebuilding the other needs no second borrow of `self`. This
         // way round on purpose: a panic in here would lose what is moved, and an

@@ -47,7 +47,7 @@ matched case-insensitively.
 | `data`            | string \| object | `WRITE`                                                                                                            | Record contents. A string is parsed as a display-format record (`^` field mark, `]` value mark, `\` sub-value mark). An object maps field names — original dictionary names or their camelCase form — to values, applying the dictionary's input conversions (ICONV).                     |
 | `structured_data` | object           | `WRITE`, `SET.DICT`                                                                                                | `WRITE`: same object form as `data`, checked first when present — use either this or `data`, not both. `SET.DICT`: the dictionary attributes of one entry.                                                                                                                                 |
 | `is_dict`         | bool             | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`                                                                       | Operate on the file's dictionary section instead of its data section. Default `false`.                                                                                                                                                                                                    |
-| `query_string`    | string           | `QUERY`, `SELECT`                                                                                                  | Pick-style query, e.g. `WITH NAME = "John" BY NAME`. Alternative to `query_node`. A bare command with neither selects every record.                                                                                                                                                       |
+| `query_string`    | string           | `QUERY`, `SELECT`                                                                                                  | Pick-style query, e.g. `WITH NAME = "John" BY NAME`. Alternative to `query_node`. A bare command with neither selects every record; a `query_string` that is not a query is refused with `INVALID_QUERY` rather than read as one.                                                          |
 | `query_node`      | object           | `QUERY`, `SELECT`                                                                                                  | Structured query tree. Takes precedence over `query_string`. See [Query node](#query-node).                                                                                                                                                                                               |
 | `sort_specs`      | array of objects | `QUERY`, `SELECT`                                                                                                  | Explicit sort order: `[{"field_name": "NAME", "descending": false}]`. Overrides any `BY`/`BY.DSND` parsed from `query_string`.                                                                                                                                                            |
 | `explode`         | array of strings | `QUERY`, `SELECT`                                                                                                  | Multivalued fields to explode, so each matching value becomes its own result row. Only the first is used. Overrides any `BY.EXP` parsed from `query_string`. See [Exploded results](#exploded-results).                                                                                    |
@@ -69,7 +69,8 @@ older server sent in its place.
 | Field       | Type                      | Populated by                                                                                         | Notes                                                                                                                                                                                                            |
 |-------------|---------------------------|------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `status`    | string                    | all                                                                                                  | `"OK"`, `"ERROR"` or `"EOF"`.                                                                                                                                                                                    |
-| `message`   | string                    | errors                                                                                               | Human-readable error text; set whenever `status` is `"ERROR"`.                                                                                                                                                   |
+| `message`   | string                    | errors                                                                                               | Human-readable error text; set whenever `status` is `"ERROR"`. For a person to read, not for a client to match on - the wording may change.                                                                       |
+| `code`      | string                    | errors                                                                                               | The error's stable classification, set whenever `status` is `"ERROR"`. This is what a client branches on. See [Error codes](#error-codes).                                                                        |
 | `record`    | object                    | `READ`, `CREATE.TEST.ACCOUNT`, `SET.FILE`, `FILE.STATS`, `SET.DICT`, `SERVER.STATS`, `GENERATE.CERT` | For `READ`, the record as field-name → display-formatted string (see [Record shape](#record-shape)). The management commands use it for their single result object, whose shape is documented with each command. |
 | `results`   | array of `[key, record]`  | `QUERY`, `GET.NEXT`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES`, `LIST.DICT`                        | Ordered `[string, object]` pairs. For `QUERY` and `GET.NEXT` each `record` has the same shape as `READ`; the management commands document their own.                                                             |
 | `keys`      | array of strings          | `LIST.FILES`, `LIST.DICT`                                                                            | Plain list of names: the files in the account, or the file's dictionary entries. Both commands fill `results` as well, with what is known about each name.                                                       |
@@ -77,7 +78,12 @@ older server sent in its place.
 | `positions` | array of objects or nulls | `QUERY`, `GET.NEXT`                                                                                  | Present only for an exploded result. Index-aligned with `results`: the position within the exploded field that put each row there. See [Exploded results](#exploded-results).                                    |
 
 There is no `NOT_FOUND` status. A missing record, table or list yields
-`status: "ERROR"` with an explanatory `message`.
+`status: "ERROR"` with the `code` that says which, and a `message` that says it
+in English:
+
+```json
+{"status": "ERROR", "code": "FILE_NOT_FOUND", "message": "Table 'ORDERS' not found in account 'SALES'"}
+```
 
 ### Record shape
 
@@ -153,6 +159,51 @@ a `null` position. `positions` is omitted entirely when nothing was exploded.
 
 `op` for `Logical` is `"And"` or `"Or"`.
 
+## Error codes
+
+Every `status: "ERROR"` reply carries a `code` beside its `message`. The code is
+the interface: it is what a client branches on, and it does not change. The
+message is for a person, and its wording may change at any time - a client that
+matches on it will break, and none of these codes needs it to.
+
+This is the complete list. The command sections below name the codes each
+command can answer with; `crates/core/src/server/protocol_doc_tests.rs` fails if
+a code is added to the server and not written up here.
+
+| Code                    | Means                                                                                            |
+|-------------------------|--------------------------------------------------------------------------------------------------|
+| `MISSING_FIELD`         | A field the command requires was absent or empty. The message names it.                          |
+| `INVALID_DATA`          | A field was present but does not describe what it has to - a record, or a dictionary entry.       |
+| `INVALID_QUERY`         | A `query_string` that is not a query. An absent one is not an error: it selects every record.      |
+| `INVALID_JSON`          | The request line was not JSON. The connection stays open.                                         |
+| `UNKNOWN_COMMAND`       | No command of that name.                                                                          |
+| `ADMIN_REQUIRED`        | The command is admin only and this client's certificate is not.                                   |
+| `ACCESS_DENIED`         | The account is not in the client's allowed list. Logged by the server.                            |
+| `DEAUTHORIZED`          | The client's authorization was revoked while it was connected; the connection closes after this.  |
+| `ACCOUNT_NOT_SPECIFIED` | The command works inside an account, none was named, and there is no single allowed one to use.   |
+| `ACCOUNT_NOT_FOUND`     | No account of that name is registered.                                                            |
+| `ACCOUNT_EXISTS`        | An account of that name is already registered; nothing was written.                               |
+| `ACCOUNT_PROTECTED`     | `SYSTEM` holds the account registry and the authorized clients, so it cannot be dropped.          |
+| `FILE_NOT_FOUND`        | The account has no file of that name.                                                             |
+| `FILE_EXISTS`           | The account already has a file of that name; nothing was written.                                 |
+| `RECORD_NOT_FOUND`      | The file holds no record under that key.                                                          |
+| `SELECT_LIST_NOT_FOUND` | `GET.NEXT` named a list no `SELECT` has filled.                                                   |
+| `CLIENT_NOT_FOUND`      | No client is authorized under that name.                                                          |
+| `INDEX_NOT_FOUND`       | The file carries no index on that field.                                                          |
+| `INDEX_EXISTS`          | The file already carries an index on that field.                                                  |
+| `INVALID_FIELD`         | The field cannot carry an index. The message says why.                                            |
+| `INVALID_REQUEST`       | Understood and refused: the database will not do this. The message says why.                      |
+| `CORRUPT_DATA`          | What is on disk does not decode. The file needs repair; retrying will not help.                   |
+| `PERMISSION_DENIED`     | The server may not touch a file or directory it needs. An operator problem, not the client's.     |
+| `IO_ERROR`              | Any other I/O failure - a full disk, a short write. Worth retrying, unlike the two above.         |
+| `UNAVAILABLE`           | The server cannot answer this command as it is currently configured.                              |
+
+A code this list does not name may appear in a future version, so read an
+unrecognised one the way you would read a missing one: the request failed, and
+the `message` says how. Every command may answer with `CORRUPT_DATA`,
+`PERMISSION_DENIED` or `IO_ERROR` if the storage underneath it fails, so those
+three are not repeated in the per-command lists below.
+
 ## Commands
 
 | Command                 | Admin | Account | Required fields                                      | Response on success                     |
@@ -194,9 +245,8 @@ need `account` on the request itself.
 Retrieve one record.
 
 - Required: `file`, `key`. Optional: `account`, `is_dict`.
-- Errors: `"File not specified"`, `"Key not specified"`, `"Account not specified"`,
-  `"Record not found"`, `"Access denied for account <name>: Not in allowed list"`,
-  `"Table error: <detail>"`.
+- Errors: `MISSING_FIELD` (no `file` or `key`), `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`,
+  `FILE_NOT_FOUND`, `RECORD_NOT_FOUND`.
 
 ```json
 {"command": "READ", "account": "SALES", "file": "USERS", "key": "3"}
@@ -215,9 +265,8 @@ correctly.
   `is_dict`.
 - `data` as a string is a raw display-format record; `data` as an object, or
   `structured_data`, is field-name → value with ICONV applied.
-- Errors: `"File not specified"`, `"Key not specified"`, `"Data not specified"`,
-  `"Invalid structured data"`, `"Invalid data type in data field: expected string or
-  object"`, `"Save error: <detail>"`, `"Table error: <detail>"`.
+- Errors: `MISSING_FIELD` (no `file`, `key` or data), `INVALID_DATA` (data that is not a
+  record), `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`, `FILE_NOT_FOUND`.
 
 ```json
 {"command": "WRITE", "account": "SALES", "file": "USERS", "key": "3",
@@ -238,8 +287,8 @@ correctly.
 Remove one record. Succeeds whether or not the key existed.
 
 - Required: `file`, `key`. Optional: `account`, `is_dict`.
-- Errors: `"File not specified"`, `"Key not specified"`, `"Save error: <detail>"`,
-  `"Table error: <detail>"`.
+- Errors: `MISSING_FIELD` (no `file` or `key`), `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`,
+  `FILE_NOT_FOUND`.
 
 ```json
 {"command": "DELETE", "account": "SALES", "file": "USERS", "key": "3"}
@@ -257,7 +306,8 @@ Search a file and return the matching records inline, in one response.
   `sort_specs`, `explode`. With no query given, every record is returned.
 - Response: `results`, an ordered list of `[key, record]` pairs, plus `positions` when
   `explode` was given.
-- Errors: `"File not specified"`, `"Table error: <detail>"`, access-denied.
+- Errors: `MISSING_FIELD` (no `file`), `INVALID_QUERY`, `ACCOUNT_NOT_SPECIFIED`,
+  `ACCESS_DENIED`, `FILE_NOT_FOUND`.
 
 ```json
 {"command": "QUERY", "account": "SALES", "file": "USERS",
@@ -278,7 +328,8 @@ list for paged retrieval with `GET.NEXT`. Only the count is returned.
 - Re-using a `list_name` replaces the previous list and resets its cursor.
 - With `explode`, `count` is the number of exploded rows, not of distinct records, and the
   positions are remembered for `GET.NEXT`.
-- Errors: `"File not specified"`, `"Table error: <detail>"`, access-denied.
+- Errors: `MISSING_FIELD` (no `file`), `INVALID_QUERY`, `ACCOUNT_NOT_SPECIFIED`,
+  `ACCESS_DENIED`, `FILE_NOT_FOUND`.
 
 ```json
 {"command": "SELECT", "account": "SALES", "file": "USERS",
@@ -297,7 +348,7 @@ Fetch the next batch of records from a select list. Advances the list's cursor.
 - Response: `results` (`[key, record]` pairs) and `count` (batch size), plus `positions`
   when the list was exploded. When the cursor is already at the end, `status: "EOF"` with
   no other fields.
-- Errors: `"Select list not found"`, `"Table error: <detail>"`.
+- Errors: `SELECT_LIST_NOT_FOUND`, `FILE_NOT_FOUND`.
 
 ```json
 {"command": "GET.NEXT", "list_name": "MYLIST", "batch_size": 50}
@@ -321,7 +372,9 @@ Create or drop an account. Names the account with `target_account`, not `account
   error rather than as an empty account, so no client has to remember to create it.
 - Dropping an account takes every file in it. `SYSTEM` cannot be dropped: it holds the
   account registry and the authorized clients.
-- Errors: `"Admin privileges required"`, `"Account name not specified"`, `"Error: <detail>"`.
+- Errors: `ADMIN_REQUIRED`, `MISSING_FIELD` (no `target_account`), `ACCOUNT_EXISTS`,
+  `ACCOUNT_NOT_FOUND` (dropping one that is not there), `ACCOUNT_PROTECTED` (dropping
+  `SYSTEM`).
 
 ```json
 {"command": "CREATE.ACCOUNT", "target_account": "SALES"}
@@ -345,7 +398,7 @@ Create an account already populated with the demo fixture — the same one the C
 - `record` names the account and the files it was given, read back after the fact rather than
   listed from a constant, so it describes whatever the fixture creates today.
 - The account must not already exist; nothing is written when it does.
-- Errors: `"Admin privileges required"`, `"Account name not specified"`, `"Error: <detail>"`.
+- Errors: `ADMIN_REQUIRED`, `MISSING_FIELD` (no `target_account`), `ACCOUNT_EXISTS`.
 
 ```json
 {"command": "CREATE.TEST.ACCOUNT", "target_account": "DEMO"}
@@ -365,8 +418,8 @@ Create a table (data and dictionary sections) in `account`.
 - With `durable: true` the file is marked mission critical in the account's `DIR` entry, so
   every write to it is flushed to disk before it is acknowledged while the rest of the
   database keeps buffering writes. See [Storage Engine](storage.md).
-- Errors: `"Admin privileges required"`, `"Account not specified"`,
-  `"File name not specified"`, `"Error: <detail>"`.
+- Errors: `ADMIN_REQUIRED`, `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`),
+  `FILE_EXISTS`.
 
 ```json
 {"command": "CREATE.FILE", "account": "SALES", "file": "LEDGER", "durable": true}
@@ -389,9 +442,9 @@ promoted to mission critical, or demoted back, while keeping the records it hold
   file gets one.
 - `DIR` itself cannot be set: it carries the flags rather than one of its own, and its writes
   are always flushed at once.
-- Errors: `"Admin privileges required"`, `"Account not specified"`,
-  `"File name not specified"`, `"Durability flag not specified"` (an absent flag is refused
-  rather than read as a demotion), `"Error: Table '<name>' not found in account '<account>'"`.
+- Errors: `ADMIN_REQUIRED`, `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`, or no
+  `durable` - an absent flag is refused rather than read as a demotion), `FILE_NOT_FOUND`,
+  `INVALID_REQUEST` (naming `DIR`).
 
 ```json
 {"command": "SET.FILE", "account": "SALES", "file": "LEDGER", "durable": true}
@@ -406,7 +459,8 @@ promoted to mission critical, or demoted back, while keeping the records it hold
 Drop a table from `account`.
 
 - Required: `account`, `file`. Admin only.
-- Errors: as `CREATE.FILE`.
+- Errors: `ADMIN_REQUIRED`, `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`),
+  `FILE_NOT_FOUND`.
 
 ```json
 {"command": "DELETE.FILE", "account": "SALES", "file": "LEDGER"}
@@ -422,8 +476,7 @@ Authorize a client certificate.
 
 - Required: `thumbprint`, `name`. Optional: `accounts_list` (default `[]`), `is_admin`
   (default `false`). Admin only.
-- Errors: `"Admin privileges required"`, `"Thumbprint not specified"`,
-  `"Name not specified"`, `"Error: <detail>"`.
+- Errors: `ADMIN_REQUIRED`, `MISSING_FIELD` (no `thumbprint` or `name`).
 
 ```json
 {"command": "AUTHORIZE.CONN", "thumbprint": "9f86d081...", "name": "reporting-bot",
@@ -440,8 +493,7 @@ Revoke a client by name. An active connection for that client is dropped after i
 request with `message: "Client deauthorized"`.
 
 - Required: `name`. Admin only.
-- Errors: `"Admin privileges required"`, `"Name not specified"`, `"Client not found"`,
-  `"Error: <detail>"`.
+- Errors: `ADMIN_REQUIRED`, `MISSING_FIELD` (no `name`), `CLIENT_NOT_FOUND`.
 
 ```json
 {"command": "DEAUTHORIZE.CONN", "name": "reporting-bot"}
@@ -457,9 +509,8 @@ Add or remove allowed accounts for an existing client. Each account in `accounts
 applied in turn; the first failure aborts and is reported.
 
 - Required: `name`. Optional: `accounts_list` (default `[]`). Admin only.
-- Errors: `"Admin privileges required"`, `"Name not specified"`,
-  `"Error adding account <name>: <detail>"`,
-  `"Error removing account <name>: <detail>"`.
+- Errors: `ADMIN_REQUIRED`, `MISSING_FIELD` (no `name`). The message of a failure part way
+  through names the account it stopped on.
 
 ```json
 {"command": "ADD.CLIENT.ACCOUNT", "name": "reporting-bot", "accounts_list": ["SUPPORT"]}
@@ -481,9 +532,10 @@ which is the only time it is sent anywhere.
   account could do nothing.
 - Certificates are valid for 365 days. Re-issuing under an existing name replaces that client's authorization, which
   revokes the previous certificate.
-- Errors: `"Admin privileges required"`, `"Name not specified"`,
-  `"A non-admin certificate needs at least one allowed account"`,
-  `"Certificate generation is unavailable: no server configuration"`, `"Error: <detail>"`.
+- Errors: `ADMIN_REQUIRED`, `MISSING_FIELD` (no `name`), `INVALID_REQUEST` (a non-admin
+  certificate with no allowed account), `INVALID_DATA` (a common name that is not
+  `[A-Za-z0-9._-]`), `UNAVAILABLE` (the server has no certificate configuration to sign
+  with).
 
 ```json
 {"command": "GENERATE.CERT", "name": "reporting-bot", "accounts_list": ["SALES"]}
@@ -508,7 +560,7 @@ List every authorized client. `results` pairs the authorization name with its de
 not the list of open sessions, which `SERVER.STATS` carries.
 
 - Required: nothing. Admin only.
-- Errors: `"Admin privileges required"`.
+- Errors: `ADMIN_REQUIRED`.
 
 ```json
 {"command": "LIST.CONNS"}
@@ -545,7 +597,7 @@ The files in one account, sorted.
   file beside its name — currently `durable`, so a client can see which files flush every
   write without reading the account's `DIR` file. A database running with
   `durable_writes = true` reports every file as durable, because every write then is.
-- Errors: `"Account not specified"`, access-denied.
+- Errors: `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`.
 
 ```json
 {"command": "LIST.FILES", "account": "SALES"}
@@ -565,7 +617,8 @@ Describe one file: how many records it holds, how they are spread across hash gr
 record is returned, and none is read to answer it unless the file is still in the pre-hashfile flat format.
 
 - Required: `account` (or a single-account client), `file`.
-- Errors: `"Account not specified"`, `"File not specified"`, `"Error: <detail>"`, access-denied.
+- Errors: `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`), `ACCESS_DENIED`,
+  `FILE_NOT_FOUND`.
 
 ```json
 {"command": "FILE.STATS", "account": "SALES", "file": "USERS"}
@@ -602,8 +655,8 @@ Every dictionary entry of one file, decomposed into the attributes
   display string, so an entry using a position not named here is still visible.
 - `field` and `width` are `null` when the entry does not hold a number there.
 - Entries come back ordered by attribute number, then by name.
-- Errors: `"Account not specified"`, `"File not specified"`, `"Table error: <detail>"`,
-  access-denied.
+- Errors: `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`), `ACCESS_DENIED`,
+  `FILE_NOT_FOUND`.
 
 ```json
 {"command": "LIST.DICT", "account": "SALES", "file": "USERS"}
@@ -636,11 +689,9 @@ Create or replace one dictionary entry, named by `key`, from the attributes in
 - `WRITE` with `is_dict` still stores a dictionary entry from a display string. `SET.DICT` is
   for a caller that has the attributes rather than the string, and wants them checked.
 - To remove an entry, use `DELETE` with `is_dict: true`.
-- Errors: `"Account not specified"`, `"File not specified"`, `"Key not specified"`,
-  `"Dictionary attributes not specified"`, `"Attribute number not specified"`,
-  `"Attribute number must be 1 or greater"`, `"Attribute number is not a whole number: <text>"`,
-  `"Display width must be 1 or greater"`, `"Display width is not a whole number: <text>"`,
-  `"Justification must be L or R"`, `"Table error: <detail>"`, access-denied.
+- Errors: `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`, `key` or
+  `structured_data`), `INVALID_DATA` (attributes that do not describe an entry - the message
+  names the attribute and what is wrong with it), `ACCESS_DENIED`, `FILE_NOT_FOUND`.
 
 ```json
 {"command": "SET.DICT", "account": "SALES", "file": "USERS", "key": "PRICE",
@@ -666,10 +717,11 @@ reported as `stale`, and the way to bring one back after its section has been da
   with the file. Maintaining it afterwards rides the ordinary write path.
 - `record` is the index as `LIST.INDEXES` describes it, read back after the build rather
   than echoed from the request.
-- Errors: `"Admin privileges required"`, `"Account not specified"`, `"File not specified"`,
-  `"Field not specified"`, and `"Error: <detail>"` for a field that is not in the file's
-  dictionary, is already indexed, is `ID` (the record key, already found without a scan), or
-  whose name cannot become a directory.
+- Errors: `ADMIN_REQUIRED`, `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file` or
+  `field`), `FILE_NOT_FOUND`, `INDEX_EXISTS` (`CREATE.INDEX` on a field already indexed),
+  `INDEX_NOT_FOUND` (`REBUILD.INDEX` on one that is not), `INVALID_FIELD` for a field that
+  is not in the file's dictionary, is `ID` (the record key, already found without a scan),
+  or whose name cannot become a directory.
 
 ```json
 {"command": "CREATE.INDEX", "account": "SALES", "file": "USERS", "field": "CITY"}
@@ -690,8 +742,8 @@ Drop an index and remove its section from disk. The file's records are untouched
 queries that were using it go back to scanning.
 
 - Required: `account` (or a single-account client), `file`, `field`.
-- Errors: `"Admin privileges required"`, `"Account not specified"`, `"File not specified"`,
-  `"Field not specified"`, `"Error: <detail>"` for a field that is not indexed.
+- Errors: `ADMIN_REQUIRED`, `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file` or
+  `field`), `FILE_NOT_FOUND`, `INDEX_NOT_FOUND`.
 
 ```json
 {"command": "DELETE.INDEX", "account": "SALES", "file": "USERS", "field": "CITY"}
@@ -714,8 +766,8 @@ Every index of one file, with the counts an operator decides with.
 - Read from memory when the file is loaded, so an index changed but not yet flushed is
   described as it now is. For a file that is not loaded the index sections are read instead —
   they hold values and keys rather than record bodies.
-- Errors: `"Account not specified"`, `"File not specified"`, `"Error: <detail>"`,
-  access-denied.
+- Errors: `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`), `ACCESS_DENIED`,
+  `FILE_NOT_FOUND`.
 
 ```json
 {"command": "LIST.INDEXES", "account": "SALES", "file": "USERS"}
@@ -737,7 +789,7 @@ The running server: how long it has been up, what it has served and which sessio
 - Required: nothing. Admin only.
 - `active_connections` lists the sessions holding a TLS connection at this instant, the caller's own included. Totals
   are counted since the process started.
-- Errors: `"Admin privileges required"`.
+- Errors: `ADMIN_REQUIRED`.
 
 ```json
 {"command": "SERVER.STATS"}
@@ -760,11 +812,15 @@ The running server: how long it has been up, what it has served and which sessio
 ### Unknown commands
 
 ```json
-{"status": "ERROR", "message": "Unknown command"}
+{"status": "ERROR", "code": "UNKNOWN_COMMAND", "message": "Unknown command"}
 ```
 
-Malformed JSON yields `{"status": "ERROR", "message": "Invalid JSON: <detail>"}` and the
-connection stays open.
+Malformed JSON yields `{"status": "ERROR", "code": "INVALID_JSON", "message": "Invalid JSON:
+<detail>"}` and the connection stays open.
+
+A client whose authorization is revoked while it is connected gets
+`{"status": "ERROR", "code": "DEAUTHORIZED", "message": "Client deauthorized"}` in answer to
+its next request, and the connection then closes.
 
 ## A full session
 

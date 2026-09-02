@@ -1,6 +1,6 @@
 use crate::db::{ClientInfo, Database, ValuePosition};
 use crate::server::handler::handle_request;
-use crate::server::models::Request;
+use crate::server::models::{ErrorCode, Request};
 use crate::test_support::{TempDir, isolated_config};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -63,7 +63,7 @@ fn test_handle_request_read_write() {
     };
     let resp_denied = handle_request(req_denied, &db_arc, &client_info);
     assert_eq!(resp_denied.status, "ERROR");
-    assert!(resp_denied.message.unwrap().contains("Access denied"));
+    assert_eq!(resp_denied.code, Some(ErrorCode::AccessDenied));
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn test_create_and_delete_file_target_the_requested_account() {
         &admin,
     );
     assert_eq!(resp.status, "ERROR");
-    assert_eq!(resp.message.unwrap(), "Account not specified");
+    assert_eq!(resp.code, Some(ErrorCode::AccountNotSpecified));
 
     let resp = handle_request(
         Request {
@@ -326,12 +326,13 @@ fn test_set_file_promotes_and_demotes_an_existing_file() {
     // A request that names no flag must not be read as a demotion.
     let resp = set(None, &admin);
     assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.code, Some(ErrorCode::MissingField));
     assert_eq!(resp.message.unwrap(), "Durability flag not specified");
 
     // Storage decisions are administrative, like creating the file was.
     let resp = set(Some(true), &client);
     assert_eq!(resp.status, "ERROR");
-    assert_eq!(resp.message.unwrap(), "Admin privileges required");
+    assert_eq!(resp.code, Some(ErrorCode::AdminRequired));
     assert!(
         !db_arc
             .write()
@@ -352,7 +353,7 @@ fn test_set_file_promotes_and_demotes_an_existing_file() {
         &admin,
     );
     assert_eq!(resp.status, "ERROR");
-    assert!(resp.message.unwrap().contains("not found"));
+    assert_eq!(resp.code, Some(ErrorCode::FileNotFound));
 }
 
 #[test]
@@ -507,7 +508,7 @@ fn test_management_commands_report_accounts_files_and_statistics() {
         &admin,
     );
     assert_eq!(resp.status, "ERROR");
-    assert!(resp.message.unwrap().contains("not found"));
+    assert_eq!(resp.code, Some(ErrorCode::FileNotFound));
 }
 
 #[test]
@@ -549,7 +550,7 @@ fn test_management_commands_respect_the_clients_permissions() {
         &client_info,
     );
     assert_eq!(resp.status, "ERROR");
-    assert!(resp.message.unwrap().contains("Access denied"));
+    assert_eq!(resp.code, Some(ErrorCode::AccessDenied));
 
     // The management views of the server itself are administrative.
     for command in ["SERVER.STATS", "LIST.CONNS", "GENERATE.CERT"] {
@@ -563,7 +564,7 @@ fn test_management_commands_respect_the_clients_permissions() {
             &client_info,
         );
         assert_eq!(resp.status, "ERROR", "{} must be refused", command);
-        assert_eq!(resp.message.unwrap(), "Admin privileges required");
+        assert_eq!(resp.code, Some(ErrorCode::AdminRequired));
     }
 }
 
@@ -901,6 +902,9 @@ fn test_set_dict_refuses_a_definition_no_query_could_use() {
     for (attributes, expected) in cases {
         let resp = set_dict(&db_arc, &client_info, "NAME", attributes.clone());
         assert_eq!(resp.status, "ERROR", "{} was accepted", attributes);
+        assert_eq!(resp.code, Some(ErrorCode::InvalidData));
+        // The code says what kind of failure it is; the message still has to
+        // say which attribute, since that is all the caller has to go on.
         assert_eq!(resp.message.unwrap(), expected);
     }
 
@@ -919,9 +923,11 @@ fn test_set_dict_refuses_a_definition_no_query_could_use() {
         &db_arc,
         &client_info,
     );
+    assert_eq!(resp.code, Some(ErrorCode::MissingField));
     assert_eq!(resp.message.unwrap(), "Dictionary attributes not specified");
 
     let resp = set_dict(&db_arc, &client_info, "   ", serde_json::json!({ "field": 1 }));
+    assert_eq!(resp.code, Some(ErrorCode::MissingField));
     assert_eq!(resp.message.unwrap(), "Key not specified");
 }
 
@@ -1017,7 +1023,7 @@ fn test_dictionary_commands_need_an_account_a_file_and_permission() {
         &db_arc,
         &client_info,
     );
-    assert_eq!(resp.message.unwrap(), "File not specified");
+    assert_eq!(resp.code, Some(ErrorCode::MissingField));
 
     let resp = handle_request(
         Request {
@@ -1029,7 +1035,7 @@ fn test_dictionary_commands_need_an_account_a_file_and_permission() {
         &db_arc,
         &client_info,
     );
-    assert!(resp.message.unwrap().contains("not found"));
+    assert_eq!(resp.code, Some(ErrorCode::FileNotFound));
 
     // A client may only reach the accounts it was authorized for, dictionary or not.
     let resp = handle_request(
@@ -1042,7 +1048,7 @@ fn test_dictionary_commands_need_an_account_a_file_and_permission() {
         &db_arc,
         &client_info,
     );
-    assert!(resp.message.unwrap().contains("Access denied"));
+    assert_eq!(resp.code, Some(ErrorCode::AccessDenied));
 }
 
 #[test]
@@ -1233,7 +1239,7 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
         &admin,
     );
     assert_eq!(resp.status, "ERROR");
-    assert!(resp.message.unwrap().contains("already exists"));
+    assert_eq!(resp.code, Some(ErrorCode::AccountExists));
 }
 
 #[test]
@@ -1259,7 +1265,7 @@ fn test_the_demo_account_is_admin_only_and_needs_a_name() {
         &db_arc,
         &ordinary,
     );
-    assert_eq!(resp.message.unwrap(), "Admin privileges required");
+    assert_eq!(resp.code, Some(ErrorCode::AdminRequired));
 
     let admin = ClientInfo {
         name: "test_admin".to_string(),
@@ -1275,7 +1281,7 @@ fn test_the_demo_account_is_admin_only_and_needs_a_name() {
         &db_arc,
         &admin,
     );
-    assert_eq!(resp.message.unwrap(), "Account name not specified");
+    assert_eq!(resp.code, Some(ErrorCode::MissingField));
 }
 
 /// Each hot path takes a fixed, small number of file locks per request.
@@ -1487,44 +1493,47 @@ fn test_index_commands_report_what_they_were_not_given() {
     let refusal = |req: Request| {
         let resp = handle_request(req, &db_arc, &admin);
         assert_eq!(resp.status, "ERROR");
-        resp.message.unwrap()
+        // The message is still there for a person; what is asserted is the code,
+        // so rewording a refusal does not fail this.
+        assert!(resp.message.is_some());
+        resp.code
     };
 
-    assert!(
+    assert_eq!(
         refusal(Request {
             command: "CREATE.INDEX".to_string(),
             account: Some("IDX_ERR".to_string()),
             ..Default::default()
-        })
-        .contains("File not specified")
+        }),
+        Some(ErrorCode::MissingField)
     );
-    assert!(
+    assert_eq!(
         refusal(Request {
             command: "CREATE.INDEX".to_string(),
             account: Some("IDX_ERR".to_string()),
             file: Some("USERS".to_string()),
             ..Default::default()
-        })
-        .contains("Field not specified")
+        }),
+        Some(ErrorCode::MissingField)
     );
-    assert!(
+    assert_eq!(
         refusal(Request {
             command: "CREATE.INDEX".to_string(),
             account: Some("IDX_ERR".to_string()),
             file: Some("USERS".to_string()),
             field: Some("NOSUCH".to_string()),
             ..Default::default()
-        })
-        .contains("not a dictionary field")
+        }),
+        Some(ErrorCode::InvalidField)
     );
-    assert!(
+    assert_eq!(
         refusal(Request {
             command: "LIST.INDEXES".to_string(),
             account: Some("IDX_ERR".to_string()),
             file: Some("NOPE".to_string()),
             ..Default::default()
-        })
-        .contains("not found")
+        }),
+        Some(ErrorCode::FileNotFound)
     );
 }
 
@@ -1558,7 +1567,7 @@ fn test_changing_an_index_needs_admin_but_reading_them_does_not() {
             &user,
         );
         assert_eq!(resp.status, "ERROR", "{} must be refused", command);
-        assert!(resp.message.unwrap().contains("Admin privileges required"));
+        assert_eq!(resp.code, Some(ErrorCode::AdminRequired));
     }
 
     let resp = handle_request(
@@ -1573,4 +1582,260 @@ fn test_changing_an_index_needs_admin_but_reading_them_does_not() {
     );
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
     assert_eq!(resp.count, Some(0));
+}
+
+/// Every refusal carries a code, whatever it was that went wrong.
+///
+/// The point of the codes is that a client never has to read the message, and
+/// that only holds if there is no refusal without one. A command that grows a
+/// new failure path and returns a bare message fails here rather than being
+/// found by whoever writes the client.
+#[test]
+fn every_refusal_carries_a_code_and_a_message() {
+    let dir = TempDir::new("server_every_refusal");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_test_account("CODES").unwrap();
+    db.set_current_account("");
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "admin".to_string(),
+        thumbprint: "tp".to_string(),
+        allowed_accounts: Vec::new(),
+        is_admin: true,
+    };
+    let ordinary = ClientInfo {
+        name: "plain".to_string(),
+        thumbprint: "tp2".to_string(),
+        allowed_accounts: vec!["CODES".to_string()],
+        is_admin: false,
+    };
+
+    // One refusal per command, spanning the missing field, the missing thing,
+    // the thing already there and the request that is simply not allowed.
+    let named = |command: &str| Request {
+        command: command.to_string(),
+        ..Default::default()
+    };
+    let in_account = |command: &str, file: Option<&str>| Request {
+        command: command.to_string(),
+        account: Some("CODES".to_string()),
+        file: file.map(str::to_string),
+        ..Default::default()
+    };
+    let cases: Vec<(Request, &ClientInfo, ErrorCode)> = vec![
+        (named("NO.SUCH.COMMAND"), &admin, ErrorCode::UnknownCommand),
+        (in_account("READ", Some("USERS")), &ordinary, ErrorCode::MissingField),
+        (
+            Request {
+                key: Some("NOPE".to_string()),
+                ..in_account("READ", Some("USERS"))
+            },
+            &ordinary,
+            ErrorCode::RecordNotFound,
+        ),
+        (
+            Request {
+                key: Some("1".to_string()),
+                ..in_account("READ", Some("NO_SUCH_FILE"))
+            },
+            &ordinary,
+            ErrorCode::FileNotFound,
+        ),
+        (in_account("WRITE", Some("USERS")), &ordinary, ErrorCode::MissingField),
+        (
+            Request {
+                key: Some("1".to_string()),
+                data: Some(serde_json::json!(7)),
+                ..in_account("WRITE", Some("USERS"))
+            },
+            &ordinary,
+            ErrorCode::InvalidData,
+        ),
+        (in_account("DELETE", Some("USERS")), &ordinary, ErrorCode::MissingField),
+        (in_account("QUERY", None), &ordinary, ErrorCode::MissingField),
+        (in_account("SELECT", None), &ordinary, ErrorCode::MissingField),
+        (named("GET.NEXT"), &ordinary, ErrorCode::SelectListNotFound),
+        (named("CREATE.ACCOUNT"), &ordinary, ErrorCode::AdminRequired),
+        (named("CREATE.ACCOUNT"), &admin, ErrorCode::MissingField),
+        (
+            Request {
+                target_account: Some("CODES".to_string()),
+                ..named("CREATE.ACCOUNT")
+            },
+            &admin,
+            ErrorCode::AccountExists,
+        ),
+        (
+            Request {
+                target_account: Some("NO_SUCH_ACCOUNT".to_string()),
+                ..named("DELETE.ACCOUNT")
+            },
+            &admin,
+            ErrorCode::AccountNotFound,
+        ),
+        (
+            Request {
+                target_account: Some("SYSTEM".to_string()),
+                ..named("DELETE.ACCOUNT")
+            },
+            &admin,
+            ErrorCode::AccountProtected,
+        ),
+        (named("CREATE.TEST.ACCOUNT"), &admin, ErrorCode::MissingField),
+        (named("CREATE.FILE"), &admin, ErrorCode::AccountNotSpecified),
+        (in_account("CREATE.FILE", Some("USERS")), &admin, ErrorCode::FileExists),
+        (in_account("SET.FILE", Some("USERS")), &admin, ErrorCode::MissingField),
+        (
+            Request {
+                durable: Some(true),
+                ..in_account("SET.FILE", Some("DIR"))
+            },
+            &admin,
+            ErrorCode::InvalidRequest,
+        ),
+        (
+            in_account("DELETE.FILE", Some("NO_SUCH_FILE")),
+            &admin,
+            ErrorCode::FileNotFound,
+        ),
+        (named("AUTHORIZE.CONN"), &admin, ErrorCode::MissingField),
+        (
+            Request {
+                name: Some("nobody".to_string()),
+                ..named("DEAUTHORIZE.CONN")
+            },
+            &admin,
+            ErrorCode::ClientNotFound,
+        ),
+        (named("ADD.CLIENT.ACCOUNT"), &admin, ErrorCode::MissingField),
+        (named("REMOVE.CLIENT.ACCOUNT"), &admin, ErrorCode::MissingField),
+        (named("GENERATE.CERT"), &admin, ErrorCode::MissingField),
+        (
+            Request {
+                name: Some("someone".to_string()),
+                ..named("GENERATE.CERT")
+            },
+            &admin,
+            // No server configuration is active in a unit test, so certificate
+            // generation cannot be attempted at all.
+            ErrorCode::Unavailable,
+        ),
+        (named("LIST.CONNS"), &ordinary, ErrorCode::AdminRequired),
+        (named("LIST.FILES"), &admin, ErrorCode::AccountNotSpecified),
+        (in_account("FILE.STATS", None), &ordinary, ErrorCode::MissingField),
+        (
+            in_account("FILE.STATS", Some("NO_SUCH_FILE")),
+            &ordinary,
+            ErrorCode::FileNotFound,
+        ),
+        (in_account("LIST.DICT", None), &ordinary, ErrorCode::MissingField),
+        (
+            in_account("SET.DICT", Some("USERS")),
+            &ordinary,
+            ErrorCode::MissingField,
+        ),
+        (
+            in_account("CREATE.INDEX", Some("USERS")),
+            &admin,
+            ErrorCode::MissingField,
+        ),
+        (
+            Request {
+                field: Some("NOSUCH".to_string()),
+                ..in_account("REBUILD.INDEX", Some("USERS"))
+            },
+            &admin,
+            ErrorCode::IndexNotFound,
+        ),
+        (
+            Request {
+                field: Some("NAME".to_string()),
+                ..in_account("DELETE.INDEX", Some("USERS"))
+            },
+            &admin,
+            ErrorCode::IndexNotFound,
+        ),
+        (in_account("LIST.INDEXES", None), &ordinary, ErrorCode::MissingField),
+        (named("SERVER.STATS"), &ordinary, ErrorCode::AdminRequired),
+        (
+            Request {
+                account: Some("SYSTEM".to_string()),
+                file: Some("$CLIENTS".to_string()),
+                key: Some("x".to_string()),
+                ..named("READ")
+            },
+            &ordinary,
+            ErrorCode::AccessDenied,
+        ),
+    ];
+
+    for (request, client, expected) in cases {
+        let command = request.command.clone();
+        let response = handle_request(request, &db_arc, client);
+        assert_eq!(response.status, "ERROR", "{command} was not refused");
+        assert_eq!(response.code, Some(expected), "{command} was refused as {:?}", response);
+        assert!(
+            response.message.is_some_and(|message| !message.is_empty()),
+            "{command} was refused with no message to read"
+        );
+    }
+}
+
+/// A query string that is not a query is refused rather than ignored.
+///
+/// It used to parse to "no criteria", which is what an absent clause parses to,
+/// so a mistyped `WITH` came back as every record in the file with
+/// `status: "OK"` - a wrong answer, and the kind a caller cannot even see is
+/// wrong. Selecting everything is still what an *absent* clause does.
+#[test]
+fn a_query_string_that_is_not_a_query_is_refused_rather_than_read_as_no_query() {
+    let dir = TempDir::new("server_bad_query");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_test_account("BAD_QUERY").unwrap();
+    db.set_current_account("");
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let client_info = ClientInfo {
+        name: "test_client".to_string(),
+        thumbprint: "tp".to_string(),
+        allowed_accounts: vec!["BAD_QUERY".to_string()],
+        is_admin: false,
+    };
+    let ask = |command: &str, query: Option<&str>| {
+        handle_request(
+            Request {
+                command: command.to_string(),
+                account: Some("BAD_QUERY".to_string()),
+                file: Some("USERS".to_string()),
+                query_string: query.map(str::to_string),
+                ..Default::default()
+            },
+            &db_arc,
+            &client_info,
+        )
+    };
+
+    for command in ["QUERY", "SELECT"] {
+        // A criterion that is not three tokens is not a criterion.
+        let resp = ask(command, Some("WITH NAME"));
+        assert_eq!(resp.status, "ERROR", "{command} accepted a half-written clause");
+        assert_eq!(resp.code, Some(ErrorCode::InvalidQuery));
+        assert!(resp.message.unwrap().contains("NAME"), "the refusal must quote it back");
+    }
+
+    // Nothing to parse is not a failure to parse: it still means everything.
+    let resp = ask("QUERY", None);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert_eq!(resp.results.unwrap().len(), 2);
+
+    // Nor is a clause that carries only an ordering.
+    let resp = ask("QUERY", Some("BY NAME"));
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert_eq!(resp.results.unwrap().len(), 2);
+
+    // And a well-formed one still selects.
+    let resp = ask("QUERY", Some("WITH NAME = [John]"));
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert_eq!(resp.results.unwrap().len(), 1);
 }

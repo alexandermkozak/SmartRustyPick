@@ -10,7 +10,7 @@ pub mod stats;
 use crate::config::Config;
 pub use certs::{ensure_certificates, load_certs, load_key};
 pub use handler::{SharedDb, handle_request, handle_request_locked, read_lock, write_lock};
-pub use models::{Request, Response};
+pub use models::{ErrorCode, Request, Response};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -254,6 +254,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                                 let resp = Response {
                                     status: "ERROR".to_string(),
                                     message: Some(format!("Invalid JSON: {}", e)),
+                                    code: Some(ErrorCode::InvalidJson),
                                     ..Default::default()
                                 };
                                 if let Ok(resp_json) = serde_json::to_string(&resp) {
@@ -301,6 +302,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                                 let resp = Response {
                                     status: "ERROR".to_string(),
                                     message: Some("Client deauthorized".to_string()),
+                                    code: Some(ErrorCode::Deauthorized),
                                     ..Default::default()
                                 };
                                 if let Ok(resp_json) = serde_json::to_string(&resp) {

@@ -12,7 +12,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(
 import harness
 
 ACCOUNT = "TEST_ACC"
-ADMIN_REQUIRED = "Admin privileges required"
+# The protocol's error code for an admin-only command, asserted rather than the
+# message beside it: the wording may change, the code may not.
+ADMIN_REQUIRED = "ADMIN_REQUIRED"
 
 
 def seed_database(admin_thumbprint, user_thumbprint):
@@ -162,13 +164,13 @@ def main():
 
             with admin, user:
                 resp = user.request(command="CREATE.ACCOUNT", target_account="EVIL_ACC")
-                suite.check_eq("Non-admin CREATE.ACCOUNT is blocked", resp.get("message"), ADMIN_REQUIRED)
+                suite.check_eq("Non-admin CREATE.ACCOUNT is blocked", resp.get("code"), ADMIN_REQUIRED)
 
                 resp = admin.request(command="CREATE.ACCOUNT", target_account="NEW_ACC")
                 suite.check_eq("Admin CREATE.ACCOUNT is allowed", resp["status"], "OK")
 
                 resp = user.request(command="CREATE.FILE", file="EVIL_FILE", account=ACCOUNT)
-                suite.check_eq("Non-admin CREATE.FILE is blocked", resp.get("message"), ADMIN_REQUIRED)
+                suite.check_eq("Non-admin CREATE.FILE is blocked", resp.get("code"), ADMIN_REQUIRED)
 
                 resp = admin.request(command="CREATE.FILE", file="GOOD_FILE", account=ACCOUNT)
                 suite.check_eq("Admin CREATE.FILE is allowed", resp["status"], "OK")
@@ -176,7 +178,7 @@ def main():
                 resp = user.request(
                     command="AUTHORIZE.CONN", thumbprint="1234", name="evil_client", is_admin=True
                 )
-                suite.check_eq("Non-admin AUTHORIZE.CONN is blocked", resp.get("message"), ADMIN_REQUIRED)
+                suite.check_eq("Non-admin AUTHORIZE.CONN is blocked", resp.get("code"), ADMIN_REQUIRED)
 
                 resp = admin.request(
                     command="AUTHORIZE.CONN",
@@ -187,20 +189,20 @@ def main():
                 suite.check_eq("Admin AUTHORIZE.CONN is allowed", resp["status"], "OK")
 
                 resp = user.request(command="DELETE.ACCOUNT", target_account=ACCOUNT)
-                suite.check_eq("Non-admin DELETE.ACCOUNT is blocked", resp.get("message"), ADMIN_REQUIRED)
+                suite.check_eq("Non-admin DELETE.ACCOUNT is blocked", resp.get("code"), ADMIN_REQUIRED)
 
                 # The user client is only authorised for TEST_ACC.
                 resp = user.request(command="READ", file="GOOD_FILE", key="K1", account="NEW_ACC")
                 suite.check(
                     "Non-admin cannot reach an account outside its allow list",
-                    resp["status"] == "ERROR" and "Access denied" in (resp.get("message") or ""),
+                    resp["status"] == "ERROR" and resp.get("code") == "ACCESS_DENIED",
                     resp.get("message", ""),
                 )
 
                 # ...but it may reach its own account, where the record simply does not exist.
                 resp = user.request(command="READ", file="GOOD_FILE", key="K1", account=ACCOUNT)
                 suite.check_eq(
-                    "Non-admin may reach its own account", resp.get("message"), "Record not found"
+                    "Non-admin may reach its own account", resp.get("code"), "RECORD_NOT_FOUND"
                 )
 
             check_connection_limits(suite, certs, user_crt, user_key)

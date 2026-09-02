@@ -159,8 +159,11 @@ it as equivalent to holding an admin certificate.
 ## HTTP API
 
 Each endpoint is one protocol command. Responses are the protocol's own JSON; failures are
-`{"error": "..."}` with a status code — `401` without a token, `403` when the protocol refused for lack of privileges,
-`404` for something that is not there, `502` when the database itself cannot be reached.
+`{"error": "..."}` with a status code — `401` without a token, `502` when the database itself cannot be reached, and
+otherwise the status that the protocol's own [error code](protocol.md#error-codes) maps to: `403` for a refusal on
+privileges, `404` for something that is not there, `409` for something that is already there, `500` for a file the
+database could not read or write, `503` for a command the server is not configured to answer, and `400` for everything
+else. The code is what decides, not the wording of the message, so a reworded refusal keeps its status.
 
 | Method   | Path                                   | Command                                                           |
 |----------|----------------------------------------|-------------------------------------------------------------------|

@@ -326,6 +326,10 @@ fn test_flipped_byte_in_a_group_is_detected_by_the_checksum() {
 
     let mut loaded = HashMap::new();
     let err = hashfile::load(&section, &mut loaded).expect_err("a damaged group must not load");
+    // The kind is what the layers above classify on - `InvalidData` from the
+    // storage layer is what the protocol reports as `CORRUPT_DATA`, rather than
+    // as an I/O failure worth retrying.
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert!(err.to_string().contains("checksum mismatch"), "unhelpful error: {err}");
     assert!(loaded.is_empty(), "a rejected group must not leave records behind");
 }
@@ -347,6 +351,7 @@ fn test_truncated_meta_is_detected() {
 
     let mut loaded = HashMap::new();
     let err = hashfile::load(&section, &mut loaded).expect_err("a torn meta must not load");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert!(
         err.to_string().contains("Corrupt section metadata"),
         "unhelpful error: {err}"

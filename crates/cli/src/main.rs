@@ -1653,7 +1653,7 @@ fn check_dir_file(db: &mut Database) -> io::Result<()> {
         }
         Err(e) => {
             println!("Error checking DIR file: {}", e);
-            Err(e)
+            Err(e.into())
         }
     }
 }
