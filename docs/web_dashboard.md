@@ -63,10 +63,10 @@ by default), so they follow `ca_path` rather than littering the working director
 | Overview       | Uptime, listener, connection and request totals, pending writes, tables in memory, and every connection open right now.          |
 | Authorizations | Every authorized client: name, thumbprint, allowed accounts, admin flag. Authorize a thumbprint, add or remove accounts, revoke. |
 | Certificates   | Issue a certificate signed by the server's CA, authorized in the same step, with its key downloadable once.                      |
-| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Accounts and files can be created and dropped, durable files are tagged in the listing and the flag can be turned on or off, and the selected file's dictionary is listed and edited below. |
+| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Accounts and files can be created and dropped, durable files are tagged in the listing and the flag can be turned on or off, and the selected file's dictionary and indexes are listed and managed below. |
 
-File statistics cover the record and dictionary counts, the hash modulus and group distribution, bytes on disk, the
-durability flag and whether the file is currently held in the server's cache. Record counts come from each file's
+File statistics cover the record and dictionary counts, the indexes the file carries, the hash modulus and group
+distribution, bytes on disk, the durability flag and whether the file is currently held in the server's cache. Record counts come from each file's
 section metadata, so opening the view does not load the file.
 
 Durability is the one thing about a file the dashboard changes rather than reports: beside the statistics, **Make
@@ -117,6 +117,32 @@ Nothing in the page judges an attribute number or a justification. `SET.DICT` do
 whatever the form left blank, so the page re-reads the dictionary after every change and shows what was actually
 stored — a refusal appears in the banner in the database's own words.
 
+### The indexes of a file
+
+Beneath the dictionary is the file's [secondary indexes](storage.md#secondary-indexes) — the fields on which
+`WITH <field> = <value>` resolves through an index instead of reading every record — and everything an operator does to
+them, in one place:
+
+- **Statistics**, per index: the attribute it follows, the distinct values it holds, the record keys it indexes in
+  total, its largest posting list, its size on disk and when it was last built.
+- **Analysis**, under the table, one sentence per index: how far a lookup actually narrows the file, and whether the
+  commonest value still covers so much of it that no index can help. An index over many values turns a scan into a
+  lookup of a handful of records; one over two or three turns it into a scan of a third of the file and still costs a
+  write every time the field changes. A file with no indexes says how many records every non-keyed selection reads.
+- **Creation**: **Index a field** offers the dictionary fields that are defined and not indexed yet — a list rather
+  than a text box, because an index is on a field the page has just shown you, and `ID` is excluded as the record key
+  that needs no index. Building it reads the file once (`CREATE.INDEX`).
+- **Rebuild** derives an index from the records again (`REBUILD.INDEX`). An index that has fallen behind is tagged
+  **stale** here and in the statistics panel above, and is rebuilt on its own when the file is next loaded — this is
+  for doing it now.
+- **Drop** removes an index and its section (`DELETE.INDEX`), after confirming, and says what that means: queries go
+  back to scanning and the records stay.
+
+The three that change something are admin commands, so a dashboard whose certificate is not an admin one is refused by
+the database and says so. Nothing here decides whether a field *can* be indexed — `CREATE.INDEX` does, and a refusal
+appears in the banner in the database's own words. Every change re-reads both the index list and the file's statistics,
+so the counts on screen are the ones that now hold rather than the ones the click was expected to produce.
+
 ## Security
 
 The dashboard can authorize clients, hand out private keys, and drop an account and everything in it, so treat reaching
@@ -156,6 +182,10 @@ Each endpoint is one protocol command. Responses are the protocol's own JSON; fa
 | `GET`    | `/api/accounts/{account}/files/{file}/dictionary`        | `LIST.DICT`                                     |
 | `POST`   | `/api/accounts/{account}/files/{file}/dictionary`        | `SET.DICT`                                      |
 | `DELETE` | `/api/accounts/{account}/files/{file}/dictionary/{name}` | `DELETE` with `is_dict`                         |
+| `GET`    | `/api/accounts/{account}/files/{file}/indexes`            | `LIST.INDEXES`                                  |
+| `POST`   | `/api/accounts/{account}/files/{file}/indexes`            | `CREATE.INDEX`                                  |
+| `POST`   | `/api/accounts/{account}/files/{file}/indexes/{field}/rebuild` | `REBUILD.INDEX`                           |
+| `DELETE` | `/api/accounts/{account}/files/{file}/indexes/{field}`   | `DELETE.INDEX`                                  |
 
 ```sh
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/stats
@@ -202,7 +232,8 @@ crates/core/src/web/ui/src/
 │   ├── certificates/        GENERATE.CERT, useCertificateIssuing, …
 │   └── accounts/            LIST.ACCOUNTS, LIST.FILES, FILE.STATS, CREATE/DELETE.ACCOUNT,
 │                            CREATE/DELETE.FILE, SET.FILE, LIST.DICT, SET.DICT,
-│                            useAccountBrowser, useFileDictionary, …
+│                            LIST.INDEXES, CREATE/REBUILD/DELETE.INDEX,
+│                            useAccountBrowser, useFileDictionary, useFileIndexes, …
 └── shared/                  the kernel every slice may use
     ├── api/client.ts        the transport: ApiError, call, record, pairs, keys
     ├── api/protocol.ts      the response envelope

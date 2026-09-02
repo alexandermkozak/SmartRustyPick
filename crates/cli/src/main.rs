@@ -196,6 +196,18 @@ fn main() -> io::Result<()> {
                 let mut db_lock = db.write().unwrap();
                 handle_delete_file(&mut db_lock, &parts);
             }
+            "CREATE.INDEX" => {
+                handle_create_index(&db.write().unwrap(), &parts);
+            }
+            "REBUILD.INDEX" => {
+                handle_rebuild_index(&db.write().unwrap(), &parts);
+            }
+            "DELETE.INDEX" => {
+                handle_delete_index(&db.write().unwrap(), &parts);
+            }
+            "LIST.INDEXES" => {
+                handle_list_indexes(&db.write().unwrap(), &parts);
+            }
             "CREATE.ACCOUNT" => {
                 let mut db_lock = db.write().unwrap();
                 if db_lock.is_current_account("SYSTEM") {
@@ -935,6 +947,12 @@ fn print_help(current_account: &str) {
     println!("  SET.FILE <name> DURABLE | BUFFERED    - Turn durable writes on or off for an existing file.");
     println!("                                          Turning it on flushes what the file still had buffered.");
     println!("  DELETE.FILE <name>                    - Delete a file (data and dict) (SYSTEM only).");
+    println!(
+        "  CREATE.INDEX <file> <field>           - Index a dictionary field, so WITH <field> = ... stops scanning."
+    );
+    println!("  LIST.INDEXES <file>                   - List a file's indexes with their size and selectivity.");
+    println!("  REBUILD.INDEX <file> <field>          - Derive an index from the records again.");
+    println!("  DELETE.INDEX <file> <field>           - Drop an index and remove its section.");
     println!("  CREATE.ACCOUNT <name> [<dir>]         - Create a new account (SYSTEM only).");
     if current_account == "SYSTEM" {
         println!("  CREATE.TEST.ACCOUNT <name>            - Create and populate a test account (SYSTEM only).");
@@ -1131,6 +1149,103 @@ fn handle_set_file(db: &mut Database, parts: &[&str]) {
             }
         }
         Err(e) => println!("Error: {}", e),
+    }
+}
+
+/// Prints one index the way `LIST.INDEXES` does, so creating one and listing it
+/// report the same numbers in the same shape.
+///
+/// "per lookup" is the postings divided by the values: how many records a
+/// lookup on this field hands back to the filter behind it, on average. It is
+/// the number that says whether the index is worth what it costs, and it is
+/// not records-per-value - on a multivalued field one record contributes
+/// several postings.
+fn print_index(stats: &smart_rusty_pick_core::db::IndexStats) {
+    let per_lookup = if stats.values == 0 {
+        0.0
+    } else {
+        stats.postings as f64 / stats.values as f64
+    };
+    println!(
+        "  {:<16} attribute {:<4} {} values, {} keys, largest {}, {:.1} per lookup{}",
+        stats.field,
+        stats.attribute,
+        stats.values,
+        stats.postings,
+        stats.largest_postings,
+        per_lookup,
+        if stats.stale { " (STALE - rebuild it)" } else { "" },
+    );
+}
+
+fn handle_create_index(db: &Database, parts: &[&str]) {
+    if parts.len() < 3 {
+        println!("Usage: CREATE.INDEX <file_name> <field_name>");
+        return;
+    }
+    let account = db.current_account();
+    match db.create_index_for_account(&account, parts[1], parts[2]) {
+        Ok(stats) => {
+            println!("[{}] indexed on {}", parts[1], stats.field);
+            print_index(&stats);
+        }
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_rebuild_index(db: &Database, parts: &[&str]) {
+    if parts.len() < 3 {
+        println!("Usage: REBUILD.INDEX <file_name> <field_name>");
+        return;
+    }
+    let account = db.current_account();
+    match db.rebuild_index_for_account(&account, parts[1], parts[2]) {
+        Ok(stats) => {
+            println!("[{}] index on {} rebuilt", parts[1], stats.field);
+            print_index(&stats);
+        }
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_delete_index(db: &Database, parts: &[&str]) {
+    if parts.len() < 3 {
+        println!("Usage: DELETE.INDEX <file_name> <field_name>");
+        return;
+    }
+    let account = db.current_account();
+    match db.drop_index_for_account(&account, parts[1], parts[2]) {
+        Ok(()) => println!("[{}] index on {} deleted", parts[1], parts[2]),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_list_indexes(db: &Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: LIST.INDEXES <file_name>");
+        return;
+    }
+    let account = db.current_account();
+    let indexes = match db.index_statistics(&account, parts[1]) {
+        Ok(indexes) => indexes,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
+    if indexes.is_empty() {
+        println!("[{}] has no indexes.", parts[1]);
+        return;
+    }
+    // The file's record count is what a value count has to be read against: an
+    // index over four values is excellent on a file of four thousand records
+    // and pointless on one of six.
+    match db.file_statistics(&account, parts[1]) {
+        Ok(file) => println!("Indexes on [{}] ({} records):", parts[1], file.record_count),
+        Err(_) => println!("Indexes on [{}]:", parts[1]),
+    }
+    for stats in &indexes {
+        print_index(stats);
     }
 }
 

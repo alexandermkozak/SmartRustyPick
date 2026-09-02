@@ -35,6 +35,10 @@ Dictionary items are special records stored in the `dict` section of a table. Th
   - `MR<n>`: Number with `<n>` decimal places (e.g., `MR2` converts `12345` to `123.45`).
   - `MD<n>`: Number with `<n>` decimal places (e.g., `MD2` converts `12345` to `123.45`).
 
+A dictionary entry is also what an index is defined on: `CREATE.INDEX <file> <field>` names an entry, and the index
+follows the attribute that entry points at. Moving an entry to a different attribute therefore makes its index stale,
+which is detected and repaired rather than silently wrong — see [Storage Engine](storage.md#secondary-indexes).
+
 #### Multivalues in queries and output
 
 A selection matches a field if **any** of its values - or, where a value has them, any of its sub-values - satisfies the
@@ -72,6 +76,9 @@ The database is stored in the `db_storage` directory, organized by account:
     - `meta`: Metadata file (version, modulus, record count).
     - `g<hex>`: Group files containing hashed records.
 - `db_storage/<account>/<table>/dict`: A flat file containing dictionary records.
+- `db_storage/<account>/<table>/index.<field>.hf/`: A [secondary index](storage.md#secondary-indexes) on a dictionary
+  field, in the same hashed layout as the records. Its keys are the indexed values and each record holds the keys
+  carrying that value; a `state` file names the field, the attribute it resolved to and the data version it matches.
 - `$SAVEDLISTS`: A special table used to store named select lists.
 
 **Record Framing**: Both group files and the dictionary use the frame encoding:

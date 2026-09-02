@@ -38,6 +38,7 @@ const REQUEST_FIELDS: &[&str] = &[
     "accounts_list",
     "is_admin",
     "durable",
+    "field",
 ];
 
 /// Every JSON key a `Response` can carry.
@@ -68,6 +69,10 @@ const COMMANDS: &[&str] = &[
     "FILE.STATS",
     "LIST.DICT",
     "SET.DICT",
+    "CREATE.INDEX",
+    "REBUILD.INDEX",
+    "DELETE.INDEX",
+    "LIST.INDEXES",
     "SERVER.STATS",
 ];
 
@@ -265,6 +270,31 @@ fn file_stats_record_is_documented() {
             "durable",
             "loaded",
             "modified_seconds_ago",
+            "indexes",
+        ],
+    );
+}
+
+#[test]
+fn index_stats_record_is_documented() {
+    let value = serde_json::to_value(crate::db::IndexStats::default()).unwrap();
+    assert_documented_shape(
+        "LIST.INDEXES / CREATE.INDEX",
+        value_keys(&value),
+        &[
+            "field",
+            "attribute",
+            "values",
+            "postings",
+            "largest_postings",
+            "modulus",
+            "version",
+            "group_count",
+            "disk_bytes",
+            "data_version",
+            "stale",
+            "loaded",
+            "built_seconds_ago",
         ],
     );
 }

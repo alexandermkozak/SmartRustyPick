@@ -17,6 +17,31 @@ export interface FileEntry {
 }
 
 /**
+ * One secondary index, as `LIST.INDEXES` describes it.
+ *
+ * The three counts are what the decision is made on. `values` against the
+ * file's record count is how selective the field is; `postings` is what
+ * maintaining the index costs per write; `largest_postings` is the skew the
+ * average hides - an index whose biggest value covers half the file saves
+ * nothing on that value.
+ */
+export interface IndexStats {
+    field: string
+    attribute: number
+    values: number
+    postings: number
+    largest_postings: number
+    modulus: number
+    version: number
+    group_count: number
+    disk_bytes: number
+    data_version: number
+    stale: boolean
+    loaded: boolean
+    built_seconds_ago: number | null
+}
+
+/**
  * One file's statistics. Deliberately record free: the dashboard navigates
  * files, it does not browse their contents.
  */
@@ -36,6 +61,8 @@ export interface FileStats {
     durable: boolean
     loaded: boolean
     modified_seconds_ago: number | null
+    /** Absent from an older server's reply, which is why it is optional here. */
+    indexes?: IndexStats[]
 }
 
 /**

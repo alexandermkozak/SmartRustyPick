@@ -1,5 +1,12 @@
 import {call, encode, pairs, record} from '@shared/api/client'
-import type {AccountStats, DictionaryDraft, DictionaryEntry, FileEntry, FileStats} from './types'
+import type {
+    AccountStats,
+    DictionaryDraft,
+    DictionaryEntry,
+    FileEntry,
+    FileStats,
+    IndexStats,
+} from './types'
 
 export const accountsApi = {
     /** `LIST.ACCOUNTS`: every account this client may reach. */
@@ -50,6 +57,34 @@ export const accountsApi = {
     /** `DELETE.FILE`: the file, its records and its dictionary. Admin only. */
     deleteFile: (account: string, file: string): Promise<unknown> =>
         call(`/api/accounts/${encode(account)}/files/${encode(file)}`, {method: 'DELETE'}),
+
+    /** `LIST.INDEXES`: every secondary index of one file, with its statistics. */
+    async indexes(account: string, file: string): Promise<IndexStats[]> {
+        const results = await pairs<IndexStats>(
+            `/api/accounts/${encode(account)}/files/${encode(file)}/indexes`,
+        )
+        return results.map(([, stats]) => stats)
+    },
+
+    /** `CREATE.INDEX` on one dictionary field. Admin only. */
+    createIndex: (account: string, file: string, field: string): Promise<unknown> =>
+        call(`/api/accounts/${encode(account)}/files/${encode(file)}/indexes`, {
+            method: 'POST',
+            body: JSON.stringify({field}),
+        }),
+
+    /** `REBUILD.INDEX`: derive an existing index from the records again. Admin only. */
+    rebuildIndex: (account: string, file: string, field: string): Promise<unknown> =>
+        call(
+            `/api/accounts/${encode(account)}/files/${encode(file)}/indexes/${encode(field)}/rebuild`,
+            {method: 'POST'},
+        ),
+
+    /** `DELETE.INDEX`: drop an index and its section. The records stay. Admin only. */
+    deleteIndex: (account: string, file: string, field: string): Promise<unknown> =>
+        call(`/api/accounts/${encode(account)}/files/${encode(file)}/indexes/${encode(field)}`, {
+            method: 'DELETE',
+        }),
 
     /** `LIST.DICT`: every dictionary entry of one file, in attribute order. */
     async dictionary(account: string, file: string): Promise<DictionaryEntry[]> {

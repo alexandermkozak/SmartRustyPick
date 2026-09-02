@@ -40,9 +40,9 @@ matched case-insensitively.
 | Field             | Type             | Used by                                                                                                            | Notes                                                                                                                                                                                                                                                                                     |
 |-------------------|------------------|--------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `command`         | string           | all                                                                                                                | Required. See [Commands](#commands).                                                                                                                                                                                                                                                      |
-| `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `GET.NEXT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS`, `LIST.DICT`, `SET.DICT` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
+| `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `GET.NEXT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `LIST.INDEXES` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
 | `target_account`  | string           | `CREATE.ACCOUNT`, `CREATE.TEST.ACCOUNT`, `DELETE.ACCOUNT`                                                          | Name of the account to create or drop. (Distinct from `account`, which selects an existing context.)                                                                                                                                                                                      |
-| `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`, `LIST.DICT`, `SET.DICT` | Table (file) name.                                                                                                                                                                                                                                                                        |
+| `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `LIST.INDEXES` | Table (file) name.                                                                                                                                                                                                                                                                        |
 | `key`             | string           | `READ`, `WRITE`, `DELETE`, `SET.DICT`                                                                              | Record key; for `SET.DICT`, the name of the dictionary entry.                                                                                                                                                                                                                                                                               |
 | `data`            | string \| object | `WRITE`                                                                                                            | Record contents. A string is parsed as a display-format record (`^` field mark, `]` value mark, `\` sub-value mark). An object maps field names — original dictionary names or their camelCase form — to values, applying the dictionary's input conversions (ICONV).                     |
 | `structured_data` | object           | `WRITE`, `SET.DICT`                                                                                                | `WRITE`: same object form as `data`, checked first when present — use either this or `data`, not both. `SET.DICT`: the dictionary attributes of one entry.                                                                                                                                 |
@@ -58,6 +58,7 @@ matched case-insensitively.
 | `accounts_list`   | array of strings | `AUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`, `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT`                                   | Allowed accounts for the client. Default `[]`.                                                                                                                                                                                                                                            |
 | `is_admin`        | bool             | `AUTHORIZE.CONN`, `GENERATE.CERT`                                                                                  | Grant the client admin rights. Default `false`.                                                                                                                                                                                                                                           |
 | `durable`         | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Per-file durable writes. Optional for `CREATE.FILE`, default `false`; required for `SET.FILE`, where an absent flag is refused rather than read as a demotion. See [Storage Engine](storage.md).                                                                                          |
+| `field`           | string           | `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`                                                                    | The dictionary field the index is on. Required by all three. See [Storage Engine](storage.md#secondary-indexes).                                                                                                                                                                           |
 
 ## Response object
 
@@ -179,6 +180,10 @@ a `null` position. `positions` is omitted entirely when nothing was exploded.
 | `FILE.STATS`            |       |   yes   | `account`, `file`                                    | `record`                                |
 | `LIST.DICT`             |       |   yes   | `account`, `file`                                    | `keys` + `results` + `count`            |
 | `SET.DICT`              |       |   yes   | `account`, `file`, `key`, `structured_data`          | `record`                                |
+| `CREATE.INDEX`          |  yes  |   yes   | `account`, `file`, `field`                           | `record`                                |
+| `REBUILD.INDEX`         |  yes  |   yes   | `account`, `file`, `field`                           | `record`                                |
+| `DELETE.INDEX`          |  yes  |   yes   | `account`, `file`, `field`                           | `status: "OK"`                          |
+| `LIST.INDEXES`          |       |   yes   | `account`, `file`                                    | `keys` + `results` + `count`            |
 | `SERVER.STATS`          |  yes  |    —    | —                                                    | `record`                                |
 
 ¹ `GET.NEXT` resolves its account from the select list created by `SELECT`, so it does not
@@ -573,9 +578,17 @@ record is returned, and none is read to answer it unless the file is still in th
   "modulus": 128, "version": 42,
   "group_count": 128, "smallest_group_bytes": 96, "largest_group_bytes": 512,
   "disk_bytes": 262144, "checksums": true, "legacy": false,
-  "durable": false, "loaded": true, "modified_seconds_ago": 12
+  "durable": false, "loaded": true, "modified_seconds_ago": 12,
+  "indexes": [
+    {"field": "CITY", "attribute": 2, "values": 64, "postings": 1280, "largest_postings": 41,
+     "modulus": 8, "version": 7, "group_count": 8, "disk_bytes": 20480,
+     "data_version": 42, "stale": false, "loaded": true, "built_seconds_ago": 12}
+  ]
 }}
 ```
+
+`indexes` describes the file's [secondary indexes](storage.md#secondary-indexes), in field
+order, with the same objects `LIST.INDEXES` returns. It is `[]` for a file that has none.
 
 ### LIST.DICT
 
@@ -639,6 +652,82 @@ Create or replace one dictionary entry, named by `key`, from the attributes in
 {"status": "OK", "record": {"field": 2, "heading": "PRICE", "justification": "R",
                             "width": 10, "conversion": "MD2",
                             "definition": "2^PRICE^R^10^^^^MD2"}}
+```
+
+### CREATE.INDEX / REBUILD.INDEX — admin
+
+Build a [secondary index](storage.md#secondary-indexes) on a dictionary field, so
+`WITH <field> = <value>` resolves through the index instead of scanning the file.
+`REBUILD.INDEX` derives an existing one from the records again — the repair for an index
+reported as `stale`, and the way to bring one back after its section has been damaged.
+
+- Required: `account` (or a single-account client), `file`, `field`.
+- Both are one pass over the file's records, which is the only cost an index has that grows
+  with the file. Maintaining it afterwards rides the ordinary write path.
+- `record` is the index as `LIST.INDEXES` describes it, read back after the build rather
+  than echoed from the request.
+- Errors: `"Admin privileges required"`, `"Account not specified"`, `"File not specified"`,
+  `"Field not specified"`, and `"Error: <detail>"` for a field that is not in the file's
+  dictionary, is already indexed, is `ID` (the record key, already found without a scan), or
+  whose name cannot become a directory.
+
+```json
+{"command": "CREATE.INDEX", "account": "SALES", "file": "USERS", "field": "CITY"}
+```
+
+```json
+{"status": "OK", "record": {
+  "field": "CITY", "attribute": 2,
+  "values": 64, "postings": 1280, "largest_postings": 41,
+  "modulus": 8, "version": 1, "group_count": 8, "disk_bytes": 20480,
+  "data_version": 42, "stale": false, "loaded": true, "built_seconds_ago": 0
+}}
+```
+
+### DELETE.INDEX — admin
+
+Drop an index and remove its section from disk. The file's records are untouched, and
+queries that were using it go back to scanning.
+
+- Required: `account` (or a single-account client), `file`, `field`.
+- Errors: `"Admin privileges required"`, `"Account not specified"`, `"File not specified"`,
+  `"Field not specified"`, `"Error: <detail>"` for a field that is not indexed.
+
+```json
+{"command": "DELETE.INDEX", "account": "SALES", "file": "USERS", "field": "CITY"}
+```
+
+### LIST.INDEXES
+
+Every index of one file, with the counts an operator decides with.
+
+- Required: `account` (or a single-account client), `file`.
+- `keys` is the plain list of indexed fields. `results` pairs each with its statistics.
+- `values` against the file's `record_count` is how selective the field is; `postings` is
+  the total (value, key) pairs, which is what maintaining the index costs per write; and
+  `largest_postings` is the skew the average hides — an index whose biggest value covers
+  half the file saves nothing on that value.
+- `stale` means the index does not match the data and has to be rebuilt before it is used.
+  Loading a file rebuilds a stale index as it opens, so this is normally only ever seen for
+  a file that is not in memory. `data_version` is the data section version the index matches;
+  `version` is the index section's own flush counter.
+- Read from memory when the file is loaded, so an index changed but not yet flushed is
+  described as it now is. For a file that is not loaded the index sections are read instead —
+  they hold values and keys rather than record bodies.
+- Errors: `"Account not specified"`, `"File not specified"`, `"Error: <detail>"`,
+  access-denied.
+
+```json
+{"command": "LIST.INDEXES", "account": "SALES", "file": "USERS"}
+```
+
+```json
+{"status": "OK", "count": 1, "keys": ["CITY"], "results": [
+  ["CITY", {"field": "CITY", "attribute": 2, "values": 64, "postings": 1280,
+            "largest_postings": 41, "modulus": 8, "version": 7, "group_count": 8,
+            "disk_bytes": 20480, "data_version": 42, "stale": false, "loaded": true,
+            "built_seconds_ago": 12}]
+]}
 ```
 
 ### SERVER.STATS — admin

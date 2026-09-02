@@ -343,6 +343,83 @@ def main():
                 json.dumps(left),
             )
 
+            # --- index maintenance ------------------------------------------
+            # NAME is attribute 1, and both records hold two values there, so an
+            # index on it has four values over two records - which is also what
+            # proves a multivalued field indexes each of its values.
+            index_path = f"/api/accounts/{ACCOUNT}/files/{FILE}/indexes"
+
+            status, payload, _ = dashboard.call(index_path)
+            suite.check_eq("A file starts with no indexes", (payload or {}).get("count"), 0)
+
+            status, payload, _ = dashboard.call(index_path, method="POST", payload={"field": "NAME"})
+            built = (payload or {}).get("record") or {}
+            suite.check(
+                "An index can be created on a dictionary field",
+                status == 200
+                and built.get("field") == "NAME"
+                and built.get("attribute") == 1
+                and built.get("values") == 4
+                and built.get("postings") == 4
+                and built.get("stale") is False,
+                json.dumps(built),
+            )
+
+            status, payload, _ = dashboard.call(index_path)
+            listed = {name: info for name, info in (payload or {}).get("results") or []}
+            suite.check_eq("It is listed with its statistics", listed.get("NAME", {}).get("values"), 4)
+
+            _, payload, _ = dashboard.call(f"/api/accounts/{ACCOUNT}/files/{FILE}")
+            reported = ((payload or {}).get("record") or {}).get("indexes") or []
+            suite.check_eq(
+                "File statistics report the indexes too",
+                [entry.get("field") for entry in reported],
+                ["NAME"],
+            )
+
+            # The index is an optimisation, so the answer must not change.
+            response = protocol_call(
+                port,
+                admin_crt,
+                admin_key,
+                certs.ca_crt,
+                {
+                    "command": "QUERY",
+                    "account": ACCOUNT,
+                    "file": FILE,
+                    "query_string": 'WITH NAME = "Alice"',
+                },
+            )
+            matched = [key for key, _ in response.get("results") or []]
+            suite.check_eq("A query resolves through the index to the same answer", matched, ["K1"])
+
+            status, payload, _ = dashboard.call(index_path, method="POST", payload={"field": "NOSUCH"})
+            suite.check_eq("A field the dictionary does not define is refused", status, 400)
+
+            status, payload, _ = dashboard.call(f"{index_path}/NAME/rebuild", method="POST")
+            rebuilt = (payload or {}).get("record") or {}
+            suite.check(
+                "An index can be rebuilt",
+                status == 200 and rebuilt.get("postings") == 4 and rebuilt.get("stale") is False,
+                json.dumps(rebuilt),
+            )
+
+            status, _, _ = dashboard.call(f"{index_path}/NAME", method="DELETE")
+            _, payload, _ = dashboard.call(index_path)
+            suite.check(
+                "An index can be dropped",
+                status == 200 and (payload or {}).get("count") == 0,
+                json.dumps(payload),
+            )
+
+            # And the records it described are still there afterwards.
+            _, payload, _ = dashboard.call(f"/api/accounts/{ACCOUNT}/files/{FILE}")
+            suite.check_eq(
+                "Dropping an index leaves the records alone",
+                ((payload or {}).get("record") or {}).get("record_count"),
+                2,
+            )
+
             # --- certificates ----------------------------------------------
             status, payload, _ = dashboard.call(
                 "/api/certificates", method="POST", payload={"common_name": "dash-issued", "accounts": [ACCOUNT]}

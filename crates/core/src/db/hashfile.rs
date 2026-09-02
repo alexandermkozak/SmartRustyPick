@@ -27,6 +27,7 @@
 //! chosen by [`FsyncPolicy`].
 
 use crate::db::models::Record;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
@@ -165,6 +166,44 @@ fn remove_stale_tmp(dir: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whatever holds a section in memory, as a flush needs to read it.
+///
+/// A flush used to take the table's `HashMap<String, Record>` directly. A
+/// secondary index holds its postings in a form of its own - a value mapped to
+/// the keys carrying it - and materialising that back into a map of records on
+/// every flush would make writing one changed record cost O(index) again, which
+/// is the property this whole format exists to keep. Reading through this trait
+/// instead lets an incremental flush ask only for the entries it is rewriting.
+///
+/// [`Cow`] rather than a reference, because a source that stores something
+/// other than a `Record` has to build one; a map of records still borrows.
+pub trait SectionSource {
+    /// Records the section holds in total. Decides the modulus, so it is the
+    /// whole count and not the number of dirty entries.
+    fn record_count(&self) -> u64;
+    /// One record, or `None` for a key that has been removed.
+    fn record(&self, key: &str) -> Option<Cow<'_, Record>>;
+    /// Every key. Called only when a full rewrite is happening, which is
+    /// already O(section).
+    fn for_each_key<'a>(&'a self, f: &mut dyn FnMut(&'a str));
+}
+
+impl SectionSource for HashMap<String, Record> {
+    fn record_count(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn record(&self, key: &str) -> Option<Cow<'_, Record>> {
+        self.get(key).map(Cow::Borrowed)
+    }
+
+    fn for_each_key<'a>(&'a self, f: &mut dyn FnMut(&'a str)) {
+        for key in self.keys() {
+            f(key.as_str());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,21 +563,16 @@ pub fn read_group(map: &mut HashMap<String, Record>, path: &Path, require_traile
     Ok(())
 }
 
-/// Writes `keys` (and their records) as frames plus a trailer, atomically
-/// replacing `path`. An empty group leaves no file behind at all.
-fn write_frames(
-    path: &Path,
-    map: &HashMap<String, Record>,
-    keys: &mut Vec<&String>,
-    fsync: FsyncPolicy,
-) -> io::Result<()> {
-    if keys.is_empty() {
+/// Writes `entries` as frames plus a trailer, atomically replacing `path`. An
+/// empty group leaves no file behind at all.
+fn write_frames(path: &Path, entries: &mut [(&str, Cow<'_, Record>)], fsync: FsyncPolicy) -> io::Result<()> {
+    if entries.is_empty() {
         if path.exists() {
             fs::remove_file(path)?;
         }
         return Ok(());
     }
-    keys.sort();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
 
     let tmp = path.with_extension("tmp");
     {
@@ -552,8 +586,7 @@ fn write_frames(
             writer.write_all(bytes)
         };
 
-        for key in keys.iter() {
-            let record = &map[*key];
+        for (key, record) in entries.iter() {
             let key_bytes = key.as_bytes();
             write(&mut writer, &(key_bytes.len() as u64).to_le_bytes())?;
             write(&mut writer, key_bytes)?;
@@ -564,7 +597,7 @@ fn write_frames(
         }
 
         writer.write_all(&GROUP_MAGIC)?;
-        writer.write_all(&(keys.len() as u64).to_le_bytes())?;
+        writer.write_all(&(entries.len() as u64).to_le_bytes())?;
         writer.write_all(&(!crc).to_le_bytes())?;
         writer.flush()?;
         drop(writer);
@@ -604,16 +637,16 @@ pub fn load(section_path: &str, map: &mut HashMap<String, Record>) -> io::Result
 /// rewrite, which is what migration and bulk edits need.
 ///
 /// Uses the default [`FsyncPolicy`]; see [`save_with_fsync`] to choose one.
-pub fn save(
+pub fn save<S: SectionSource + ?Sized>(
     section_path: &str,
-    map: &HashMap<String, Record>,
+    source: &S,
     previous: SectionMeta,
     dirty_keys: Option<&HashSet<String>>,
     per_group: usize,
 ) -> io::Result<SectionMeta> {
     save_with_fsync(
         section_path,
-        map,
+        source,
         previous,
         dirty_keys,
         per_group,
@@ -629,9 +662,9 @@ pub fn save(
 /// crash. The reverse order would let a surviving `meta` advertise a modulus
 /// the group files do not implement, and records would hash into groups that
 /// never received them.
-pub fn save_with_fsync(
+pub fn save_with_fsync<S: SectionSource + ?Sized>(
     section_path: &str,
-    map: &HashMap<String, Record>,
+    source: &S,
     previous: SectionMeta,
     dirty_keys: Option<&HashSet<String>>,
     per_group: usize,
@@ -640,19 +673,23 @@ pub fn save_with_fsync(
     let dir = section_dir(section_path);
     fs::create_dir_all(&dir)?;
 
-    let records = map.len() as u64;
+    let records = source.record_count();
     let modulus = plan_modulus(previous.modulus, records, per_group);
     let full_rewrite = dirty_keys.is_none() || modulus != previous.modulus || previous.version == 0;
 
     if full_rewrite {
-        let mut buckets: HashMap<u64, Vec<&String>> = (0..modulus).map(|g| (g, Vec::new())).collect();
-        for key in map.keys() {
+        let mut buckets: HashMap<u64, Vec<&str>> = (0..modulus).map(|g| (g, Vec::new())).collect();
+        source.for_each_key(&mut |key| {
             if let Some(bucket) = buckets.get_mut(&group_of(key, modulus)) {
                 bucket.push(key);
             }
-        }
-        for (group, mut keys) in buckets {
-            write_frames(&group_path(&dir, group), map, &mut keys, fsync)?;
+        });
+        for (group, keys) in buckets {
+            let mut entries: Vec<(&str, Cow<'_, Record>)> = keys
+                .into_iter()
+                .filter_map(|key| source.record(key).map(|record| (key, record)))
+                .collect();
+            write_frames(&group_path(&dir, group), &mut entries, fsync)?;
         }
         remove_groups_beyond(&dir, modulus)?;
     } else {
@@ -669,13 +706,16 @@ pub fn save_with_fsync(
             let mut contents: HashMap<String, Record> = HashMap::new();
             read_group(&mut contents, &path, previous.checksums)?;
             for key in keys {
-                match map.get(key) {
-                    Some(record) => contents.insert(key.clone(), record.clone()),
+                match source.record(key) {
+                    Some(record) => contents.insert(key.clone(), record.into_owned()),
                     None => contents.remove(key),
                 };
             }
-            let mut group_keys: Vec<&String> = contents.keys().collect();
-            write_frames(&path, &contents, &mut group_keys, fsync)?;
+            let mut entries: Vec<(&str, Cow<'_, Record>)> = contents
+                .iter()
+                .map(|(key, record)| (key.as_str(), Cow::Borrowed(record)))
+                .collect();
+            write_frames(&path, &mut entries, fsync)?;
         }
     }
 

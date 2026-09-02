@@ -73,6 +73,57 @@ fn bench_incremental_write(c: &mut Criterion) {
     group.finish();
 }
 
+/// What an index costs the write path, and where that cost comes from.
+///
+/// The same single-record write as `incremental_write`, with one index on the
+/// file. Two shapes of index, because they do not behave alike:
+///
+/// * `unique_field` indexes `NAME`, which is distinct per record. Each entry
+///   holds one key, so the write stays flat as the file grows - the same
+///   property the record write has.
+/// * `shared_field` indexes `CITY`, which has ten values whatever the size of
+///   the file. An entry then holds a tenth of the keys in the file, and
+///   rewriting it costs proportionally more as the file grows.
+///
+/// That second row is the honest cost of an equality index on a field with few
+/// values, and it is measured here rather than assumed.
+fn bench_indexed_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("storage");
+    group.throughput(Throughput::Elements(1));
+
+    for records in [1_000usize, 10_000usize] {
+        for (label, field) in [("unique_field", "NAME"), ("shared_field", "CITY")] {
+            let dir = common::TempDir::new(&format!("idxwrite{records}{label}"));
+            let mut db = common::new_db(dir.path());
+            common::build_table(&mut db, TABLE, records);
+            db.save().unwrap();
+            db.create_index_for_account(common::ACCOUNT, TABLE, field).unwrap();
+
+            group.bench_function(format!("indexed_write/{label}/{records}_records"), |b| {
+                let mut counter = 0usize;
+                b.iter(|| {
+                    counter += 1;
+                    // Each write really moves a value - the record replacing the
+                    // key carries a different NAME - while the set of values
+                    // stays bounded, so the index reaches a steady size instead
+                    // of growing for the length of the run.
+                    let table_handle = db.get_table_mut_for_account(common::ACCOUNT, TABLE).unwrap();
+                    let mut table = table_handle.write();
+                    table.insert_record(
+                        &format!("K{:06}", counter % records),
+                        common::sample_record(counter % (2 * records)),
+                    );
+                    drop(table);
+                    db.save().unwrap();
+                    black_box(counter)
+                })
+            });
+        }
+    }
+
+    group.finish();
+}
+
 fn bench_serialize(c: &mut Criterion) {
     let dir = common::TempDir::new("serialize");
     let mut db = common::new_db(dir.path());
@@ -89,5 +140,11 @@ fn bench_serialize(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_save, bench_incremental_write, bench_serialize);
+criterion_group!(
+    benches,
+    bench_save,
+    bench_incremental_write,
+    bench_indexed_write,
+    bench_serialize
+);
 criterion_main!(benches);

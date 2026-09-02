@@ -1,6 +1,7 @@
 use crate::db::hashfile::SectionMeta;
+use crate::db::index::FileIndex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub const FM: u8 = 254; // Field Mark
 pub const VM: u8 = 253; // Value Mark
@@ -251,6 +252,12 @@ pub struct Table {
     /// migrations); forces a full rewrite of every group.
     pub dirty_all: bool,
     pub dict_dirty: bool,
+    /// Secondary indexes on this file's dictionary fields, by field name.
+    ///
+    /// Held beside the records rather than derived on demand: an index has to
+    /// see the record a write replaces to know which value to withdraw, and
+    /// that record is only still available at the moment of the write.
+    pub indexes: BTreeMap<String, FileIndex>,
 }
 
 impl Default for Table {
@@ -270,11 +277,20 @@ impl Table {
             dirty_keys: HashSet::new(),
             dirty_all: false,
             dict_dirty: false,
+            indexes: BTreeMap::new(),
         }
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty_all || self.dict_dirty || !self.dirty_keys.is_empty()
+        self.dirty_all || self.dict_dirty || !self.dirty_keys.is_empty() || self.indexes_dirty()
+    }
+
+    /// True when an index has changes to write out, or has fallen behind the
+    /// records and still has to be rebuilt.
+    pub fn indexes_dirty(&self) -> bool {
+        self.indexes
+            .values()
+            .any(|index| index.is_dirty() || index.needs_rebuild)
     }
 
     pub fn records_dirty(&self) -> bool {
@@ -289,22 +305,40 @@ impl Table {
 
     /// Marks the whole table - records and dictionary - as changed. Only for
     /// edits whose key set is not known, since it costs a full rewrite.
+    ///
+    /// A change that names no keys is exactly the change an index cannot
+    /// maintain incrementally, so every index is marked for a rebuild. Until
+    /// that happens a query scans rather than trusting an index that may no
+    /// longer describe the records.
     pub fn touch_all(&mut self) {
         self.dirty_all = true;
         self.dict_dirty = true;
+        for index in self.indexes.values_mut() {
+            index.needs_rebuild = true;
+        }
     }
 
     pub fn mark_dict_dirty(&mut self) {
         self.dict_dirty = true;
+        self.recheck_index_attributes();
     }
 
     pub fn insert_record(&mut self, key: &str, record: Record) {
+        if !self.indexes.is_empty() {
+            let previous = self.records.get(key);
+            for index in self.indexes.values_mut() {
+                index.apply(key, previous, Some(&record));
+            }
+        }
         self.records.insert(key.to_string(), record);
         self.mark_dirty(key);
     }
 
     pub fn remove_record(&mut self, key: &str) -> Option<Record> {
         let previous = self.records.remove(key);
+        for index in self.indexes.values_mut() {
+            index.apply(key, previous.as_ref(), None);
+        }
         self.mark_dirty(key);
         previous
     }
@@ -313,6 +347,128 @@ impl Table {
         self.dirty_keys.clear();
         self.dirty_all = false;
         self.dict_dirty = false;
+    }
+
+    /// The fields this file has an index on, sorted.
+    pub fn index_fields(&self) -> Vec<String> {
+        self.indexes.keys().cloned().collect()
+    }
+
+    pub fn has_index(&self, field: &str) -> bool {
+        self.indexes.contains_key(field)
+    }
+
+    /// Adds an index on `field` and builds it from the records.
+    ///
+    /// `Err` carries the reason the field cannot be indexed, which is worth
+    /// saying rather than leaving an index that answers nothing: a name that
+    /// cannot become a directory, a field the dictionary does not define, or
+    /// `ID` - which is the record key, already found in one hash lookup.
+    pub fn create_index(&mut self, field: &str) -> Result<(), String> {
+        let field = field.trim().to_string();
+        if field == "ID" {
+            return Err("ID is the record key and is already found without a scan".to_string());
+        }
+        if !crate::db::index::is_valid_field_name(&field) {
+            return Err(format!(
+                "'{}' cannot name an index: use letters, digits and . _ - $ # %",
+                field
+            ));
+        }
+        let attr = self
+            .field_index(&field)
+            .ok_or_else(|| format!("'{}' is not a dictionary field of this file", field))?;
+        let mut index = FileIndex::new(&field, attr);
+        index.rebuild(&self.records, attr);
+        self.indexes.insert(field, index);
+        Ok(())
+    }
+
+    /// Forgets an index. The section on disk is removed by the caller that owns
+    /// the file's directory.
+    pub fn drop_index(&mut self, field: &str) -> bool {
+        self.indexes.remove(field.trim()).is_some()
+    }
+
+    /// Derives one index from the records again.
+    pub fn rebuild_index(&mut self, field: &str) -> Result<(), String> {
+        let field = field.trim();
+        if !self.indexes.contains_key(field) {
+            return Err(format!("'{}' is not indexed on this file", field));
+        }
+        let attr = self
+            .field_index(field)
+            .ok_or_else(|| format!("'{}' is not a dictionary field of this file", field))?;
+        // The indexes are moved aside rather than the records, so that reading
+        // one while rebuilding the other needs no second borrow of `self`. This
+        // way round on purpose: a panic in here would lose what is moved, and an
+        // index can be derived again where the records cannot.
+        let mut indexes = std::mem::take(&mut self.indexes);
+        if let Some(index) = indexes.get_mut(field) {
+            index.rebuild(&self.records, attr);
+        }
+        self.indexes = indexes;
+        Ok(())
+    }
+
+    /// Rebuilds every index that has fallen behind the records. Called where a
+    /// `&mut Table` is available - a load, or the start of a flush.
+    pub fn rebuild_stale_indexes(&mut self) {
+        if !self.indexes.values().any(|index| index.needs_rebuild) {
+            return;
+        }
+        let attributes: Vec<(String, Option<usize>)> = self
+            .indexes
+            .keys()
+            .map(|field| (field.clone(), self.field_index(field)))
+            .collect();
+        // See `rebuild_index`: the indexes move aside, never the records.
+        let mut indexes = std::mem::take(&mut self.indexes);
+        for (field, attr) in attributes {
+            let Some(index) = indexes.get_mut(&field) else {
+                continue;
+            };
+            if !index.needs_rebuild {
+                continue;
+            }
+            match attr {
+                Some(attr) => index.rebuild(&self.records, attr),
+                // The dictionary no longer defines the field. Leave the index
+                // marked so nothing consults it; dropping it here would delete
+                // a section over what may well be a half-finished edit.
+                None => index.needs_rebuild = true,
+            }
+        }
+        self.indexes = indexes;
+    }
+
+    /// Marks an index stale when a dictionary edit has moved its field to a
+    /// different attribute, which is the one way a change to the dictionary can
+    /// make the postings wrong.
+    fn recheck_index_attributes(&mut self) {
+        if self.indexes.is_empty() {
+            return;
+        }
+        let moved: Vec<String> = self
+            .indexes
+            .values()
+            .filter(|index| self.field_index(&index.field) != Some(index.attr))
+            .map(|index| index.field.clone())
+            .collect();
+        for field in moved {
+            if let Some(index) = self.indexes.get_mut(&field) {
+                index.needs_rebuild = true;
+            }
+        }
+    }
+
+    /// The keys an index says carry `value`, or `None` when no usable index can
+    /// answer for that field.
+    pub fn index_candidates(&self, field: &str, value: &str) -> Option<&BTreeSet<String>> {
+        self.indexes
+            .get(field)
+            .filter(|index| self.field_index(field) == Some(index.attr))
+            .and_then(|index| index.candidates(&crate::db::index::index_key(value)))
     }
 }
 
@@ -477,6 +633,8 @@ pub struct FileStats {
     /// Seconds since the data section was last modified, when the filesystem
     /// reports a usable timestamp.
     pub modified_seconds_ago: Option<u64>,
+    /// The secondary indexes this file carries, in field order.
+    pub indexes: Vec<crate::db::index::IndexStats>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

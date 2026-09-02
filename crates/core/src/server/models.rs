@@ -30,6 +30,8 @@ pub struct Request {
     /// already exists. Required there, since an absent flag must not be read as
     /// a request to demote.
     pub durable: Option<bool>,
+    /// The dictionary field an index command names, alongside `file`.
+    pub field: Option<String>,
 }
 
 /// Every field but `status` is skipped when empty, so a reply carries only what

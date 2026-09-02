@@ -8,7 +8,7 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {flushPromises, mount, type VueWrapper} from '@vue/test-utils'
 import type {Component} from 'vue'
-import type {AccountStats, DictionaryEntry, FileStats} from './types'
+import type {AccountStats, DictionaryEntry, FileStats, IndexStats} from './types'
 
 const account: AccountStats = {
     name: 'SALES',
@@ -34,6 +34,7 @@ const fileStats: FileStats = {
     durable: false,
     loaded: true,
     modified_seconds_ago: 12,
+    indexes: [],
 }
 
 // The real envelope: the server omits every field the command did not populate,
@@ -90,12 +91,37 @@ const dictionaryList = (entries: DictionaryEntry[] = dictionary) =>
         count: entries.length,
     })
 
+const emailIndex: IndexStats = {
+    field: 'EMAIL',
+    attribute: 2,
+    values: 1200,
+    postings: 1280,
+    largest_postings: 3,
+    modulus: 128,
+    version: 7,
+    group_count: 128,
+    disk_bytes: 40960,
+    data_version: 42,
+    stale: false,
+    loaded: true,
+    built_seconds_ago: 90,
+}
+
+const indexList = (entries: IndexStats[]) =>
+    envelope({
+        keys: entries.map((entry) => entry.field),
+        results: entries.map((entry) => [entry.field, entry]),
+        count: entries.length,
+    })
+
 const routes = {
     '/api/accounts': envelope({results: [['SALES', account]], count: 1}),
     '/api/accounts/SALES/files': fileList(false),
     '/api/accounts/SALES/files/USERS': envelope({record: fileStats}),
     '/api/accounts/SALES/files/USERS/dictionary': dictionaryList(),
     '/api/accounts/SALES/files/DIR/dictionary': dictionaryList([]),
+    '/api/accounts/SALES/files/USERS/indexes': indexList([]),
+    '/api/accounts/SALES/files/DIR/indexes': indexList([]),
 }
 
 /** Every request the page made, in order, as `METHOD /path`. */
@@ -651,5 +677,223 @@ describe('the dictionary of a file', () => {
         expect(wrapper.text()).toContain('Dictionary of SALES/DIR')
         expect(wrapper.text()).not.toContain('Edit EMAIL')
         expect((fields(wrapper)[0].element as HTMLInputElement).value).toBe('')
+    })
+})
+
+describe('the indexes of a file', () => {
+    let View: Component
+    let alerts: {message: {value: string | null}}
+
+    /** The index section. Like the dictionary, it is a root-level sibling. */
+    const panel = (wrapper: VueWrapper) => wrapper.find('.indexes')
+    const rows = (wrapper: VueWrapper) => panel(wrapper).findAll('tbody tr')
+
+    beforeEach(async () => {
+        vi.resetModules()
+        reset()
+        vi.stubGlobal('fetch', stubServer())
+        vi.stubGlobal(
+            'confirm',
+            vi.fn(() => true),
+        )
+        View = (await import('./AccountsView.vue')).default
+        alerts = (await import('@shared/composables/useAlerts')).useAlerts()
+    })
+
+    afterEach(() => {
+        vi.unstubAllGlobals()
+        vi.restoreAllMocks()
+    })
+
+    it('appears only once a file is selected, and says what a file with none costs', async () => {
+        const wrapper = mount(View)
+        await flushPromises()
+        expect(wrapper.find('.indexes').exists()).toBe(false)
+
+        const opened = await openUsers(View)
+        expect(opened.text()).toContain('Indexes on SALES/USERS')
+        expect(panel(opened).text()).toContain('This file has no indexes')
+        expect(panel(opened).text()).toContain('1,280')
+    })
+
+    it('shows the counts an index is judged on, and what they add up to', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubServer({
+                '/api/accounts/SALES/files/USERS/indexes': indexList([emailIndex]),
+            }),
+        )
+        const wrapper = await openUsers(View)
+
+        const cells = rows(wrapper)[0].findAll('td')
+        expect(cells[0].text()).toContain('EMAIL')
+        expect(cells[1].text()).toBe('2')
+        expect(cells[2].text()).toBe('1,200')
+        expect(cells[3].text()).toBe('1,280')
+        expect(cells[4].text()).toBe('1.1')
+        expect(cells[5].text()).toBe('3')
+        // The analysis, not just the numbers: this one is worth having.
+        expect(panel(wrapper).text()).toContain('Close to unique')
+    })
+
+    it('warns when one value covers so much of the file that an index cannot help', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubServer({
+                '/api/accounts/SALES/files/USERS/indexes': indexList([
+                    {...emailIndex, values: 2, postings: 1280, largest_postings: 900},
+                ]),
+            }),
+        )
+        const wrapper = await openUsers(View)
+        expect(panel(wrapper).text()).toContain('about 640 records')
+        expect(panel(wrapper).text()).toContain('covers 70% of the file')
+    })
+
+    it('marks a stale index and says what to do about it', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubServer({
+                '/api/accounts/SALES/files/USERS/indexes': indexList([
+                    {...emailIndex, stale: true},
+                ]),
+                '/api/accounts/SALES/files/USERS': envelope({
+                    record: {...fileStats, indexes: [{...emailIndex, stale: true}]},
+                }),
+            }),
+        )
+        const wrapper = await openUsers(View)
+        expect(panel(wrapper).find('.tag.stale').exists()).toBe(true)
+        expect(panel(wrapper).text()).toContain('rebuild it')
+        // And it is visible from the statistics panel, which is where an
+        // operator already is when they are wondering about the file.
+        expect(wrapper.text()).toContain('EMAIL (1 stale)')
+    })
+
+    it('offers only the dictionary fields that are not indexed yet', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubServer({
+                '/api/accounts/SALES/files/USERS/indexes': indexList([emailIndex]),
+            }),
+        )
+        const wrapper = await openUsers(View)
+
+        const options = panel(wrapper)
+            .findAll('.new-index option')
+            .map((option) => option.text())
+        expect(options).toEqual(['Choose a field…', 'NAME'])
+    })
+
+    it('creates an index on the chosen field and re-reads what it now costs', async () => {
+        const wrapper = await openUsers(View)
+        reset()
+
+        vi.stubGlobal(
+            'fetch',
+            stubServer({
+                '/api/accounts/SALES/files/USERS/indexes': indexList([emailIndex]),
+                '/api/accounts/SALES/files/USERS': envelope({
+                    record: {...fileStats, indexes: [emailIndex]},
+                }),
+            }),
+        )
+        await panel(wrapper).find('.new-index select').setValue('EMAIL')
+        await panel(wrapper).find('.new-index').trigger('submit')
+        await flushPromises()
+
+        expect(sent).toEqual([
+            {
+                method: 'POST',
+                path: '/api/accounts/SALES/files/USERS/indexes',
+                body: '{"field":"EMAIL"}',
+            },
+        ])
+        // The list and the file's statistics both describe the new index.
+        expect(rows(wrapper)).toHaveLength(1)
+        expect(wrapper.text()).toContain('EMAIL')
+        expect(traffic).toContain('GET /api/accounts/SALES/files/USERS')
+    })
+
+    it('rebuilds an index through its own endpoint', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubServer({
+                '/api/accounts/SALES/files/USERS/indexes': indexList([
+                    {...emailIndex, stale: true},
+                ]),
+            }),
+        )
+        const wrapper = await openUsers(View)
+        reset()
+
+        await rows(wrapper)[0].findAll('button')[0].trigger('click')
+        await flushPromises()
+
+        expect(sent).toEqual([
+            {
+                method: 'POST',
+                path: '/api/accounts/SALES/files/USERS/indexes/EMAIL/rebuild',
+                body: undefined,
+            },
+        ])
+    })
+
+    it('confirms before dropping an index, and says the records stay', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubServer({
+                '/api/accounts/SALES/files/USERS/indexes': indexList([emailIndex]),
+            }),
+        )
+        const wrapper = await openUsers(View)
+        reset()
+
+        await rows(wrapper)[0].findAll('button')[1].trigger('click')
+        await flushPromises()
+
+        expect(window.confirm).toHaveBeenCalledWith(
+            'Drop the index on "EMAIL"? Queries on it go back to scanning; the records stay.',
+        )
+        expect(sent).toEqual([
+            {
+                method: 'DELETE',
+                path: '/api/accounts/SALES/files/USERS/indexes/EMAIL',
+                body: undefined,
+            },
+        ])
+    })
+
+    it('reports the database’s own words when an index is refused', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubServer(
+                {},
+                {
+                    'POST /api/accounts/SALES/files/USERS/indexes': 'Admin privileges required',
+                },
+            ),
+        )
+        const wrapper = await openUsers(View)
+
+        await panel(wrapper).find('.new-index select').setValue('EMAIL')
+        await panel(wrapper).find('.new-index').trigger('submit')
+        await flushPromises()
+
+        expect(alerts.message.value).toBe('Admin privileges required')
+        expect(panel(wrapper).text()).toContain('This file has no indexes')
+    })
+
+    it('says why a file with no dictionary has nothing to index', async () => {
+        const wrapper = mount(View)
+        await flushPromises()
+        await selectors(wrapper, 0)[0].trigger('click')
+        await flushPromises()
+        await selectors(wrapper, 1)[0].trigger('click')
+        await flushPromises()
+
+        expect(wrapper.text()).toContain('Indexes on SALES/DIR')
+        expect(panel(wrapper).text()).toContain('An index is on a named field')
+        expect(panel(wrapper).find('select').exists()).toBe(false)
     })
 })

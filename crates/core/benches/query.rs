@@ -46,6 +46,59 @@ fn bench_query(c: &mut Criterion) {
     group.finish();
 }
 
+/// What a secondary index is for: the cost of finding a record by a non-key
+/// value stops growing with the size of the file.
+///
+/// Shaped like `incremental_write` in `benches/storage.rs` - the same query at
+/// two file sizes - because the number that matters is not the absolute time
+/// but whether it moves when the file gets ten times bigger. The scan beside it
+/// is the control, and it moves by exactly that factor.
+fn bench_index(c: &mut Criterion) {
+    let mut group = c.benchmark_group("index");
+    group.throughput(Throughput::Elements(1));
+
+    for records in [1_000usize, 10_000usize] {
+        let dir = common::TempDir::new(&format!("index{records}"));
+        let mut db = common::new_db(dir.path());
+        common::build_table(&mut db, TABLE, records);
+        db.save().unwrap();
+
+        // NAME is distinct per record, which is the shape an index is for. The
+        // same query runs both ways, so the two rows differ only in the plan.
+        let node = db.parse_query(TABLE, &["WITH", "NAME", "=", "NAME42"]).unwrap();
+        assert_eq!(
+            db.query_for_account(common::ACCOUNT, TABLE, false, &node, None).len(),
+            1
+        );
+
+        group.bench_function(format!("scan/{records}_records"), |b| {
+            b.iter(|| {
+                black_box(
+                    db.query_for_account(black_box(common::ACCOUNT), black_box(TABLE), false, &node, None)
+                        .len(),
+                )
+            })
+        });
+
+        db.create_index_for_account(common::ACCOUNT, TABLE, "NAME").unwrap();
+        assert_eq!(
+            db.query_for_account(common::ACCOUNT, TABLE, false, &node, None).len(),
+            1
+        );
+
+        group.bench_function(format!("indexed/{records}_records"), |b| {
+            b.iter(|| {
+                black_box(
+                    db.query_for_account(black_box(common::ACCOUNT), black_box(TABLE), false, &node, None)
+                        .len(),
+                )
+            })
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_sort(c: &mut Criterion) {
     let dir = common::TempDir::new("sort");
     let mut db = common::new_db(dir.path());
@@ -271,6 +324,7 @@ fn bench_serialize(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_query,
+    bench_index,
     bench_sort,
     bench_explode,
     bench_select,

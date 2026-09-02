@@ -1388,3 +1388,189 @@ fn the_hot_paths_lock_a_file_a_fixed_number_of_times() {
         );
     }
 }
+
+#[test]
+fn test_index_commands_create_list_rebuild_and_drop_over_the_wire() {
+    let dir = TempDir::new("server_indexes");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_test_account("IDX_TEST").unwrap();
+    db.set_current_account("");
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "admin".to_string(),
+        thumbprint: "tp".to_string(),
+        allowed_accounts: vec![],
+        is_admin: true,
+    };
+    let index_request = |command: &str, field: Option<&str>| Request {
+        command: command.to_string(),
+        account: Some("IDX_TEST".to_string()),
+        file: Some("USERS".to_string()),
+        field: field.map(str::to_string),
+        ..Default::default()
+    };
+
+    let resp = handle_request(index_request("CREATE.INDEX", Some("EMAIL")), &db_arc, &admin);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let created = resp.record.unwrap();
+    assert_eq!(created["field"], serde_json::json!("EMAIL"));
+    assert_eq!(created["attribute"], serde_json::json!(2));
+    // The demo fixture holds two users with distinct addresses.
+    assert_eq!(created["values"], serde_json::json!(2));
+    assert_eq!(created["postings"], serde_json::json!(2));
+    assert_eq!(created["stale"], serde_json::json!(false));
+
+    let resp = handle_request(index_request("LIST.INDEXES", None), &db_arc, &admin);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert_eq!(resp.keys.unwrap(), vec!["EMAIL".to_string()]);
+    assert_eq!(resp.count, Some(1));
+    let listed = resp.results.unwrap();
+    assert_eq!(listed[0].1, created);
+
+    // FILE.STATS carries the same objects, so a dashboard needs one request.
+    let resp = handle_request(
+        Request {
+            command: "FILE.STATS".to_string(),
+            account: Some("IDX_TEST".to_string()),
+            file: Some("USERS".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "OK");
+    let indexes = resp.record.unwrap()["indexes"].clone();
+    assert_eq!(indexes.as_array().unwrap().len(), 1);
+    assert_eq!(indexes[0]["field"], serde_json::json!("EMAIL"));
+
+    // A query resolves through it, and returns what it always returned.
+    let resp = handle_request(
+        Request {
+            command: "QUERY".to_string(),
+            account: Some("IDX_TEST".to_string()),
+            file: Some("USERS".to_string()),
+            query_string: Some("WITH EMAIL = \"jane@example.com\"".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "OK");
+    let keys: Vec<String> = resp.results.unwrap().into_iter().map(|(key, _)| key).collect();
+    assert_eq!(keys, vec!["2".to_string()]);
+
+    let resp = handle_request(index_request("REBUILD.INDEX", Some("EMAIL")), &db_arc, &admin);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert_eq!(resp.record.unwrap()["postings"], serde_json::json!(2));
+
+    let resp = handle_request(index_request("DELETE.INDEX", Some("EMAIL")), &db_arc, &admin);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let resp = handle_request(index_request("LIST.INDEXES", None), &db_arc, &admin);
+    assert_eq!(resp.count, Some(0));
+}
+
+#[test]
+fn test_index_commands_report_what_they_were_not_given() {
+    let dir = TempDir::new("server_index_errors");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_test_account("IDX_ERR").unwrap();
+    db.set_current_account("");
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "admin".to_string(),
+        thumbprint: "tp".to_string(),
+        allowed_accounts: vec![],
+        is_admin: true,
+    };
+    let refusal = |req: Request| {
+        let resp = handle_request(req, &db_arc, &admin);
+        assert_eq!(resp.status, "ERROR");
+        resp.message.unwrap()
+    };
+
+    assert!(
+        refusal(Request {
+            command: "CREATE.INDEX".to_string(),
+            account: Some("IDX_ERR".to_string()),
+            ..Default::default()
+        })
+        .contains("File not specified")
+    );
+    assert!(
+        refusal(Request {
+            command: "CREATE.INDEX".to_string(),
+            account: Some("IDX_ERR".to_string()),
+            file: Some("USERS".to_string()),
+            ..Default::default()
+        })
+        .contains("Field not specified")
+    );
+    assert!(
+        refusal(Request {
+            command: "CREATE.INDEX".to_string(),
+            account: Some("IDX_ERR".to_string()),
+            file: Some("USERS".to_string()),
+            field: Some("NOSUCH".to_string()),
+            ..Default::default()
+        })
+        .contains("not a dictionary field")
+    );
+    assert!(
+        refusal(Request {
+            command: "LIST.INDEXES".to_string(),
+            account: Some("IDX_ERR".to_string()),
+            file: Some("NOPE".to_string()),
+            ..Default::default()
+        })
+        .contains("not found")
+    );
+}
+
+#[test]
+fn test_changing_an_index_needs_admin_but_reading_them_does_not() {
+    // Creating an index is a storage decision about a file, gated like creating
+    // the file. Listing them is not, any more than listing the files is.
+    let dir = TempDir::new("server_index_perm");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_test_account("IDX_PERM").unwrap();
+    db.set_current_account("");
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let user = ClientInfo {
+        name: "user".to_string(),
+        thumbprint: "tp".to_string(),
+        allowed_accounts: vec!["IDX_PERM".to_string()],
+        is_admin: false,
+    };
+
+    for command in ["CREATE.INDEX", "REBUILD.INDEX", "DELETE.INDEX"] {
+        let resp = handle_request(
+            Request {
+                command: command.to_string(),
+                account: Some("IDX_PERM".to_string()),
+                file: Some("USERS".to_string()),
+                field: Some("EMAIL".to_string()),
+                ..Default::default()
+            },
+            &db_arc,
+            &user,
+        );
+        assert_eq!(resp.status, "ERROR", "{} must be refused", command);
+        assert!(resp.message.unwrap().contains("Admin privileges required"));
+    }
+
+    let resp = handle_request(
+        Request {
+            command: "LIST.INDEXES".to_string(),
+            account: Some("IDX_PERM".to_string()),
+            file: Some("USERS".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &user,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert_eq!(resp.count, Some(0));
+}

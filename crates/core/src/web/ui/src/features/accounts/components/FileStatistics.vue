@@ -8,12 +8,26 @@ import type {FileStats} from '../types'
 const props = defineProps<{stats: FileStats | null; changing: boolean}>()
 const emit = defineEmits<{setDurable: [durable: boolean]}>()
 
+/**
+ * The indexes as one line: how many, and whether any of them has fallen behind
+ * the records. The table below the dictionary says the rest; this is the row
+ * that makes a stale index visible from the panel a person is already reading.
+ */
+function indexSummary(file: FileStats): string {
+  const indexes = file.indexes ?? []
+  if (!indexes.length) return 'none'
+  const stale = indexes.filter((index) => index.stale).length
+  const fields = indexes.map((index) => index.field).join(', ')
+  return stale ? `${fields} (${stale} stale)` : fields
+}
+
 const rows = computed<Array<[string, string]>>(() => {
   const file = props.stats
   if (!file) return []
   return [
     ['Records', count(file.record_count)],
     ['Dictionary entries', count(file.dict_count)],
+    ['Indexes', indexSummary(file)],
     ['Hash modulus', count(file.modulus)],
     ['Group files', count(file.group_count)],
     ['Smallest group', bytes(file.smallest_group_bytes)],

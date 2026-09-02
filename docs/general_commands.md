@@ -205,6 +205,53 @@ Delete a table (both data and dictionary sections).
 - **Usage**: `DELETE.FILE <name>`
 - **Example**: `DELETE.FILE OLD_DATA`
 
+#### CREATE.INDEX
+
+Index a dictionary field, so `WITH <field> = <value>` resolves through the index instead of reading every record. The
+cost of finding a record by that field then stops growing with the size of the file — see
+[Storage Engine](storage.md#secondary-indexes).
+
+Building it reads the file once. After that the index is maintained on every write, and a query that cannot use it (a
+wildcard, an inequality, a field with no index) falls back to the scan it always had.
+
+- **Usage**: `CREATE.INDEX <file> <field>`
+- **Example**: `CREATE.INDEX ORDERS CUSTOMER`
+- **Note**: The field has to be one the file's dictionary defines. `ID` cannot be indexed — it is the record key, which
+  is already found without a scan.
+
+#### LIST.INDEXES
+
+List a file's indexes with the counts each one is judged on: how many distinct values it holds, how many record keys it
+indexes in total, the size of its largest posting list, and — where the file's record count is known — how many records
+an average lookup narrows the file to.
+
+An index over many values turns a scan into a lookup of a handful of records. One over two or three values turns it into
+a scan of a third of the file, and still costs a write every time the field changes.
+
+- **Usage**: `LIST.INDEXES <file>`
+- **Example**: `LIST.INDEXES ORDERS`
+
+#### REBUILD.INDEX
+
+Derive an index from the records again. The repair for an index reported as stale, and the way to bring one back after
+its section has been damaged or removed underneath the server.
+
+An index is normally rebuilt on its own — a stale one is detected and rebuilt when the file is loaded, and never
+consulted before it has been — so this is for the case where the file is already in memory and the rebuild should happen
+now.
+
+- **Usage**: `REBUILD.INDEX <file> <field>`
+- **Example**: `REBUILD.INDEX ORDERS CUSTOMER`
+
+#### DELETE.INDEX
+
+Drop an index and remove its section. The records are untouched; queries that were using it go back to scanning.
+
+- **Usage**: `DELETE.INDEX <file> <field>`
+- **Example**: `DELETE.INDEX ORDERS CUSTOMER`
+- **Note**: Admin clients can do all four over the [remote protocol](protocol.md), and from the
+  [web dashboard](web_dashboard.md).
+
 #### HELP
 
 Show the help message.
