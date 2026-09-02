@@ -182,7 +182,16 @@ or JSON in the way, and Criterion compares each run against the previous one sto
 | `record_codec` | `Record` encode/decode for a small (3 field) and a wide (~50 field, multi-valued) record.       |
 | `query`        | `parse_query` and `query_for_account` for unique-match, 10%-match and full-scan shapes.         |
 | `sort`         | `sort_results_for_account` over 10 000 records, single and compound sort specs.                 |
+| `explode`      | `query_exploded_in` bare, selective and unexploded, and sorting on the exploded column.         |
+| `select`       | `select_entries_in` against the owning path it replaced, over a narrow and a wide record.       |
+| `serialize`    | `serialize_record_with_schema` for a single-valued and a multivalued record.                    |
 | `storage`      | Saving 5 000 records, loading them back from disk, JSON serialisation, and `incremental_write`. |
+
+`select/owning_baseline/*` is kept beside `select/select_entries_in/*` deliberately: `SELECT` keeps keys and discards
+the records, so the baseline is what the same selection cost when it cloned every match first. The gap widens with the
+record rather than with the file - on a criterion matching one record in ten of ten thousand, 1.4x on a three-field
+record and 3.4x on one carrying an eight-valued field. A `select` figure drifting back towards its baseline means a
+record has found its way onto the path again.
 
 `storage/incremental_write/{1000,10000}_records` is the sharpest guard on write amplification: it updates a single
 record and flushes, on a small and on a large table. The two figures must match - 63 us and 61 us when this was written.

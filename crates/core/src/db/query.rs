@@ -461,11 +461,44 @@ impl Database {
         query: &QueryNode,
         keys_to_filter: Option<&[String]>,
     ) -> Vec<(String, &'a Record)> {
+        Self::collect_matches_in(table, use_dict_section, query, keys_to_filter, |key, record| {
+            (key.to_string(), record)
+        })
+    }
+
+    /// The keys `query` matches, in the order [`query_in`](Self::query_in)
+    /// produces them, without ever putting a record in the result.
+    ///
+    /// `SELECT` keeps keys and nothing else, so it has no use for the records
+    /// the evaluation walks over. Deciding that here rather than at the call
+    /// site means the vector it builds is one `String` per match instead of a
+    /// key and a record beside it.
+    pub fn query_keys_in(
+        table: &Table,
+        use_dict_section: bool,
+        query: &QueryNode,
+        keys_to_filter: Option<&[String]>,
+    ) -> Vec<String> {
+        Self::collect_matches_in(table, use_dict_section, query, keys_to_filter, |key, _| key.to_string())
+    }
+
+    /// Runs `query` over the section and projects each match through `project`,
+    /// which is the one place the evaluation order is defined: `keys_to_filter`
+    /// preserves the caller's order, a full scan is sorted by key.
+    ///
+    /// Generic over what a match becomes so that a caller wanting only keys and
+    /// a caller wanting the records share an evaluation rather than a copy of
+    /// one.
+    fn collect_matches_in<'a, T>(
+        table: &'a Table,
+        use_dict_section: bool,
+        query: &QueryNode,
+        keys_to_filter: Option<&[String]>,
+        project: impl Fn(&str, &'a Record) -> T,
+    ) -> Vec<T> {
         // Pre-calculate field indices and conversions to avoid repeated lookups per record
         let mut field_map = HashMap::new();
         Self::collect_field_indices(table, query, &mut field_map);
-
-        let mut results = Vec::new();
 
         let source_map = if use_dict_section {
             &table.dictionary
@@ -473,25 +506,27 @@ impl Database {
             &table.records
         };
 
-        if let Some(filter_keys) = keys_to_filter {
-            for key in filter_keys {
-                if let Some(record) = source_map.get(key)
-                    && Self::evaluate_node_static_with_id(key, record, query, &field_map)
-                {
-                    results.push((key.clone(), record));
-                }
-            }
-        } else {
+        let Some(filter_keys) = keys_to_filter else {
             // Optimize: Filter before sorting.
-            // Avoid cloning the entire table by using an iterator.
-            results = source_map
+            // Avoid cloning the entire table by using an iterator, and order the
+            // borrowed keys rather than copies of them, so only the matches that
+            // survive are ever materialised.
+            let mut matches: Vec<(&String, &Record)> = source_map
                 .iter()
                 .filter(|(key, record)| Self::evaluate_node_static_with_id(key, record, query, &field_map))
-                .map(|(key, record)| (key.clone(), record))
                 .collect();
-            results.sort_by(|a, b| a.0.cmp(&b.0));
-        }
+            matches.sort_by(|a, b| a.0.cmp(b.0));
+            return matches.into_iter().map(|(key, record)| project(key, record)).collect();
+        };
 
+        let mut results = Vec::new();
+        for key in filter_keys {
+            if let Some(record) = source_map.get(key)
+                && Self::evaluate_node_static_with_id(key, record, query, &field_map)
+            {
+                results.push(project(key, record));
+            }
+        }
         results
     }
 
@@ -591,6 +626,69 @@ impl Database {
                 all
             }
         }
+    }
+
+    /// Every key of the section, filtered to `keys_to_filter` when given, in the
+    /// same order [`all_in`](Self::all_in) produces - and without the records
+    /// beside them, which an unsorted, unexploded selection never reads.
+    fn all_keys_in(table: &Table, use_dict_section: bool, keys_to_filter: Option<&[String]>) -> Vec<String> {
+        let source_map = if use_dict_section {
+            &table.dictionary
+        } else {
+            &table.records
+        };
+        match keys_to_filter {
+            Some(filter_keys) => filter_keys
+                .iter()
+                .filter(|key| source_map.contains_key(*key))
+                .cloned()
+                .collect(),
+            None => {
+                let mut all: Vec<String> = source_map.keys().cloned().collect();
+                all.sort();
+                all
+            }
+        }
+    }
+
+    /// The entries a `SELECT` stores: the matching keys, ordered by `specs`,
+    /// with one entry per exploded value when `explode` names a field.
+    ///
+    /// This is the whole of what `SELECT` needs, and it copies no record on any
+    /// of its three paths. Unsorted and unexploded, the records are never even
+    /// borrowed. Sorted, they are borrowed to read the sort column from -
+    /// [`sort_results_in`](Self::sort_results_in) is generic over `Borrow`, so
+    /// references sort exactly as owned records would. Only the exploded path
+    /// carries records through, because a position belongs to a record.
+    pub fn select_entries_in(
+        table: &Table,
+        use_dict_section: bool,
+        query: Option<&QueryNode>,
+        explode: Option<&ExplodeSpec>,
+        keys_to_filter: Option<&[String]>,
+        specs: &[SortSpec],
+    ) -> Vec<SelectEntry> {
+        if explode.is_some() {
+            let mut rows = Self::query_exploded_in(table, use_dict_section, query, explode, keys_to_filter);
+            let explode_idx = Self::explode_field_index(table, explode);
+            Self::sort_entries_in(table, &mut rows, specs, explode_idx);
+            return rows.into_iter().map(|(entry, _)| entry).collect();
+        }
+
+        if specs.is_empty() {
+            let keys = match query {
+                Some(node) => Self::query_keys_in(table, use_dict_section, node, keys_to_filter),
+                None => Self::all_keys_in(table, use_dict_section, keys_to_filter),
+            };
+            return keys.into_iter().map(SelectEntry::new).collect();
+        }
+
+        let mut results = match query {
+            Some(node) => Self::query_in(table, use_dict_section, node, keys_to_filter),
+            None => Self::all_in(table, use_dict_section, keys_to_filter),
+        };
+        Self::sort_results_in(table, &mut results, specs);
+        results.into_iter().map(|(key, _)| SelectEntry::new(key)).collect()
     }
 
     /// Gathers every condition in the node that names `field_name`, regardless
