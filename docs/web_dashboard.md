@@ -163,6 +163,23 @@ Nothing in the page judges an attribute number or a justification. `SET.DICT` do
 whatever the form left blank, so the page re-reads the dictionary after every change and shows what was actually
 stored — a refusal appears in the banner in the database's own words.
 
+### The indexes of an account
+
+Above the per-file sections, and appearing as soon as an account is selected: every index in the account that is not
+earning its keep, named by file and field, with the measures that say why.
+
+This is the first gap an operator meets and the one the per-file table could never close. Nothing reported on an index
+unless somebody opened the page for its file, so a database with forty files had no view saying which three were worth
+attention — and a problem nobody is told about is a problem nobody finds. There are three columns of navigation before
+a single index otherwise.
+
+Only the exceptions are listed. A table of every index in the account would be the same wall of numbers one level
+further out; what is wanted here is which file to open, and the file's own table has the rest. Each row is a way
+through to that file. An account whose indexes are all fine says so, and one with none says what that costs.
+
+It is read when an account is chosen and again after any change to an index, not on a poll: the listing walks every
+file in the account, and a verdict that changes on a flush does not need a five-second refresh.
+
 ### The indexes of a file
 
 Beneath the dictionary is the file's [secondary indexes](storage.md#secondary-indexes) — the fields on which

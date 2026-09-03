@@ -212,6 +212,7 @@ const routes = {
     '/api/accounts/SALES/files/USERS/indexes': indexList([]),
     '/api/accounts/SALES/files/DIR/indexes': indexList([]),
     '/api/accounts/SALES/files/USERS/indexes/EMAIL': envelope({record: emailReport()}),
+    '/api/accounts/SALES/indexes': indexList([]),
 }
 
 /** Every request the page made, in order, as `METHOD /path`. */
@@ -826,6 +827,107 @@ describe('the dictionary of a file', () => {
         expect(wrapper.text()).toContain('Dictionary of SALES/DIR')
         expect(wrapper.text()).not.toContain('Edit EMAIL')
         expect((fields(wrapper)[0].element as HTMLInputElement).value).toBe('')
+    })
+})
+
+describe('the indexes of an account', () => {
+    let View: Component
+
+    /** The account-wide panel, a root-level sibling like the others. */
+    const panel = (wrapper: VueWrapper) => wrapper.find('.account-indexes')
+
+    const badIndex: IndexStats = {
+        ...emailIndex,
+        file: 'ORDERS',
+        field: 'STATUS',
+        values: 3,
+        largest_postings: 1164,
+        usage: {lookups: 0, candidates: 0, matched: 0, measured_lookups: 0, excluded_lookups: 0},
+        health: health(
+            measure('dominant_value', 'act', '91%', 'One value covers 91% of the file.'),
+            measure(
+                'usage',
+                'watch',
+                '0',
+                'No query has used this index since the server started.',
+            ),
+        ),
+    }
+
+    beforeEach(async () => {
+        vi.resetModules()
+        reset()
+        View = (await import('./AccountsView.vue')).default
+    })
+
+    afterEach(() => {
+        vi.unstubAllGlobals()
+        vi.restoreAllMocks()
+    })
+
+    it('appears with the account rather than waiting for a file to be opened', async () => {
+        // The gap this closes: nothing reported on an index unless somebody
+        // opened the page for its file, so a database with forty files had no
+        // view saying which three were worth looking at.
+        vi.stubGlobal('fetch', stubServer({'/api/accounts/SALES/indexes': indexList([badIndex])}))
+        const wrapper = mount(View)
+        await flushPromises()
+        expect(wrapper.find('.account-indexes').exists()).toBe(false)
+
+        await selectors(wrapper, 0)[0].trigger('click')
+        await flushPromises()
+        expect(panel(wrapper).text()).toContain('Indexes in SALES')
+        // Named by file and field, because the point is to say which file to open.
+        expect(panel(wrapper).text()).toContain('ORDERS/STATUS')
+        expect(panel(wrapper).text()).toContain('One value covers 91% of the file.')
+        expect(panel(wrapper).find('.tag.verdict.act').exists()).toBe(true)
+    })
+
+    it('lists only what needs attention, not every index in the account', async () => {
+        // A table of all forty would be the same wall of numbers one level
+        // further out. The file's own table is where the rest live.
+        vi.stubGlobal(
+            'fetch',
+            stubServer({
+                '/api/accounts/SALES/indexes': indexList([
+                    badIndex,
+                    {...emailIndex, health: health(measure('selectivity', 'good', '1.1', 'Fine.'))},
+                ]),
+            }),
+        )
+        const wrapper = mount(View)
+        await flushPromises()
+        await selectors(wrapper, 0)[0].trigger('click')
+        await flushPromises()
+
+        expect(panel(wrapper).text()).toContain('2 indexes across 2 files')
+        expect(panel(wrapper).text()).toContain('1 need attention')
+        expect(panel(wrapper).findAll('.list li')).toHaveLength(1)
+        expect(panel(wrapper).text()).not.toContain('USERS/EMAIL')
+    })
+
+    it('opens the file the bad index belongs to', async () => {
+        vi.stubGlobal('fetch', stubServer({'/api/accounts/SALES/indexes': indexList([badIndex])}))
+        const wrapper = mount(View)
+        await flushPromises()
+        await selectors(wrapper, 0)[0].trigger('click')
+        await flushPromises()
+
+        // ORDERS is not in the file list stub, so the request is what is
+        // asserted: the row is a way through to the file, not a dead end.
+        reset()
+        await panel(wrapper).find('.list button.select').trigger('click')
+        await flushPromises()
+        expect(traffic).toContain('GET /api/accounts/SALES/files/ORDERS')
+    })
+
+    it('says what an account with no indexes costs, rather than showing an empty table', async () => {
+        vi.stubGlobal('fetch', stubServer())
+        const wrapper = mount(View)
+        await flushPromises()
+        await selectors(wrapper, 0)[0].trigger('click')
+        await flushPromises()
+        expect(panel(wrapper).text()).toContain('No file in this account carries a secondary index')
     })
 })
 

@@ -449,6 +449,7 @@ select {
 
 /* The dictionary sits under the three columns and uses the whole width. */
 .dictionary .form,
+.account-indexes .form,
 .indexes .form {
   margin-top: 1rem;
 }
