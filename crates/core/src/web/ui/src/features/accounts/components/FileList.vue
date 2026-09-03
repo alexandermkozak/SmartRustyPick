@@ -1,7 +1,16 @@
 <script lang="ts" setup>
-/** The files of the selected account, each with its durability at a glance,
- *  and the two things an operator does to the list itself. */
+/**
+ * The files of the selected account, each with its durability and its health at
+ * a glance, and the two things an operator does to the list itself.
+ *
+ * The health pill is why this list is worth reading rather than only clicking
+ * through: a file whose format is out of date or whose index has fallen behind
+ * says so here, so a problem is findable without opening every file in turn.
+ * It is the cheap verdict - metadata only - and the panel to the right has the
+ * measures behind it.
+ */
 import {reactive} from 'vue'
+import HealthPill from '@shared/components/HealthPill.vue'
 import type {FileEntry} from '../types'
 
 const props = defineProps<{
@@ -55,12 +64,15 @@ function drop(name: string): void {
       >
         <span class="row">
           <span>{{ file.name }}</span>
-          <span
-            v-if="file.durable"
-            class="tag durable"
-            title="Every write is flushed before it is acknowledged"
-          >
-            durable
+          <span class="tags">
+            <HealthPill :title="file.health.reasons.join('; ')" :verdict="file.health.verdict" />
+            <span
+              v-if="file.durable"
+              class="tag durable"
+              title="Every write is flushed before it is acknowledged"
+            >
+              durable
+            </span>
           </span>
         </span>
       </button>

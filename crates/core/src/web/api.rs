@@ -93,6 +93,23 @@ fn accounts(body: &Value, name: &str) -> Vec<String> {
     }
 }
 
+/// A list of strings from a JSON body, empty when there is none.
+///
+/// Unlike [`accounts`] this does not split a string on commas and does not drop
+/// blanks: an index exclusion may legitimately be the empty value - a sparse
+/// field most records do not carry - and it may hold a comma. The only thing
+/// that can say what a value is, is the caller.
+fn values(body: &Value, name: &str) -> Vec<String> {
+    match body.get(name) {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(|value| value.as_str())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// A flag the caller must actually have sent. `SET.FILE` reads an absent
 /// durability flag as a mistake rather than as "off", so the endpoint has to
 /// tell "false" and "not there" apart before it forwards anything.
@@ -298,6 +315,11 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
             )
             .await
         }
+        // Every index in the account, so index health is visible without
+        // walking file by file. Same command, without the file.
+        ("GET", ["api", "accounts", account, "indexes"]) => {
+            run(client, json!({ "command": "LIST.INDEXES", "account": account })).await
+        }
         ("POST", ["api", "accounts", account, "files", file, "indexes"]) => {
             let field = match field(&body, "field") {
                 Some(field) => field,
@@ -305,7 +327,52 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
             };
             run(
                 client,
-                json!({ "command": "CREATE.INDEX", "account": account, "file": file, "field": field }),
+                json!({
+                    "command": "CREATE.INDEX",
+                    "account": account,
+                    "file": file,
+                    "field": field,
+                    "values": values(&body, "values"),
+                }),
+            )
+            .await
+        }
+        // One index in full, with the values that dominate it. The page asks
+        // for this deliberately, which is why it is not folded into the listing
+        // above: that one is read on every navigation and stays cheap.
+        ("GET", ["api", "accounts", account, "files", file, "indexes", field]) => {
+            let limit = request
+                .query
+                .get("limit")
+                .and_then(|limit| limit.parse::<usize>().ok());
+            run(
+                client,
+                json!({
+                    "command": "INDEX.STATS",
+                    "account": account,
+                    "file": file,
+                    "field": field,
+                    "limit": limit,
+                }),
+            )
+            .await
+        }
+        // Acting on the diagnosis the histogram above shows. Its own endpoint
+        // rather than a flag, for the reason `rebuild` is: it changes what an
+        // existing index holds, and confusing the two would let a mistyped
+        // field name quietly create a second index.
+        ("POST", ["api", "accounts", account, "files", file, "indexes", field, "exclude"]) => {
+            // An absent list clears the exclusions, which is what the command
+            // means by replacing the set - so nothing is refused for being empty.
+            run(
+                client,
+                json!({
+                    "command": "SET.INDEX.EXCLUDE",
+                    "account": account,
+                    "file": file,
+                    "field": field,
+                    "values": values(&body, "values"),
+                }),
             )
             .await
         }
@@ -443,6 +510,21 @@ mod tests {
             dictionary_attributes(&json!({ "name": "NAME", "field": 1 })),
             json!({ "field": 1 })
         );
+    }
+
+    #[test]
+    fn index_exclusions_keep_every_value_the_caller_sent() {
+        // Not `accounts`: an exclusion may be the empty value, which is the
+        // commonest one there is - a sparse field most records do not carry -
+        // and it may hold a comma or edge whitespace. Dropping either would be
+        // this endpoint deciding what a value is, which only the caller knows.
+        let body = json!({ "values": ["ACTIVE", "", "a,b", " padded "] });
+        assert_eq!(values(&body, "values"), vec!["ACTIVE", "", "a,b", " padded "]);
+
+        // An absent or non-array list is no exclusions, which is what clearing
+        // them looks like on the wire.
+        assert!(values(&json!({}), "values").is_empty());
+        assert!(values(&json!({ "values": "ACTIVE" }), "values").is_empty());
     }
 
     #[test]

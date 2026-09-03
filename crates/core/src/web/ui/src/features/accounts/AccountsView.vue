@@ -112,8 +112,12 @@ async function afterIndexChange(done: boolean): Promise<void> {
       :indexes="indexes.indexes.value"
       :loaded="indexes.loaded.value"
       :records="recordCount"
+      :report="indexes.report.value"
+      :report-field="indexes.inspecting.value"
       @rebuild="(field) => indexes.rebuild(field).then(afterIndexChange)"
       @drop="(field) => indexes.remove(field).then(afterIndexChange)"
+      @inspect="indexes.inspect"
+      @exclude="(field, values) => indexes.exclude(field, values).then(afterIndexChange)"
     />
     <IndexForm
       v-model="indexes.field.value"

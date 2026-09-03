@@ -8,7 +8,40 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {flushPromises, mount, type VueWrapper} from '@vue/test-utils'
 import type {Component} from 'vue'
-import type {AccountStats, DictionaryEntry, FileStats, IndexStats} from './types'
+import type {Health, Measure, Verdict} from '@shared/health'
+import type {AccountStats, DictionaryEntry, FileStats, IndexReport, IndexStats} from './types'
+
+/**
+ * A health object as the server sends one.
+ *
+ * The verdicts and the wording are the database's: the page renders what it is
+ * given rather than deciding anything, which is the property these fixtures are
+ * shaped to test. A fixture that re-derived a verdict here would be asserting
+ * that the page has a rule, which is exactly what it must not have.
+ */
+const measure = (id: string, verdict: Verdict, value: string, detail: string): Measure => ({
+    id,
+    label: id.replace(/_/g, ' '),
+    value,
+    verdict,
+    threshold: `the rule behind ${id}`,
+    detail,
+})
+
+const health = (...measures: Measure[]): Health => ({
+    verdict: measures.reduce<Verdict>(
+        (worst, m) =>
+            m.verdict === 'act' || worst === 'act'
+                ? 'act'
+                : m.verdict === 'watch'
+                  ? 'watch'
+                  : worst,
+        'good',
+    ),
+    measures,
+})
+
+const healthy = health(measure('skew', 'good', '1.2x', 'Records are spread evenly.'))
 
 const account: AccountStats = {
     name: 'SALES',
@@ -16,6 +49,10 @@ const account: AccountStats = {
     file_count: 2,
     record_count: 1280,
     disk_bytes: 262144,
+    index_count: 1,
+    stale_indexes: 0,
+    unhealthy_files: 0,
+    health: {verdict: 'good', reasons: []},
 }
 
 const fileStats: FileStats = {
@@ -35,6 +72,29 @@ const fileStats: FileStats = {
     loaded: true,
     modified_seconds_ago: 12,
     indexes: [],
+    group_bytes: 212992,
+    index_bytes: 40960,
+    records_per_group_target: 16,
+    load_factor: 0.625,
+    records_until_growth: 769,
+    records_until_shrink: 768,
+    largest_group_share: 0.021,
+    skew: 2.7,
+    group_records: {
+        groups: 128,
+        min: 3,
+        max: 27,
+        mean: 10,
+        median: 10,
+        empty: 0,
+        overweight: 4,
+        unreadable: 0,
+        buckets: [
+            {min: 3, max: 12, groups: 120},
+            {min: 13, max: 27, groups: 8},
+        ],
+    },
+    health: healthy,
 }
 
 // The real envelope: the server omits every field the command did not populate,
@@ -53,12 +113,12 @@ function stubFetch(routes: Record<string, unknown>) {
     })
 }
 
-const fileList = (durable: boolean) =>
+const fileList = (durable: boolean, usersHealth = 'good', reasons: string[] = []) =>
     envelope({
         keys: ['DIR', 'USERS'],
         results: [
-            ['DIR', {durable: false}],
-            ['USERS', {durable}],
+            ['DIR', {durable: false, health: 'good', health_reasons: []}],
+            ['USERS', {durable, health: usersHealth, health_reasons: reasons}],
         ],
         count: 2,
     })
@@ -92,6 +152,7 @@ const dictionaryList = (entries: DictionaryEntry[] = dictionary) =>
     })
 
 const emailIndex: IndexStats = {
+    file: 'USERS',
     field: 'EMAIL',
     attribute: 2,
     values: 1200,
@@ -105,7 +166,35 @@ const emailIndex: IndexStats = {
     stale: false,
     loaded: true,
     built_seconds_ago: 90,
+    excluded: [],
+    usage: {
+        lookups: 812,
+        candidates: 866,
+        matched: 840,
+        measured_lookups: 800,
+        excluded_lookups: 0,
+    },
+    health: health(
+        measure(
+            'selectivity',
+            'good',
+            '1.1',
+            'An average lookup narrows 1,280 records to about 1.',
+        ),
+    ),
 }
+
+/** `INDEX.STATS` for one index: the values that dominate it. */
+const emailReport = (index: IndexStats = emailIndex): IndexReport => ({
+    record_count: 1280,
+    index,
+    values_available: true,
+    top_values: [
+        {value: 'ACTIVE', keys: 900},
+        {value: '', keys: 200},
+        {value: 'PENDING', keys: 180},
+    ],
+})
 
 const indexList = (entries: IndexStats[]) =>
     envelope({
@@ -122,6 +211,7 @@ const routes = {
     '/api/accounts/SALES/files/DIR/dictionary': dictionaryList([]),
     '/api/accounts/SALES/files/USERS/indexes': indexList([]),
     '/api/accounts/SALES/files/DIR/indexes': indexList([]),
+    '/api/accounts/SALES/files/USERS/indexes/EMAIL': envelope({record: emailReport()}),
 }
 
 /** Every request the page made, in order, as `METHOD /path`. */
@@ -213,6 +303,65 @@ describe('the accounts view', () => {
         expect(wrapper.text()).toContain('2 files')
         expect(wrapper.text()).toContain('1,280 records')
         expect(wrapper.text()).toContain('db_storage/SALES')
+    })
+
+    it('shows what the database makes of a file, not only what it is made of', async () => {
+        // The panel used to render thirteen rows with no evaluation of any of
+        // them, leaving the reader to decide whether four megabytes against
+        // ninety-six kilobytes was fine.
+        const unwell = {
+            ...fileStats,
+            legacy: true,
+            checksums: false,
+            health: health(
+                measure('format', 'act', 'legacy flat file', 'The next flush converts it.'),
+                measure(
+                    'skew',
+                    'watch',
+                    '4.1x',
+                    'The largest group holds 27 against a mean of 10.',
+                ),
+            ),
+        }
+        vi.stubGlobal(
+            'fetch',
+            stubFetch({...routes, '/api/accounts/SALES/files/USERS': envelope({record: unwell})}),
+        )
+        const wrapper = await openUsers(View)
+
+        // The verdict, its wording and the rule behind it - all the server's.
+        expect(wrapper.text()).toContain('needs attention')
+        expect(wrapper.text()).toContain('The next flush converts it.')
+        expect(wrapper.text()).toContain('the rule behind format')
+        // Worst first, so the row to act on is the one read first.
+        const measures = wrapper.findAll('.measure')
+        expect(measures[0].classes()).toContain('act')
+
+        // And the layout is still there, with the two figures that were only
+        // ever available by opening the file: the spread and the headroom.
+        expect(wrapper.text()).toContain('Records per group')
+        expect(wrapper.text()).toContain('3 / 10 / 10.0 / 27')
+        expect(wrapper.text()).toContain('769 more records doubles it')
+        expect(wrapper.find('.distribution').exists()).toBe(true)
+    })
+
+    it('marks the file that needs attention in the list, so it can be found', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubFetch({
+                ...routes,
+                '/api/accounts/SALES/files': fileList(false, 'act', ['1 of 2 indexes stale']),
+            }),
+        )
+        const wrapper = mount(View)
+        await flushPromises()
+        await selectors(wrapper, 0)[0].trigger('click')
+        await flushPromises()
+
+        const entries = wrapper.findAll('.list')[1].findAll('li')
+        expect(entries[0].find('.tag.verdict').exists()).toBe(false)
+        expect(entries[1].find('.tag.verdict.act').exists()).toBe(true)
+        expect(entries[1].find('.tag.verdict').attributes('title')).toBe('1 of 2 indexes stale')
     })
 
     it("drills from an account to its files to one file's statistics", async () => {
@@ -716,7 +865,7 @@ describe('the indexes of a file', () => {
         expect(panel(opened).text()).toContain('1,280')
     })
 
-    it('shows the counts an index is judged on, and what they add up to', async () => {
+    it('shows the counts an index is judged on, and how much it is used', async () => {
         vi.stubGlobal(
             'fetch',
             stubServer({
@@ -732,22 +881,134 @@ describe('the indexes of a file', () => {
         expect(cells[3].text()).toBe('1,280')
         expect(cells[4].text()).toBe('1.1')
         expect(cells[5].text()).toBe('3')
-        // The analysis, not just the numbers: this one is worth having.
-        expect(panel(wrapper).text()).toContain('Close to unique')
+        // Lookups served: the number that says whether anything is querying it
+        // at all, which no shape over the data can answer.
+        expect(cells[6].text()).toBe('812')
     })
 
-    it('warns when one value covers so much of the file that an index cannot help', async () => {
+    it('renders the database’s verdict rather than deciding one of its own', async () => {
+        // The page used to hold its own thresholds - a lookup narrowing to two
+        // records is "close to unique", a largest posting list of a quarter of
+        // the file is worth warning about - which the CLI did not share. The
+        // rule now lives in the engine, and this asserts the page says what it
+        // was told and nothing else.
+        const dominated = {
+            ...emailIndex,
+            values: 2,
+            postings: 1280,
+            largest_postings: 900,
+            health: health(
+                measure(
+                    'dominant_value',
+                    'act',
+                    '70%',
+                    'One value covers 70% of the file. Read the value histogram and exclude it.',
+                ),
+            ),
+        }
         vi.stubGlobal(
             'fetch',
             stubServer({
-                '/api/accounts/SALES/files/USERS/indexes': indexList([
-                    {...emailIndex, values: 2, postings: 1280, largest_postings: 900},
-                ]),
+                '/api/accounts/SALES/files/USERS/indexes': indexList([dominated]),
+                '/api/accounts/SALES/files/USERS/indexes/EMAIL': envelope({
+                    record: emailReport(dominated),
+                }),
             }),
         )
         const wrapper = await openUsers(View)
-        expect(panel(wrapper).text()).toContain('about 640 records')
-        expect(panel(wrapper).text()).toContain('covers 70% of the file')
+
+        // The verdict is visible on the row before anything is opened.
+        expect(rows(wrapper)[0].find('.tag.verdict.act').exists()).toBe(true)
+
+        await rows(wrapper)[0].findAll('button')[0].trigger('click')
+        await flushPromises()
+        expect(panel(wrapper).text()).toContain('One value covers 70% of the file')
+        // And the rule behind it, so the number is arguable rather than oracular.
+        expect(panel(wrapper).text()).toContain('the rule behind dominant_value')
+    })
+
+    it('names the value that dominates an index, and offers to stop indexing it', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubServer({
+                '/api/accounts/SALES/files/USERS/indexes': indexList([emailIndex]),
+            }),
+        )
+        const wrapper = await openUsers(View)
+
+        // The values are their own request: the listing is read on every
+        // navigation and stays cheap, so this is asked for deliberately.
+        expect(traffic).not.toContain('GET /api/accounts/SALES/files/USERS/indexes/EMAIL')
+        await rows(wrapper)[0].findAll('button')[0].trigger('click')
+        await flushPromises()
+        expect(traffic).toContain('GET /api/accounts/SALES/files/USERS/indexes/EMAIL')
+
+        // Largest first, with its share of the file - "STATUS = ACTIVE is 70%
+        // of it" rather than "this index is skewed".
+        const values = panel(wrapper).findAll('.value-histogram tbody tr')
+        expect(values[0].text()).toContain('ACTIVE')
+        expect(values[0].text()).toContain('900')
+        expect(values[0].text()).toContain('70%')
+        // The empty value is a value like any other and is named, not blank.
+        expect(values[1].text()).toContain('(the empty value)')
+
+        // Acting on the diagnosis without leaving the page for the CLI.
+        reset()
+        await values[0].find('button').trigger('click')
+        await flushPromises()
+        expect(sent[0]).toEqual({
+            method: 'POST',
+            path: '/api/accounts/SALES/files/USERS/indexes/EMAIL/exclude',
+            body: JSON.stringify({values: ['ACTIVE']}),
+        })
+        // The histogram is what has just changed, so it is re-read as well as
+        // the listing.
+        expect(traffic).toContain('GET /api/accounts/SALES/files/USERS/indexes/EMAIL')
+    })
+
+    it('keeps the exclusions it already has when another value is added', async () => {
+        const excluding = {...emailIndex, excluded: ['']}
+        vi.stubGlobal(
+            'fetch',
+            stubServer({
+                '/api/accounts/SALES/files/USERS/indexes': indexList([excluding]),
+                '/api/accounts/SALES/files/USERS/indexes/EMAIL': envelope({
+                    record: emailReport(excluding),
+                }),
+            }),
+        )
+        const wrapper = await openUsers(View)
+        await rows(wrapper)[0].findAll('button')[0].trigger('click')
+        await flushPromises()
+        expect(panel(wrapper).text()).toContain('Not indexed: “(the empty value)”')
+
+        reset()
+        await panel(wrapper).findAll('.value-histogram tbody tr')[0].find('button').trigger('click')
+        await flushPromises()
+        // The command replaces the set, so the page has to send what it wants
+        // kept as well as what it is adding.
+        expect(sent[0].body).toBe(JSON.stringify({values: ['', 'ACTIVE']}))
+    })
+
+    it('will not read the values of an index that does not match the records', async () => {
+        const stale = {...emailIndex, stale: true}
+        vi.stubGlobal(
+            'fetch',
+            stubServer({
+                '/api/accounts/SALES/files/USERS/indexes': indexList([stale]),
+                '/api/accounts/SALES/files/USERS/indexes/EMAIL': envelope({
+                    record: {...emailReport(stale), values_available: false, top_values: []},
+                }),
+            }),
+        )
+        const wrapper = await openUsers(View)
+        await rows(wrapper)[0].findAll('button')[0].trigger('click')
+        await flushPromises()
+
+        // An empty histogram would read as an empty index, which is a different
+        // and wrong thing to tell somebody.
+        expect(panel(wrapper).find('.value-histogram').exists()).toBe(false)
+        expect(panel(wrapper).text()).toContain('does not match the records')
     })
 
     it('marks a stale index and says what to do about it', async () => {
@@ -764,7 +1025,6 @@ describe('the indexes of a file', () => {
         )
         const wrapper = await openUsers(View)
         expect(panel(wrapper).find('.tag.stale').exists()).toBe(true)
-        expect(panel(wrapper).text()).toContain('rebuild it')
         // And it is visible from the statistics panel, which is where an
         // operator already is when they are wondering about the file.
         expect(wrapper.text()).toContain('EMAIL (1 stale)')
@@ -806,7 +1066,7 @@ describe('the indexes of a file', () => {
             {
                 method: 'POST',
                 path: '/api/accounts/SALES/files/USERS/indexes',
-                body: '{"field":"EMAIL"}',
+                body: '{"field":"EMAIL","values":[]}',
             },
         ])
         // The list and the file's statistics both describe the new index.
@@ -827,7 +1087,8 @@ describe('the indexes of a file', () => {
         const wrapper = await openUsers(View)
         reset()
 
-        await rows(wrapper)[0].findAll('button')[0].trigger('click')
+        // Values, Rebuild, Drop.
+        await rows(wrapper)[0].findAll('button')[1].trigger('click')
         await flushPromises()
 
         expect(sent).toEqual([
@@ -849,7 +1110,7 @@ describe('the indexes of a file', () => {
         const wrapper = await openUsers(View)
         reset()
 
-        await rows(wrapper)[0].findAll('button')[1].trigger('click')
+        await rows(wrapper)[0].findAll('button')[2].trigger('click')
         await flushPromises()
 
         expect(window.confirm).toHaveBeenCalledWith(

@@ -35,3 +35,20 @@ export interface ServerSnapshot {
     loaded_tables: number
     authorized_clients: number
 }
+
+/**
+ * One account's storage roll-up, as the Overview reads it.
+ *
+ * The same object `LIST.ACCOUNTS` hands the Accounts tab; this slice needs only
+ * the counts and the verdict, and declares only those - a slice does not import
+ * another slice's types any more than it imports its code.
+ */
+export interface AccountHealth {
+    name: string
+    file_count: number
+    /** Absent from an older server's reply, which is why these are optional. */
+    index_count?: number
+    stale_indexes?: number
+    unhealthy_files?: number
+    health?: {verdict: string; reasons: string[]}
+}

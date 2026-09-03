@@ -16,7 +16,7 @@
 import {computed, ref, watch, type Ref} from 'vue'
 import {useAlerts} from '@shared/composables/useAlerts'
 import {accountsApi} from '../api'
-import type {DictionaryEntry, IndexStats} from '../types'
+import type {DictionaryEntry, IndexReport, IndexStats} from '../types'
 
 export function useFileIndexes(
     account: Ref<string | null>,
@@ -31,6 +31,11 @@ export function useFileIndexes(
     const working = ref(false)
     /** The field the create form has selected. */
     const field = ref('')
+    /** The index whose values are open, and the report behind them. `null`
+     *  while nothing is open, which is most of the time - reading an index's
+     *  values costs more than listing them, so it is asked for deliberately. */
+    const inspecting = ref<string | null>(null)
+    const report = ref<IndexReport | null>(null)
 
     /**
      * The dictionary fields that could still be indexed: everything defined,
@@ -59,6 +64,26 @@ export function useFileIndexes(
             alerts.fail(cause)
         } finally {
             loaded.value = true
+        }
+    }
+
+    /**
+     * Reads one index's values, or forgets them when nothing is open.
+     *
+     * Its own request rather than part of the listing: `LIST.INDEXES` is read
+     * on every navigation and stays cheap, while this sorts the index's values.
+     */
+    async function inspect(name: string | null): Promise<void> {
+        inspecting.value = name
+        report.value = null
+        const [selectedAccount, selectedFile] = [account.value, file.value]
+        if (!name || !selectedAccount || !selectedFile) return
+        try {
+            report.value = await accountsApi.indexReport(selectedAccount, selectedFile, name)
+        } catch (cause) {
+            // The listing is still on screen and still true, so this is a
+            // failure to read *more*, not a failure of the page.
+            alerts.fail(cause)
         }
     }
 
@@ -114,7 +139,25 @@ export function useFileIndexes(
     async function remove(name: string): Promise<boolean> {
         const [selectedAccount, selectedFile] = [account.value, file.value]
         if (!selectedAccount || !selectedFile) return false
+        if (inspecting.value === name) await inspect(null)
         return change(() => accountsApi.deleteIndex(selectedAccount, selectedFile, name))
+    }
+
+    /**
+     * Replaces the values one index skips.
+     *
+     * The values are re-read afterwards as well as the list: excluding a value
+     * rebuilds the index, so the histogram the operator was looking at when
+     * they pressed the button is the thing that has just changed.
+     */
+    async function exclude(name: string, values: string[]): Promise<boolean> {
+        const [selectedAccount, selectedFile] = [account.value, file.value]
+        if (!selectedAccount || !selectedFile) return false
+        const done = await change(() =>
+            accountsApi.setIndexExclusions(selectedAccount, selectedFile, name, values),
+        )
+        if (inspecting.value === name) await inspect(name)
+        return done
     }
 
     // A different file has different indexes, and whatever field was chosen for
@@ -125,6 +168,8 @@ export function useFileIndexes(
             loaded.value = false
             indexes.value = []
             field.value = ''
+            inspecting.value = null
+            report.value = null
             void load()
         },
         {immediate: true},
@@ -137,5 +182,19 @@ export function useFileIndexes(
         if (field.value && !available.includes(field.value)) field.value = ''
     })
 
-    return {indexes, loaded, working, field, candidates, load, create, rebuild, remove}
+    return {
+        indexes,
+        loaded,
+        working,
+        field,
+        candidates,
+        inspecting,
+        report,
+        load,
+        create,
+        rebuild,
+        remove,
+        inspect,
+        exclude,
+    }
 }
