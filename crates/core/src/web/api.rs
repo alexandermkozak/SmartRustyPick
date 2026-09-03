@@ -341,10 +341,7 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
         // for this deliberately, which is why it is not folded into the listing
         // above: that one is read on every navigation and stays cheap.
         ("GET", ["api", "accounts", account, "files", file, "indexes", field]) => {
-            let limit = request
-                .query
-                .get("limit")
-                .and_then(|limit| limit.parse::<usize>().ok());
+            let limit = request.query.get("limit").and_then(|limit| limit.parse::<usize>().ok());
             run(
                 client,
                 json!({

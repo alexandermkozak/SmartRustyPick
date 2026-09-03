@@ -77,7 +77,41 @@ AI agents have been responsible for several critical improvements and fixes in t
   itself immediately: a `query_string` the parser could not read used to come back as *the whole file* with
   `status: "OK"`, because "not a query" and "no query" were the same `None`. It is now `INVALID_QUERY`.
 
-### 5. Concurrency
+### 5. Health: turning a number into advice
+
+- **Verdicts, not raw figures:** `FILE.STATS` used to answer "how big is this file" and `LIST.INDEXES` reported three
+  counts. Neither answered the question an administrator actually has, which is *is this healthy, and will it stay that
+  way*. Every derived measure now carries a verdict - `good` / `watch` / `act` - and the threshold that produced it.
+- **The rule that keeps it honest:** the verdict is decided **on the server**, in `db::health`, and every threshold in
+  the system sits in one module. The CLI, the remote protocol and the browser describe the same file, and three copies
+  of "5% is the line" is three chances to disagree. A client branches on `id` and `verdict`; `label`, `threshold` and
+  `detail` are prose for a person, exactly as an error code is the interface and its message is not. The dashboard's
+  `shared/health.ts` holds no threshold at all - only presentation.
+- **A measure that cannot be judged says so.** Skew over four records, usage on a server that started a second ago:
+  both report `good` and explain why in their detail. Inventing a verdict from too little data is how a dashboard
+  teaches people to ignore it.
+- **Records per group, without reading a record.** The count is in each group's 20-byte trailer, so the true
+  distribution costs one seek per group. A test asserts the file is still not loaded afterwards, because
+  `docs/web_dashboard.md` promises that and the easy implementation would have broken it.
+- **The bug the distribution found:** it was first computed over the group *files*. An empty group has no file, so a
+  file whose records had piled into four groups out of thirty-two averaged out as perfectly even - the exact case skew
+  exists to catch. It is over the modulus now, with absent groups counted as the zeroes they are.
+- **Excluded index values.** An index can skip nominated values: the shape it exists for is a field where 90% of
+  records carry one value, which is excellent to index *for the other 10%*. The whole risk is the planner, and the
+  contract is that a lookup on an excluded value returns `None` - "I cannot help, scan for it" - and never an empty
+  posting list, which would read as "no records". That is sound because "I do not know" was already an answer the
+  planner handled. The tests run the same queries with and without the index and assert the answers are identical,
+  the excluded value included. Excluding the dominant value of a skewed field is 8x off the write path on a thousand
+  records, and takes the index section from 84 KB to 12 KB on ten thousand.
+- **A benchmark that measured nothing.** The first version of `storage/excluded_write` re-stored records with the
+  status they already had, and an index charges nothing for that - it compares two short lists and stops. Two rounds of
+  "the numbers are suspiciously equal" before the write was made to actually *move* the value. Worth remembering: a
+  benchmark agreeing with the null hypothesis is a claim about the benchmark first.
+- **Usage counters, honestly attributed.** Survivors are credited to an index only when one index resolved the whole
+  query; once an `AND` intersects two there is no honest way to say which of them a surviving record is owed to, so
+  such a query counts its lookups and leaves the precision alone.
+
+### 6. Concurrency
 
 - **Per-file locking:** The database-wide write lock is gone. Each loaded file carries its own lock, and every other
   piece of shared state - the account registry, the file listings, the client authorizations, the flush accounting -

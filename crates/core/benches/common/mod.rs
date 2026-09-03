@@ -121,3 +121,51 @@ pub fn build_mv_table(db: &mut Database, table_name: &str, count: usize) {
     }
     table.touch_all();
 }
+
+/// Record shaped `NAME^STATUS^AMOUNT`, where `STATUS` is one dominant value on
+/// nine records in ten.
+///
+/// The shape an index exclusion exists for: a field where most of the file
+/// carries one value and the rest is spread thinly. That field is excellent to
+/// index for the thin part, and indexing the dominant value buys nothing while
+/// costing the most.
+pub fn dominant_record(i: usize) -> Record {
+    let mut rec = Record::new();
+    rec.fields.push(field(&format!("NAME{i}")));
+    let status = if i.is_multiple_of(10) {
+        format!("RARE{}", i % 500)
+    } else {
+        "ACTIVE".to_string()
+    };
+    rec.fields.push(field(&status));
+    rec.fields.push(field(&format!("{}", i % 1000)));
+    rec
+}
+
+/// [`dominant_record`] with `STATUS` chosen rather than derived from the key.
+///
+/// What a benchmark of index maintenance needs: a write only costs an index
+/// anything when it *moves* a value, and re-storing a record with the value it
+/// already had costs a comparison of two short lists and no index work at all.
+pub fn record_with_status(i: usize, status: &str) -> Record {
+    let mut rec = Record::new();
+    rec.fields.push(field(&format!("NAME{i}")));
+    rec.fields.push(field(status));
+    rec.fields.push(field(&format!("{}", i % 1000)));
+    rec
+}
+
+/// Creates `table_name` with a `NAME`/`STATUS`/`AMOUNT` dictionary and `count`
+/// records from [`dominant_record`].
+pub fn build_dominant_table(db: &mut Database, table_name: &str, count: usize) {
+    db.create_table(table_name).unwrap();
+    let table_handle = db.get_table_mut(table_name).unwrap();
+    let mut table = table_handle.write();
+    table.dictionary.insert("NAME".to_string(), dict_entry("NAME", 1));
+    table.dictionary.insert("STATUS".to_string(), dict_entry("STATUS", 2));
+    table.dictionary.insert("AMOUNT".to_string(), dict_entry("AMOUNT", 3));
+    for i in 0..count {
+        table.records.insert(format!("K{i:06}"), dominant_record(i));
+    }
+    table.touch_all();
+}

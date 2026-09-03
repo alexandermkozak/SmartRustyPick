@@ -955,3 +955,63 @@ fn an_exclusion_round_trips_through_the_state_file_whatever_it_holds() {
     index::write_state(&path, &with_newline, crate::db::hashfile::FsyncPolicy::Never).unwrap();
     assert_eq!(index::read_state(&path), Some(with_newline));
 }
+
+#[test]
+fn excluding_the_dominant_value_is_what_makes_the_write_cheaper() {
+    // The cost side of the feature, asserted rather than argued. An index entry
+    // is one record holding every key that carries its value, so the dominant
+    // value's entry is both the largest thing in the index and the thing
+    // rewritten on every write that moves a record into or out of it.
+    //
+    // Bytes rather than time: what the exclusion changes is how much has to be
+    // written, and that is measurable without depending on the disk underneath.
+    let guard = TempDir::new("index_exclude_cost");
+    let db = open_account(guard.path());
+    build_skewed_file(&db, "ORDERS", 2_000);
+
+    let section_bytes = || -> u64 {
+        let dir = crate::db::hashfile::section_dir(&index::section_path(&format!("{}/ORDERS", guard.path()), "STATUS"));
+        let Ok(entries) = fs::read_dir(dir) else { return 0 };
+        entries
+            .flatten()
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len())
+            .sum()
+    };
+
+    // A write that moves one record's status, which is what a status field does
+    // in life and the only kind of write an index pays for at all - re-storing
+    // a record with the value it already had compares two short lists and stops.
+    let flip = |db: &Database, to: &str| {
+        let handle = db.get_table_mut("ORDERS").unwrap();
+        handle
+            .write()
+            .insert_record("K0001", Record::from_display_string(&format!("NAME1^{}", to)));
+        drop(handle);
+        db.save().unwrap();
+    };
+
+    db.create_index_for_account(ACCOUNT, "ORDERS", "STATUS").unwrap();
+    flip(&db, "ACTIVE");
+    let whole = section_bytes();
+
+    db.set_index_exclusions(ACCOUNT, "ORDERS", "STATUS", &["ACTIVE".to_string()])
+        .unwrap();
+    flip(&db, "ACTIVE");
+    let trimmed = section_bytes();
+
+    // The dominant value is 85% of this file, and its entry is 85% of the index
+    // - so dropping it should be most of the section, not a rounding error.
+    assert!(
+        trimmed * 3 < whole,
+        "excluding the dominant value left the index at {} bytes against {}; \
+         it should be a fraction of it",
+        trimmed,
+        whole
+    );
+
+    // And the write is still correct: the record moved, and a query for the
+    // excluded value finds it exactly as a scan would.
+    assert!(query(&db, "ORDERS", &["WITH", "STATUS", "=", "ACTIVE"]).contains(&"K0001".to_string()));
+}

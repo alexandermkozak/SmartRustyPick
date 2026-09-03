@@ -124,6 +124,60 @@ fn bench_indexed_write(c: &mut Criterion) {
     group.finish();
 }
 
+/// What excluding the dominant value of a skewed field does to the write cost.
+///
+/// The motivating case for index exclusions, measured rather than argued. The
+/// field is `STATUS`: `ACTIVE` on nine records in ten, and one of five hundred
+/// rare values on the tenth.
+///
+/// * `whole` indexes every value. The `ACTIVE` posting list holds nine tenths
+///   of the file's keys, so every write that touches a record carrying it
+///   rewrites that entry - the longest one in the index.
+/// * `excluding_dominant` indexes everything but `ACTIVE`. The rare values are
+///   still found through the index; a query for `ACTIVE` falls back to the scan
+///   that was going to do the work anyway.
+///
+/// The gap between the two rows is what the exclusion is worth, and it widens
+/// with the file: the dominant entry grows with the records while the rare ones
+/// do not.
+fn bench_excluded_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("storage");
+    group.throughput(Throughput::Elements(1));
+
+    for records in [1_000usize, 10_000usize] {
+        for (label, exclude) in [("whole", &[][..]), ("excluding_dominant", &["ACTIVE".to_string()][..])] {
+            let dir = common::TempDir::new(&format!("excl{records}{label}"));
+            let mut db = common::new_db(dir.path());
+            common::build_dominant_table(&mut db, TABLE, records);
+            db.save().unwrap();
+            db.create_index_excluding(common::ACCOUNT, TABLE, "STATUS", exclude)
+                .unwrap();
+
+            group.bench_function(format!("excluded_write/{label}/{records}_records"), |b| {
+                let mut counter = 0usize;
+                b.iter(|| {
+                    counter += 1;
+                    // One record, whose status alternates. The write has to
+                    // *move* the indexed value or it costs the index nothing at
+                    // all - re-storing a record with the value it already had
+                    // compares two short lists and stops - and holding the key
+                    // fixed keeps the data-group write constant, so the whole
+                    // difference between the two rows is the index.
+                    let status = if counter.is_multiple_of(2) { "ACTIVE" } else { "RARE7" };
+                    let table_handle = db.get_table_mut_for_account(common::ACCOUNT, TABLE).unwrap();
+                    let mut table = table_handle.write();
+                    table.insert_record("K000007", common::record_with_status(7, status));
+                    drop(table);
+                    db.save().unwrap();
+                    black_box(counter)
+                })
+            });
+        }
+    }
+
+    group.finish();
+}
+
 fn bench_serialize(c: &mut Criterion) {
     let dir = common::TempDir::new("serialize");
     let mut db = common::new_db(dir.path());
@@ -145,6 +199,7 @@ criterion_group!(
     bench_save,
     bench_incremental_write,
     bench_indexed_write,
+    bench_excluded_write,
     bench_serialize
 );
 criterion_main!(benches);
