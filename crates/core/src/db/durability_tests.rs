@@ -1,3 +1,4 @@
+use crate::db::DbError;
 use crate::db::engine::Database;
 use crate::db::hashfile;
 use crate::db::models::*;
@@ -301,13 +302,15 @@ fn test_the_durability_flag_is_only_settable_on_a_file_that_can_carry_one() {
     db.create_table("LEDGER").unwrap();
 
     let missing = db.set_table_durable("NOPE", true).unwrap_err();
-    assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
-    assert!(missing.to_string().contains("NOPE"), "unexpected message: {}", missing);
+    assert!(
+        matches!(&missing, DbError::FileNotFound { file, .. } if file == "NOPE"),
+        "unexpected error: {missing:?}"
+    );
 
     // DIR holds the flags and its entry for itself would be dropped the next
     // time the listing is rebuilt, so the answer is no rather than a lie.
     let dir = db.set_table_durable("DIR", true).unwrap_err();
-    assert_eq!(dir.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(matches!(dir, DbError::InvalidRequest(_)), "unexpected error: {dir:?}");
 }
 
 #[test]

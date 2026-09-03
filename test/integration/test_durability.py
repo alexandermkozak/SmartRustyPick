@@ -182,6 +182,9 @@ def main():
                 resp = conn.request(command="SET.FILE", file=BUFFERED_FILE, account=ACCOUNT)
                 suite.check_eq("SET.FILE without a flag is refused", resp["status"], "ERROR")
                 suite.check_eq(
+                    "SET.FILE classifies the refusal", resp.get("code"), "MISSING_FIELD"
+                )
+                suite.check_eq(
                     "SET.FILE says which field is missing",
                     resp.get("message"),
                     "Durability flag not specified",
@@ -191,7 +194,9 @@ def main():
                     command="SET.FILE", file="NO_SUCH_FILE", account=ACCOUNT, durable=True
                 )
                 suite.check_eq("SET.FILE on a missing file is refused", resp["status"], "ERROR")
-                suite.check("SET.FILE says the file is not there", "not found" in (resp.get("message") or ""))
+                suite.check_eq(
+                    "SET.FILE says the file is not there", resp.get("code"), "FILE_NOT_FOUND"
+                )
 
             # Durability is a storage decision, so it is admin only - a client
             # that may read and write the account still may not change it.
@@ -200,9 +205,7 @@ def main():
                     command="SET.FILE", file=BUFFERED_FILE, account=ACCOUNT, durable=False
                 )
                 suite.check_eq("A non-admin client may not set durability", resp["status"], "ERROR")
-                suite.check_eq(
-                    "The refusal says why", resp.get("message"), "Admin privileges required"
-                )
+                suite.check_eq("The refusal says why", resp.get("code"), "ADMIN_REQUIRED")
         except Exception as exc:  # noqa: BLE001 - report instead of aborting the whole run
             suite.error("Durability suite", exc)
         finally:

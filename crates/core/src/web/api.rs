@@ -6,6 +6,7 @@
 //! TCP listener could not, and a permission decision is made in exactly one
 //! place - the command handler.
 
+use crate::server::models::ErrorCode;
 use crate::web::client::ProtocolClient;
 use crate::web::http::{Request, Response};
 use serde_json::{Value, json};
@@ -13,18 +14,30 @@ use std::sync::Arc;
 
 /// Maps a protocol error onto the status code that describes it.
 ///
-/// The protocol has one error status and a human-readable message; a browser
-/// client wants to tell "you may not" apart from "that does not exist" without
-/// parsing prose, so the few messages that carry a distinct meaning are
-/// classified here and everything else is a plain bad request.
-fn status_for(message: &str) -> u16 {
-    let lowered = message.to_ascii_lowercase();
-    if lowered.contains("admin privileges required") || lowered.contains("access denied") {
-        403
-    } else if lowered.contains("not found") {
-        404
-    } else {
-        400
+/// The protocol has one error status; a browser client wants to tell "you may
+/// not" apart from "that does not exist", and the error code is what says
+/// which. This used to read the message instead, which made the wording of
+/// every refusal part of the dashboard's interface. A response with no code -
+/// from a server older than the codes - is a plain bad request, as it was
+/// before.
+fn status_for(code: Option<ErrorCode>) -> u16 {
+    match code {
+        Some(ErrorCode::AdminRequired | ErrorCode::AccessDenied | ErrorCode::Deauthorized) => 403,
+        Some(ErrorCode::PermissionDenied | ErrorCode::AccountProtected) => 403,
+        Some(
+            ErrorCode::AccountNotFound
+            | ErrorCode::FileNotFound
+            | ErrorCode::RecordNotFound
+            | ErrorCode::IndexNotFound
+            | ErrorCode::SelectListNotFound
+            | ErrorCode::ClientNotFound,
+        ) => 404,
+        Some(ErrorCode::AccountExists | ErrorCode::FileExists | ErrorCode::IndexExists) => 409,
+        // The database failed rather than the request: a corrupt file or a disk
+        // that will not take the write is not something the browser can fix.
+        Some(ErrorCode::CorruptData | ErrorCode::IoError) => 500,
+        Some(ErrorCode::Unavailable) => 503,
+        _ => 400,
     }
 }
 
@@ -40,7 +53,11 @@ async fn run(client: &ProtocolClient, payload: Value) -> Response {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("Request failed");
-                Response::error(status_for(message), message)
+                let code = response
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .and_then(ErrorCode::from_wire);
+                Response::error(status_for(code), message)
             }
         }
         // The database is the dashboard's upstream, so an unreachable one is a
@@ -360,13 +377,15 @@ mod tests {
 
     #[test]
     fn protocol_errors_keep_their_meaning_in_the_status_code() {
-        assert_eq!(status_for("Admin privileges required"), 403);
-        assert_eq!(
-            status_for("Access denied for account PAYROLL: Not in allowed list"),
-            403
-        );
-        assert_eq!(status_for("Table 'ORDERS' not found in account 'SALES'"), 404);
-        assert_eq!(status_for("File not specified"), 400);
+        assert_eq!(status_for(Some(ErrorCode::AdminRequired)), 403);
+        assert_eq!(status_for(Some(ErrorCode::AccessDenied)), 403);
+        assert_eq!(status_for(Some(ErrorCode::FileNotFound)), 404);
+        assert_eq!(status_for(Some(ErrorCode::FileExists)), 409);
+        assert_eq!(status_for(Some(ErrorCode::IoError)), 500);
+        assert_eq!(status_for(Some(ErrorCode::MissingField)), 400);
+        // A code this build does not know, and one that is not there at all.
+        assert_eq!(status_for(ErrorCode::from_wire("SOMETHING_NEW")), 400);
+        assert_eq!(status_for(None), 400);
     }
 
     #[test]

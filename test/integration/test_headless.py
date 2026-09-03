@@ -55,15 +55,15 @@ def main():
                 resp = conn.request(command="READ", file=FILE, key="K1")
                 suite.check_eq(
                     "Headless server is reachable and answers the protocol",
-                    resp.get("message"),
-                    "Account not specified",
+                    resp.get("code"),
+                    "ACCOUNT_NOT_SPECIFIED",
                 )
 
                 resp = conn.request(command="READ", file=FILE, key="K1", account=ACCOUNT)
                 suite.check_eq(
                     "Headless server resolves the seeded account",
-                    resp.get("message"),
-                    "Record not found",
+                    resp.get("code"),
+                    "RECORD_NOT_FOUND",
                 )
 
                 # A CLI started inside the account directory auto-logs into that account.

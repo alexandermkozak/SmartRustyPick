@@ -5,6 +5,7 @@ mod durability_tests;
 pub mod engine;
 #[cfg(test)]
 mod engine_tests;
+pub mod error;
 pub mod hashfile;
 #[cfg(test)]
 mod hashfile_tests;
@@ -22,5 +23,6 @@ pub mod report;
 mod report_tests;
 
 pub use engine::{Database, TableHandle, TableKey};
+pub use error::{DbError, DbResult};
 pub use index::{FileIndex, IndexStats};
 pub use models::*;

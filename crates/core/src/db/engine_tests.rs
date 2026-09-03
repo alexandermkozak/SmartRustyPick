@@ -1,3 +1,4 @@
+use crate::db::DbError;
 use crate::db::engine::Database;
 use crate::db::models::*;
 use crate::test_support::{TempDir, isolated_config};
@@ -183,9 +184,10 @@ fn test_directory_traversal_vulnerability() {
     // Attempt directory traversal to access the SECRET account's table
     let traversal_name = "../SECRET/PRIVATE";
 
-    // This call should now return an error.
+    // This call should now return an error, and one that says the file is not
+    // in the account rather than blaming the disk.
     let res = db.get_table_mut(traversal_name);
-    assert!(res.is_err());
+    assert!(matches!(res.err(), Some(DbError::FileNotFound { .. })));
 
     let _secret_table_path = Path::new(base_dir).join("SECRET").join("PRIVATE");
     // It should NOT have been re-created or modified via the traversal path in USER's dir.
@@ -193,7 +195,7 @@ fn test_directory_traversal_vulnerability() {
     // Let's use a name that DOESN'T exist.
     let traversal_name_new = "../SECRET/NEW_PRIVATE";
     let res2 = db.get_table_mut(traversal_name_new);
-    assert!(res2.is_err());
+    assert!(matches!(res2.err(), Some(DbError::FileNotFound { .. })));
     let new_secret_table_path = Path::new(base_dir).join("SECRET").join("NEW_PRIVATE");
     assert!(!new_secret_table_path.exists());
 

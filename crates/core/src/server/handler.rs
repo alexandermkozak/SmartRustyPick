@@ -1,5 +1,5 @@
-use crate::db::{Database, ExplodeSpec, IndexStats, QueryNode, Record, SortSpec, Table};
-use crate::server::models::{Request, Response};
+use crate::db::{Database, DbError, ExplodeSpec, IndexStats, QueryNode, Record, SortSpec, Table};
+use crate::server::models::{ErrorCode, Request, Response};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// The database handle shared by every connection.
@@ -27,12 +27,29 @@ pub fn write_lock(db: &SharedDb) -> RwLockWriteGuard<'_, Database> {
 /// shorter lived and is issued separately.
 const CLIENT_CERT_DAYS: u32 = 365;
 
-fn error(message: impl Into<String>) -> Response {
+/// An error reply: the code a client branches on, and the message a person
+/// reads. Both, always - a refusal that carries only prose is one no client can
+/// act on, which is why every failure in this file goes through here.
+fn error(code: ErrorCode, message: impl Into<String>) -> Response {
     Response {
         status: "ERROR".to_string(),
         message: Some(message.into()),
+        code: Some(code),
         ..Default::default()
     }
+}
+
+/// The engine's own failure, classified by its variant rather than by reading
+/// what it says.
+fn db_error(e: DbError) -> Response {
+    error(ErrorCode::from(&e), e.to_string())
+}
+
+/// The same, where the error's own words do not say what was being attempted:
+/// "No space left on device" is not much use without "Save error" in front of
+/// it. The code is unchanged - the context is for the reader.
+fn db_error_in(context: &str, e: DbError) -> Response {
+    error(ErrorCode::from(&e), format!("{}: {}", context, e))
 }
 
 /// The default display width `SET.DICT` gives an entry that does not name one.
@@ -152,11 +169,11 @@ fn dictionary_record(key: &str, spec: &serde_json::Value) -> Result<Record, Stri
 fn index_target(req: &Request) -> Result<(String, String), Response> {
     let file = match req.file.as_deref().map(str::trim) {
         Some(file) if !file.is_empty() => file.to_string(),
-        _ => return Err(error("File not specified")),
+        _ => return Err(error(ErrorCode::MissingField, "File not specified")),
     };
     let field = match req.field.as_deref().map(str::trim) {
         Some(field) if !field.is_empty() => field.to_string(),
-        _ => return Err(error("Field not specified")),
+        _ => return Err(error(ErrorCode::MissingField, "Field not specified")),
     };
     Ok((file, field))
 }
@@ -243,14 +260,15 @@ fn record_command(command: &str, req: Request, db: &Database, acc: &str) -> Resp
 // the error path and an unboxing at each call site.
 #[allow(clippy::result_large_err)]
 fn resolve_file(db: &Database, acc: &str, name: &str) -> Result<crate::db::TableHandle, Response> {
-    db.get_table_mut_for_account(acc, name)
-        .map_err(|e| error(format!("Table error: {}", e)))
+    db.get_table_mut_for_account(acc, name).map_err(db_error)
 }
 
 /// The file a request names, or the error to send back when it names none.
 #[allow(clippy::result_large_err)]
 fn requested_file(req: &Request) -> Result<&str, Response> {
-    req.file.as_deref().ok_or_else(|| error("File not specified"))
+    req.file
+        .as_deref()
+        .ok_or_else(|| error(ErrorCode::MissingField, "File not specified"))
 }
 
 fn read_record(db: &Database, acc: &str, req: &Request) -> Response {
@@ -302,26 +320,31 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
 
     let key = match req.key {
         Some(k) => k,
-        None => return error("Key not specified"),
+        None => return error(ErrorCode::MissingField, "Key not specified"),
     };
     let is_dict = req.is_dict.unwrap_or(false);
 
     let record = if let Some(structured) = req.structured_data {
         match db.deserialize_record_in(&handle.read(), &structured) {
             Some(r) => r,
-            None => return error("Invalid structured data"),
+            None => return error(ErrorCode::InvalidData, "Invalid structured data"),
         }
     } else if let Some(data_val) = req.data {
         match data_val {
             serde_json::Value::String(s) => Record::from_display_string(&s),
             serde_json::Value::Object(_) => match db.deserialize_record_in(&handle.read(), &data_val) {
                 Some(r) => r,
-                None => return error("Invalid structured data in data field"),
+                None => return error(ErrorCode::InvalidData, "Invalid structured data in data field"),
             },
-            _ => return error("Invalid data type in data field: expected string or object"),
+            _ => {
+                return error(
+                    ErrorCode::InvalidData,
+                    "Invalid data type in data field: expected string or object",
+                );
+            }
         }
     } else {
-        return error("Data not specified");
+        return error(ErrorCode::MissingField, "Data not specified");
     };
 
     // The file's lock is dropped before the flush below: `note_write_for` may
@@ -340,7 +363,7 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
             status: "OK".to_string(),
             ..Default::default()
         },
-        Err(e) => error(format!("Save error: {}", e)),
+        Err(e) => db_error_in("Save error", e),
     }
 }
 
@@ -351,7 +374,7 @@ fn delete_record(db: &Database, acc: &str, req: Request) -> Response {
     };
     let key = match req.key {
         Some(k) => k,
-        None => return error("Key not specified"),
+        None => return error(ErrorCode::MissingField, "Key not specified"),
     };
     let is_dict = req.is_dict.unwrap_or(false);
 
@@ -373,7 +396,7 @@ fn delete_record(db: &Database, acc: &str, req: Request) -> Response {
             status: "OK".to_string(),
             ..Default::default()
         },
-        Err(e) => error(format!("Save error: {}", e)),
+        Err(e) => db_error_in("Save error", e),
     }
 }
 
@@ -396,11 +419,11 @@ fn allowed_account<'a>(req: &'a Request, client_info: &'a crate::db::ClientInfo)
 /// Reads a single record from `table`, which the caller has already resolved.
 fn read_command(db: &Database, table: &Table, req: &Request) -> Response {
     if req.file.is_none() {
-        return error("File not specified");
+        return error(ErrorCode::MissingField, "File not specified");
     }
     let key = match req.key.as_deref() {
         Some(k) => k,
-        None => return error("Key not specified"),
+        None => return error(ErrorCode::MissingField, "Key not specified"),
     };
     let is_dict = req.is_dict.unwrap_or(false);
 
@@ -411,7 +434,7 @@ fn read_command(db: &Database, table: &Table, req: &Request) -> Response {
             record: Some(db.serialize_record_in(table, record)),
             ..Default::default()
         },
-        None => error("Record not found"),
+        None => error(ErrorCode::RecordNotFound, "Record not found"),
     }
 }
 
@@ -419,11 +442,14 @@ fn read_command(db: &Database, table: &Table, req: &Request) -> Response {
 fn query_command(db: &Database, table: &Table, req: &Request) -> Response {
     let table_name = match req.file.as_deref() {
         Some(t) => t,
-        None => return error("File not specified"),
+        None => return error(ErrorCode::MissingField, "File not specified"),
     };
     let is_dict = req.is_dict.unwrap_or(false);
 
-    let (query_node, sort_specs, explode) = resolve_clause(db, table_name, req);
+    let (query_node, sort_specs, explode) = match resolve_clause(db, table_name, req) {
+        Ok(clause) => clause,
+        Err(response) => return response,
+    };
 
     // Resolve the dictionary once for the whole result set rather than per record.
     let schema = db.record_schema(table);
@@ -476,15 +502,21 @@ fn query_command(db: &Database, table: &Table, req: &Request) -> Response {
     }
 }
 
+/// What a QUERY or SELECT selects: the criteria, the ordering, and the field
+/// whose values become rows of their own.
+type Clause = (Option<QueryNode>, Vec<SortSpec>, Option<ExplodeSpec>);
+
 /// Resolves the selection clause a QUERY or SELECT carries, however it was
 /// spelled: a pre-built `query_node`, or a `query_string` re-parsed here.
 /// `sort_specs` and `explode` given as their own fields win over anything the
 /// query string spells out, so a structured client is never second-guessed.
-fn resolve_clause(
-    db: &Database,
-    table_name: &str,
-    req: &Request,
-) -> (Option<QueryNode>, Vec<SortSpec>, Option<ExplodeSpec>) {
+///
+/// `Err` is a query string that was given and not understood. It used to parse
+/// to "no criteria", which is the same thing an absent clause parses to - so a
+/// mistyped `WITH` came back as the whole file with `status: "OK"`, a wrong
+/// answer rather than a refusal.
+#[allow(clippy::result_large_err)]
+fn resolve_clause(db: &Database, table_name: &str, req: &Request) -> Result<Clause, Response> {
     let mut sort_specs = req.sort_specs.clone().unwrap_or_default();
     let mut explode = req
         .explode
@@ -503,13 +535,19 @@ fn resolve_clause(
             sort_specs = parsed_sorts;
         }
         query_node = db.parse_query_read_only(table_name, &clause_parts);
+        if query_node.is_none() && !clause_parts.is_empty() {
+            return Err(error(
+                ErrorCode::InvalidQuery,
+                format!("Query is not understood: {}", clause_parts.join(" ")),
+            ));
+        }
         if let (None, Some(spec)) = (&explode, parsed_explodes.into_iter().next()) {
             query_node = Database::and_condition(query_node, spec.condition.clone());
             explode = Some(spec);
         }
     }
 
-    (query_node, sort_specs, explode)
+    Ok((query_node, sort_specs, explode))
 }
 
 /// Handles a request against an exclusively borrowed database. Commands that
@@ -521,11 +559,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         if !client_info.is_admin && !client_info.allowed_accounts.contains(&acc) {
             let msg = format!("Access denied for account {}: Not in allowed list", acc);
             let _ = db.log_error("REMOTE", &msg);
-            return Response {
-                status: "ERROR".to_string(),
-                message: Some(msg),
-                ..Default::default()
-            };
+            return error(ErrorCode::AccessDenied, msg);
         }
         Some(acc)
     } else {
@@ -537,11 +571,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             // Admin can access SYSTEM or other accounts, but must specify one if multiple are possible.
             None
         } else {
-            return Response {
-                status: "ERROR".to_string(),
-                message: Some("Account not specified".to_string()),
-                ..Default::default()
-            };
+            return error(ErrorCode::AccountNotSpecified, "Account not specified");
         }
     };
 
@@ -558,57 +588,48 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         // denial, and the tests.
         "READ" => {
             if target_account.is_none() {
-                return error("Account not specified");
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             read_record(db, acc, &req)
         }
         "WRITE" => {
             if target_account.is_none() {
-                return error("Account not specified");
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             write_record(db, acc, req)
         }
         "DELETE" => {
             if target_account.is_none() {
-                return error("Account not specified");
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             delete_record(db, acc, req)
         }
         "QUERY" => {
             if target_account.is_none() {
-                return error("Account not specified");
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             query_records(db, acc, &req)
         }
         "SELECT" => {
             if target_account.is_none() {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Account not specified".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             let table_name = match req.file.clone() {
                 Some(t) => t,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("File not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "File not specified");
                 }
             };
             let is_dict = req.is_dict.unwrap_or(false);
             let list_name = req.list_name.clone().unwrap_or_else(|| "DEFAULT".to_string());
 
-            let (query_node, sort_specs, explode) = resolve_clause(db, &table_name, &req);
+            let (query_node, sort_specs, explode) = match resolve_clause(db, &table_name, &req) {
+                Ok(clause) => clause,
+                Err(response) => return response,
+            };
 
             if let Err(e) = db.get_table_mut_for_account(acc, &table_name) {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Table error: {}", e)),
-                    ..Default::default()
-                };
+                return db_error(e);
             }
             let entries = match db.get_table_read_only_for_account(acc, &table_name) {
                 Some(handle) => Database::select_entries_in(
@@ -619,7 +640,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     None,
                     &sort_specs,
                 ),
-                None => return error(format!("Table error: {} not loaded", table_name)),
+                None => return error(ErrorCode::FileNotFound, format!("File '{}' is not loaded", table_name)),
             };
 
             let list = crate::db::SelectList {
@@ -646,11 +667,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 let list = match db.remote_select_lists.get(&list_name) {
                     Some(l) => l,
                     None => {
-                        return Response {
-                            status: "ERROR".to_string(),
-                            message: Some("Select list not found".to_string()),
-                            ..Default::default()
-                        };
+                        return error(ErrorCode::SelectListNotFound, "Select list not found");
                     }
                 };
 
@@ -673,15 +690,11 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             };
 
             if let Err(e) = db.get_table_mut_for_account(acc, &table_name) {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Table error: {}", e)),
-                    ..Default::default()
-                };
+                return db_error(e);
             }
             let handle = match db.get_table_read_only_for_account(acc, &table_name) {
                 Some(handle) => handle,
-                None => return error(format!("Table error: {} not loaded", table_name)),
+                None => return error(ErrorCode::FileNotFound, format!("File '{}' is not loaded", table_name)),
             };
             let table = handle.read();
             let records = if is_dict { &table.dictionary } else { &table.records };
@@ -713,20 +726,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         }
         "CREATE.ACCOUNT" => {
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             let name = match req.target_account {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Account name not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "Account name not specified");
                 }
             };
             match db.create_account(&name, None) {
@@ -734,11 +739,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     status: "OK".to_string(),
                     ..Default::default()
                 },
-                Err(e) => Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Error: {}", e)),
-                    ..Default::default()
-                },
+                Err(e) => db_error(e),
             }
         }
         "CREATE.TEST.ACCOUNT" => {
@@ -746,20 +747,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             // equivalent is an admin certificate, the same gate the other
             // account commands sit behind.
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             let name = match req.target_account {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Account name not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "Account name not specified");
                 }
             };
             match db.create_test_account(&name) {
@@ -773,29 +766,17 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                         ..Default::default()
                     }
                 }
-                Err(e) => Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Error: {}", e)),
-                    ..Default::default()
-                },
+                Err(e) => db_error(e),
             }
         }
         "DELETE.ACCOUNT" => {
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             let name = match req.target_account {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Account name not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "Account name not specified");
                 }
             };
             match db.delete_account(&name) {
@@ -803,36 +784,20 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     status: "OK".to_string(),
                     ..Default::default()
                 },
-                Err(e) => Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Error: {}", e)),
-                    ..Default::default()
-                },
+                Err(e) => db_error(e),
             }
         }
         "CREATE.FILE" => {
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             if target_account.is_none() {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Account not specified".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             let name = match req.file {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("File name not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "File name not specified");
                 }
             };
             let durable = req.durable.unwrap_or(false);
@@ -841,38 +806,22 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     status: "OK".to_string(),
                     ..Default::default()
                 },
-                Err(e) => Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Error: {}", e)),
-                    ..Default::default()
-                },
+                Err(e) => db_error(e),
             }
         }
         "SET.FILE" => {
             // Promoting a file to durable is a storage decision for the account,
             // like creating one, so it is gated the same way.
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             if target_account.is_none() {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Account not specified".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             let name = match req.file {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("File name not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "File name not specified");
                 }
             };
             // Absent rather than false: an omitted flag would otherwise quietly
@@ -880,11 +829,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             let durable = match req.durable {
                 Some(d) => d,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Durability flag not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "Durability flag not specified");
                 }
             };
             match db.set_table_durable_for_account(acc, &name, durable) {
@@ -893,36 +838,20 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     record: Some(serde_json::json!({ "account": acc, "name": name, "durable": durable })),
                     ..Default::default()
                 },
-                Err(e) => Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Error: {}", e)),
-                    ..Default::default()
-                },
+                Err(e) => db_error(e),
             }
         }
         "DELETE.FILE" => {
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             if target_account.is_none() {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Account not specified".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             let name = match req.file {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("File name not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "File name not specified");
                 }
             };
             match db.delete_table_for_account(acc, &name) {
@@ -930,11 +859,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     status: "OK".to_string(),
                     ..Default::default()
                 },
-                Err(e) => Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Error: {}", e)),
-                    ..Default::default()
-                },
+                Err(e) => db_error(e),
             }
         }
         // Indexes. Creating, rebuilding and dropping one are storage decisions
@@ -942,10 +867,10 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         // listing them is not, any more than listing the files is.
         "CREATE.INDEX" => {
             if !client_info.is_admin {
-                return error("Admin privileges required");
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             if target_account.is_none() {
-                return error("Account not specified");
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             let (file, field) = match index_target(&req) {
                 Ok(target) => target,
@@ -953,15 +878,15 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             };
             match db.create_index_for_account(acc, &file, &field) {
                 Ok(stats) => index_response(stats),
-                Err(e) => error(format!("Error: {}", e)),
+                Err(e) => db_error(e),
             }
         }
         "REBUILD.INDEX" => {
             if !client_info.is_admin {
-                return error("Admin privileges required");
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             if target_account.is_none() {
-                return error("Account not specified");
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             let (file, field) = match index_target(&req) {
                 Ok(target) => target,
@@ -969,15 +894,15 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             };
             match db.rebuild_index_for_account(acc, &file, &field) {
                 Ok(stats) => index_response(stats),
-                Err(e) => error(format!("Error: {}", e)),
+                Err(e) => db_error(e),
             }
         }
         "DELETE.INDEX" => {
             if !client_info.is_admin {
-                return error("Admin privileges required");
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             if target_account.is_none() {
-                return error("Account not specified");
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             let (file, field) = match index_target(&req) {
                 Ok(target) => target,
@@ -988,48 +913,36 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     status: "OK".to_string(),
                     ..Default::default()
                 },
-                Err(e) => error(format!("Error: {}", e)),
+                Err(e) => db_error(e),
             }
         }
         "LIST.INDEXES" => {
             if target_account.is_none() {
-                return error("Account not specified");
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             let file = match req.file.as_deref().map(str::trim) {
                 Some(file) if !file.is_empty() => file.to_string(),
-                _ => return error("File not specified"),
+                _ => return error(ErrorCode::MissingField, "File not specified"),
             };
             match db.index_statistics(acc, &file) {
                 Ok(indexes) => index_listing(indexes),
-                Err(e) => error(format!("Error: {}", e)),
+                Err(e) => db_error(e),
             }
         }
         "AUTHORIZE.CONN" => {
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             let thumbprint = match req.thumbprint {
                 Some(t) => t,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Thumbprint not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "Thumbprint not specified");
                 }
             };
             let name = match req.name {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Name not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "Name not specified");
                 }
             };
             let accounts = req.accounts_list.unwrap_or_default();
@@ -1039,29 +952,17 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     status: "OK".to_string(),
                     ..Default::default()
                 },
-                Err(e) => Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Error: {}", e)),
-                    ..Default::default()
-                },
+                Err(e) => db_error(e),
             }
         }
         "DEAUTHORIZE.CONN" => {
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             let name = match req.name {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Name not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "Name not specified");
                 }
             };
             match db.remove_authorized_client(&name) {
@@ -1069,44 +970,24 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     status: "OK".to_string(),
                     ..Default::default()
                 },
-                Ok(false) => Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Client not found".to_string()),
-                    ..Default::default()
-                },
-                Err(e) => Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Error: {}", e)),
-                    ..Default::default()
-                },
+                Ok(false) => error(ErrorCode::ClientNotFound, "Client not found"),
+                Err(e) => db_error(e),
             }
         }
         "ADD.CLIENT.ACCOUNT" => {
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             let name = match req.name {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Name not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "Name not specified");
                 }
             };
             let accounts = req.accounts_list.unwrap_or_default();
             for acc in accounts {
                 if let Err(e) = db.add_client_account(&name, &acc) {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some(format!("Error adding account {}: {}", acc, e)),
-                        ..Default::default()
-                    };
+                    return db_error_in(&format!("Error adding account {}", acc), e);
                 }
             }
             Response {
@@ -1116,30 +997,18 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         }
         "REMOVE.CLIENT.ACCOUNT" => {
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             let name = match req.name {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Name not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "Name not specified");
                 }
             };
             let accounts = req.accounts_list.unwrap_or_default();
             for acc in accounts {
                 if let Err(e) = db.remove_client_account(&name, &acc) {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some(format!("Error removing account {}: {}", acc, e)),
-                        ..Default::default()
-                    };
+                    return db_error_in(&format!("Error removing account {}", acc), e);
                 }
             }
             Response {
@@ -1149,11 +1018,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         }
         "LIST.CONNS" => {
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             // Re-read first: another process (a CLI beside this server) may have
             // authorized or revoked a client since the last request.
@@ -1204,11 +1069,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         }
         "LIST.FILES" => {
             if target_account.is_none() {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Account not specified".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             // `keys` is the plain listing every client already reads; `results`
             // carries what is worth knowing about a file beside its name, so
@@ -1230,20 +1091,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         }
         "FILE.STATS" => {
             if target_account.is_none() {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Account not specified".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             let name = match req.file {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("File not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "File not specified");
                 }
             };
             match db.file_statistics(acc, &name) {
@@ -1252,34 +1105,22 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     record: Some(serde_json::to_value(stats).unwrap_or(serde_json::Value::Null)),
                     ..Default::default()
                 },
-                Err(e) => Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Error: {}", e)),
-                    ..Default::default()
-                },
+                Err(e) => db_error(e),
             }
         }
         "LIST.DICT" => {
             if target_account.is_none() {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Account not specified".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             let name = match req.file {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("File not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "File not specified");
                 }
             };
             let handle = match db.get_table_mut_for_account(acc, &name) {
                 Ok(handle) => handle,
-                Err(e) => return error(format!("Table error: {}", e)),
+                Err(e) => return db_error(e),
             };
             let table = handle.read();
             // Ordered by attribute number, then by name: the order the file's
@@ -1313,51 +1154,29 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         }
         "SET.DICT" => {
             if target_account.is_none() {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Account not specified".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             let name = match req.file {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("File not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "File not specified");
                 }
             };
             let key = match req.key.as_deref().map(str::trim) {
                 Some(k) if !k.is_empty() => k.to_string(),
                 _ => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Key not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "Key not specified");
                 }
             };
             let spec = match req.structured_data {
                 Some(spec @ serde_json::Value::Object(_)) => spec,
                 _ => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Dictionary attributes not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "Dictionary attributes not specified");
                 }
             };
             let record = match dictionary_record(&key, &spec) {
                 Ok(record) => record,
-                Err(message) => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some(message),
-                        ..Default::default()
-                    };
-                }
+                Err(message) => return error(ErrorCode::InvalidData, message),
             };
             // Read back what was stored rather than echoing what was asked for,
             // so a caller sees the defaults this filled in.
@@ -1366,7 +1185,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             {
                 let handle = match db.get_table_mut_for_account(acc, &name) {
                     Ok(handle) => handle,
-                    Err(e) => return error(format!("Table error: {}", e)),
+                    Err(e) => return db_error(e),
                 };
                 let mut table = handle.write();
                 table.dictionary.insert(key, record);
@@ -1378,20 +1197,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     record: Some(entry),
                     ..Default::default()
                 },
-                Err(e) => Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Save error: {}", e)),
-                    ..Default::default()
-                },
+                Err(e) => db_error_in("Save error", e),
             }
         }
         "SERVER.STATS" => {
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             let mut snapshot =
                 serde_json::to_value(crate::server::stats::snapshot()).unwrap_or(serde_json::Value::Null);
@@ -1415,30 +1226,21 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         }
         "GENERATE.CERT" => {
             if !client_info.is_admin {
-                return Response {
-                    status: "ERROR".to_string(),
-                    message: Some("Admin privileges required".to_string()),
-                    ..Default::default()
-                };
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
             }
             let common_name = match req.name {
                 Some(n) => n,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Name not specified".to_string()),
-                        ..Default::default()
-                    };
+                    return error(ErrorCode::MissingField, "Name not specified");
                 }
             };
             let config = match crate::server::active_config() {
                 Some(config) => config,
                 None => {
-                    return Response {
-                        status: "ERROR".to_string(),
-                        message: Some("Certificate generation is unavailable: no server configuration".to_string()),
-                        ..Default::default()
-                    };
+                    return error(
+                        ErrorCode::Unavailable,
+                        "Certificate generation is unavailable: no server configuration",
+                    );
                 }
             };
             // A generated certificate is useless until it is authorized, and a
@@ -1449,18 +1251,13 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     let accounts = req.accounts_list.unwrap_or_default();
                     let is_admin = req.is_admin.unwrap_or(false);
                     if !is_admin && accounts.is_empty() {
-                        return Response {
-                            status: "ERROR".to_string(),
-                            message: Some("A non-admin certificate needs at least one allowed account".to_string()),
-                            ..Default::default()
-                        };
+                        return error(
+                            ErrorCode::InvalidRequest,
+                            "A non-admin certificate needs at least one allowed account",
+                        );
                     }
                     if let Err(e) = db.add_authorized_client(&common_name, &generated.thumbprint, accounts, is_admin) {
-                        return Response {
-                            status: "ERROR".to_string(),
-                            message: Some(format!("Certificate generated but authorization failed: {}", e)),
-                            ..Default::default()
-                        };
+                        return db_error_in("Certificate generated but authorization failed", e);
                     }
                     Response {
                         status: "OK".to_string(),
@@ -1468,17 +1265,9 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                         ..Default::default()
                     }
                 }
-                Err(e) => Response {
-                    status: "ERROR".to_string(),
-                    message: Some(format!("Error: {}", e)),
-                    ..Default::default()
-                },
+                Err(e) => db_error(DbError::Io(e)),
             }
         }
-        _ => Response {
-            status: "ERROR".to_string(),
-            message: Some("Unknown command".to_string()),
-            ..Default::default()
-        },
+        _ => error(ErrorCode::UnknownCommand, "Unknown command"),
     }
 }

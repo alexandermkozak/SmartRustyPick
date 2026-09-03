@@ -186,13 +186,13 @@ def main():
                 resp = conn.request(command="READ", file=FILE, key="USER1", account=ACCOUNT)
                 suite.check(
                     "READ after DELETE reports a missing record",
-                    resp["status"] == "ERROR" and "Record not found" in (resp.get("message") or ""),
+                    resp["status"] == "ERROR" and resp.get("code") == "RECORD_NOT_FOUND",
                     resp.get("message", ""),
                 )
 
                 resp = conn.request(command="READ", key="USER1", account=ACCOUNT)
                 suite.check_eq(
-                    "READ without a file is rejected", resp.get("message"), "File not specified"
+                    "READ without a file is rejected", resp.get("code"), "MISSING_FIELD"
                 )
         except Exception as exc:  # noqa: BLE001 - report instead of aborting the whole run
             suite.error("Server protocol suite", exc)

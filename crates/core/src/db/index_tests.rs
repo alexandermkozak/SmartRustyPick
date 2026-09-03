@@ -7,10 +7,10 @@
 //! assert the two are identical, rather than asserting what the indexed run
 //! happens to return.
 
-use crate::db::IndexStats;
 use crate::db::engine::Database;
 use crate::db::index;
 use crate::db::models::*;
+use crate::db::{DbError, IndexStats};
 use crate::test_support::{TempDir, isolated_config};
 use std::collections::HashMap;
 use std::fs;
@@ -428,29 +428,35 @@ fn rebuilding_repairs_an_index_edited_out_from_under_the_server() {
     assert!(!after.stale);
 }
 
+/// The refusals are asserted on the variant rather than on the wording, so the
+/// message can be reworded without a test to update - and so the reason a
+/// caller branches on is the one being checked.
 #[test]
 fn what_cannot_be_indexed_is_refused_with_the_reason() {
     let guard = TempDir::new("index_refusals");
     let db = open_account(guard.path());
     build_file(&db, "PEOPLE", 5);
 
-    let message = |field: &str| {
-        db.create_index_for_account(ACCOUNT, "PEOPLE", field)
-            .unwrap_err()
-            .to_string()
-    };
-    assert!(message("ID").contains("record key"));
-    assert!(message("NOSUCH").contains("not a dictionary field"));
-    assert!(message("../escape").contains("cannot name an index"));
+    let refusal = |field: &str| db.create_index_for_account(ACCOUNT, "PEOPLE", field).unwrap_err();
+    for field in ["ID", "NOSUCH", "../escape"] {
+        let error = refusal(field);
+        assert!(
+            matches!(&error, DbError::InvalidField { field: named, .. } if named == field),
+            "{field} was refused as {error:?}"
+        );
+        // The reason is still said out loud, since somebody has to read it.
+        assert!(!error.to_string().is_empty());
+    }
 
     db.create_index_for_account(ACCOUNT, "PEOPLE", "CITY").unwrap();
-    assert!(message("CITY").contains("already indexed"));
-    assert!(
-        db.drop_index_for_account(ACCOUNT, "PEOPLE", "NAME")
-            .unwrap_err()
-            .to_string()
-            .contains("not indexed")
-    );
+    assert!(matches!(
+        refusal("CITY"),
+        DbError::IndexExists { ref file, ref field } if file == "PEOPLE" && field == "CITY"
+    ));
+    assert!(matches!(
+        db.drop_index_for_account(ACCOUNT, "PEOPLE", "NAME").unwrap_err(),
+        DbError::IndexNotFound { ref file, ref field } if file == "PEOPLE" && field == "NAME"
+    ));
 }
 
 #[test]
