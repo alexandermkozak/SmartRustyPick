@@ -1,6 +1,7 @@
 use crate::db::error::{DbError, DbResult};
 use crate::db::hashfile::{self, FsyncPolicy, SectionMeta};
-use crate::db::index::{self, FileIndex, IndexStats};
+use crate::db::health::{HealthSummary, Verdict};
+use crate::db::index::{self, FileIndex, IndexReport, IndexStats, IndexValue};
 use crate::db::models::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
@@ -1705,12 +1706,43 @@ impl Database {
                     .map(|file| self.file_record_count(&directory, &name, file))
                     .sum();
                 let (disk_bytes, _) = Self::tree_stats(Path::new(&directory));
+                // The roll-up is what makes a problem findable without opening
+                // every file in the account in turn, so it is the cheap check -
+                // metadata and index `state` files only - repeated per file.
+                let mut health = HealthSummary::good();
+                let (mut index_count, mut stale_indexes, mut unhealthy_files) = (0, 0, 0);
+                for file in &files {
+                    let file_dir = format!("{}/{}", directory, file);
+                    let data_version = hashfile::read_meta(&format!("{}/data", file_dir))
+                        .map(|meta| meta.version)
+                        .unwrap_or(0);
+                    for field in index::indexed_fields(&file_dir) {
+                        index_count += 1;
+                        if index::read_state(&index::section_path(&file_dir, &field))
+                            .is_none_or(|state| state.data_version != data_version)
+                        {
+                            stale_indexes += 1;
+                        }
+                    }
+                    let summary = self.file_health_summary(&name, file);
+                    if summary.verdict != Verdict::Good {
+                        unhealthy_files += 1;
+                    }
+                    health.absorb(&summary);
+                }
+                if unhealthy_files > 0 {
+                    health.reasons = vec![format!("{} of {} files need attention", unhealthy_files, files.len())];
+                }
                 AccountStats {
                     name,
                     directory,
                     file_count: files.len(),
                     record_count,
                     disk_bytes,
+                    index_count,
+                    stale_indexes,
+                    unhealthy_files,
+                    health,
                 }
             })
             .collect()
@@ -1785,7 +1817,16 @@ impl Database {
         let file_dir = format!("{}/{}", directory, name);
         let data_path = format!("{}/data", file_dir);
         let meta = hashfile::read_meta(&data_path);
-        let group_sizes = hashfile::group_sizes(&data_path);
+        // The group *trailers*, not just the file lengths: the record count of
+        // each group is in its 20-byte trailer, so the true distribution costs
+        // one seek per group and loads nothing. Bytes per group were all this
+        // ever reported, and bytes are not the thing that hurts.
+        let groups = hashfile::group_profile(&data_path);
+        let group_sizes: Vec<u64> = {
+            let mut sizes: Vec<u64> = groups.iter().map(|group| group.bytes).collect();
+            sizes.sort();
+            sizes
+        };
         let (disk_bytes, modified) = Self::tree_stats(Path::new(&file_dir));
 
         let loaded_table = self.get_table_read_only_for_account(account, name);
@@ -1803,13 +1844,20 @@ impl Database {
             }
         };
 
-        Ok(FileStats {
-            indexes: self.index_statistics(account, name).unwrap_or_default(),
+        let indexes = self.index_statistics(account, name).unwrap_or_default();
+        let index_bytes = indexes.iter().map(|index| index.disk_bytes).sum();
+        let modulus = meta.map(|m| m.modulus).unwrap_or(0);
+        let per_group = self.records_per_group;
+        let distribution = GroupDistribution::of(&groups, modulus);
+
+        let capacity = modulus.saturating_mul(per_group as u64);
+        let mut stats = FileStats {
+            indexes,
             account: account.to_string(),
             name: name.to_string(),
             record_count,
             dict_count,
-            modulus: meta.map(|m| m.modulus).unwrap_or(0),
+            modulus,
             version: meta.map(|m| m.version).unwrap_or(0),
             group_count: group_sizes.len(),
             smallest_group_bytes: group_sizes.first().copied().unwrap_or(0),
@@ -1822,7 +1870,77 @@ impl Database {
             modified_seconds_ago: modified
                 .and_then(|time| SystemTime::now().duration_since(time).ok())
                 .map(|elapsed| elapsed.as_secs()),
-        })
+            group_bytes: groups.iter().map(|group| group.bytes).sum(),
+            index_bytes,
+            records_per_group_target: per_group as u64,
+            load_factor: if capacity == 0 {
+                0.0
+            } else {
+                record_count as f64 / capacity as f64
+            },
+            records_until_growth: hashfile::records_until_growth(modulus, record_count, per_group),
+            records_until_shrink: hashfile::records_until_shrink(modulus, record_count, per_group),
+            largest_group_share: if record_count == 0 {
+                0.0
+            } else {
+                distribution.max as f64 / record_count as f64
+            },
+            skew: if distribution.mean > 0.0 {
+                distribution.max as f64 / distribution.mean
+            } else {
+                0.0
+            },
+            group_records: distribution,
+            health: crate::db::health::Health::default(),
+        };
+        // Judged last, from the numbers above, so the verdicts and the values
+        // they are about cannot be built apart and get out of step.
+        stats.health = crate::db::health::file_health(&stats);
+        Ok(stats)
+    }
+
+    /// A file's verdict without the measures behind it, from section metadata
+    /// and index `state` files alone.
+    ///
+    /// What a *listing* can afford. `LIST.FILES` answers "which of these is
+    /// worth opening", and answering it must not cost what opening one costs -
+    /// so this reads no group trailer and no index section, and says only what
+    /// `meta` and `state` already know: the format, the checksums, and whether
+    /// an index has fallen behind the records. The full measures arrive with
+    /// `FILE.STATS`.
+    pub fn file_health_summary(&self, account: &str, name: &str) -> HealthSummary {
+        let file_dir = self.file_dir(account, name);
+        let meta = hashfile::read_meta(&format!("{}/data", file_dir));
+        let mut summary = HealthSummary::good();
+        match meta {
+            None => summary.note(Verdict::Act, "legacy flat file"),
+            Some(meta) if !meta.checksums => summary.note(Verdict::Act, "no per-group checksums"),
+            Some(_) => {}
+        }
+        let data_version = meta.map(|meta| meta.version).unwrap_or(0);
+        let fields = index::indexed_fields(&file_dir);
+        let stale = fields
+            .iter()
+            .filter(|field| {
+                index::read_state(&index::section_path(&file_dir, field))
+                    .is_none_or(|state| state.data_version != data_version)
+            })
+            .count();
+        if stale > 0 {
+            summary.note(Verdict::Act, format!("{} of {} indexes stale", stale, fields.len()));
+        }
+        summary
+    }
+
+    /// Every file of an account with its cheap verdict, for the listing.
+    pub fn file_health_for_account(&self, account: &str) -> Vec<(String, HealthSummary)> {
+        self.list_tables_for_account(account)
+            .into_iter()
+            .map(|file| {
+                let summary = self.file_health_summary(account, &file);
+                (file, summary)
+            })
+            .collect()
     }
 
     /// Creates an index on a dictionary field of one file and writes it out.
@@ -1830,6 +1948,18 @@ impl Database {
     /// Building it is a single pass over the records, which is the one O(file)
     /// cost an index has; everything afterwards rides the ordinary write path.
     pub fn create_index_for_account(&self, account: &str, file: &str, field: &str) -> DbResult<IndexStats> {
+        self.create_index_excluding(account, file, field, &[])
+    }
+
+    /// [`Database::create_index_for_account`], with values the index will not
+    /// hold. See [`Database::set_index_exclusions`] for what that is for.
+    pub fn create_index_excluding(
+        &self,
+        account: &str,
+        file: &str,
+        field: &str,
+        exclude: &[String],
+    ) -> DbResult<IndexStats> {
         let handle = self.get_table_mut_for_account(account, file)?;
         {
             let mut table = handle.write();
@@ -1839,7 +1969,7 @@ impl Database {
                     field: field.trim().to_string(),
                 });
             }
-            table.create_index(field)?;
+            table.create_index_excluding(field, exclude.iter().cloned().collect())?;
         }
         // The file's lock is released first: a flush locks each dirty file in
         // turn, and would wait on the one this thread is holding.
@@ -1910,12 +2040,16 @@ impl Database {
             });
         }
         let file_dir = self.file_dir(account, file);
+        let directory = self.account_storage_dir(account);
+        // The file's record count is what every index verdict is read against,
+        // so it is fetched once here rather than by each `stats` call.
+        let records = self.file_record_count(&directory, account, file);
         if let Some(handle) = self.get_table_read_only_for_account(account, file) {
             let table = handle.read();
             return Ok(table
                 .indexes
                 .values()
-                .map(|index| index.stats(&file_dir, true))
+                .map(|index| index.stats(&file_dir, true, records).in_file(file))
                 .collect());
         }
         let data_version = hashfile::read_meta(&format!("{}/data", file_dir))
@@ -1923,8 +2057,140 @@ impl Database {
             .unwrap_or(0);
         Ok(index::indexed_fields(&file_dir)
             .into_iter()
-            .map(|field| index::stats_from_disk(&file_dir, &field, data_version))
+            .map(|field| index::stats_from_disk(&file_dir, &field, data_version, records).in_file(file))
             .collect())
+    }
+
+    /// Every index in an account, with the file each belongs to.
+    ///
+    /// The view that comes to you. A database with forty files had no way to
+    /// ask "which three indexes are worth my attention" short of opening forty
+    /// pages, which is a question nobody asks and so a problem nobody finds.
+    /// Sorted by file then field, so the same account always lists the same way.
+    pub fn index_statistics_for_account(&self, account: &str) -> DbResult<Vec<(String, IndexStats)>> {
+        if !self.list_accounts().iter().any(|name| name == account) {
+            return Err(DbError::AccountNotFound(account.to_string()));
+        }
+        let mut out = Vec::new();
+        for file in self.list_tables_for_account(account) {
+            let Ok(indexes) = self.index_statistics(account, &file) else {
+                continue;
+            };
+            for stats in indexes {
+                out.push((file.clone(), stats));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.field.cmp(&b.1.field)));
+        Ok(out)
+    }
+
+    /// One index in full: its statistics, its verdicts and the values that
+    /// dominate it.
+    ///
+    /// The histogram is what turns "this index is skewed" into "`STATUS =
+    /// ACTIVE` is 91% of it", which is the difference between a number and
+    /// something to do about it.
+    pub fn index_report(&self, account: &str, file: &str, field: &str, limit: usize) -> DbResult<IndexReport> {
+        let field = field.trim();
+        let limit = limit.clamp(1, crate::db::health::thresholds::HISTOGRAM_MAX);
+        if !self.account_has_table(account, file) {
+            self.scan_available_tables(account)?;
+        }
+        if !self.account_has_table(account, file) {
+            return Err(DbError::FileNotFound {
+                account: account.to_string(),
+                file: file.to_string(),
+            });
+        }
+        let file_dir = self.file_dir(account, file);
+        let directory = self.account_storage_dir(account);
+        let record_count = self.file_record_count(&directory, account, file);
+
+        let (stats, top_values, values_available) =
+            if let Some(handle) = self.get_table_read_only_for_account(account, file) {
+                let table = handle.read();
+                let index = table.indexes.get(field).ok_or_else(|| DbError::IndexNotFound {
+                    file: file.to_string(),
+                    field: field.to_string(),
+                })?;
+                // A stale index's postings do not describe the records, so
+                // reporting its values would be reporting fiction.
+                let available = !index.needs_rebuild;
+                let values = if available { index.histogram(limit) } else { Vec::new() };
+                (
+                    index.stats(&file_dir, true, record_count).in_file(file),
+                    values,
+                    available,
+                )
+            } else {
+                if !index::indexed_fields(&file_dir).iter().any(|f| f == field) {
+                    return Err(DbError::IndexNotFound {
+                        file: file.to_string(),
+                        field: field.to_string(),
+                    });
+                }
+                let data_version = hashfile::read_meta(&format!("{}/data", file_dir))
+                    .map(|meta| meta.version)
+                    .unwrap_or(0);
+                let (stats, values, available) =
+                    index::stats_and_values_from_disk(&file_dir, field, data_version, record_count, limit);
+                (stats.in_file(file), values, available)
+            };
+
+        Ok(IndexReport {
+            record_count,
+            index: stats,
+            top_values,
+            values_available,
+        })
+    }
+
+    /// Replaces the values one index deliberately does not hold.
+    ///
+    /// The remedy between "leave it" and "drop it". A field where 90% of
+    /// records carry one value is excellent to index - for the other 10%;
+    /// excluding the dominant value keeps everything the index is good at and
+    /// stops paying for the entry that saves nothing.
+    ///
+    /// Changing the set rebuilds the index, exactly as moving its field to
+    /// another attribute does: the index no longer holds what it says it holds.
+    pub fn set_index_exclusions(
+        &self,
+        account: &str,
+        file: &str,
+        field: &str,
+        values: &[String],
+    ) -> DbResult<IndexStats> {
+        let field = field.trim();
+        let handle = self.get_table_mut_for_account(account, file)?;
+        {
+            let mut table = handle.write();
+            let attr = table.field_index(field);
+            let index = table.indexes.get_mut(field).ok_or_else(|| DbError::IndexNotFound {
+                file: file.to_string(),
+                field: field.to_string(),
+            })?;
+            let excluded: std::collections::BTreeSet<String> = values.iter().cloned().collect();
+            if index.set_excluded(excluded) {
+                // Rebuilt here rather than left for the load path, so the
+                // command's own reply already describes the new index.
+                let attr = attr.unwrap_or(index.attr);
+                let records = std::mem::take(&mut table.records);
+                if let Some(index) = table.indexes.get_mut(field) {
+                    index.rebuild(&records, attr);
+                }
+                table.records = records;
+            }
+        }
+        // The file's lock is released first: a flush locks each dirty file in
+        // turn, and would wait on the one this thread is holding.
+        self.flush_table(&(account.to_string(), file.to_string()))?;
+        self.index_statistics_for_field(account, file, field)
+    }
+
+    /// The values one index holds, largest first - the histogram alone.
+    pub fn index_values(&self, account: &str, file: &str, field: &str, limit: usize) -> DbResult<Vec<IndexValue>> {
+        Ok(self.index_report(account, file, field, limit)?.top_values)
     }
 
     /// One index's statistics, by field name.

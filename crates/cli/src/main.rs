@@ -208,6 +208,15 @@ fn main() -> io::Result<()> {
             "LIST.INDEXES" => {
                 handle_list_indexes(&db.write().unwrap(), &parts);
             }
+            "INDEX.STATS" => {
+                handle_index_stats(&db.write().unwrap(), &parts);
+            }
+            "SET.INDEX.EXCLUDE" => {
+                handle_set_index_exclude(&db.write().unwrap(), &parts);
+            }
+            "FILE.STATS" => {
+                handle_file_stats(&db.write().unwrap(), &parts);
+            }
             "CREATE.ACCOUNT" => {
                 let mut db_lock = db.write().unwrap();
                 if db_lock.is_current_account("SYSTEM") {
@@ -947,12 +956,15 @@ fn print_help(current_account: &str) {
     println!("  SET.FILE <name> DURABLE | BUFFERED    - Turn durable writes on or off for an existing file.");
     println!("                                          Turning it on flushes what the file still had buffered.");
     println!("  DELETE.FILE <name>                    - Delete a file (data and dict) (SYSTEM only).");
-    println!(
-        "  CREATE.INDEX <file> <field>           - Index a dictionary field, so WITH <field> = ... stops scanning."
-    );
-    println!("  LIST.INDEXES <file>                   - List a file's indexes with their size and selectivity.");
+    println!("  CREATE.INDEX <file> <field> [EXCLUDE <value>...] - Index a dictionary field, so WITH <field> = ...");
+    println!("                                          stops scanning. EXCLUDE names values not worth indexing.");
+    println!("  LIST.INDEXES [<file>]                 - List a file's indexes, or every index in the account.");
+    println!("  INDEX.STATS <file> <field> [<n>]      - One index in full: its verdicts and its commonest values.");
+    println!("  SET.INDEX.EXCLUDE <file> <field> [<value>...] - Replace the values an index skips, and rebuild it.");
+    println!("                                          With no values, the exclusions are cleared.");
     println!("  REBUILD.INDEX <file> <field>          - Derive an index from the records again.");
     println!("  DELETE.INDEX <file> <field>           - Drop an index and remove its section.");
+    println!("  FILE.STATS <file>                     - A file's layout, how healthy it is and what to do about it.");
     println!("  CREATE.ACCOUNT <name> [<dir>]         - Create a new account (SYSTEM only).");
     if current_account == "SYSTEM" {
         println!("  CREATE.TEST.ACCOUNT <name>            - Create and populate a test account (SYSTEM only).");
@@ -1167,29 +1179,224 @@ fn print_index(stats: &smart_rusty_pick_core::db::IndexStats) {
         stats.postings as f64 / stats.values as f64
     };
     println!(
-        "  {:<16} attribute {:<4} {} values, {} keys, largest {}, {:.1} per lookup{}",
+        "  {:<16} attribute {:<4} {} values, {} keys, largest {}, {:.1} per lookup, {} lookups served [{}]{}",
         stats.field,
         stats.attribute,
         stats.values,
         stats.postings,
         stats.largest_postings,
         per_lookup,
+        stats.usage.lookups,
+        stats.health.verdict,
         if stats.stale { " (STALE - rebuild it)" } else { "" },
     );
 }
 
+/// The values after an `EXCLUDE` keyword, and whether one was given at all.
+///
+/// Quoted values are unwrapped so `EXCLUDE ""` means the empty value - which is
+/// the commonest exclusion there is, a sparse field most records do not carry,
+/// and is unspellable otherwise.
+fn exclusions_after(parts: &[&str], from: usize) -> Vec<String> {
+    let Some(at) = parts[from..]
+        .iter()
+        .position(|part| part.eq_ignore_ascii_case("EXCLUDE"))
+    else {
+        return Vec::new();
+    };
+    parts[from + at + 1..].iter().map(|part| unquote(part)).collect()
+}
+
+/// Strips one layer of matching quotes, so `""` is the empty value rather than
+/// two characters.
+fn unquote(value: &str) -> String {
+    let trimmed = value.trim();
+    for quote in ['"', '\''] {
+        if trimmed.len() >= 2 && trimmed.starts_with(quote) && trimmed.ends_with(quote) {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 fn handle_create_index(db: &Database, parts: &[&str]) {
     if parts.len() < 3 {
-        println!("Usage: CREATE.INDEX <file_name> <field_name>");
+        println!("Usage: CREATE.INDEX <file_name> <field_name> [EXCLUDE <value>...]");
         return;
     }
     let account = db.current_account();
-    match db.create_index_for_account(&account, parts[1], parts[2]) {
+    let exclude = exclusions_after(parts, 3);
+    match db.create_index_excluding(&account, parts[1], parts[2], &exclude) {
         Ok(stats) => {
             println!("[{}] indexed on {}", parts[1], stats.field);
             print_index(&stats);
         }
         Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_set_index_exclude(db: &Database, parts: &[&str]) {
+    if parts.len() < 3 {
+        println!("Usage: SET.INDEX.EXCLUDE <file_name> <field_name> [<value>...]");
+        println!("  With no values, the index stops excluding anything.");
+        return;
+    }
+    let account = db.current_account();
+    let values: Vec<String> = parts[3..].iter().map(|part| unquote(part)).collect();
+    match db.set_index_exclusions(&account, parts[1], parts[2], &values) {
+        Ok(stats) => {
+            if stats.excluded.is_empty() {
+                println!("[{}] index on {} excludes nothing", parts[1], stats.field);
+            } else {
+                println!(
+                    "[{}] index on {} now excludes {}",
+                    parts[1],
+                    stats.field,
+                    describe_values(&stats.excluded)
+                );
+            }
+            print_index(&stats);
+        }
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+/// Values as prose, naming the empty one rather than printing nothing for it.
+fn describe_values(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| {
+            if value.is_empty() {
+                "\"\" (the empty value)".to_string()
+            } else {
+                format!("\"{}\"", value)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn handle_index_stats(db: &Database, parts: &[&str]) {
+    if parts.len() < 3 {
+        println!("Usage: INDEX.STATS <file_name> <field_name> [<how_many_values>]");
+        return;
+    }
+    let account = db.current_account();
+    let limit = parts
+        .get(3)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(smart_rusty_pick_core::db::health::thresholds::HISTOGRAM_DEFAULT);
+    let report = match db.index_report(&account, parts[1], parts[2], limit) {
+        Ok(report) => report,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
+    println!(
+        "Index on {} of [{}] - {} records in the file",
+        report.index.field, report.index.file, report.record_count
+    );
+    print_index(&report.index);
+    if !report.index.excluded.is_empty() {
+        println!("  excludes {}", describe_values(&report.index.excluded));
+    }
+    println!();
+    print_health(&report.index.health);
+
+    if !report.values_available {
+        println!();
+        println!("  The values could not be read: the index is stale or its section would not load.");
+        return;
+    }
+    if report.top_values.is_empty() {
+        return;
+    }
+    println!();
+    println!("Commonest values:");
+    for value in &report.top_values {
+        let share = if report.record_count == 0 {
+            0.0
+        } else {
+            value.keys as f64 / report.record_count as f64
+        };
+        println!(
+            "  {:<32} {:>8} keys  {:>5}",
+            if value.value.is_empty() {
+                "\"\" (the empty value)".to_string()
+            } else {
+                value.value.clone()
+            },
+            value.keys,
+            smart_rusty_pick_core::db::health::percent(share),
+        );
+    }
+}
+
+/// A set of verdicts, worst first, in the shape the dashboard renders them.
+///
+/// The verdicts themselves come from the engine, never from here: the CLI, the
+/// remote protocol and the browser describe the same file, and three copies of
+/// "5% is the line" is three chances to disagree.
+fn print_health(health: &smart_rusty_pick_core::db::Health) {
+    use smart_rusty_pick_core::db::Verdict;
+    println!("Health: {}", health.verdict.as_str().to_uppercase());
+    let mut measures: Vec<_> = health.measures.iter().collect();
+    measures.sort_by(|a, b| b.verdict.cmp(&a.verdict));
+    for measure in measures {
+        let mark = match measure.verdict {
+            Verdict::Good => "  ok  ",
+            Verdict::Watch => " watch",
+            Verdict::Act => " ACT  ",
+        };
+        println!(
+            "{} {:<22} {:>12}   {}",
+            mark, measure.label, measure.value, measure.detail
+        );
+        if measure.verdict != Verdict::Good {
+            println!("         threshold: {}", measure.threshold);
+        }
+    }
+}
+
+fn handle_file_stats(db: &Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: FILE.STATS <file_name>");
+        return;
+    }
+    let account = db.current_account();
+    let stats = match db.file_statistics(&account, parts[1]) {
+        Ok(stats) => stats,
+        Err(e) => {
+            println!("Error: {}", e);
+            return;
+        }
+    };
+    let groups = &stats.group_records;
+    println!("[{}/{}]", stats.account, stats.name);
+    println!(
+        "  {} records, {} dictionary entries, {} on disk",
+        stats.record_count,
+        stats.dict_count,
+        smart_rusty_pick_core::db::health::bytes(stats.disk_bytes),
+    );
+    println!(
+        "  modulus {} over {} groups; records per group min {} / median {} / mean {} / max {}",
+        stats.modulus,
+        stats.group_count,
+        groups.min,
+        groups.median,
+        smart_rusty_pick_core::db::health::ratio(groups.mean),
+        groups.max,
+    );
+    println!();
+    print_health(&stats.health);
+    if !stats.indexes.is_empty() {
+        println!();
+        println!("Indexes:");
+        for index in &stats.indexes {
+            print_index(index);
+        }
     }
 }
 
@@ -1221,11 +1428,23 @@ fn handle_delete_index(db: &Database, parts: &[&str]) {
 }
 
 fn handle_list_indexes(db: &Database, parts: &[&str]) {
+    let account = db.current_account();
+    // No file named: every index in the account, so a database with forty files
+    // can be asked "which of these is worth my attention" in one command.
     if parts.len() < 2 {
-        println!("Usage: LIST.INDEXES <file_name>");
+        match db.index_statistics_for_account(&account) {
+            Ok(indexes) if indexes.is_empty() => println!("No indexes in {}.", account),
+            Ok(indexes) => {
+                println!("Indexes in {}:", account);
+                for (file, stats) in &indexes {
+                    println!("  [{}]", file);
+                    print_index(stats);
+                }
+            }
+            Err(e) => println!("Error: {}", e),
+        }
         return;
     }
-    let account = db.current_account();
     let indexes = match db.index_statistics(&account, parts[1]) {
         Ok(indexes) => indexes,
         Err(e) => {

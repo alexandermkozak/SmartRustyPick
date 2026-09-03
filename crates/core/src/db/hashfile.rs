@@ -758,6 +758,82 @@ fn remove_groups_beyond(dir: &Path, modulus: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// How many more records the section takes before its modulus has to grow.
+///
+/// Growth is a *full rewrite of every group*, so "3,000 records from a rehash"
+/// is worth seeing before it happens rather than after. `0` means the next
+/// flush already picks a larger modulus.
+pub fn records_until_growth(modulus: u64, records: u64, per_group: usize) -> u64 {
+    let capacity = modulus.saturating_mul(per_group.max(1) as u64);
+    // `target_modulus` grows at the first record past capacity.
+    capacity.saturating_add(1).saturating_sub(records)
+}
+
+/// How many records the section has to lose before its modulus shrinks, or
+/// `None` when it is already as small as it goes.
+///
+/// The mirror of [`records_until_growth`], and asymmetric for the same reason
+/// [`plan_modulus`] is: shrinking waits for a quarter, so a table hovering
+/// around a boundary does not rehash on every flush.
+pub fn records_until_shrink(modulus: u64, records: u64, per_group: usize) -> Option<u64> {
+    if plan_modulus(modulus, records, per_group) < modulus {
+        return Some(0);
+    }
+    let quarter = modulus / 4;
+    if quarter < MIN_MODULUS {
+        return None;
+    }
+    // `target_modulus(r) <= quarter` exactly while `r <= quarter * per_group`.
+    let ceiling = quarter.saturating_mul(per_group.max(1) as u64);
+    (records > ceiling).then(|| records - ceiling)
+}
+
+/// One group file, as a diagnostic sees it without reading a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupEntry {
+    pub bytes: u64,
+    /// Records the group holds, from its trailer. `None` for a group written
+    /// before the format appended one, whose count is only in its frames.
+    pub records: Option<u64>,
+}
+
+/// Every group of a section: its size, and how many records it holds.
+///
+/// The record count comes out of the 20-byte trailer
+/// (`[magic][record_count][crc32c]`) rather than by reading the frames, so the
+/// true distribution costs one seek per group and loads nothing. That is what
+/// lets a management view report records per group while keeping the promise
+/// that it never returns - or even reads - a record.
+///
+/// Sorted by record count, then by size, so a caller reading the extremes off
+/// the ends gets the record extremes.
+pub fn group_profile(section_path: &str) -> Vec<GroupEntry> {
+    let dir = section_dir(section_path);
+    let mut groups = Vec::new();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return groups;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or_default();
+        if !name.starts_with('g') || name.ends_with(".tmp") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else { continue };
+        let bytes = metadata.len();
+        // An unreadable trailer is reported as an unknown count rather than as
+        // an error: this is a diagnostic, and refusing to describe a section
+        // because one group is damaged is exactly backwards.
+        let records = read_trailer(&entry.path(), bytes)
+            .ok()
+            .flatten()
+            .map(|(count, _)| count);
+        groups.push(GroupEntry { bytes, records });
+    }
+    groups.sort_by_key(|group| (group.records.unwrap_or(0), group.bytes));
+    groups
+}
+
 /// Group file sizes, smallest first. Used by tests and diagnostics to confirm
 /// the modulus really is spreading records instead of piling them up.
 pub fn group_sizes(section_path: &str) -> Vec<u64> {

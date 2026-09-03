@@ -39,6 +39,8 @@ const REQUEST_FIELDS: &[&str] = &[
     "is_admin",
     "durable",
     "field",
+    "values",
+    "limit",
 ];
 
 /// Every JSON key a `Response` can carry.
@@ -82,6 +84,8 @@ const COMMANDS: &[&str] = &[
     "REBUILD.INDEX",
     "DELETE.INDEX",
     "LIST.INDEXES",
+    "INDEX.STATS",
+    "SET.INDEX.EXCLUDE",
     "SERVER.STATS",
 ];
 
@@ -301,7 +305,17 @@ fn list_accounts_entry_is_documented() {
     assert_documented_shape(
         "LIST.ACCOUNTS",
         value_keys(&value),
-        &["name", "directory", "file_count", "record_count", "disk_bytes"],
+        &[
+            "name",
+            "directory",
+            "file_count",
+            "record_count",
+            "disk_bytes",
+            "index_count",
+            "stale_indexes",
+            "unhealthy_files",
+            "health",
+        ],
     );
 }
 
@@ -328,7 +342,96 @@ fn file_stats_record_is_documented() {
             "loaded",
             "modified_seconds_ago",
             "indexes",
+            "group_bytes",
+            "index_bytes",
+            "group_records",
+            "records_per_group_target",
+            "load_factor",
+            "records_until_growth",
+            "records_until_shrink",
+            "largest_group_share",
+            "skew",
+            "health",
         ],
+    );
+}
+
+/// The nested objects `FILE.STATS` carries. Pinned separately because they are
+/// their own shapes, and a field added to one of them is as invisible to a
+/// reader of the documentation as a field added to the reply itself.
+#[test]
+fn file_stats_derived_objects_are_documented() {
+    assert_documented_shape(
+        "FILE.STATS group_records",
+        value_keys(&serde_json::to_value(crate::db::GroupDistribution::default()).unwrap()),
+        &[
+            "groups",
+            "min",
+            "max",
+            "mean",
+            "median",
+            "empty",
+            "overweight",
+            "unreadable",
+            "buckets",
+        ],
+    );
+    assert_documented_shape(
+        "FILE.STATS group_records.buckets",
+        value_keys(&serde_json::to_value(crate::db::DistributionBucket::default()).unwrap()),
+        &["min", "max", "groups"],
+    );
+}
+
+/// A verdict is the half of a measure a client is allowed to branch on, in the
+/// same way an error code is: the wording of a `detail` may change, a verdict
+/// may not.
+#[test]
+fn health_objects_are_documented() {
+    assert_documented_shape(
+        "health",
+        value_keys(&serde_json::to_value(crate::db::Health::default()).unwrap()),
+        &["verdict", "measures"],
+    );
+    assert_documented_shape(
+        "health.measures",
+        value_keys(&serde_json::to_value(crate::db::Measure::default()).unwrap()),
+        &["id", "label", "value", "verdict", "threshold", "detail"],
+    );
+    assert_documented_shape(
+        "LIST.FILES / LIST.ACCOUNTS health",
+        value_keys(&serde_json::to_value(crate::db::HealthSummary::default()).unwrap()),
+        &["verdict", "reasons"],
+    );
+    for verdict in [
+        crate::db::Verdict::Good,
+        crate::db::Verdict::Watch,
+        crate::db::Verdict::Act,
+    ] {
+        assert_eq!(
+            serde_json::to_string(&verdict).unwrap(),
+            format!("\"{}\"", verdict.as_str()),
+            "a verdict is not sent as the string it names"
+        );
+        assert!(
+            PROTOCOL_DOC.contains(&format!("`{}`", verdict.as_str())),
+            "verdict `{verdict}` is not listed in docs/protocol.md"
+        );
+    }
+}
+
+/// What `INDEX.STATS` adds on top of the listing's per-index object.
+#[test]
+fn index_report_record_is_documented() {
+    assert_documented_shape(
+        "INDEX.STATS",
+        value_keys(&serde_json::to_value(crate::db::IndexReport::default()).unwrap()),
+        &["record_count", "index", "top_values", "values_available"],
+    );
+    assert_documented_shape(
+        "INDEX.STATS top_values",
+        value_keys(&serde_json::to_value(crate::db::IndexValue::default()).unwrap()),
+        &["value", "keys"],
     );
 }
 
@@ -339,6 +442,7 @@ fn index_stats_record_is_documented() {
         "LIST.INDEXES / CREATE.INDEX",
         value_keys(&value),
         &[
+            "file",
             "field",
             "attribute",
             "values",
@@ -352,6 +456,20 @@ fn index_stats_record_is_documented() {
             "stale",
             "loaded",
             "built_seconds_ago",
+            "excluded",
+            "usage",
+            "health",
+        ],
+    );
+    assert_documented_shape(
+        "LIST.INDEXES usage",
+        value_keys(&serde_json::to_value(crate::db::IndexUsageStats::default()).unwrap()),
+        &[
+            "lookups",
+            "candidates",
+            "matched",
+            "measured_lookups",
+            "excluded_lookups",
         ],
     );
 }

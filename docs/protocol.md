@@ -40,9 +40,9 @@ matched case-insensitively.
 | Field             | Type             | Used by                                                                                                            | Notes                                                                                                                                                                                                                                                                                     |
 |-------------------|------------------|--------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `command`         | string           | all                                                                                                                | Required. See [Commands](#commands).                                                                                                                                                                                                                                                      |
-| `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `GET.NEXT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `LIST.INDEXES` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
+| `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `GET.NEXT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `LIST.INDEXES`, `INDEX.STATS`, `SET.INDEX.EXCLUDE` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
 | `target_account`  | string           | `CREATE.ACCOUNT`, `CREATE.TEST.ACCOUNT`, `DELETE.ACCOUNT`                                                          | Name of the account to create or drop. (Distinct from `account`, which selects an existing context.)                                                                                                                                                                                      |
-| `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `LIST.INDEXES` | Table (file) name.                                                                                                                                                                                                                                                                        |
+| `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `INDEX.STATS`, `SET.INDEX.EXCLUDE` | Table (file) name. Optional on `LIST.INDEXES`, which lists the whole account without it. |                                                                                                                                                                                                                                                                        |
 | `key`             | string           | `READ`, `WRITE`, `DELETE`, `SET.DICT`                                                                              | Record key; for `SET.DICT`, the name of the dictionary entry.                                                                                                                                                                                                                                                                               |
 | `data`            | string \| object | `WRITE`                                                                                                            | Record contents. A string is parsed as a display-format record (`^` field mark, `]` value mark, `\` sub-value mark). An object maps field names — original dictionary names or their camelCase form — to values, applying the dictionary's input conversions (ICONV).                     |
 | `structured_data` | object           | `WRITE`, `SET.DICT`                                                                                                | `WRITE`: same object form as `data`, checked first when present — use either this or `data`, not both. `SET.DICT`: the dictionary attributes of one entry.                                                                                                                                 |
@@ -58,7 +58,9 @@ matched case-insensitively.
 | `accounts_list`   | array of strings | `AUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`, `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT`                                   | Allowed accounts for the client. Default `[]`.                                                                                                                                                                                                                                            |
 | `is_admin`        | bool             | `AUTHORIZE.CONN`, `GENERATE.CERT`                                                                                  | Grant the client admin rights. Default `false`.                                                                                                                                                                                                                                           |
 | `durable`         | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Per-file durable writes. Optional for `CREATE.FILE`, default `false`; required for `SET.FILE`, where an absent flag is refused rather than read as a demotion. See [Storage Engine](storage.md).                                                                                          |
-| `field`           | string           | `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`                                                                    | The dictionary field the index is on. Required by all three. See [Storage Engine](storage.md#secondary-indexes).                                                                                                                                                                           |
+| `field`           | string           | `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`                                | The dictionary field the index is on. Required by all of them. See [Storage Engine](storage.md#secondary-indexes).                                                                                                                                                                         |
+| `values`          | array of strings | `CREATE.INDEX`, `SET.INDEX.EXCLUDE`                                                                                | Values the index is to skip. Optional on `CREATE.INDEX`. On `SET.INDEX.EXCLUDE` it replaces the set, and an absent or empty list clears it.                                                                                                                                                |
+| `limit`           | number           | `INDEX.STATS`                                                                                                      | How many of the commonest values to return. Defaults to 10 and is clamped to 200, so one request cannot ask the server to sort and send every distinct value an index holds.                                                                                                               |
 
 ## Response object
 
@@ -231,10 +233,12 @@ three are not repeated in the per-command lists below.
 | `FILE.STATS`            |       |   yes   | `account`, `file`                                    | `record`                                |
 | `LIST.DICT`             |       |   yes   | `account`, `file`                                    | `keys` + `results` + `count`            |
 | `SET.DICT`              |       |   yes   | `account`, `file`, `key`, `structured_data`          | `record`                                |
-| `CREATE.INDEX`          |  yes  |   yes   | `account`, `file`, `field`                           | `record`                                |
+| `CREATE.INDEX`          |  yes  |   yes   | `account`, `file`, `field`, `values`                 | `record`                                |
 | `REBUILD.INDEX`         |  yes  |   yes   | `account`, `file`, `field`                           | `record`                                |
 | `DELETE.INDEX`          |  yes  |   yes   | `account`, `file`, `field`                           | `status: "OK"`                          |
-| `LIST.INDEXES`          |       |   yes   | `account`, `file`                                    | `keys` + `results` + `count`            |
+| `LIST.INDEXES`          |       |   yes   | `account`, `file` (optional)                         | `keys` + `results` + `count`            |
+| `INDEX.STATS`           |       |   yes   | `account`, `file`, `field`, `limit`                  | `record`                                |
+| `SET.INDEX.EXCLUDE`     |  yes  |   yes   | `account`, `file`, `field`, `values`                 | `record`                                |
 | `SERVER.STATS`          |  yes  |    —    | —                                                    | `record`                                |
 
 ¹ `GET.NEXT` resolves its account from the select list created by `SELECT`, so it does not
@@ -585,8 +589,17 @@ each file's section metadata, so no records are read.
 ```json
 {"status": "OK", "count": 1,
  "results": [["SALES", {"name": "SALES", "directory": "db_storage/SALES",
-                        "file_count": 3, "record_count": 1280, "disk_bytes": 262144}]]}
+                        "file_count": 3, "record_count": 1280, "disk_bytes": 262144,
+                        "index_count": 4, "stale_indexes": 1, "unhealthy_files": 1,
+                        "health": {"verdict": "act",
+                                   "reasons": ["1 of 3 files need attention"]}}]]}
 ```
+
+`index_count` and `stale_indexes` count the [secondary indexes](storage.md#secondary-indexes)
+across every file in the account, and `unhealthy_files` how many files the cheap check
+reports as anything but `good`. `health` is the worst of those file verdicts, in the summary
+form [Health](#health-verdicts-and-measures) describes — enough to know an account is worth
+opening, and no more.
 
 ### LIST.FILES
 
@@ -594,9 +607,15 @@ The files in one account, sorted.
 
 - Required: `account` (or a client with exactly one allowed account).
 - `keys` is the plain list of names. `results` pairs each name with what is known about the
-  file beside its name — currently `durable`, so a client can see which files flush every
-  write without reading the account's `DIR` file. A database running with
+  file beside its name: `durable`, so a client can see which files flush every write without
+  reading the account's `DIR` file, and a [health](#health-verdicts-and-measures) verdict, so
+  a problem file can be found without opening every file in turn. A database running with
   `durable_writes = true` reports every file as durable, because every write then is.
+- `health` here is the *cheap* verdict — one of `good`, `watch` or `act`, derived from the
+  section metadata and the index `state` files alone. It reads no group trailer and no
+  record, because a listing must not cost what opening a file costs. `health_reasons` names
+  what is wrong in short phrases, and is `[]` when nothing is. The full measures, including
+  everything that needs the group distribution, arrive with `FILE.STATS`.
 - Errors: `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`.
 
 ```json
@@ -605,16 +624,58 @@ The files in one account, sorted.
 
 ```json
 {"status": "OK", "count": 3, "keys": ["DIR", "LEDGER", "USERS"], "results": [
-  ["DIR", {"durable": false}],
-  ["LEDGER", {"durable": true}],
-  ["USERS", {"durable": false}]
+  ["DIR", {"durable": false, "health": "good", "health_reasons": []}],
+  ["LEDGER", {"durable": true, "health": "good", "health_reasons": []}],
+  ["USERS", {"durable": false, "health": "act",
+             "health_reasons": ["1 of 2 indexes stale"]}]
 ]}
 ```
 
+### Health: verdicts and measures
+
+Several replies carry a `health` object rather than leaving a reader to decide whether a
+number is bad. The verdicts are decided by the server, in one place, so the CLI, this
+protocol and the web dashboard cannot disagree about where the line is.
+
+A `health` object has two fields:
+
+| Field      | Type             | Meaning                                                 |
+|------------|------------------|---------------------------------------------------------|
+| `verdict`  | string           | The worst verdict among `measures`.                     |
+| `measures` | array of objects | One entry per thing measured, in a stable order.        |
+
+One measure:
+
+| Field       | Type   | Meaning                                                                    |
+|-------------|--------|----------------------------------------------------------------------------|
+| `id`        | string | Stable identifier — `skew`, `load_factor`, `dominant_value` and so on.     |
+| `label`     | string | Short name for a person.                                                   |
+| `value`     | string | The measurement, already formatted. `"—"` when there is nothing to report. |
+| `verdict`   | string | `good`, `watch` or `act`.                                                  |
+| `threshold` | string | The rule that produced the verdict, so a reader can argue with it.         |
+| `detail`    | string | What it means, and for anything but `good`, what to do about it.           |
+
+The three verdicts:
+
+- `good` — nothing to do.
+- `watch` — not wrong now, and heading somewhere: a file about to rehash, an index nothing
+  has queried yet.
+- `act` — something is costing more than it should, and `detail` says what to do.
+
+**A client branches on `id` and `verdict`, never on `label`, `threshold` or `detail`.** Those
+are prose for a person and may be reworded; the identifiers and the verdicts are the
+interface, exactly as an [error code](#error-codes) is and its message is not. A measure that
+cannot be judged yet — skew over four records, usage on a server that started a second ago —
+reports `good` and says so in its `detail` rather than inventing a verdict.
+
+`LIST.FILES` and `LIST.ACCOUNTS` carry a cheaper form instead: a `verdict` string and a
+`reasons` array of short phrases, with no measures behind them.
+
 ### FILE.STATS
 
-Describe one file: how many records it holds, how they are spread across hash groups and what it costs on disk. No
-record is returned, and none is read to answer it unless the file is still in the pre-hashfile flat format.
+Describe one file: how many records it holds, how they are spread across hash groups, what it costs on disk — and
+whether any of that is a problem. No record is returned, and none is read to answer it unless the file is still in the
+pre-hashfile flat format.
 
 - Required: `account` (or a single-account client), `file`.
 - Errors: `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`), `ACCESS_DENIED`,
@@ -630,18 +691,69 @@ record is returned, and none is read to answer it unless the file is still in th
   "record_count": 1280, "dict_count": 4,
   "modulus": 128, "version": 42,
   "group_count": 128, "smallest_group_bytes": 96, "largest_group_bytes": 512,
-  "disk_bytes": 262144, "checksums": true, "legacy": false,
+  "disk_bytes": 262144, "group_bytes": 212992, "index_bytes": 20480,
+  "checksums": true, "legacy": false,
   "durable": false, "loaded": true, "modified_seconds_ago": 12,
+  "records_per_group_target": 16, "load_factor": 0.625,
+  "records_until_growth": 769, "records_until_shrink": 768,
+  "largest_group_share": 0.021, "skew": 2.7,
+  "group_records": {
+    "groups": 128,
+    "min": 3, "max": 27, "mean": 10.0, "median": 10,
+    "empty": 0, "overweight": 4, "unreadable": 0,
+    "buckets": [{"min": 3, "max": 4, "groups": 6},
+                {"min": 5, "max": 6, "groups": 21},
+                {"min": 25, "max": 27, "groups": 1}]
+  },
+  "health": {"verdict": "good", "measures": [
+    {"id": "skew", "label": "Group skew", "value": "2.7x", "verdict": "good",
+     "threshold": "watch above 3x the mean group, act above 6x; not judged below 4 records per group",
+     "detail": "Records are spread evenly: the largest group holds 27 against a mean of 10."}
+  ]},
   "indexes": [
-    {"field": "CITY", "attribute": 2, "values": 64, "postings": 1280, "largest_postings": 41,
-     "modulus": 8, "version": 7, "group_count": 8, "disk_bytes": 20480,
-     "data_version": 42, "stale": false, "loaded": true, "built_seconds_ago": 12}
+    {"file": "USERS", "field": "CITY", "attribute": 2, "values": 64, "postings": 1280,
+     "largest_postings": 41, "modulus": 8, "version": 7, "group_count": 8,
+     "disk_bytes": 20480, "data_version": 42, "stale": false, "loaded": true,
+     "built_seconds_ago": 12, "excluded": [],
+     "usage": {"lookups": 0, "candidates": 0, "matched": 0,
+               "measured_lookups": 0, "excluded_lookups": 0},
+     "health": {"verdict": "watch", "measures": []}}
   ]
 }}
 ```
 
 `indexes` describes the file's [secondary indexes](storage.md#secondary-indexes), in field
-order, with the same objects `LIST.INDEXES` returns. It is `[]` for a file that has none.
+order, with the same objects `LIST.INDEXES` returns. It is `[]` for a file that has none. The
+worst index verdict is rolled into the file's own `health`, so a badly shaped index is
+visible from the file rather than only from the index table.
+
+**Bytes.** `disk_bytes` is the whole file directory. `group_bytes` is the record groups alone
+and `index_bytes` the index sections, so the remainder is the dictionary and the small
+metadata files. There is no "wasted space" figure because there is no waste to report: a
+group is rewritten whole from its live entries, so a deleted record leaves nothing behind
+inside one.
+
+**Layout and headroom.** `records_per_group_target` is the records per group the modulus aims
+for, and `load_factor` is `record_count / (modulus * records_per_group_target)`. Past 1.0 the
+next flush picks a larger modulus, which rewrites *every* group —
+`records_until_growth` says how far away that is, and `records_until_shrink` how far the
+other way, or `null` when the modulus is already at its floor and will not shrink.
+
+**Distribution.** `group_records` is how the records are spread over the groups, read from
+each group's 20-byte trailer rather than by loading anything — one seek per group, no record.
+It is over `groups`, which is the **modulus** and not `group_count`: a group holding nothing
+has no file at all, so averaging the files that exist would report a file whose records had
+piled into four groups out of thirty-two as perfectly even. `empty` counts the groups holding
+nothing, file or no file.
+`skew` is `max / mean`, which is scale-free and so readable on a file of any size;
+`largest_group_share` is the same extreme against the whole file. `overweight` counts the
+groups above twice the mean, which says something one extreme cannot: that the hash itself is
+not spreading rather than that one group is unlucky. `unreadable` counts groups written
+before the format appended a trailer, whose counts are left out of every other figure rather
+than folded in as zero. `buckets` is the shape, as at most sixteen equal-width columns over
+the record counts, so a file with a modulus of 65,536 still answers in a small reply.
+
+`health` is described under [Health](#health-verdicts-and-measures).
 
 ### LIST.DICT
 
@@ -713,6 +825,8 @@ Build a [secondary index](storage.md#secondary-indexes) on a dictionary field, s
 reported as `stale`, and the way to bring one back after its section has been damaged.
 
 - Required: `account` (or a single-account client), `file`, `field`.
+- Optional on `CREATE.INDEX`: `values`, the values the index is not to hold. See
+  [SET.INDEX.EXCLUDE](#setindexexclude--admin) for what that is for and what it costs.
 - Both are one pass over the file's records, which is the only cost an index has that grows
   with the file. Maintaining it afterwards rides the ordinary write path.
 - `record` is the index as `LIST.INDEXES` describes it, read back after the build rather
@@ -728,11 +842,20 @@ reported as `stale`, and the way to bring one back after its section has been da
 ```
 
 ```json
+{"command": "CREATE.INDEX", "account": "SALES", "file": "ORDERS", "field": "STATUS",
+ "values": ["ACTIVE", ""]}
+```
+
+```json
 {"status": "OK", "record": {
-  "field": "CITY", "attribute": 2,
+  "file": "USERS", "field": "CITY", "attribute": 2,
   "values": 64, "postings": 1280, "largest_postings": 41,
   "modulus": 8, "version": 1, "group_count": 8, "disk_bytes": 20480,
-  "data_version": 42, "stale": false, "loaded": true, "built_seconds_ago": 0
+  "data_version": 42, "stale": false, "loaded": true, "built_seconds_ago": 0,
+  "excluded": [],
+  "usage": {"lookups": 0, "candidates": 0, "matched": 0,
+            "measured_lookups": 0, "excluded_lookups": 0},
+  "health": {"verdict": "good", "measures": []}
 }}
 ```
 
@@ -751,23 +874,43 @@ queries that were using it go back to scanning.
 
 ### LIST.INDEXES
 
-Every index of one file, with the counts an operator decides with.
+Every index of one file — or, with no `file`, every index in the account, so index health is
+visible without walking file by file.
 
-- Required: `account` (or a single-account client), `file`.
-- `keys` is the plain list of indexed fields. `results` pairs each with its statistics.
+- Required: `account` (or a single-account client). `file` is optional.
+- With a `file`, `keys` is the plain list of indexed fields. Without one, each key is
+  `<file>/<field>`, so two files indexing the same field name are still two rows. Either way
+  every entry names its own `file`, and a client renders one table for both.
 - `values` against the file's `record_count` is how selective the field is; `postings` is
   the total (value, key) pairs, which is what maintaining the index costs per write; and
   `largest_postings` is the skew the average hides — an index whose biggest value covers
-  half the file saves nothing on that value.
+  half the file saves nothing on that value. `health` turns all of that into a verdict; see
+  [Health](#health-verdicts-and-measures).
 - `stale` means the index does not match the data and has to be rebuilt before it is used.
   Loading a file rebuilds a stale index as it opens, so this is normally only ever seen for
   a file that is not in memory. `data_version` is the data section version the index matches;
   `version` is the index section's own flush counter.
+- `excluded` lists the values this index deliberately does not hold. See
+  [SET.INDEX.EXCLUDE](#setindexexclude--admin).
+- `usage` is what the read path has actually asked of this index **since the server
+  started**, and is never persisted:
+  - `lookups` — lookups it answered. Zero is the clearest possible signal that an index is
+    pure cost, since it is maintained on every write to its field whether or not anything
+    queries it. Read it against how long the server has been up.
+  - `candidates` — record keys those lookups handed to the filter behind them.
+  - `matched` — how many of those survived the filter, over `measured_lookups`.
+  - `measured_lookups` — lookups whose survivors could be attributed to this index, which is
+    a query one index resolved on its own. Once an `AND` intersects two indexes there is no
+    honest way to say which of them a surviving record is owed to, so such a query counts in
+    `lookups` and `candidates` and not here.
+  - `excluded_lookups` — lookups that fell back to a scan because the value asked for is
+    excluded.
 - Read from memory when the file is loaded, so an index changed but not yet flushed is
   described as it now is. For a file that is not loaded the index sections are read instead —
-  they hold values and keys rather than record bodies.
-- Errors: `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`), `ACCESS_DENIED`,
-  `FILE_NOT_FOUND`.
+  they hold values and keys rather than record bodies — and `usage` is all zeroes, because
+  the counters live on the in-memory index.
+- Errors: `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`, `FILE_NOT_FOUND`, `ACCOUNT_NOT_FOUND`
+  (the account-wide form).
 
 ```json
 {"command": "LIST.INDEXES", "account": "SALES", "file": "USERS"}
@@ -775,11 +918,112 @@ Every index of one file, with the counts an operator decides with.
 
 ```json
 {"status": "OK", "count": 1, "keys": ["CITY"], "results": [
-  ["CITY", {"field": "CITY", "attribute": 2, "values": 64, "postings": 1280,
+  ["CITY", {"file": "USERS", "field": "CITY", "attribute": 2, "values": 64, "postings": 1280,
             "largest_postings": 41, "modulus": 8, "version": 7, "group_count": 8,
             "disk_bytes": 20480, "data_version": 42, "stale": false, "loaded": true,
-            "built_seconds_ago": 12}]
+            "built_seconds_ago": 12, "excluded": [],
+            "usage": {"lookups": 812, "candidates": 16240, "matched": 15980,
+                      "measured_lookups": 800, "excluded_lookups": 0},
+            "health": {"verdict": "good", "measures": []}}]
 ]}
+```
+
+Every index in the account, keyed by file and field:
+
+```json
+{"command": "LIST.INDEXES", "account": "SALES"}
+```
+
+```json
+{"status": "OK", "count": 2, "keys": ["ORDERS/STATUS", "USERS/CITY"], "results": [
+  ["ORDERS/STATUS", {"file": "ORDERS", "field": "STATUS", "...": "..."}],
+  ["USERS/CITY", {"file": "USERS", "field": "CITY", "...": "..."}]
+]}
+```
+
+### INDEX.STATS
+
+One index in full: its statistics, its verdicts, and the values that dominate it.
+
+- Required: `account` (or a single-account client), `file`, `field`. Optional: `limit`.
+- Its own command rather than a wider `LIST.INDEXES` because it costs more: `LIST.INDEXES` is
+  a per-file listing read on every navigation and should stay cheap, while this sorts the
+  index's values and is asked for deliberately.
+- `top_values` is the `limit` values holding the most record keys, largest first, ties broken
+  on the value so the same index always reports the same list. `limit` defaults to 10 and is
+  clamped to 200.
+- This is what turns "this index is skewed" into "`STATUS = ACTIVE` is 91% of it", which is
+  what makes the diagnosis actionable: the value it names is the one to hand to
+  [SET.INDEX.EXCLUDE](#setindexexclude--admin).
+- `values_available` is false when the values could not be read — a stale index, whose
+  postings do not describe the records, or a section that would not load. `top_values` is
+  then `[]`, which is not the same as an empty index and is why the flag is there.
+- No record is read: an index holds values and record keys, never record bodies.
+- Errors: `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file` or `field`), `ACCESS_DENIED`,
+  `FILE_NOT_FOUND`, `INDEX_NOT_FOUND`.
+
+```json
+{"command": "INDEX.STATS", "account": "SALES", "file": "ORDERS", "field": "STATUS",
+ "limit": 5}
+```
+
+```json
+{"status": "OK", "record": {
+  "record_count": 1280, "values_available": true,
+  "index": {"file": "ORDERS", "field": "STATUS", "attribute": 4, "...": "..."},
+  "top_values": [
+    {"value": "ACTIVE", "keys": 1164},
+    {"value": "PENDING", "keys": 71},
+    {"value": "CANCELLED", "keys": 33},
+    {"value": "", "keys": 12}
+  ]
+}}
+```
+
+### SET.INDEX.EXCLUDE — admin
+
+Replace the values one index deliberately does not hold.
+
+The remedy between leaving an index alone and dropping it. Take the common real shape: a
+field where 90% of records carry one value and the remaining 10% are spread over hundreds.
+That field is *excellent* to index — for the 10%. Indexing the dominant value buys nothing,
+because the lookup hands the scan behind it most of the file and the scan does that work
+anyway, and it costs the most, because it is the longest posting list and so the entry
+rewritten most expensively on every write that touches it. `"index everything except the
+empty string"` is the other common spelling: a sparse field most records simply do not carry.
+
+- Required: `account` (or a single-account client), `file`, `field`. Optional: `values`.
+- `values` **replaces** the set. An absent or empty list clears the exclusions, since
+  replacing the set is the whole command.
+- Changing the set rebuilds the index, exactly as moving its field to another attribute does:
+  the index no longer holds what it says it holds. The set is stored in the index section's
+  `state` file, so it survives a restart and is part of what a staleness check compares.
+- Values are compared after trimming, which is what a query does to a value before testing
+  it, so `"ACTIVE"` and `" ACTIVE "` are the same exclusion.
+- **A query for an excluded value returns exactly what it returned without the index.** The
+  planner is told "I cannot help, scan for it" rather than being handed an empty posting list
+  it would read as "no records" — and the same applies inside `AND` and `OR`: an excluded
+  side is an unknown side, not an empty one. That is sound because the index only ever
+  narrows and the evaluation behind it decides, so "I do not know" was already an answer the
+  planner handled.
+- There is no automatic variant that skips any value over some share of the file. It would
+  make an index's contents depend on the data distribution at build time, so the same command
+  would produce different indexes on different days, and a value could silently cross the
+  threshold as the file grew. The exclusions stay explicit; `INDEX.STATS` suggests them.
+- `record` is the index as `LIST.INDEXES` describes it, read back after the rebuild.
+- Errors: `ADMIN_REQUIRED`, `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file` or `field`),
+  `ACCESS_DENIED`, `FILE_NOT_FOUND`, `INDEX_NOT_FOUND`.
+
+```json
+{"command": "SET.INDEX.EXCLUDE", "account": "SALES", "file": "ORDERS",
+ "field": "STATUS", "values": ["ACTIVE", ""]}
+```
+
+```json
+{"status": "OK", "record": {
+  "file": "ORDERS", "field": "STATUS", "values": 104, "postings": 104,
+  "largest_postings": 71, "excluded": ["", "ACTIVE"], "stale": false, "...": "..."
+}}
 ```
 
 ### SERVER.STATS — admin

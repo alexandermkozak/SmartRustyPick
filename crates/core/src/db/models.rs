@@ -365,6 +365,11 @@ impl Table {
     /// cannot become a directory, a field the dictionary does not define, or
     /// `ID` - which is the record key, already found in one hash lookup.
     pub fn create_index(&mut self, field: &str) -> crate::db::DbResult<()> {
+        self.create_index_excluding(field, BTreeSet::new())
+    }
+
+    /// [`Table::create_index`], with a set of values the index will not hold.
+    pub fn create_index_excluding(&mut self, field: &str, excluded: BTreeSet<String>) -> crate::db::DbResult<()> {
         let field = field.trim().to_string();
         let refuse = |reason: &str| crate::db::DbError::InvalidField {
             field: field.clone(),
@@ -379,7 +384,7 @@ impl Table {
         let attr = self
             .field_index(&field)
             .ok_or_else(|| refuse("it is not a dictionary field of this file"))?;
-        let mut index = FileIndex::new(&field, attr);
+        let mut index = FileIndex::with_exclusions(&field, attr, excluded);
         index.rebuild(&self.records, attr);
         self.indexes.insert(field, index);
         Ok(())
@@ -611,6 +616,15 @@ pub struct AccountStats {
     pub record_count: u64,
     /// Bytes on disk under the account directory.
     pub disk_bytes: u64,
+    /// Secondary indexes across every file in the account.
+    pub index_count: usize,
+    /// How many of those do not match the records they describe.
+    pub stale_indexes: usize,
+    /// Files whose cheap health check is not `good`, so a problem file can be
+    /// found without opening every file in the account in turn.
+    pub unhealthy_files: usize,
+    /// The worst file verdict in the account.
+    pub health: crate::db::health::HealthSummary,
 }
 
 /// Statistics for a single data file. Deliberately record free: the dashboard
@@ -645,6 +659,150 @@ pub struct FileStats {
     pub modified_seconds_ago: Option<u64>,
     /// The secondary indexes this file carries, in field order.
     pub indexes: Vec<crate::db::index::IndexStats>,
+
+    // --- Derived measures. Everything below is computed from the section
+    // metadata and the group trailers; none of it reads a record.
+    /// Bytes in the data section's group files alone. `disk_bytes` is the whole
+    /// file directory, so the difference is the dictionary, the indexes and the
+    /// small metadata files.
+    pub group_bytes: u64,
+    /// Bytes under this file's index sections.
+    pub index_bytes: u64,
+    /// How the records are spread over the groups, read from the trailers.
+    pub group_records: GroupDistribution,
+    /// Records per group the modulus is aiming for.
+    pub records_per_group_target: u64,
+    /// `records / (modulus * records_per_group_target)`. Above 1 the next flush
+    /// picks a larger modulus and rewrites every group.
+    pub load_factor: f64,
+    /// Records this file takes before the modulus doubles.
+    pub records_until_growth: u64,
+    /// Records it has to lose before the modulus halves, or `null` when the
+    /// modulus is already at its floor.
+    pub records_until_shrink: Option<u64>,
+    /// Records in the largest group as a share of every record in the file.
+    pub largest_group_share: f64,
+    /// Largest group over the mean group, in records. The scale-free way to
+    /// read skew: 1.0 is a perfectly even hash whatever the file's size.
+    pub skew: f64,
+    /// The verdicts on all of the above.
+    pub health: crate::db::health::Health,
+}
+
+/// How records are spread over a section's groups.
+///
+/// A hash file's failure mode is not size, it is imbalance: a group holding a
+/// large share of the records makes every write to it rewrite that whole group,
+/// which is the one cost this format exists to avoid. Two extremes in *bytes*
+/// hid that; these are records, and they come from the group trailers rather
+/// than from loading anything.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct GroupDistribution {
+    /// Groups these figures are over: the modulus, not the group *files*. A
+    /// group holding nothing has no file at all, so counting the files would
+    /// average four full groups out of a modulus of thirty-two and report a
+    /// perfectly even file - which is precisely the case skew exists to catch.
+    pub groups: usize,
+    pub min: u64,
+    pub max: u64,
+    pub mean: f64,
+    pub median: u64,
+    /// Groups holding no records at all, whether or not they have a file.
+    pub empty: usize,
+    /// Groups above [`thresholds::OVERWEIGHT_FACTOR`] times the mean. One
+    /// outlier is noise; a count of them says the hash is not spreading.
+    ///
+    /// [`thresholds::OVERWEIGHT_FACTOR`]: crate::db::health::thresholds::OVERWEIGHT_FACTOR
+    pub overweight: usize,
+    /// Groups written before the format appended a trailer, whose record count
+    /// cannot be read without loading them. Counted rather than guessed at.
+    pub unreadable: usize,
+    /// The shape, bucketed for drawing. Empty for a section with no groups.
+    pub buckets: Vec<DistributionBucket>,
+}
+
+/// One column of a group distribution: how many groups hold between `min` and
+/// `max` records, inclusive.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct DistributionBucket {
+    pub min: u64,
+    pub max: u64,
+    pub groups: usize,
+}
+
+impl GroupDistribution {
+    /// Summarises the group profile of a section.
+    ///
+    /// Groups whose record count could not be read - the pre-trailer format -
+    /// are counted in `unreadable` and left out of every other figure, rather
+    /// than folded in as zero. A group holding an unknown number of records is
+    /// not a group holding none, and averaging the second into the first is how
+    /// a diagnostic quietly starts lying.
+    pub fn of(groups: &[crate::db::hashfile::GroupEntry], modulus: u64) -> Self {
+        let counts: Vec<u64> = groups.iter().filter_map(|group| group.records).collect();
+        let unreadable = groups.len() - counts.len();
+        // The groups the modulus has that no file exists for. They hold nothing,
+        // which is a fact about the distribution and not an absence from it.
+        let absent = (modulus as usize).saturating_sub(groups.len());
+        if counts.is_empty() && absent == 0 {
+            return GroupDistribution {
+                groups: groups.len(),
+                unreadable,
+                ..Default::default()
+            };
+        }
+        let mut sorted = counts;
+        sorted.extend(std::iter::repeat_n(0, absent));
+        sorted.sort_unstable();
+        let total: u64 = sorted.iter().sum();
+        let mean = total as f64 / sorted.len() as f64;
+        let overweight_at = mean * crate::db::health::thresholds::OVERWEIGHT_FACTOR;
+        GroupDistribution {
+            groups: sorted.len() + unreadable,
+            min: sorted[0],
+            max: sorted[sorted.len() - 1],
+            mean,
+            median: sorted[sorted.len() / 2],
+            empty: sorted.iter().take_while(|count| **count == 0).count(),
+            overweight: sorted.iter().filter(|count| **count as f64 > overweight_at).count(),
+            unreadable,
+            buckets: Self::bucket(&sorted),
+        }
+    }
+
+    /// The shape, as at most [`DISTRIBUTION_BUCKETS`] equal-width columns over
+    /// the record counts.
+    ///
+    /// Bucketed rather than sent per group so that a file with a modulus of
+    /// 65,536 still answers in a small reply, and equal-width rather than
+    /// equal-population because the point of drawing it is to see one column
+    /// standing far out to the right.
+    ///
+    /// [`DISTRIBUTION_BUCKETS`]: crate::db::health::thresholds::DISTRIBUTION_BUCKETS
+    fn bucket(sorted: &[u64]) -> Vec<DistributionBucket> {
+        let (low, high) = (sorted[0], sorted[sorted.len() - 1]);
+        let span = high - low + 1;
+        let wanted = crate::db::health::thresholds::DISTRIBUTION_BUCKETS as u64;
+        // A narrow spread gets one column per record count, which is exact; a
+        // wide one gets equal-width columns that still cover the whole range.
+        let width = span.div_ceil(wanted).max(1);
+        let count = span.div_ceil(width) as usize;
+        let mut buckets: Vec<DistributionBucket> = (0..count)
+            .map(|i| {
+                let min = low + i as u64 * width;
+                DistributionBucket {
+                    min,
+                    max: (min + width - 1).min(high),
+                    groups: 0,
+                }
+            })
+            .collect();
+        for value in sorted {
+            let index = (((value - low) / width) as usize).min(buckets.len() - 1);
+            buckets[index].groups += 1;
+        }
+        buckets
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
