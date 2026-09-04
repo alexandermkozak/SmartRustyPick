@@ -6,19 +6,13 @@ fn test_record_bytes_roundtrip() {
 
     // Field 0: Multiple values
     let mut f0 = Field::default();
-    f0.values.push(Value {
-        sub_values: vec!["V1".to_string(), "V2".to_string()],
-    });
-    f0.values.push(Value {
-        sub_values: vec!["V3".to_string()],
-    });
+    f0.values.push(Value::texts(["V1", "V2"]));
+    f0.values.push(Value::text("V3"));
     rec.fields.push(f0);
 
     // Field 1: Single value
     let mut f1 = Field::default();
-    f1.values.push(Value {
-        sub_values: vec!["F2".to_string()],
-    });
+    f1.values.push(Value::text("F2"));
     rec.fields.push(f1);
 
     let bytes = rec.to_bytes();
@@ -27,9 +21,9 @@ fn test_record_bytes_roundtrip() {
     assert_eq!(decoded.fields.len(), 2);
     assert_eq!(decoded.fields[0].values.len(), 2);
     assert_eq!(decoded.fields[0].values[0].sub_values.len(), 2);
-    assert_eq!(decoded.fields[0].values[0].sub_values[0], "V1");
-    assert_eq!(decoded.fields[0].values[0].sub_values[1], "V2");
-    assert_eq!(decoded.fields[0].values[1].sub_values[0], "V3");
+    assert_eq!(text_of(&decoded.fields[0].values[0].sub_values[0]), "V1");
+    assert_eq!(text_of(&decoded.fields[0].values[0].sub_values[1]), "V2");
+    assert_eq!(text_of(&decoded.fields[0].values[1].sub_values[0]), "V3");
 }
 
 #[test]
@@ -37,13 +31,13 @@ fn test_record_display_string() {
     let s = "F1^V1]V2^S1\\S2";
     let rec = Record::from_display_string(s);
     assert_eq!(rec.fields.len(), 3);
-    assert_eq!(rec.fields[0].values[0].sub_values[0], "F1");
+    assert_eq!(text_of(&rec.fields[0].values[0].sub_values[0]), "F1");
     assert_eq!(rec.fields[1].values.len(), 2);
-    assert_eq!(rec.fields[1].values[0].sub_values[0], "V1");
-    assert_eq!(rec.fields[1].values[1].sub_values[0], "V2");
+    assert_eq!(text_of(&rec.fields[1].values[0].sub_values[0]), "V1");
+    assert_eq!(text_of(&rec.fields[1].values[1].sub_values[0]), "V2");
     assert_eq!(rec.fields[2].values[0].sub_values.len(), 2);
-    assert_eq!(rec.fields[2].values[0].sub_values[0], "S1");
-    assert_eq!(rec.fields[2].values[0].sub_values[1], "S2");
+    assert_eq!(text_of(&rec.fields[2].values[0].sub_values[0]), "S1");
+    assert_eq!(text_of(&rec.fields[2].values[0].sub_values[1]), "S2");
 
     let out = rec.to_display_string();
     assert_eq!(s, out);
@@ -54,7 +48,7 @@ fn test_record_edit_string() {
     let s = "F1\nV1]V2\nS1\\S2";
     let rec = Record::from_edit_string(s);
     assert_eq!(rec.fields.len(), 3);
-    assert_eq!(rec.fields[0].values[0].sub_values[0], "F1");
+    assert_eq!(text_of(&rec.fields[0].values[0].sub_values[0]), "F1");
     assert_eq!(rec.fields[1].values.len(), 2);
 
     let out = rec.to_edit_string();
@@ -64,7 +58,7 @@ fn test_record_edit_string() {
     let s_with_nl = "F1\nV1\n";
     let rec2 = Record::from_edit_string(s_with_nl);
     assert_eq!(rec2.fields.len(), 2);
-    assert_eq!(rec2.fields[1].values[0].sub_values[0], "V1");
+    assert_eq!(text_of(&rec2.fields[1].values[0].sub_values[0]), "V1");
 }
 
 #[test]
@@ -170,4 +164,87 @@ fn attributes_survive_the_mark_characters_a_display_string_would_split_on() {
         Record::from_attributes(["1", "NAME", "L", "20"])
     );
     assert!(Record::from_attributes(Vec::<String>::new()).fields.is_empty());
+}
+
+/// The bug this codec change exists to kill.
+///
+/// `from_bytes` used to run every sub-value through `String::from_utf8_lossy`,
+/// so a byte that was not valid UTF-8 came back as `U+FFFD` and the original
+/// was gone. The write reported success; the read returned something else.
+#[test]
+fn a_sub_value_that_is_not_utf8_survives_a_round_trip() {
+    // A lone continuation byte, a truncated two-byte sequence, an over-long
+    // encoding and a bare NUL: each of these used to become U+FFFD.
+    let nasty: &[&[u8]] = &[
+        b"\x80",
+        b"\xC3",
+        b"\xC0\xAF",
+        b"\xED\xA0\x80",
+        b"\x00",
+        b"before\x00after",
+        b"\xFF\xFB\x00\x01",
+    ];
+
+    for bytes in nasty {
+        let mut record = Record::new();
+        record.fields.push(Field {
+            values: vec![Value::bytes(bytes.to_vec())],
+        });
+
+        let decoded = Record::from_bytes(&record.to_bytes());
+        assert_eq!(decoded, record, "{:?} did not survive the round trip", bytes);
+        assert_eq!(decoded.fields[0].values[0].sub_values[0], bytes.to_vec());
+    }
+}
+
+/// Every byte a sub-value may hold, in one value, in one pass.
+#[test]
+fn every_non_mark_byte_survives_a_round_trip() {
+    // The marks are excluded because they are the structure - see below.
+    let payload: Vec<u8> = (0..=255u8).filter(|b| ![FM, VM, SVM].contains(b)).collect();
+    let record = Record {
+        fields: vec![Field {
+            values: vec![Value::bytes(payload.clone())],
+        }],
+    };
+
+    let decoded = Record::from_bytes(&record.to_bytes());
+    assert_eq!(decoded.fields[0].values[0].sub_values[0], payload);
+    assert_eq!(decoded, record);
+}
+
+/// The limit, asserted so that it is a decision rather than a surprise.
+///
+/// `FM`/`VM`/`SVM` *are* the record's structure, so a mark inside a sub-value
+/// is indistinguishable from the separator it is and splits the value on the
+/// way back. That is the MultiValue data model, and it is why content that may
+/// hold arbitrary bytes belongs in a blob referenced by the record rather than
+/// inlined into one.
+#[test]
+fn a_mark_byte_inside_a_sub_value_is_still_structural() {
+    let record = Record {
+        fields: vec![Field {
+            values: vec![Value::bytes(vec![b'a', VM, b'b'])],
+        }],
+    };
+
+    let decoded = Record::from_bytes(&record.to_bytes());
+    assert_eq!(
+        decoded.fields[0].values.len(),
+        2,
+        "a value mark inside a sub-value separates two values, as it always has"
+    );
+    assert_eq!(decoded.fields[0].values[0].sub_values[0], b"a".to_vec());
+    assert_eq!(decoded.fields[0].values[1].sub_values[0], b"b".to_vec());
+}
+
+/// Text goes in and text comes out: the ordinary path is unchanged.
+#[test]
+fn text_values_are_unaffected_by_the_byte_representation() {
+    let record = Record::from_display_string("1^NAME]OTHER^L");
+    let decoded = Record::from_bytes(&record.to_bytes());
+    assert_eq!(decoded, record);
+    assert_eq!(decoded.to_display_string(), "1^NAME]OTHER^L");
+    assert_eq!(decoded.fields[1].values[0].first_text().unwrap(), "NAME");
+    assert_eq!(decoded.fields[1].values[1].first_text().unwrap(), "OTHER");
 }

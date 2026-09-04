@@ -1,3 +1,4 @@
+pub mod base64;
 #[cfg(test)]
 mod db_tests;
 #[cfg(test)]

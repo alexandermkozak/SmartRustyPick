@@ -855,14 +855,14 @@ impl Database {
             // A value with one sub-value is an ordinary value, not a sub-valued
             // one, so it reports as a plain value position.
             if value.sub_values.len() <= 1 {
-                let text = value.sub_values.first().map(String::as_str).unwrap_or("");
-                if Self::any_condition_matches(text, conditions, &search_vals) {
+                let text = crate::db::models::text_of(value.first_bytes());
+                if Self::any_condition_matches(&text, conditions, &search_vals) {
                     push_unique(out, ValuePosition::value(v_idx));
                 }
                 continue;
             }
             for (sv_idx, sub) in value.sub_values.iter().enumerate() {
-                if Self::any_condition_matches(sub, conditions, &search_vals) {
+                if Self::any_condition_matches(&crate::db::models::text_of(sub), conditions, &search_vals) {
                     push_unique(out, ValuePosition::sub_value(v_idx, sv_idx));
                 }
             }
@@ -927,7 +927,7 @@ impl Database {
                         }
                         if v.sub_values
                             .iter()
-                            .any(|sv| Self::compare_values(sv, &cond.op, &search_val))
+                            .any(|sv| Self::compare_values(&crate::db::models::text_of(sv), &cond.op, &search_val))
                         {
                             return true;
                         }

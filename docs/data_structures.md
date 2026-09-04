@@ -16,12 +16,29 @@ A `Field` is a component of a `Record`.
 
 #### Value
 A `Value` is a component of a `Field`, allowing for multi-valued fields.
-- Internal representation: `Vec<String>` (Sub-values)
+- Internal representation: `Vec<SubValue>` (Sub-values)
 - Separator: `SVM` (Sub-Value Mark, `\xFC` or `252`)
 - Display/Edit representation: `\`
 
 #### Sub-Value
-A `Sub-Value` is the most granular unit of data, stored as a `String`.
+A `Sub-Value` is the most granular unit of data, stored as **raw bytes** (`Vec<u8>`).
+
+Bytes rather than a `String`, because a record has always been a byte container on disk.
+Reading one used to pass every sub-value through a lossy UTF-8 conversion, which replaced
+any byte that was not valid UTF-8 with `U+FFFD` and lost the original: a write that
+reported success and read back as something else. Text is now a *view* of a sub-value,
+taken where a caller asks for text, rather than the way it is stored.
+
+Every byte value survives storage and retrieval untouched, **except the three marks**.
+`FM` (`0xFE`), `VM` (`0xFD`) and `SVM` (`0xFC`) are the structure of a record, so a mark
+inside a sub-value is indistinguishable from the separator it is, and reading the record
+back splits the value in two. That is the MultiValue data model rather than a defect, and
+it is why content that may contain arbitrary bytes belongs in a blob referenced by the
+record rather than inlined into one.
+
+Over the remote protocol, a sub-value that is not valid UTF-8 travels as
+`{"$base64": "..."}` — see [Protocol](protocol.md#values-that-are-not-text). A sub-value
+that *is* valid UTF-8 travels as a plain JSON string, exactly as before.
 
 #### Dictionary Items
 Dictionary items are special records stored in the `dict` section of a table. They define how data in the `data` section is interpreted.

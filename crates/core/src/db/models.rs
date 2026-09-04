@@ -26,6 +26,9 @@ pub const DICT_JUSTIFY_IDX: usize = 2;
 pub const DICT_WIDTH_IDX: usize = 3;
 pub const DICT_CONV_IDX: usize = 7;
 
+/// The JSON key a sub-value that is not valid UTF-8 travels under.
+pub const BINARY_JSON_KEY: &str = "$base64";
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Record {
     pub fields: Vec<Field>,
@@ -36,9 +39,73 @@ pub struct Field {
     pub values: Vec<Value>,
 }
 
+/// One sub-value: the smallest addressable piece of a record.
+///
+/// Raw bytes rather than a `String`, because a record is a byte container and
+/// always was on disk. Reading one used to go through `String::from_utf8_lossy`,
+/// which turned every byte that was not valid UTF-8 into `U+FFFD` and lost the
+/// original for good - a write that reported success and came back as something
+/// else. Text is now a *view* of a sub-value ([`text`](SubValues::text)), taken
+/// where a caller has asked for text, rather than the way it is stored.
+pub type SubValue = Vec<u8>;
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Value {
-    pub sub_values: Vec<String>,
+    pub sub_values: Vec<SubValue>,
+}
+
+/// Bytes as text, replacing anything that is not valid UTF-8.
+///
+/// Lossy on purpose and only here: a caller reaching for this has asked for
+/// something displayable and has accepted that answer. Nothing on the storage
+/// path may use it - see [`Record::to_bytes`].
+pub fn text_of(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(bytes)
+}
+
+impl Value {
+    /// A value holding one sub-value of text.
+    pub fn text(s: impl AsRef<str>) -> Self {
+        Value {
+            sub_values: vec![s.as_ref().as_bytes().to_vec()],
+        }
+    }
+
+    /// A value holding one sub-value of raw bytes.
+    pub fn bytes(b: impl Into<SubValue>) -> Self {
+        Value {
+            sub_values: vec![b.into()],
+        }
+    }
+
+    /// A value whose sub-values are each a piece of text, in order.
+    pub fn texts<I, S>(subs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Value {
+            sub_values: subs.into_iter().map(|s| s.as_ref().as_bytes().to_vec()).collect(),
+        }
+    }
+
+    /// The first sub-value as text, or `None` when the value is empty.
+    pub fn first_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.sub_values.first().map(|sub| text_of(sub))
+    }
+
+    /// This value as the sole value of a field.
+    pub fn into_field(self) -> Field {
+        Field { values: vec![self] }
+    }
+
+    /// The first sub-value's bytes, or an empty slice when there is none.
+    ///
+    /// The shape most callers want: a value with exactly one sub-value is an
+    /// ordinary single value, and reading it should not have to say so.
+    pub fn first_bytes(&self) -> &[u8] {
+        self.sub_values.first().map(Vec::as_slice).unwrap_or(&[])
+    }
 }
 
 impl Record {
@@ -56,10 +123,7 @@ impl Record {
                 let values = f
                     .split(|&b| b == VM)
                     .map(|v| {
-                        let sub_values = v
-                            .split(|&b| b == SVM)
-                            .map(|sv| String::from_utf8_lossy(sv).to_string())
-                            .collect();
+                        let sub_values = v.split(|&b| b == SVM).map(<[u8]>::to_vec).collect();
                         Value { sub_values }
                     })
                     .collect();
@@ -69,6 +133,20 @@ impl Record {
         Record { fields }
     }
 
+    /// The record as it is stored: sub-values joined by `SVM`, values by `VM`,
+    /// fields by `FM`.
+    ///
+    /// Byte-exact in both directions -
+    /// `Record::from_bytes(r.to_bytes()) == r` - for any record whose
+    /// sub-values hold no mark byte. Every other byte, valid UTF-8 or not,
+    /// survives untouched.
+    ///
+    /// The exception is not a bug to fix here: `FM`, `VM` and `SVM` *are* the
+    /// structure, so a mark inside a sub-value is indistinguishable from the
+    /// separator it is, and reading it back splits the value in two. That is
+    /// the MultiValue data model, and it is why content that may contain
+    /// arbitrary bytes belongs in a blob section referenced by the record
+    /// rather than inlined into one (see #32).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut res = Vec::new();
         for (i, f) in self.fields.iter().enumerate() {
@@ -83,7 +161,7 @@ impl Record {
                     if k > 0 {
                         res.push(SVM);
                     }
-                    res.extend_from_slice(sv.as_bytes());
+                    res.extend_from_slice(sv);
                 }
             }
         }
@@ -109,10 +187,8 @@ impl Record {
         Record {
             fields: attributes
                 .into_iter()
-                .map(|text| Field {
-                    values: vec![Value {
-                        sub_values: vec![text.as_ref().to_string()],
-                    }],
+                .map(|attribute| Field {
+                    values: vec![Value::text(attribute)],
                 })
                 .collect(),
         }
@@ -183,7 +259,7 @@ impl Record {
         };
         match pos.sub_value {
             Some(sv) => match value.sub_values.get(sv) {
-                Some(s) => to_display_chars(s.as_bytes()),
+                Some(s) => to_display_chars(s),
                 None => String::new(),
             },
             None => {
@@ -192,7 +268,7 @@ impl Record {
                     if k > 0 {
                         res.push(SVM);
                     }
-                    res.extend_from_slice(sv.as_bytes());
+                    res.extend_from_slice(sv);
                 }
                 to_display_chars(&res)
             }
@@ -210,7 +286,7 @@ impl Record {
                     if k > 0 {
                         res.push(SVM);
                     }
-                    res.extend_from_slice(sv.as_bytes());
+                    res.extend_from_slice(sv);
                 }
             }
             to_display_chars(&res)

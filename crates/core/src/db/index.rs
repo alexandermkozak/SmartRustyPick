@@ -40,7 +40,7 @@
 
 use crate::db::hashfile::{self, FsyncPolicy, SectionMeta, SectionSource};
 use crate::db::health::{self, Health, Measure, Verdict};
-use crate::db::models::{Field, Record, Value};
+use crate::db::models::{Field, Record, Value, text_of};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -160,7 +160,11 @@ pub fn keys_of(record: Option<&Record>, attr: usize) -> Vec<String> {
             push("", &mut out);
         }
         for sub in &value.sub_values {
-            push(sub, &mut out);
+            // An index is a text index: a key is the uppercased, trimmed text
+            // of a value. A sub-value that is not valid UTF-8 indexes under its
+            // lossy text, which is the honest answer for an equality index on
+            // bytes - the record itself keeps every byte.
+            push(&text_of(sub), &mut out);
         }
     }
     out
@@ -171,12 +175,7 @@ pub fn keys_of(record: Option<&Record>, attr: usize) -> Vec<String> {
 fn posting_record(keys: &BTreeSet<String>) -> Record {
     Record {
         fields: vec![Field {
-            values: keys
-                .iter()
-                .map(|key| Value {
-                    sub_values: vec![key.clone()],
-                })
-                .collect(),
+            values: keys.iter().map(Value::text).collect(),
         }],
     }
 }
@@ -190,7 +189,7 @@ fn posting_keys(record: &Record) -> BTreeSet<String> {
             field
                 .values
                 .iter()
-                .filter_map(|value| value.sub_values.first().cloned())
+                .filter_map(|value| value.first_text().map(|key| key.to_string()))
                 .collect()
         })
         .unwrap_or_default()

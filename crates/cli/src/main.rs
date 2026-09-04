@@ -907,7 +907,7 @@ fn print_record_fields(record: &Record) {
                 if k > 0 {
                     res.push(smart_rusty_pick_core::db::SVM);
                 }
-                res.extend_from_slice(sv.as_bytes());
+                res.extend_from_slice(sv);
             }
         }
         let display_bytes: Vec<u8> = res
@@ -1552,10 +1552,9 @@ fn handle_list_files(db: &mut Database) {
                         .fields
                         .first()
                         .and_then(|f| f.values.first())
-                        .and_then(|v| v.sub_values.first())
-                        .map(|s| s.as_str())
-                        .unwrap_or("")
-                        == "F"
+                        .map(|v| v.first_bytes())
+                        .unwrap_or_default()
+                        == b"F"
                 })
                 .map(|(name, _)| name.clone())
                 .collect();
@@ -1700,8 +1699,8 @@ fn handle_list_conns(db: &mut Database) {
                     .fields
                     .first()
                     .and_then(|f| f.values.first())
-                    .and_then(|v| v.sub_values.first())
-                    .cloned()
+                    .and_then(|v| v.first_text())
+                    .map(|tp| tp.to_string())
                     .unwrap_or_else(|| "N/A".to_string());
                 println!("{:<20} {:<64}", name, thumbprint);
             }

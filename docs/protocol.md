@@ -108,6 +108,27 @@ multivalue structure. A plain string is always stored as a single value — it i
 re-split on `]` — so a value that genuinely contains that character survives the round
 trip.
 
+#### Values that are not text
+
+A record is a byte container; a JSON string is UTF-8. A value whose bytes are not valid
+UTF-8 therefore cannot travel as a string, and is sent as a one-key object instead:
+
+```json
+{"signature": {"$base64": "3q2+7w=="}}
+```
+
+`WRITE` accepts the same envelope and stores exactly the bytes it decodes to, so binary
+content read and written again is byte-for-byte identical. The envelope is used **only**
+where it is needed: a value that is valid UTF-8 is always a plain string, so a client that
+never stores binary never sees this shape. No output conversion is applied to a value that
+travels this way — there is no conversion of a byte string. A `$base64` payload that is not
+valid base64 is refused with `INVALID_DATA` rather than stored as a guess.
+
+The mark bytes `0xFC`, `0xFD` and `0xFE` are the record's *structure* (see
+[Data Structures](data_structures.md)), not content: a value containing one is read back as
+two values. Content that may hold arbitrary bytes — an image, a PDF, a compiled module —
+belongs in a blob referenced by the record rather than inlined into one.
+
 ### Exploded results
 
 `QUERY` and `SELECT` can explode a multivalued field: instead of one row per record, the
