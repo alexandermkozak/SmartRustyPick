@@ -127,7 +127,15 @@ fn optional_flag(body: &Value, name: &str) -> Option<bool> {
 /// deleting `name` keeps anything else a caller sent out of the record.
 fn dictionary_attributes(body: &Value) -> Value {
     let mut attributes = serde_json::Map::new();
-    for name in ["field", "heading", "justification", "width", "conversion"] {
+    for name in [
+        "field",
+        "heading",
+        "justification",
+        "width",
+        "association",
+        "associationDepth",
+        "conversion",
+    ] {
         if let Some(value) = body.get(name) {
             attributes.insert(name.to_string(), value.clone());
         }

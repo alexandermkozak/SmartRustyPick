@@ -50,7 +50,7 @@ matched case-insensitively.
 | `query_string`    | string           | `QUERY`, `SELECT`                                                                                                  | Pick-style query, e.g. `WITH NAME = "John" BY NAME`. Alternative to `query_node`. A bare command with neither selects every record; a `query_string` that is not a query is refused with `INVALID_QUERY` rather than read as one.                                                          |
 | `query_node`      | object           | `QUERY`, `SELECT`                                                                                                  | Structured query tree. Takes precedence over `query_string`. See [Query node](#query-node).                                                                                                                                                                                               |
 | `sort_specs`      | array of objects | `QUERY`, `SELECT`                                                                                                  | Explicit sort order: `[{"field_name": "NAME", "descending": false}]`. Overrides any `BY`/`BY.DSND` parsed from `query_string`.                                                                                                                                                            |
-| `explode`         | array of strings | `QUERY`, `SELECT`                                                                                                  | Multivalued fields to explode, so each matching value becomes its own result row. Only the first is used. Overrides any `BY.EXP` parsed from `query_string`. See [Exploded results](#exploded-results).                                                                                    |
+| `explode`         | array of strings | `QUERY`, `SELECT`                                                                                                  | Multivalued fields to explode, so each matching value becomes its own result row. Several may be named only when they are members of one association group, which is then what explodes; unassociated fields are refused with `INVALID_QUERY`. Overrides any `BY.EXP` parsed from `query_string`. See [Exploded results](#exploded-results).                                                                                    |
 | `list_name`       | string           | `SELECT`, `GET.NEXT`                                                                                               | Names the server-side select list. Default `"DEFAULT"`.                                                                                                                                                                                                                                   |
 | `batch_size`      | integer          | `GET.NEXT`                                                                                                         | Records per batch. Default `1`.                                                                                                                                                                                                                                                           |
 | `thumbprint`      | string           | `AUTHORIZE.CONN`                                                                                                   | SHA-256 thumbprint (lowercase hex) of the client certificate to authorize.                                                                                                                                                                                                                |
@@ -135,6 +135,13 @@ belongs in a blob referenced by the record rather than inlined into one.
 result carries one row per value of that field, and — when a criterion names the same field
 — only the values that satisfied it. This is the wire form of the CLI's `BY.EXP` clause.
 
+Where the field belongs to an [association group](data_structures.md#association-groups), the
+whole group explodes and one row's position speaks for every member of it. Naming any member
+names the group, so `["ACCOUNTS"]` and `["ACCT.DATES"]` ask the same question, and several
+members may be named together. Two fields that are *not* associated are refused with
+`INVALID_QUERY`: there is no defined pairing between their values, which is what an
+association supplies.
+
 Name the field with `explode`, or spell it inside `query_string`; both of these ask the
 same question:
 
@@ -161,6 +168,12 @@ came from. `sub_value` is `null` when the whole value matched:
 The record in each row is still the whole record; `positions` is what tells you which part
 of it answered the query. Records kept by a condition on some other field appear once with
 a `null` position. `positions` is omitted entirely when nothing was exploded.
+
+With a group, one position is read against every member: a value-tier member shows the value
+it names, a sub-value-tier member the sub-value. A client that renders the row itself resolves
+each column against the dictionary's `association` and `associationDepth`, exactly as `LIST`
+does — see [Exploding multivalues](general_commands.md#exploding-multivalues) for the rules
+the rows follow.
 
 ### Query node
 
@@ -197,7 +210,7 @@ a code is added to the server and not written up here.
 |-------------------------|--------------------------------------------------------------------------------------------------|
 | `MISSING_FIELD`         | A field the command requires was absent or empty. The message names it.                          |
 | `INVALID_DATA`          | A field was present but does not describe what it has to - a record, or a dictionary entry.       |
-| `INVALID_QUERY`         | A `query_string` that is not a query. An absent one is not an error: it selects every record.      |
+| `INVALID_QUERY`         | A `query_string` that is not a query, or a `BY.EXP` clause naming fields no association pairs. An absent query is not an error: it selects every record. |
 | `INVALID_JSON`          | The request line was not JSON. The connection stays open.                                         |
 | `UNKNOWN_COMMAND`       | No command of that name.                                                                          |
 | `ADMIN_REQUIRED`        | The command is admin only and this client's certificate is not.                                   |
@@ -418,8 +431,12 @@ Create an account already populated with the demo fixture — the same one the C
   account; over the wire an admin certificate is the equivalent gate.
 - The account gets a `DIR`, a `USERS` file and a `PRODUCTS` file, each with a dictionary and a
   couple of records. Between them they reach every level of the hierarchy — `ROLES` is
-  multivalued and one of its values is sub-valued — and `PRODUCTS.PRICE` carries an `MD2`
-  conversion, so the fixture exercises multivalues and conversions rather than only flat text.
+  multivalued and one of its values is sub-valued — `PRODUCTS.PRICE` carries an `MD2`
+  conversion, and `PRODUCTS` carries an
+  [association group](data_structures.md#association-groups): `SUPPLIERS` controls, `SUP.CODES`
+  pairs with it value for value and `SUP.CONTACTS` at the sub-value tier, with one record
+  deliberately ragged. So the fixture exercises multivalues, conversions and correlated
+  multivalues rather than only flat text.
 - `record` names the account and the files it was given, read back after the fact rather than
   listed from a constant, so it describes whatever the fixture creates today.
 - The account must not already exist; nothing is written when it does.
@@ -787,6 +804,10 @@ Every dictionary entry of one file, decomposed into the attributes
   is called. This reads the fixed dictionary positions instead. `definition` carries the raw
   display string, so an entry using a position not named here is still visible.
 - `field` and `width` are `null` when the entry does not hold a number there.
+- `association` names the controlling field this entry is a dependent of, and `associationDepth`
+  the tier it pairs on — `"V"` value for value, `"S"` sub-value for sub-value. Both are empty on
+  a controller and on a field in no group. See
+  [Dictionary items](data_structures.md#dictionary-items).
 - Entries come back ordered by attribute number, then by name.
 - Errors: `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`), `ACCESS_DENIED`,
   `FILE_NOT_FOUND`.
@@ -796,11 +817,16 @@ Every dictionary entry of one file, decomposed into the attributes
 ```
 
 ```json
-{"status": "OK", "count": 2, "keys": ["NAME", "PRICE"], "results": [
+{"status": "OK", "count": 3, "keys": ["NAME", "PRICE", "PRICE.DATE"], "results": [
   ["NAME", {"field": 1, "heading": "NAME", "justification": "L", "width": 20,
+            "association": "", "associationDepth": "",
             "conversion": "", "definition": "1^NAME^L^20"}],
   ["PRICE", {"field": 2, "heading": "PRICE", "justification": "R", "width": 10,
-             "conversion": "MD2", "definition": "2^PRICE^R^10^^^^MD2"}]
+             "association": "", "associationDepth": "",
+             "conversion": "MD2", "definition": "2^PRICE^R^10^^^^MD2"}],
+  ["PRICE.DATE", {"field": 3, "heading": "AS OF", "justification": "L", "width": 10,
+                  "association": "PRICE", "associationDepth": "V",
+                  "conversion": "", "definition": "3^AS OF^L^10^PRICE^V"}]
 ]}
 ```
 
@@ -812,8 +838,13 @@ Create or replace one dictionary entry, named by `key`, from the attributes in
 - Required: `account` (or a single-account client), `file`, `key`, `structured_data`.
 - `structured_data` holds `field` (the 1-based attribute number, required), and optionally
   `heading` (defaults to `key`), `justification` (`"L"` or `"R"`, defaults to `"L"`),
-  `width` (defaults to `10`) and `conversion`. Numbers may be sent as JSON numbers or as
-  strings, which is what an HTML form has to hand.
+  `width` (defaults to `10`), `association`, `associationDepth` and `conversion`. Numbers may
+  be sent as JSON numbers or as strings, which is what an HTML form has to hand.
+- `association` names the controlling field this entry pairs its values with, making the two
+  an [association group](data_structures.md#association-groups); `associationDepth` is `"V"`
+  (the default) or `"S"`. An entry may not name itself, a depth without a controlling field is
+  refused, and a controller that does not exist yet is not — a dictionary is written in some
+  order, and the group forms once both entries are there.
 - The rules are enforced here rather than by the caller: an entry with no attribute number is
   invisible to every query, and one with a justification `LIST` does not understand lays out
   wrongly — neither shows up until someone reads the file.
@@ -834,7 +865,8 @@ Create or replace one dictionary entry, named by `key`, from the attributes in
 
 ```json
 {"status": "OK", "record": {"field": 2, "heading": "PRICE", "justification": "R",
-                            "width": 10, "conversion": "MD2",
+                            "width": 10, "association": "", "associationDepth": "",
+                            "conversion": "MD2",
                             "definition": "2^PRICE^R^10^^^^MD2"}}
 ```
 

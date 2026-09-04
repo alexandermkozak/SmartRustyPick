@@ -58,14 +58,16 @@ AI agents have been responsible for several critical improvements and fixes in t
 
 - **MultiValue Logic:** Implementation of hierarchical data structures (FM, VM, SVM), and the `BY.EXP` clause that
   gives each value of a multivalued field its own `LIST` row, carrying the matched position through select lists,
-  `SAVE-LIST`/`GET-LIST` and the remote protocol.
+  `SAVE-LIST`/`GET-LIST` and the remote protocol. Fields that belong together explode together - see
+  [Association groups](#7-association-groups-correlated-multivalues-for-free) below.
 - **Dictionary Support:** Logic for field formatting and conversions (Dates, Numbers).
 - **Query Engine:** Implementation of `SELECT` and `QUERY` commands for data retrieval.
 - **Test Infrastructure:** Added `CREATE.TEST.ACCOUNT` command in the `SYSTEM` account to quickly spin up pre-populated
   accounts for feature verification and regression testing. It is reachable over the remote protocol and from the web
   dashboard as well, so the fixture is one command away from any interface. This command must be maintained and updated as new data
   structures or features are added to the system - the `USERS` file now carries a multivalued `ROLES` field, one of
-  whose values is sub-valued, so the fixture reaches every level of the hierarchy.
+  whose values is sub-valued, and `PRODUCTS` carries an association group whose members are deliberately ragged, so the
+  fixture reaches every level of the hierarchy and both tiers of an association.
 - **Certificate Management:** Implemented `GENERATE.CERT` in the `SYSTEM` account, allowing users to create signed
   client certificates and PKCS#12 (.pfx) files directly from the database CLI for simplified secure remote access setup.
 - **Typed errors:** The engine reports a `DbError` variant - `FileNotFound`, `AccountExists`, `IndexNotFound`, `Io` and
@@ -130,6 +132,43 @@ AI agents have been responsible for several critical improvements and fixes in t
 - **Batching per file:** an ordinary buffered write flushes the file it touched, not the whole database, so a burst on
   one file no longer drags every other file through a flush with it. The connection-close, ticker and shutdown paths
   still flush everything, which is what bounds how long any change can stay in memory.
+
+### 7. Association groups: correlated multivalues for free
+
+- **The gap.** `BY.EXP` accepted exactly one field, and refused two with *Only one BY.EXP field may be given*. That
+  refusal was honest rather than lazy: three accounts beside three dates could mean three rows or nine, and nothing in
+  the data says which. Lifting the restriction was never a parser change - it needed somewhere to record that the two
+  fields belong together.
+- **Where it is recorded:** attribute 5 of the **dependent**, naming its controller, with attribute 6 saying which tier
+  it pairs on. The alternative - a multivalued list of dependents on the controller - makes `BY.EXP CONTROLLER` a
+  single lookup, and buys that with a list that can name a field that no longer exists, or that another controller also
+  claims. On the dependent, a field is in at most one group *by construction*, and there is nothing to keep in step.
+  The cost is a scan of the dictionary to resolve a group; it is a small map held in memory, scanned once per query.
+- **Two tiers, because PICK has two.** A `V` member pairs value for value; an `S` member pairs sub-value for sub-value
+  *inside* the controlling value, and a value the second tier reaches becomes one row per sub-value with the `V`
+  members repeating down them. Retrofitting a depth onto the format later would have been the expensive kind of change,
+  so the tier went in with the attribute rather than after it.
+- **The one thing a group changes that surprises people.** A lone `BY.EXP` field gives a row for the deepest thing that
+  matched, down to a sub-value. A `V` member gives a row for the whole *value*, even when a sub-value satisfied the
+  criterion - because that is the tier its siblings are lined up against. Declaring an association therefore changes
+  what `BY.EXP` on that field returns. It is documented as the price of the values lining up, and a field that should
+  still explode by sub-value is an `S` member.
+- **What did not have to change.** `SelectEntry` already carried one `ValuePosition`, and one position is enough for a
+  whole group: "value 2" now means value 2 of every member. So the saved-list encoding, the wire's `positions` and
+  `Request.explode` - already a `Vec` - all kept their shape. What broadened is only what a position is resolved
+  *against*, which is one `Narrowing` per column, decided once from the dictionary rather than per cell.
+- **Ragged is normal, not an error.** Three accounts beside two dates give three rows, the third showing an empty date.
+  Nothing rejects a write that leaves a group uneven, and rows come from the longest member: dropping a value because a
+  sibling ran out of them would hide data that is really there.
+- **A criterion has to narrow.** The first version unioned every member's positions unconditionally, so
+  `WITH ACCT.CODES = "P-7"` came back with every row - the two members carrying no criterion drowned out the one that
+  did. The rule that works: the members a criterion names select the rows, and only when *no* member is named does
+  every member contribute. Non-selecting `S` members are still read afterwards, to say how deep the chosen rows go.
+- **The bug the loop found.** `Database::and_condition(node, None)` returned `None` - discarding the node - because it
+  was spelled `QueryNode::Condition(condition?)` and had only ever been called with a `Some`. Folding a clause of
+  several `BY.EXP` specs in calls it once per spec, so the specs carrying no criterion threw away the `WITH` clause of
+  the ones that did. Every unit test passed; it took driving the real CLI to see four rows where two belonged. The
+  function is total now, and says in its own documentation why the obvious spelling is wrong.
 
 ### TLS Troubleshooting
 

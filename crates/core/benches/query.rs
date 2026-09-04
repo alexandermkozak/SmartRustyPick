@@ -1,6 +1,6 @@
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use smart_rusty_pick_core::db::Database;
-use smart_rusty_pick_core::db::models::{ExplodeSpec, Record, SortSpec};
+use smart_rusty_pick_core::db::models::{ExplodeTarget, Record, SortSpec};
 
 mod common;
 
@@ -167,17 +167,16 @@ fn bench_explode(c: &mut Criterion) {
     common::build_mv_table(&mut db, TABLE, RECORDS);
 
     let node = db.parse_query(TABLE, &["WITH", "ROLES", "=", "ROLE42"]).unwrap();
-    let explode = ExplodeSpec {
-        field_name: "ROLES".to_string(),
-        condition: None,
-    };
     let table_handle = db.get_table_read_only_for_account(common::ACCOUNT, TABLE).unwrap();
     let table = &*table_handle.read();
+    // `ROLES` is in no association, so this resolves to the lone-field target -
+    // the shape the numbers below have always described.
+    let explode = Database::explode_target_in(table, "ROLES").unwrap();
 
     // A bare explode gives every value a row; the criterion matches one
     // position in `MV_VALUES - 1` records per hundred.
     let selective_rows = (RECORDS / 100) * (common::MV_VALUES - 1);
-    let shapes: [(&str, Option<&_>, Option<&ExplodeSpec>, usize); 3] = [
+    let shapes: [(&str, Option<&_>, Option<&ExplodeTarget>, usize); 3] = [
         ("bare", None, Some(&explode), RECORDS * common::MV_VALUES),
         ("selective", Some(&node), Some(&explode), selective_rows),
         ("unexploded", Some(&node), None, selective_rows),
@@ -206,7 +205,6 @@ fn bench_explode(c: &mut Criterion) {
     // than once per record, which is the one place the pre-resolved sort keys
     // do extra work.
     let base = Database::query_exploded_in(table, false, Some(&node), Some(&explode), None);
-    let explode_idx = Database::explode_field_index(table, Some(&explode));
     let specs = [SortSpec {
         field_name: "ROLES".to_string(),
         descending: false,
@@ -215,7 +213,7 @@ fn bench_explode(c: &mut Criterion) {
         b.iter_batched_ref(
             || base.clone(),
             |rows| {
-                Database::sort_entries_in(table, rows, black_box(&specs), explode_idx);
+                Database::sort_entries_in(table, rows, black_box(&specs), Some(&explode));
                 black_box(rows.len())
             },
             criterion::BatchSize::LargeInput,

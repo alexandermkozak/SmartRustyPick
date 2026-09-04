@@ -23,8 +23,10 @@ const blankDraft = (): DictionaryDraft => ({
     field: '',
     heading: '',
     justification: 'L',
-    width: '',
+    association: '',
+    associationDepth: '',
     conversion: '',
+    width: '',
 })
 
 export function useFileDictionary(account: Ref<string | null>, file: Ref<string | null>) {
@@ -76,6 +78,8 @@ export function useFileDictionary(account: Ref<string | null>, file: Ref<string 
             heading: entry.heading,
             justification: entry.justification || 'L',
             width: entry.width === null ? '' : String(entry.width),
+            association: entry.association,
+            associationDepth: entry.associationDepth,
             conversion: entry.conversion,
         }
     }

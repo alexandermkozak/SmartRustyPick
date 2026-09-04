@@ -98,10 +98,13 @@ fn test_render_list_explodes_only_the_exploded_column() {
         ],
     );
 
+    let handle = table(&db);
+    let table = handle.read();
+    let explode = Database::explode_target_in(&table, "ROLES").unwrap();
     let lines = report::render_list(
-        &table(&db).read(),
+        &table,
         &["NAME".to_string(), "ROLES".to_string()],
-        Some("ROLES"),
+        Some(&explode),
         &rows,
     );
 
@@ -150,6 +153,78 @@ fn test_render_list_survives_a_stale_position() {
     // exists. It renders empty rather than panicking.
     let rows = rows_for(&db, vec![SelectEntry::at("2".to_string(), ValuePosition::value(9))]);
 
-    let lines = report::render_list(&table(&db).read(), &["ROLES".to_string()], Some("ROLES"), &rows);
+    let handle = table(&db);
+    let table = handle.read();
+    let explode = Database::explode_target_in(&table, "ROLES").unwrap();
+    let lines = report::render_list(&table, &["ROLES".to_string()], Some(&explode), &rows);
     assert_eq!(lines[2].trim_end(), "2");
+}
+
+/// The same file with an association over it: `ROLES` controls, `SINCE` pairs
+/// value for value and `TASK` pairs at the second tier. `NAME` stays outside
+/// the group, so a report can be read for what narrows and what repeats.
+fn assoc_report_db(label: &str) -> (TempDir, Database) {
+    let (dir, db) = report_db(label);
+    {
+        let handle = db.get_table_mut("USERS").unwrap();
+        let mut table = handle.write();
+        table
+            .dictionary
+            .insert("SINCE".to_string(), Record::from_display_string("4^SINCE^L^6^ROLES^V"));
+        table
+            .dictionary
+            .insert("TASK".to_string(), Record::from_display_string("5^TASK^L^8^ROLES^S"));
+        table.records.insert(
+            "1".to_string(),
+            Record::from_display_string("John^ADMIN]DEV]QA^120000]250^2019]2021^audit]build\\ship"),
+        );
+        table.mark_dict_dirty();
+        table.touch_all();
+    }
+    (dir, db)
+}
+
+#[test]
+fn test_render_list_narrows_every_member_of_a_group() {
+    let (_dir, db) = assoc_report_db("render_assoc");
+    let handle = table(&db);
+    let table = handle.read();
+    let explode = Database::explode_target_in(&table, "ROLES").unwrap();
+    let rows = vec![
+        (
+            SelectEntry::at("1".to_string(), ValuePosition::sub_value(0, 0)),
+            table.records["1"].clone(),
+        ),
+        (
+            SelectEntry::at("1".to_string(), ValuePosition::sub_value(1, 0)),
+            table.records["1"].clone(),
+        ),
+        (
+            SelectEntry::at("1".to_string(), ValuePosition::sub_value(1, 1)),
+            table.records["1"].clone(),
+        ),
+        (
+            SelectEntry::at("1".to_string(), ValuePosition::value(2)),
+            table.records["1"].clone(),
+        ),
+    ];
+
+    let columns = ["NAME", "ROLES", "SINCE", "TASK"].map(str::to_string);
+    let lines = report::render_list(&table, &columns, Some(&explode), &rows);
+
+    // ROLES and SINCE pair at the value tier, so they repeat across the two
+    // rows their value's sub-values produced rather than blanking out. TASK
+    // narrows to its own sub-value. NAME is outside the group and shows whole.
+    // The third role has no date and no task: the row is still there, with the
+    // cells a short member leaves empty.
+    let cells: Vec<String> = lines[2..].iter().map(|line| line.trim_end().to_string()).collect();
+    assert_eq!(
+        cells,
+        vec![
+            "1          John       ADMIN        2019   audit",
+            "1          John       DEV          2021   build",
+            "1          John       DEV          2021   ship",
+            "1          John       QA",
+        ]
+    );
 }

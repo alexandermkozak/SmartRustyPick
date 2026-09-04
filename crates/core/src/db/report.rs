@@ -8,7 +8,7 @@
 //! it.
 
 use crate::db::engine::Database;
-use crate::db::models::{Record, SelectEntry, Table};
+use crate::db::models::{ExplodeTarget, Narrowing, Record, SelectEntry, Table};
 
 /// The `ID` column is not dictionary-driven; it is always first and always this
 /// wide.
@@ -19,6 +19,9 @@ struct FieldFormat {
     header: String,
     width: usize,
     justify: String,
+    /// How much of a row's position this column reads. Resolved once here
+    /// rather than per cell: it depends only on the dictionary.
+    narrowing: Narrowing,
 }
 
 impl FieldFormat {
@@ -48,11 +51,14 @@ fn expand_columns(table: &Table, columns: &[String]) -> Vec<String> {
 
 /// Renders the header, the separator rule and one line per row.
 ///
-/// Each row carries the position that put it in the result. That position
-/// belongs to `explode_field` alone: only that column narrows to the single
-/// value that matched, while every other column repeats the record's whole
-/// field. Applying it everywhere would blank out every single-valued column on
-/// any row past the first.
+/// Each row carries the position that put it in the result, and `explode` says
+/// which columns that position speaks for. A lone exploded field narrows only
+/// itself, while every other column repeats the record's whole field: applying
+/// the position everywhere would blank out every single-valued column on any
+/// row past the first. An association group narrows every member instead -
+/// that is what associating them means - each at the tier it pairs on, so a
+/// value-tier column shows a whole value even on a row a sub-value-tier
+/// sibling put there.
 ///
 /// The table is passed in rather than looked up, because the caller is holding
 /// its lock already - a row's records are borrowed out of it. Resolving the
@@ -61,7 +67,7 @@ fn expand_columns(table: &Table, columns: &[String]) -> Vec<String> {
 pub fn render_list<T: std::borrow::Borrow<Record>>(
     table: &Table,
     columns: &[String],
-    explode_field: Option<&str>,
+    explode: Option<&ExplodeTarget>,
     rows: &[(SelectEntry, T)],
 ) -> Vec<String> {
     let mut formats = vec![FieldFormat {
@@ -69,13 +75,19 @@ pub fn render_list<T: std::borrow::Borrow<Record>>(
         header: "ID".to_string(),
         width: ID_WIDTH,
         justify: "L".to_string(),
+        narrowing: Narrowing::Whole,
     }];
     for name in expand_columns(table, columns) {
+        let narrowing = match (explode, table.field_index(&name)) {
+            (Some(target), Some(index)) => target.narrowing_at(index),
+            _ => Narrowing::Whole,
+        };
         formats.push(FieldFormat {
             header: Database::field_header_in(table, &name),
             width: Database::field_width_in(table, &name),
             justify: Database::field_justification_in(table, &name),
             name,
+            narrowing,
         });
     }
 
@@ -103,9 +115,7 @@ pub fn render_list<T: std::borrow::Borrow<Record>>(
             let value = if fmt.name == "ID" {
                 entry.key.clone()
             } else {
-                let position = (Some(fmt.name.as_str()) == explode_field)
-                    .then_some(entry.position)
-                    .flatten();
+                let position = fmt.narrowing.apply(entry.position);
                 Database::format_record_field_at_in(table, record.borrow(), &fmt.name, position)
             };
             row_line.push_str(&fmt.cell(&value));

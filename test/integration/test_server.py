@@ -21,6 +21,12 @@ SETUP_COMMANDS = [
     "SET DICT %s SURNAME 2" % FILE,
     "SET DICT %s AGE 3" % FILE,
     "SET DICT %s ROLES 4" % FILE,
+    # ACCT.DATES is associated with ACCOUNTS, so the two explode in lockstep and
+    # the protocol has a group to answer for as well as a lone field. They are
+    # their own pair rather than hung off ROLES, which stays unassociated so the
+    # single-field checks above keep describing a single field.
+    "SET DICT %s ACCOUNTS 5" % FILE,
+    "SET DICT %s ACCT.DATES 6^ACCT.DATES^L^10^ACCOUNTS^V" % FILE,
     "SAVE",
 ]
 
@@ -49,7 +55,8 @@ def main():
                 # is waited for - not merely a connection.
                 harness.wait_for_seed(
                     conn,
-                    lambda resp: sorted(resp.get("keys") or []) == ["AGE", "NAME", "ROLES", "SURNAME"],
+                    lambda resp: sorted(resp.get("keys") or [])
+                    == ["ACCOUNTS", "ACCT.DATES", "AGE", "NAME", "ROLES", "SURNAME"],
                     process=cli,
                     command="LIST.DICT",
                     file=FILE,
@@ -65,7 +72,14 @@ def main():
                 suite.check_eq(
                     "READ returns the structured record",
                     resp.get("record"),
-                    {"name": "John", "surname": "Doe", "age": "30", "roles": ""},
+                    {
+                        "name": "John",
+                        "surname": "Doe",
+                        "age": "30",
+                        "roles": "",
+                        "accounts": "",
+                        "acctDates": "",
+                    },
                 )
 
                 resp = conn.request(
@@ -177,6 +191,64 @@ def main():
                         {"value": 2, "sub_value": None},
                     ],
                 )
+
+                # --- association groups -----------------------------------
+                # USER3 holds three accounts and two dates. They are one group,
+                # so exploding either explodes both, and the third account keeps
+                # its row with an empty date rather than being dropped.
+                resp = conn.request(
+                    command="WRITE",
+                    file=FILE,
+                    key="USER3",
+                    data="Ann^Roe^41^ADMIN^TEST]PAYROLL]LAB^2019]2021",
+                    account=ACCOUNT,
+                )
+                suite.check_eq("WRITE a record with an association group", resp["status"], "OK")
+
+                for named in (["ACCOUNTS"], ["ACCT.DATES"], ["ACCOUNTS", "ACCT.DATES"]):
+                    resp = conn.request(
+                        command="QUERY",
+                        file=FILE,
+                        query_string="WITH ID = USER3",
+                        explode=named,
+                        account=ACCOUNT,
+                    )
+                    suite.check_eq(
+                        "QUERY explodes the group named by %s" % "+".join(named),
+                        resp.get("positions"),
+                        [
+                            {"value": 0, "sub_value": None},
+                            {"value": 1, "sub_value": None},
+                            {"value": 2, "sub_value": None},
+                        ],
+                    )
+
+                # A criterion on one member positions the whole group.
+                resp = conn.request(
+                    command="QUERY",
+                    file=FILE,
+                    query_string="WITH ID = USER3 AND ACCT.DATES = 2021",
+                    explode=["ACCOUNTS"],
+                    account=ACCOUNT,
+                )
+                suite.check_eq(
+                    "a criterion on one member positions the group",
+                    resp.get("positions"),
+                    [{"value": 1, "sub_value": None}],
+                )
+
+                # Two fields no association pairs still have no defined pairing.
+                resp = conn.request(
+                    command="QUERY", file=FILE, explode=["ACCOUNTS", "NAME"], account=ACCOUNT
+                )
+                suite.check_eq(
+                    "unassociated explode fields are refused",
+                    (resp.get("status"), resp.get("code")),
+                    ("ERROR", "INVALID_QUERY"),
+                )
+
+                resp = conn.request(command="DELETE", file=FILE, key="USER3", account=ACCOUNT)
+                suite.check_eq("DELETE the associated record", resp["status"], "OK")
 
                 resp = conn.request(command="DELETE", file=FILE, key="USER2", account=ACCOUNT)
                 suite.check_eq("DELETE the multivalued record", resp["status"], "OK")

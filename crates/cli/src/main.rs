@@ -1,5 +1,5 @@
 use smart_rusty_pick_core::config::Config;
-use smart_rusty_pick_core::db::{Database, Record, SelectEntry, SelectList, ValuePosition, report};
+use smart_rusty_pick_core::db::{Database, ExplodeSpec, Record, SelectEntry, SelectList, ValuePosition, report};
 use smart_rusty_pick_core::server;
 use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
@@ -549,14 +549,6 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
     // Strip the sort and explode clauses; a WITH clause, if any, ends the
     // column list. What is left in front of it are the fields to display.
     let (clause_parts, sort_specs, explode_specs) = Database::parse_clause_specs(&parts[offset + 1..]);
-    let explode = match explode_specs.len() {
-        0 => None,
-        1 => explode_specs.into_iter().next(),
-        _ => {
-            println!("Only one BY.EXP field may be given");
-            return;
-        }
-    };
 
     // Columns may sit on either side of the selection clause, so the criteria
     // are cut out of the token list and what is left is the column list.
@@ -574,10 +566,10 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
             (node, columns)
         }
     };
-    if let Some(condition) = explode.as_ref().and_then(|e| e.condition.clone()) {
+    for spec in &explode_specs {
         // The compact `BY.EXP ACCOUNTS = "TEST"` filters exactly as the
         // explicit `BY.EXP ACCOUNTS WITH ACCOUNTS = "TEST"` does.
-        query = Database::and_condition(query, Some(condition));
+        query = Database::and_condition(query, spec.condition.clone());
     }
 
     // An active list for this table stands in for a fresh scan, keeping the
@@ -599,6 +591,28 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
         };
         let table = &*handle.read();
 
+        // A BY.EXP clause of this command names the target; failing that, the
+        // field a preceding SELECT exploded does, and its group is resolved
+        // afresh from the dictionary as it stands now.
+        let named: Vec<ExplodeSpec> = if explode_specs.is_empty() {
+            list_explode_field
+                .iter()
+                .map(|field_name| ExplodeSpec {
+                    field_name: field_name.clone(),
+                    condition: None,
+                })
+                .collect()
+        } else {
+            explode_specs.clone()
+        };
+        let explode = match Database::resolve_explode_in(table, &named) {
+            Ok(target) => target,
+            Err(message) => {
+                println!("{}", message);
+                return;
+            }
+        };
+
         let mut rows: Vec<(SelectEntry, &Record)> = match &from_list {
             // The list already decided which rows exist, positions included;
             // re-running the selection over it would only lose them.
@@ -614,18 +628,13 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
 
         // Rows already arrive in key order, and within a key in value-position
         // order, so an absent sort clause needs nothing further.
-        let explode_idx = Database::explode_field_index(table, explode.as_ref());
-        Database::sort_entries_in(table, &mut rows, &sort_specs, explode_idx);
+        Database::sort_entries_in(table, &mut rows, &sort_specs, explode.as_ref());
 
         if field_names.is_empty() {
             rows.iter().map(|(entry, _)| entry.key.clone()).collect()
         } else {
             let columns: Vec<String> = field_names.iter().map(|s| s.to_string()).collect();
-            let explode_field = explode
-                .as_ref()
-                .map(|e| e.field_name.clone())
-                .or(list_explode_field.clone());
-            report::render_list(table, &columns, explode_field.as_deref(), &rows)
+            report::render_list(table, &columns, explode.as_ref(), &rows)
         }
     };
 
@@ -670,14 +679,6 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
 
     // Strip the sort and explode clauses before parsing the selection criteria.
     let (clause_parts, sort_specs, explode_specs) = Database::parse_clause_specs(&parts[offset + 1..]);
-    let explode = match explode_specs.len() {
-        0 => None,
-        1 => explode_specs.into_iter().next(),
-        _ => {
-            println!("Only one BY.EXP field may be given");
-            return;
-        }
-    };
 
     let mut query = if clause_parts.is_empty() {
         None
@@ -691,12 +692,12 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
         }
     } else {
         println!(
-            "Usage: SELECT [DICT] <table> [WITH <field> <op> <value>] [BY|BY.DSND <field> ...] [BY.EXP <field> [<op> <value>]]"
+            "Usage: SELECT [DICT] <table> [WITH <field> <op> <value>] [BY|BY.DSND <field> ...] [BY.EXP <field> [<op> <value>] ...]"
         );
         return;
     };
-    if let Some(condition) = explode.as_ref().and_then(|e| e.condition.clone()) {
-        query = Database::and_condition(query, Some(condition));
+    for spec in &explode_specs {
+        query = Database::and_condition(query, spec.condition.clone());
     }
 
     if !db.list_tables().contains(&table_name.to_string()) {
@@ -710,8 +711,16 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
             println!("TABLE NOT FOUND");
             return;
         };
+        let table = handle.read();
+        let explode = match Database::resolve_explode_in(&table, &explode_specs) {
+            Ok(target) => target,
+            Err(message) => {
+                println!("{}", message);
+                return;
+            }
+        };
         Database::select_entries_in(
-            &handle.read(),
+            &table,
             is_dict,
             query.as_ref(),
             explode.as_ref(),
@@ -728,7 +737,10 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
         db.active_select_list = Some(SelectList {
             table_name: table_name.to_string(),
             is_dict,
-            explode_field: explode.map(|e| e.field_name),
+            // One member names the whole group, and the group is resolved
+            // afresh when the list is read back - so the list keeps its shape
+            // and follows a dictionary that has moved on since.
+            explode_field: explode_specs.into_iter().next().map(|spec| spec.field_name),
             entries,
         });
     }

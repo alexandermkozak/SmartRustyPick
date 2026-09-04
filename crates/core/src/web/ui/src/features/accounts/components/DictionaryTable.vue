@@ -5,12 +5,21 @@
  *
  * The raw definition is shown as a title rather than a column. It is the whole
  * truth about an entry - including anything at a position this table does not
- * name - but it is unreadable next to six columns that say the same thing.
+ * name - but it is unreadable next to the columns that say the same thing.
  */
 import type {DictionaryEntry} from '../types'
 
 defineProps<{entries: DictionaryEntry[]; loaded: boolean; editing: string | null; busy: boolean}>()
 const emit = defineEmits<{edit: [entry: DictionaryEntry]; drop: [name: string]}>()
+
+/**
+ * The controlling field, and the tier it pairs on when that is the second one.
+ * `V` is the default and adds nothing to read, so only `S` is spelled out.
+ */
+function association(entry: DictionaryEntry): string {
+  if (!entry.association) return '—'
+  return entry.associationDepth === 'S' ? `${entry.association} (sub-values)` : entry.association
+}
 
 function drop(name: string): void {
   if (!window.confirm(`Delete the dictionary entry "${name}"? The field's data stays.`)) return
@@ -32,6 +41,7 @@ function drop(name: string): void {
           <th>Heading</th>
           <th>Justify</th>
           <th class="num">Width</th>
+          <th>Associated with</th>
           <th>Conversion</th>
           <th></th>
         </tr>
@@ -43,6 +53,7 @@ function drop(name: string): void {
           <td>{{ entry.heading || '—' }}</td>
           <td>{{ entry.justification || '—' }}</td>
           <td class="num">{{ entry.width ?? '—' }}</td>
+          <td class="mono">{{ association(entry) }}</td>
           <td class="mono">{{ entry.conversion || '—' }}</td>
           <td class="actions">
             <button :disabled="busy" class="small" type="button" @click="$emit('edit', entry)">

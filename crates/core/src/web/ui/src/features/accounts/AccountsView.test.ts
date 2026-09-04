@@ -130,6 +130,8 @@ const dictionary: DictionaryEntry[] = [
         heading: 'Name',
         justification: 'L',
         width: 20,
+        association: '',
+        associationDepth: '',
         conversion: '',
         definition: '1^Name^L^20',
     },
@@ -139,8 +141,29 @@ const dictionary: DictionaryEntry[] = [
         heading: 'EMAIL',
         justification: 'L',
         width: 30,
+        association: '',
+        associationDepth: '',
         conversion: '',
         definition: '2^EMAIL^L^30',
+    },
+]
+
+/// The same dictionary with a dependent in it, for the tests that need a group
+/// to look at. Kept apart from `dictionary` so the entry count the other tests
+/// read - the next free attribute number, the fields left to index - stays
+/// where they put it.
+const associatedDictionary: DictionaryEntry[] = [
+    ...dictionary,
+    {
+        name: 'EMAIL.KIND',
+        field: 3,
+        heading: 'KIND',
+        justification: 'L',
+        width: 10,
+        association: 'EMAIL',
+        associationDepth: 'S',
+        conversion: '',
+        definition: '3^KIND^L^10^EMAIL^S',
     },
 ]
 
@@ -720,7 +743,7 @@ describe('the dictionary of a file', () => {
         await fields(wrapper)[0].setValue('PRICE')
         await dict(wrapper).find('.form select').setValue('R')
         await fields(wrapper)[3].setValue('12')
-        await fields(wrapper)[4].setValue('MD2')
+        await fields(wrapper)[5].setValue('MD2')
         await submit(wrapper)
         await flushPromises()
 
@@ -733,8 +756,10 @@ describe('the dictionary of a file', () => {
                     field: '3',
                     heading: '',
                     justification: 'R',
-                    width: '12',
+                    association: '',
+                    associationDepth: '',
                     conversion: 'MD2',
+                    width: '12',
                 }),
             },
         ])
@@ -763,6 +788,57 @@ describe('the dictionary of a file', () => {
         })
         // Saved, so the form is adding again rather than still editing EMAIL.
         expect(wrapper.text()).toContain('Add a dictionary entry')
+    })
+
+    it('shows which fields are associated, and edits the association back', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubServer({
+                '/api/accounts/SALES/files/USERS/dictionary': dictionaryList(associatedDictionary),
+            }),
+        )
+        const wrapper = await openUsers(View)
+
+        // A field in no group says so; a dependent names its controller, and
+        // spells out the second tier because that is the part `V` does not
+        // imply.
+        expect(rows(wrapper)[1].findAll('td')[5].text()).toBe('—')
+        expect(rows(wrapper)[2].findAll('td')[5].text()).toBe('EMAIL (sub-values)')
+
+        // Editing loads the association into the form and saves it back, so a
+        // change to the width does not quietly drop the group.
+        await rows(wrapper)[2].find('button').trigger('click')
+        await flushPromises()
+        expect((fields(wrapper)[4].element as HTMLInputElement).value).toBe('EMAIL')
+
+        await fields(wrapper)[3].setValue('14')
+        await submit(wrapper)
+        await flushPromises()
+        expect(JSON.parse(sent[0].body as string)).toMatchObject({
+            name: 'EMAIL.KIND',
+            width: '14',
+            association: 'EMAIL',
+            associationDepth: 'S',
+        })
+    })
+
+    it('fills in the tier when a field is associated, and clears it when it is not', async () => {
+        const wrapper = await openUsers(View)
+        const depth = () => dict(wrapper).findAll('.form select')[1]
+
+        // A depth without a controlling field is refused by SET.DICT, so the
+        // form does not offer one until there is a controller to pair with.
+        expect((depth().element as HTMLSelectElement).disabled).toBe(true)
+        expect((depth().element as HTMLSelectElement).value).toBe('')
+
+        await fields(wrapper)[4].setValue('EMAIL')
+        await flushPromises()
+        expect((depth().element as HTMLSelectElement).disabled).toBe(false)
+        expect((depth().element as HTMLSelectElement).value).toBe('V')
+
+        await fields(wrapper)[4].setValue('')
+        await flushPromises()
+        expect((depth().element as HTMLSelectElement).value).toBe('')
     })
 
     it('deletes an entry after confirming, and re-reads what is left', async () => {

@@ -127,8 +127,8 @@ whatever the button asked for. See [Storage Engine](storage.md).
 
 Under the account list is a field that creates one. **Create account** makes an empty one (`CREATE.ACCOUNT`) and
 **Create demo** makes the populated fixture (`CREATE.TEST.ACCOUNT`) — the same one the CLI creates, with `USERS` and
-`PRODUCTS` files, their dictionaries, a multivalued field whose values go one level deeper still, and a price carrying
-an `MD2` conversion. It is the quickest way to have something real to point the file statistics and the dictionary
+`PRODUCTS` files, their dictionaries, a multivalued field whose values go one level deeper still, a price carrying
+an `MD2` conversion, and an [association group](data_structures.md#association-groups) over the `PRODUCTS` suppliers. It is the quickest way to have something real to point the file statistics and the dictionary
 editor at. Each row carries a **Drop** (`DELETE.ACCOUNT`). The same pair sits under the file list: a name and a **Durable** tick create a file
 (`CREATE.FILE`, durable from its first write), and each file has its own **Drop** (`DELETE.FILE`). All four are admin
 commands, so a dashboard whose certificate is not an admin one is refused by the database and says so.
@@ -150,14 +150,22 @@ listing is otherwise refreshed only every twenty seconds, which is a long time t
 ### The dictionary of a file
 
 Selecting a file lists its dictionary in full width beneath the three columns: the name a query uses, the attribute the
-field sits at, the heading and width `LIST` lays it out with, the justification, and the conversion. The raw definition
-— the whole truth about an entry, including anything at a position the table does not name — is the title of the name
-cell.
+field sits at, the heading and width `LIST` lays it out with, the justification, the field it is associated with, and
+the conversion. The raw definition — the whole truth about an entry, including anything at a position the table does
+not name — is the title of the name cell.
 
 **Add a dictionary entry** stores one (`SET.DICT`), suggesting the next free attribute number; **Edit** loads an
 existing entry into the same form, because storing an entry under a name that already exists is what replacing it
 means; **Delete** removes one (`DELETE` with `is_dict`) and leaves the field's data where it is. Selecting a different
 file abandons an open edit rather than carrying it across.
+
+**Associated with** names the controlling field this one's values pair with, making the two an
+[association group](data_structures.md#association-groups) that `BY.EXP` explodes together. The box suggests the file's
+other entries without being limited to them — a dictionary is written in some order, and naming a controller that does
+not exist yet is allowed. **Pairs on** says which tier: each value, or each sub-value inside the controlling value. It
+is offered only once a controlling field is named, because a tier without one is refused, and it fills in *each value*
+by default rather than leaving the attribute blank. The table spells the second tier out and leaves the first implied,
+since that is the one that adds nothing to read.
 
 Nothing in the page judges an attribute number or a justification. `SET.DICT` does, and it fills in the defaults for
 whatever the form left blank, so the page re-reads the dictionary after every change and shows what was actually

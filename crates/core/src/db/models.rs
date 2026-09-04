@@ -24,7 +24,24 @@ pub const DICT_FIELD_IDX: usize = 0;
 pub const DICT_NAME_IDX: usize = 1;
 pub const DICT_JUSTIFY_IDX: usize = 2;
 pub const DICT_WIDTH_IDX: usize = 3;
+/// Attribute 5: the controlling field this entry is associated with. Empty on a
+/// controller and on an unassociated field - see [`Association`].
+pub const DICT_ASSOC_IDX: usize = 4;
+/// Attribute 6: the tier this entry associates at, [`ASSOC_VALUE`] or
+/// [`ASSOC_SUB_VALUE`]. Only read when attribute 5 names a controller.
+pub const DICT_ASSOC_DEPTH_IDX: usize = 5;
 pub const DICT_CONV_IDX: usize = 7;
+
+/// Attribute 6 for a dependent that pairs value-for-value with its controller.
+pub const ASSOC_VALUE: &str = "V";
+/// Attribute 6 for a dependent that pairs sub-value-for-sub-value inside the
+/// controller's value.
+pub const ASSOC_SUB_VALUE: &str = "S";
+
+/// How far up the chain of controllers a walk will follow before deciding the
+/// dictionary describes a cycle. A dictionary deep enough to need more than
+/// this is a dictionary that has gone wrong.
+pub(crate) const ASSOC_MAX_DEPTH: usize = 16;
 
 /// The JSON key a sub-value that is not valid UTF-8 travels under.
 pub const BINARY_JSON_KEY: &str = "$base64";
@@ -597,6 +614,170 @@ impl ValuePosition {
     }
 }
 
+/// Which tier of the record hierarchy an association pairs its members on.
+///
+/// PICK has two, and so does this: a value tier, where row *n* is value *n* of
+/// every member, and a sub-value tier nested inside it, where a row is one
+/// sub-value of one controlling value. A member declares its own tier in
+/// attribute 6, so a group can pair some of its fields value-for-value and
+/// others sub-value-for-sub-value at the same time.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AssociationDepth {
+    #[default]
+    Value,
+    SubValue,
+}
+
+impl AssociationDepth {
+    /// Reads attribute 6. Only [`ASSOC_SUB_VALUE`] asks for the second tier;
+    /// everything else - an empty attribute, or one that has been mistyped by
+    /// hand - is the value tier, which is what an association means by default.
+    pub fn from_attribute(text: &str) -> Self {
+        if text.trim().eq_ignore_ascii_case(ASSOC_SUB_VALUE) {
+            AssociationDepth::SubValue
+        } else {
+            AssociationDepth::Value
+        }
+    }
+
+    /// The attribute 6 text for this tier.
+    pub fn as_attribute(self) -> &'static str {
+        match self {
+            AssociationDepth::Value => ASSOC_VALUE,
+            AssociationDepth::SubValue => ASSOC_SUB_VALUE,
+        }
+    }
+}
+
+/// One field of an association group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssociationMember {
+    pub name: String,
+    /// 0-based index into a record's fields, as [`Table::field_index`] resolves
+    /// it.
+    ///
+    /// [`Table::field_index`]: crate::db::engine::Table::field_index
+    pub index: usize,
+    pub depth: AssociationDepth,
+}
+
+/// A set of dictionary fields that explode in lockstep: PICK's correlated
+/// multivalued attributes.
+///
+/// Exploding any one member explodes all of them, so a record whose `ACCOUNTS`
+/// and `ACCT.DATES` each hold three values yields three rows pairing them,
+/// rather than three rows repeating every date or nine rows pairing nothing.
+///
+/// The relationship is recorded on the *dependent*, in attribute 5, naming its
+/// controller. One name per entry means a field is in at most one group by
+/// construction, and there is no list on the controller to fall out of step
+/// with the entries it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Association {
+    /// The field every member's attribute 5 leads to. It is a member itself
+    /// whenever the dictionary defines it, and always at the value tier: the
+    /// controller *is* the value axis the rest are paired against.
+    pub controller: String,
+    /// Every member, the controller included, in attribute order.
+    pub members: Vec<AssociationMember>,
+}
+
+impl Association {
+    pub fn member(&self, name: &str) -> Option<&AssociationMember> {
+        self.members.iter().find(|member| member.name == name)
+    }
+
+    pub fn member_at(&self, index: usize) -> Option<&AssociationMember> {
+        self.members.iter().find(|member| member.index == index)
+    }
+
+    /// True when some member pairs at the sub-value tier, so a row of this
+    /// group can be one sub-value rather than one whole value.
+    pub fn has_sub_value_tier(&self) -> bool {
+        self.members
+            .iter()
+            .any(|member| member.depth == AssociationDepth::SubValue)
+    }
+}
+
+/// How much of a row's position applies to one column.
+///
+/// Resolved once per column rather than per cell: a report asks the same
+/// question of every row, and the answer depends only on the dictionary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Narrowing {
+    /// Not part of what exploded: the column shows its whole field, repeated
+    /// down the rows.
+    Whole,
+    /// The position as the row carries it - a value, or a sub-value when the
+    /// match went that deep.
+    AsGiven,
+    /// The value the position names, sub-values and all. A member pairing at
+    /// the value tier shows a whole value even on a row a sub-value tier
+    /// member put there.
+    ValueOnly,
+}
+
+impl Narrowing {
+    /// The position to read a column at on a row carrying `position`.
+    pub fn apply(self, position: Option<ValuePosition>) -> Option<ValuePosition> {
+        match self {
+            Narrowing::Whole => None,
+            Narrowing::AsGiven => position,
+            Narrowing::ValueOnly => position.map(|pos| ValuePosition::value(pos.value)),
+        }
+    }
+}
+
+/// What a `BY.EXP` clause resolved to against a dictionary.
+///
+/// A field in no association explodes alone, exactly as `BY.EXP` has always
+/// done. A field in one explodes the whole group, and the single position a row
+/// already carried is now read against every member of it - which is why
+/// [`SelectEntry`], the saved-list encoding and the wire's `positions` all keep
+/// their shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExplodeTarget {
+    Field { name: String, index: usize },
+    Group(Association),
+}
+
+impl ExplodeTarget {
+    /// The fields whose values become rows.
+    pub fn indices(&self) -> Vec<usize> {
+        match self {
+            ExplodeTarget::Field { index, .. } => vec![*index],
+            ExplodeTarget::Group(group) => group.members.iter().map(|member| member.index).collect(),
+        }
+    }
+
+    /// The group this resolved to, or `None` for a lone field.
+    pub fn group(&self) -> Option<&Association> {
+        match self {
+            ExplodeTarget::Field { .. } => None,
+            ExplodeTarget::Group(group) => Some(group),
+        }
+    }
+
+    /// How a row's position applies to the column at `field_idx`.
+    pub fn narrowing_at(&self, field_idx: usize) -> Narrowing {
+        match self {
+            ExplodeTarget::Field { index, .. } if *index == field_idx => Narrowing::AsGiven,
+            ExplodeTarget::Field { .. } => Narrowing::Whole,
+            ExplodeTarget::Group(group) => match group.member_at(field_idx) {
+                Some(member) if member.depth == AssociationDepth::SubValue => Narrowing::AsGiven,
+                Some(_) => Narrowing::ValueOnly,
+                None => Narrowing::Whole,
+            },
+        }
+    }
+
+    /// The position to read `field_idx` at on a row carrying `position`.
+    pub fn position_at(&self, field_idx: usize, position: Option<ValuePosition>) -> Option<ValuePosition> {
+        self.narrowing_at(field_idx).apply(position)
+    }
+}
+
 /// One row of a select list: a record key, plus the position within an exploded
 /// field that put it there. `position` is `None` for an ordinary, unexploded
 /// selection, which is what every list held before `BY.EXP` existed.
@@ -625,7 +806,12 @@ pub struct SelectList {
     pub is_dict: bool,
     /// The field the entries' positions refer to, when the list was built by a
     /// `BY.EXP` clause. A later `LIST` of the same file needs this to know which
-    /// column those positions narrow.
+    /// columns those positions narrow.
+    ///
+    /// One name even where the clause named a whole [`Association`]: any member
+    /// resolves to the group, and resolving it again when the list is read back
+    /// means a saved list keeps its shape and follows a dictionary that has
+    /// moved on since - rather than pinning a group as it stood.
     pub explode_field: Option<String>,
     pub entries: Vec<SelectEntry>,
 }

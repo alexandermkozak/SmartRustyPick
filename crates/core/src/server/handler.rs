@@ -56,6 +56,8 @@ fn db_error_in(context: &str, e: DbError) -> Response {
 const DEFAULT_DICT_WIDTH: i64 = 10;
 /// The justifications a dictionary entry may carry, as `LIST` understands them.
 const DICT_JUSTIFICATIONS: [&str; 2] = ["L", "R"];
+/// The tiers an association may pair on, as the engine reads them.
+const DICT_ASSOC_DEPTHS: [&str; 2] = [crate::db::ASSOC_VALUE, crate::db::ASSOC_SUB_VALUE];
 
 /// One dictionary entry decomposed into the attributes
 /// [Data Structures](../../../../docs/data_structures.md) documents.
@@ -73,6 +75,8 @@ pub(crate) fn dictionary_entry(record: &Record) -> serde_json::Value {
         "heading": attribute(crate::db::DICT_NAME_IDX),
         "justification": attribute(crate::db::DICT_JUSTIFY_IDX),
         "width": number(crate::db::DICT_WIDTH_IDX),
+        "association": attribute(crate::db::DICT_ASSOC_IDX),
+        "associationDepth": attribute(crate::db::DICT_ASSOC_DEPTH_IDX),
         "conversion": attribute(crate::db::DICT_CONV_IDX),
         "definition": record.to_display_string(),
     })
@@ -145,16 +149,43 @@ fn dictionary_record(key: &str, spec: &serde_json::Value) -> Result<Record, Stri
     }
     let conversion = dict_text(spec, "conversion").unwrap_or_default();
 
+    // The association is recorded on the dependent, naming its controller, so
+    // this is the field that says "my values pair with those of that one". A
+    // controller carries nothing: it is found by the entries that name it.
+    let association = dict_text(spec, "association").unwrap_or_default();
+    if association == key {
+        return Err("A dictionary entry cannot be associated with itself".to_string());
+    }
+    let depth = match dict_text(spec, "associationDepth") {
+        Some(text) if !text.is_empty() => text.to_uppercase(),
+        _ => String::new(),
+    };
+    if !depth.is_empty() && !DICT_ASSOC_DEPTHS.contains(&depth.as_str()) {
+        return Err(format!(
+            "Association depth must be {} (value) or {} (sub-value)",
+            DICT_ASSOC_DEPTHS[0], DICT_ASSOC_DEPTHS[1]
+        ));
+    }
+    if association.is_empty() && !depth.is_empty() {
+        return Err("Association depth given without a controlling field".to_string());
+    }
+    // An association with no tier named pairs value for value, and says so
+    // rather than leaving the attribute blank for a reader to guess at.
+    let depth = match (association.is_empty(), depth.is_empty()) {
+        (false, true) => DICT_ASSOC_DEPTHS[0].to_string(),
+        _ => depth,
+    };
+
     // The conversion sits at attribute 8, so the positions between it and the
-    // width are filled and then trimmed back off when nothing occupies them -
-    // an entry without a conversion is `1^NAME^L^20`, as the CLI writes it.
+    // association are filled and then trimmed back off when nothing occupies
+    // them - an entry with neither is `1^NAME^L^20`, as the CLI writes it.
     let mut attributes = vec![
         field.to_string(),
         heading,
         justification,
         width.to_string(),
-        String::new(),
-        String::new(),
+        association,
+        depth,
         String::new(),
         conversion,
     ];
@@ -460,15 +491,21 @@ fn query_command(db: &Database, table: &Table, req: &Request) -> Response {
     };
     let is_dict = req.is_dict.unwrap_or(false);
 
-    let (query_node, sort_specs, explode) = match resolve_clause(db, table_name, req) {
+    let (query_node, sort_specs, explode_specs) = match resolve_clause(db, table_name, req) {
         Ok(clause) => clause,
         Err(response) => return response,
+    };
+    // What the clause named, resolved against this file's dictionary: a lone
+    // field, or the association group it belongs to.
+    let explode = match Database::resolve_explode_in(table, &explode_specs) {
+        Ok(target) => target,
+        Err(message) => return error(ErrorCode::InvalidQuery, message),
     };
 
     // Resolve the dictionary once for the whole result set rather than per record.
     let schema = db.record_schema(table);
 
-    if query_node.is_none() && explode.is_none() {
+    if query_node.is_none() && explode_specs.is_empty() {
         // Full scan with nothing to explode: sort the keys only, then serialize
         // each record by reference so the whole table is never cloned into
         // memory.
@@ -497,10 +534,11 @@ fn query_command(db: &Database, table: &Table, req: &Request) -> Response {
     }
 
     let mut rows = Database::query_exploded_in(table, is_dict, query_node.as_ref(), explode.as_ref(), None);
-    let explode_idx = Database::explode_field_index(table, explode.as_ref());
-    Database::sort_entries_in(table, &mut rows, &sort_specs, explode_idx);
+    Database::sort_entries_in(table, &mut rows, &sort_specs, explode.as_ref());
 
-    let exploded = explode.is_some();
+    // A clause that named a field the dictionary does not know still asked for
+    // an exploded result, and gets one - of `null` positions.
+    let exploded = !explode_specs.is_empty();
     let mut results_processed = Vec::with_capacity(rows.len());
     let mut positions = Vec::with_capacity(rows.len());
     for (entry, record) in rows {
@@ -516,9 +554,12 @@ fn query_command(db: &Database, table: &Table, req: &Request) -> Response {
     }
 }
 
-/// What a QUERY or SELECT selects: the criteria, the ordering, and the field
+/// What a QUERY or SELECT selects: the criteria, the ordering, and the fields
 /// whose values become rows of their own.
-type Clause = (Option<QueryNode>, Vec<SortSpec>, Option<ExplodeSpec>);
+///
+/// The explode specs are left unresolved here because resolving them needs the
+/// file's dictionary, which a caller holding the table has and this does not.
+type Clause = (Option<QueryNode>, Vec<SortSpec>, Vec<ExplodeSpec>);
 
 /// Resolves the selection clause a QUERY or SELECT carries, however it was
 /// spelled: a pre-built `query_node`, or a `query_string` re-parsed here.
@@ -532,14 +573,16 @@ type Clause = (Option<QueryNode>, Vec<SortSpec>, Option<ExplodeSpec>);
 #[allow(clippy::result_large_err)]
 fn resolve_clause(db: &Database, table_name: &str, req: &Request) -> Result<Clause, Response> {
     let mut sort_specs = req.sort_specs.clone().unwrap_or_default();
-    let mut explode = req
+    let mut explode: Vec<ExplodeSpec> = req
         .explode
-        .as_ref()
-        .and_then(|names| names.first())
-        .map(|name| ExplodeSpec {
-            field_name: name.clone(),
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|field_name| ExplodeSpec {
+            field_name,
             condition: None,
-        });
+        })
+        .collect();
 
     let mut query_node = req.query_node.clone();
     if let (None, Some(q_str)) = (&query_node, req.query_string.as_deref()) {
@@ -555,9 +598,11 @@ fn resolve_clause(db: &Database, table_name: &str, req: &Request) -> Result<Clau
                 format!("Query is not understood: {}", clause_parts.join(" ")),
             ));
         }
-        if let (None, Some(spec)) = (&explode, parsed_explodes.into_iter().next()) {
-            query_node = Database::and_condition(query_node, spec.condition.clone());
-            explode = Some(spec);
+        if explode.is_empty() {
+            for spec in &parsed_explodes {
+                query_node = Database::and_condition(query_node, spec.condition.clone());
+            }
+            explode = parsed_explodes;
         }
     }
 
@@ -637,7 +682,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             let is_dict = req.is_dict.unwrap_or(false);
             let list_name = req.list_name.clone().unwrap_or_else(|| "DEFAULT".to_string());
 
-            let (query_node, sort_specs, explode) = match resolve_clause(db, &table_name, &req) {
+            let (query_node, sort_specs, explode_specs) = match resolve_clause(db, &table_name, &req) {
                 Ok(clause) => clause,
                 Err(response) => return response,
             };
@@ -646,21 +691,31 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 return db_error(e);
             }
             let entries = match db.get_table_read_only_for_account(acc, &table_name) {
-                Some(handle) => Database::select_entries_in(
-                    &handle.read(),
-                    is_dict,
-                    query_node.as_ref(),
-                    explode.as_ref(),
-                    None,
-                    &sort_specs,
-                ),
+                Some(handle) => {
+                    let table = handle.read();
+                    let explode = match Database::resolve_explode_in(&table, &explode_specs) {
+                        Ok(target) => target,
+                        Err(message) => return error(ErrorCode::InvalidQuery, message),
+                    };
+                    Database::select_entries_in(
+                        &table,
+                        is_dict,
+                        query_node.as_ref(),
+                        explode.as_ref(),
+                        None,
+                        &sort_specs,
+                    )
+                }
                 None => return error(ErrorCode::FileNotFound, format!("File '{}' is not loaded", table_name)),
             };
 
             let list = crate::db::SelectList {
                 table_name,
                 is_dict,
-                explode_field: explode.map(|e| e.field_name),
+                // One member names the whole group, and the group is re-resolved
+                // from the dictionary when the list is read back - so a saved
+                // list keeps its shape and follows a dictionary that has moved on.
+                explode_field: explode_specs.into_iter().next().map(|spec| spec.field_name),
                 entries,
             };
             let count = list.len();

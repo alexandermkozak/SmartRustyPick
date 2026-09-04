@@ -46,6 +46,10 @@ Dictionary items are special records stored in the `dict` section of a table. Th
 - **Field 2**: Display Heading (used in LIST output).
 - **Field 3**: Justification (`L` for Left, `R` for Right).
 - **Field 4**: Display Width (cosmetic constraint for LIST output).
+- **Field 5**: Association — the controlling field this entry's values pair with (optional). See
+  [Association groups](#association-groups).
+- **Field 6**: Association depth — `V` (value for value, the default) or `S` (sub-value for
+  sub-value). Only read when field 5 names a controller.
 - **Field 8**: Conversion Code (optional).
   - `D4-`: Date with 4-digit year (e.g., 03-21-2026).
   - `D2/`: Date with 2-digit year (e.g., 03/21/26).
@@ -74,6 +78,44 @@ exactly those values. Over the remote protocol the same positions come back alon
 The clause is documented, with its rules and examples, under
 [Exploding multivalues](general_commands.md#exploding-multivalues); the wire form is under
 [Exploded results](protocol.md#exploded-results).
+
+#### Association groups
+
+Some multivalued fields are only meaningful together. A `$CLIENTS` record with
+`ACCOUNTS` holding `TEST]PAYROLL]LAB` and `ACCT.CODES` holding `T-1]P-7]L-3` means three
+accounts, each with its own code — not three accounts and, separately, three codes. Exploding
+one of them ought to explode the other in lockstep.
+
+Nothing in the values says so, and nothing can: three values beside three values could mean
+three rows or nine. The dictionary says so. **Attribute 5 of a dependent names its
+controller**, and the fields sharing a controller are an *association group* — PICK's
+correlated multivalued attributes.
+
+```
+ACCOUNTS     2^ACCOUNTS^L^12
+ACCT.CODES   3^CODE^L^8^ACCOUNTS^V
+ACCT.NOTES   4^NOTE^L^10^ACCOUNTS^S
+```
+
+The relationship is recorded on the dependent rather than as a list on the controller, so a
+field is in at most one group by construction and there is no list to fall out of step with
+the entries it names. A controller carries nothing: it is found by the entries that name it.
+A dependent may name a dependent, and the chain is followed to its head, so a group can be
+built up in tiers; a chain that runs in a circle forms no group rather than hanging.
+
+**Two tiers.** Attribute 6 says which one a dependent pairs on:
+
+- `V` (the default) — value for value. Row *n* is value *n* of every `V` member.
+- `S` — sub-value for sub-value, *inside* the controlling value. A value that has sub-values
+  at the second tier becomes one row per sub-value, and the `V` members repeat down them.
+
+A group is not a constraint. Members may be ragged — three accounts beside two codes — and
+the rows come from the longest of them, the short ones showing empty. Nothing is dropped
+because a sibling ran out of values, and nothing rejects a write that leaves a group uneven.
+
+What a group changes is `BY.EXP`: naming any member explodes all of them, one row's position
+is read against every member, and several members may be named in one clause. The rules and
+examples are under [Exploding multivalues](general_commands.md#exploding-multivalues).
 
 #### Conversions (ICONV / OCONV)
 
