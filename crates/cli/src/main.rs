@@ -1342,7 +1342,7 @@ fn print_health(health: &smart_rusty_pick_core::db::Health) {
     use smart_rusty_pick_core::db::Verdict;
     println!("Health: {}", health.verdict.as_str().to_uppercase());
     let mut measures: Vec<_> = health.measures.iter().collect();
-    measures.sort_by(|a, b| b.verdict.cmp(&a.verdict));
+    measures.sort_by_key(|measure| std::cmp::Reverse(measure.verdict));
     for measure in measures {
         let mark = match measure.verdict {
             Verdict::Good => "  ok  ",

@@ -184,13 +184,16 @@ impl Health {
     }
 
     /// The measures that are not `Good`, worst first. What a summary line says.
+    ///
+    /// A stable sort, so two measures of the same verdict keep the order they
+    /// were judged in - which reads as a sequence rather than as a jumble.
     pub fn concerns(&self) -> Vec<&Measure> {
         let mut concerns: Vec<&Measure> = self
             .measures
             .iter()
             .filter(|measure| measure.verdict != Verdict::Good)
             .collect();
-        concerns.sort_by(|a, b| b.verdict.cmp(&a.verdict));
+        concerns.sort_by_key(|measure| std::cmp::Reverse(measure.verdict));
         concerns
     }
 }
