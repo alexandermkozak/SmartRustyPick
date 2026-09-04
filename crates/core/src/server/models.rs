@@ -33,6 +33,14 @@ pub struct Request {
     pub durable: Option<bool>,
     /// The dictionary field an index command names, alongside `file`.
     pub field: Option<String>,
+    /// `CREATE.INDEX` and `SET.INDEX.EXCLUDE`: the values the index is to skip.
+    /// An empty list on `SET.INDEX.EXCLUDE` clears the exclusions; an absent
+    /// one there means the same, since replacing the set is the whole command.
+    pub values: Option<Vec<String>>,
+    /// `INDEX.STATS`: how many of the commonest values to return. Capped by the
+    /// server, so one request cannot ask it to sort and send every distinct
+    /// value an index holds.
+    pub limit: Option<usize>,
 }
 
 /// The machine-readable classification of an error response.

@@ -1,12 +1,29 @@
 import {call, encode, pairs, record} from '@shared/api/client'
+import {verdictOf, type HealthSummary} from '@shared/health'
 import type {
     AccountStats,
     DictionaryDraft,
     DictionaryEntry,
     FileEntry,
     FileStats,
+    IndexReport,
     IndexStats,
 } from './types'
+
+/**
+ * A listing's health summary, tolerating a server that sends none.
+ *
+ * An older server's `LIST.FILES` reply has no `health` at all, and treating
+ * that as a problem would be worse than treating it as nothing to report.
+ */
+function summaryOf(value: unknown, reasons: unknown): HealthSummary {
+    return {
+        verdict: verdictOf(value),
+        reasons: Array.isArray(reasons)
+            ? reasons.filter((r): r is string => typeof r === 'string')
+            : [],
+    }
+}
 
 export const accountsApi = {
     /** `LIST.ACCOUNTS`: every account this client may reach. */
@@ -15,10 +32,20 @@ export const accountsApi = {
         return results.map(([, stats]) => stats)
     },
 
-    /** `LIST.FILES` for one account, each file with its durability flag. */
+    /**
+     * `LIST.FILES` for one account, each file with its durability flag and its
+     * cheap health verdict - so a problem file is findable from the list rather
+     * than only by opening every file in turn.
+     */
     async files(account: string): Promise<FileEntry[]> {
-        const results = await pairs<{durable: boolean}>(`/api/accounts/${encode(account)}/files`)
-        return results.map(([name, info]) => ({name, durable: info.durable === true}))
+        const results = await pairs<{durable: boolean; health?: string; health_reasons?: string[]}>(
+            `/api/accounts/${encode(account)}/files`,
+        )
+        return results.map(([name, info]) => ({
+            name,
+            durable: info.durable === true,
+            health: summaryOf(info.health, info.health_reasons),
+        }))
     },
 
     /** `FILE.STATS` for one file. */
@@ -66,11 +93,46 @@ export const accountsApi = {
         return results.map(([, stats]) => stats)
     },
 
-    /** `CREATE.INDEX` on one dictionary field. Admin only. */
-    createIndex: (account: string, file: string, field: string): Promise<unknown> =>
+    /** `LIST.INDEXES` with no file: every index in the account, so index health
+     *  is visible without walking file by file. */
+    async accountIndexes(account: string): Promise<IndexStats[]> {
+        const results = await pairs<IndexStats>(`/api/accounts/${encode(account)}/indexes`)
+        return results.map(([, stats]) => stats)
+    },
+
+    /** `INDEX.STATS`: one index in full, with the values that dominate it. */
+    indexReport: (account: string, file: string, field: string, limit = 10): Promise<IndexReport> =>
+        record<IndexReport>(
+            `/api/accounts/${encode(account)}/files/${encode(file)}/indexes/${encode(field)}` +
+                `?limit=${encodeURIComponent(limit)}`,
+        ),
+
+    /**
+     * `SET.INDEX.EXCLUDE`: replace the values one index does not hold, and
+     * rebuild it. An empty list clears the exclusions. Admin only.
+     */
+    setIndexExclusions: (
+        account: string,
+        file: string,
+        field: string,
+        values: string[],
+    ): Promise<unknown> =>
+        call(
+            `/api/accounts/${encode(account)}/files/${encode(file)}/indexes/${encode(field)}/exclude`,
+            {method: 'POST', body: JSON.stringify({values})},
+        ),
+
+    /** `CREATE.INDEX` on one dictionary field, optionally skipping values that
+     *  are not worth indexing. Admin only. */
+    createIndex: (
+        account: string,
+        file: string,
+        field: string,
+        exclude: string[] = [],
+    ): Promise<unknown> =>
         call(`/api/accounts/${encode(account)}/files/${encode(file)}/indexes`, {
             method: 'POST',
-            body: JSON.stringify({field}),
+            body: JSON.stringify({field, values: exclude}),
         }),
 
     /** `REBUILD.INDEX`: derive an existing index from the records again. Admin only. */

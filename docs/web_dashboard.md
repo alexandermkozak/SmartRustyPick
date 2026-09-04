@@ -60,14 +60,60 @@ by default), so they follow `ca_path` rather than littering the working director
 
 | Tab            | Contents                                                                                                                         |
 |----------------|----------------------------------------------------------------------------------------------------------------------------------|
-| Overview       | Uptime, listener, connection and request totals, pending writes, tables in memory, and every connection open right now.          |
+| Overview       | Uptime, listener, connection and request totals, pending writes, tables in memory, every connection open right now, and a storage roll-up naming the accounts that need attention. |
 | Authorizations | Every authorized client: name, thumbprint, allowed accounts, admin flag. Authorize a thumbprint, add or remove accounts, revoke. |
 | Certificates   | Issue a certificate signed by the server's CA, authorized in the same step, with its key downloadable once.                      |
 | Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Accounts and files can be created and dropped, durable files are tagged in the listing and the flag can be turned on or off, and the selected file's dictionary and indexes are listed and managed below. |
 
 File statistics cover the record and dictionary counts, the indexes the file carries, the hash modulus and group
-distribution, bytes on disk, the durability flag and whether the file is currently held in the server's cache. Record counts come from each file's
-section metadata, so opening the view does not load the file.
+distribution, bytes on disk, the durability flag and whether the file is currently held in the server's cache. Record
+counts come from each file's section metadata and the per-group counts from each group's trailer, so opening the view
+does not load the file — a property asserted by a test, not merely intended.
+
+### Health: what the numbers mean
+
+The panel opens with a verdict rather than with numbers. Thirteen rows with no evaluation of any of them left the
+reader to decide whether a four-megabyte largest group against a ninety-six-kilobyte smallest one was fine, and a
+number nobody knows how to read is not information.
+
+Every measure carries one of three verdicts and the threshold that produced it:
+
+| Verdict            | Means                                                                                       |
+|--------------------|---------------------------------------------------------------------------------------------|
+| *healthy*          | Nothing to do.                                                                              |
+| *watch*            | Not wrong now, and heading somewhere — a file about to rehash, an index nothing has queried. |
+| *needs attention*  | Something is costing more than it should, and the detail says what to do about it.           |
+
+**The page decides none of this.** The verdicts come from the database, which is also what the CLI prints, so the two
+cannot disagree about where a line is and improving a threshold is one change in one place. `shared/health.ts` holds no
+threshold at all: what is there is presentation — which verdict sorts first, what it is called, what it is coloured.
+
+What is measured, and what to do about a bad one:
+
+| Measure               | Bad means                                                              | Remedy                                                                                        |
+|-----------------------|------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------|
+| **Storage format**    | Still the pre-hashfile flat file: every write rewrites the whole file, and a torn write reads back as missing records. | Converted on the next flush. Write to the file, or flush the database. |
+| **Per-group checksums** | Written before the format appended a checksum trailer, so a truncated group reads back as fewer records rather than as an error. | Written on the next flush, as above. |
+| **Group skew**        | The largest group holds several times the mean, so every write landing there rewrites all of it. | Keys sharing a prefix the hash does not separate are the usual cause; the fix is in how keys are chosen. Not judged below four records per group. |
+| **Overweight groups** | More than a tenth of the groups hold over twice the mean — the hash is not spreading, rather than one group being unlucky. | As above. |
+| **Load factor**       | Near or past the modulus' capacity: the next flush rehashes, rewriting every group. Or far below it: a directory of near-empty groups. | Nothing to do — both resolve on a flush. Worth knowing before it happens on a busy file. |
+| **Bytes per record**  | Informational: what the disk is spent on, split between groups, indexes and metadata. | — |
+| **Indexes**           | The worst verdict among the file's indexes, so a badly shaped one is visible from the file. | See the index table below. |
+
+Beneath the verdicts is the **records-per-group distribution**, drawn as columns. Two extremes cannot show skew — a
+smallest and a largest say nothing about whether a file is one long tail or one outlier, and it is the outlier that
+costs. One column standing far out to the right is what an operator is looking for, and it is visible there and nowhere
+in a table of numbers. The distribution is over the modulus rather than the group files: a group holding nothing has no
+file, so counting only the files that exist would draw a piled-up file as a perfectly even one.
+
+The layout table follows, with everything the panel showed before plus the spread and the headroom — how many records
+until the modulus doubles, and how many until it halves.
+
+**Finding a bad file without opening every file.** The file list and the account list each carry the same verdict as a
+coloured pill, and the Overview tab has a **Storage** card naming the accounts that need attention. These are the
+*cheap* verdict: section metadata and index `state` files only, no group trailers and no records, which is what a
+listing can afford. The full measures arrive when a file is opened. A healthy row shows no pill at all — forty green
+badges would hide the one that matters.
 
 Durability is the one thing about a file the dashboard changes rather than reports: beside the statistics, **Make
 durable** promotes the file so every write to it is flushed before being acknowledged, and **Buffer writes** returns it
@@ -117,6 +163,23 @@ Nothing in the page judges an attribute number or a justification. `SET.DICT` do
 whatever the form left blank, so the page re-reads the dictionary after every change and shows what was actually
 stored — a refusal appears in the banner in the database's own words.
 
+### The indexes of an account
+
+Above the per-file sections, and appearing as soon as an account is selected: every index in the account that is not
+earning its keep, named by file and field, with the measures that say why.
+
+This is the first gap an operator meets and the one the per-file table could never close. Nothing reported on an index
+unless somebody opened the page for its file, so a database with forty files had no view saying which three were worth
+attention — and a problem nobody is told about is a problem nobody finds. There are three columns of navigation before
+a single index otherwise.
+
+Only the exceptions are listed. A table of every index in the account would be the same wall of numbers one level
+further out; what is wanted here is which file to open, and the file's own table has the rest. Each row is a way
+through to that file. An account whose indexes are all fine says so, and one with none says what that costs.
+
+It is read when an account is chosen and again after any change to an index, not on a poll: the listing walks every
+file in the account, and a verdict that changes on a flush does not need a five-second refresh.
+
 ### The indexes of a file
 
 Beneath the dictionary is the file's [secondary indexes](storage.md#secondary-indexes) — the fields on which
@@ -124,11 +187,24 @@ Beneath the dictionary is the file's [secondary indexes](storage.md#secondary-in
 them, in one place:
 
 - **Statistics**, per index: the attribute it follows, the distinct values it holds, the record keys it indexes in
-  total, its largest posting list, its size on disk and when it was last built.
-- **Analysis**, under the table, one sentence per index: how far a lookup actually narrows the file, and whether the
-  commonest value still covers so much of it that no index can help. An index over many values turns a scan into a
-  lookup of a handful of records; one over two or three turns it into a scan of a third of the file and still costs a
-  write every time the field changes. A file with no indexes says how many records every non-keyed selection reads.
+  total, its largest posting list, the lookups it has served since the server started, its size on disk and when it was
+  last built. A file with no indexes says how many records every non-keyed selection reads instead.
+- **A verdict** on each row, from the database, in the same three states the file's own measures use. The page used to
+  hold its own thresholds here — a lookup narrowing to two records is "close to unique", a largest posting list of a
+  quarter of the file is worth warning about — which were reasonable guesses the CLI did not share and which could only
+  be improved by editing prose in a component. What is judged now: whether the index matches the records, how far a
+  lookup actually narrows the file, whether one value covers so much of it that indexing that value buys nothing,
+  whether anything has queried it at all, and how much of what it hands back survives the filter.
+- **Values** opens one index's histogram (`INDEX.STATS`): the values holding the most record keys, largest first, each
+  with its share of the file. This is what turns "this index is skewed" into "`STATUS = ACTIVE` is 91% of it". A stale
+  index shows nothing here and says why — its postings do not describe the records, and an empty histogram would read
+  as an empty index, which is a different and wrong thing to tell somebody.
+- **Stop indexing**, on each value in that histogram, excludes it (`SET.INDEX.EXCLUDE`). The dashboard should not show
+  someone which value is the problem and then send them to the CLI to do something about it. The confirmation says what
+  the exclusion does to their queries, which is nothing: a query for an excluded value scans exactly as it would with
+  no index at all, and returns the same records in the same order. What changes is that the longest posting list stops
+  being rewritten on every write that touches it. Excluded values are listed above the histogram with a button that
+  puts each one back. See [Excluded values](storage.md#excluded-values).
 - **Creation**: **Index a field** offers the dictionary fields that are defined and not indexed yet — a list rather
   than a text box, because an index is on a field the page has just shown you, and `ID` is excluded as the record key
   that needs no index. Building it reads the file once (`CREATE.INDEX`).
@@ -137,6 +213,11 @@ them, in one place:
   for doing it now.
 - **Drop** removes an index and its section (`DELETE.INDEX`), after confirming, and says what that means: queries go
   back to scanning and the records stay.
+
+Reading an index's values is its own request, made only when **Values** is pressed: the listing above it is read on
+every navigation and stays cheap, while the histogram sorts the index's values. Excluding one rebuilds the index, so
+the histogram is re-read afterwards as well as the list — the thing the operator was looking at when they pressed the
+button is the thing that has just changed.
 
 The three that change something are admin commands, so a dashboard whose certificate is not an admin one is refused by
 the database and says so. Nothing here decides whether a field *can* be indexed — `CREATE.INDEX` does, and a refusal

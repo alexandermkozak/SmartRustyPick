@@ -515,16 +515,25 @@ impl Database {
             false => Self::index_candidates(table, query, &field_map),
         };
 
+        // Which index, if exactly one, is owed the survivors of this query. See
+        // `FileIndex::note_survivors`: an `AND` over two indexes has no honest
+        // answer to that, so only a single condition is attributed.
+        let sole_index = candidates.as_ref().and_then(|_| Self::sole_indexed_field(table, query));
+
         let Some(filter_keys) = keys_to_filter else {
             if let Some(candidates) = candidates {
                 // A `BTreeSet` iterates in key order, which is the order a full
                 // scan sorts its matches into.
-                return candidates
+                let matched: Vec<T> = candidates
                     .iter()
                     .filter_map(|key| source_map.get_key_value(key.as_str()))
                     .filter(|(key, record)| Self::evaluate_node_static_with_id(key, record, query, &field_map))
                     .map(|(key, record)| project(key, record))
                     .collect();
+                if let Some(index) = sole_index {
+                    index.note_survivors(matched.len() as u64);
+                }
+                return matched;
             }
             // Optimize: Filter before sorting.
             // Avoid cloning the entire table by using an iterator, and order the
@@ -551,7 +560,26 @@ impl Database {
                 results.push(project(key, record));
             }
         }
+        if let Some(index) = sole_index {
+            index.note_survivors(results.len() as u64);
+        }
         results
+    }
+
+    /// The one index that resolved `query` on its own, if there is one.
+    ///
+    /// Only a single equality condition qualifies. The moment two conditions
+    /// compose, a surviving record is owed to both of them and attributing it
+    /// to either would make the precision figure a fiction - which is exactly
+    /// the number it exists to keep honest.
+    fn sole_indexed_field<'t>(table: &'t Table, query: &QueryNode) -> Option<&'t crate::db::index::FileIndex> {
+        let QueryNode::Condition(cond) = query else {
+            return None;
+        };
+        table
+            .indexes
+            .get(&cond.field_name)
+            .filter(|index| table.field_index(&cond.field_name) == Some(index.attr))
     }
 
     /// The keys an index can narrow `query` down to, or `None` when no index

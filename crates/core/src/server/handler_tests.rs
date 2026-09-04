@@ -1756,7 +1756,34 @@ fn every_refusal_carries_a_code_and_a_message() {
             &admin,
             ErrorCode::IndexNotFound,
         ),
-        (in_account("LIST.INDEXES", None), &ordinary, ErrorCode::MissingField),
+        // `LIST.INDEXES` with no file is the account-wide listing rather than a
+        // refusal, so the missing-field case moves to the commands that still
+        // need a file and a field.
+        (in_account("INDEX.STATS", None), &ordinary, ErrorCode::MissingField),
+        (
+            Request {
+                field: Some("NOSUCH".to_string()),
+                ..in_account("INDEX.STATS", Some("USERS"))
+            },
+            &ordinary,
+            ErrorCode::IndexNotFound,
+        ),
+        (
+            Request {
+                field: Some("NOSUCH".to_string()),
+                ..in_account("SET.INDEX.EXCLUDE", Some("USERS"))
+            },
+            &admin,
+            ErrorCode::IndexNotFound,
+        ),
+        (
+            Request {
+                field: Some("NAME".to_string()),
+                ..in_account("SET.INDEX.EXCLUDE", Some("USERS"))
+            },
+            &ordinary,
+            ErrorCode::AdminRequired,
+        ),
         (named("SERVER.STATS"), &ordinary, ErrorCode::AdminRequired),
         (
             Request {

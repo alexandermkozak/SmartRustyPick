@@ -54,6 +54,47 @@ scales with the size of the table, so updating one record costs the same on a ta
 million. A full rewrite of every group happens only when the modulus changes, when a table is edited in bulk (a change
 that cannot be attributed to individual keys), or during migration from the old format.
 
+### Reading a file's health
+
+`FILE.STATS` answers "is this file healthy, and will it stay that way", not only "how big is it". Everything below is
+derived from the section metadata and the group **trailers**, so answering it reads no record — the property the
+[web dashboard](web_dashboard.md) promises about that whole view, and one a test asserts by checking the file is still
+not loaded afterwards.
+
+**Records per group.** Each group's 20-byte trailer holds `[magic][record_count][crc32c]`, so the true distribution
+costs one seek per group and loads nothing. `group_records` reports the min, median, mean and max, a bucketed shape for
+drawing, and counts of the empty, the overweight and the unreadable.
+
+It is computed over the **modulus**, not over the group files. A group holding nothing has no file at all — an empty
+bucket is deleted rather than written — so averaging the files that exist would report a file whose records had piled
+into four groups out of thirty-two as perfectly even. That is precisely the case the measure exists to catch.
+
+**Skew.** A hash file's failure mode is not size, it is imbalance: a group holding a large share of the records makes
+every write to it rewrite that whole group, which is the one cost this format exists to avoid. `skew` is max over mean,
+which is scale-free and so reads the same on a file of any size; `largest_group_share` is that extreme against the whole
+file; `overweight` counts the groups above twice the mean, which says something one extreme cannot — that the hash
+itself is not spreading, rather than that one group was unlucky. None of it is judged below four records per group,
+because on four records over eight groups the largest group is three times the mean and that is simply what small
+numbers look like.
+
+**Headroom.** `load_factor` is `records / (modulus × records_per_group)`. `records_until_growth` says how many more
+records the file takes before the modulus doubles, and `records_until_shrink` how many fewer before it halves (`null`
+at the floor). A modulus change rehashes every group, so "3,000 records from a rehash" is worth seeing before it
+happens rather than after.
+
+**Bytes.** `group_bytes` is the record groups, `index_bytes` the index sections, and `disk_bytes` the whole directory —
+the remainder is the dictionary and the small metadata files. There is no "wasted space" figure because there is no
+waste to report: a group is rewritten whole from its live entries, so a deleted record leaves nothing behind inside one.
+
+**Integrity.** `legacy` and `checksums: false` both mean the file is not yet protected by the current format's
+guarantees, and both are reported as something to act on with the remedy attached ("converted on the next flush")
+rather than as neutral rows reading "no".
+
+Each of these carries a verdict from `db::health` — `good`, `watch` or `act` — with the threshold that produced it, and
+a file's verdict absorbs its indexes'. The cheaper form of the same question, for a *listing*, reads metadata and index
+`state` files only and appears on `LIST.FILES` and `LIST.ACCOUNTS`: enough to say which file is worth opening, which is
+all a listing should cost.
+
 ### Atomic Writes
 
 When a group is flushed, it is written to a `.tmp` sibling file and then renamed to the final group filename, ensuring
@@ -181,20 +222,85 @@ The one place the file's size does show through is the size of a posting list: a
 a tenth of the file's keys in each entry, and rewriting that entry writes them all. An index is worth most on a field
 with many values, which is also the field where it saves most.
 
+### Excluded values
+
+An index may be told not to hold particular values.
+
+The motivating shape is a field where 90% of records carry one value and the remaining 10% are spread over hundreds.
+That field is *excellent* to index — for the 10%. Indexing the dominant value buys nothing, because the lookup hands
+the scan behind it most of the file and the scan was going to do that work anyway, and it costs the most, because it is
+the longest posting list and so the entry rewritten most expensively on every write that touches it. `"index everything
+except the empty string"` is the other common spelling: a sparse field most records simply do not carry.
+
+The exclusions live in the index section's `state` file, beside `field`, `attribute` and `data_version`. They are part
+of what the index *is*, so:
+
+- they survive a restart, and
+- changing them marks the index for rebuild, exactly as moving its field to another attribute does. Adding an exclusion
+  has to drop a posting list; removing one has to derive a list that was never kept, and that needs every record anyway.
+
+**The planner is the whole risk of the feature.** `FileIndex::candidates` returns `Option<&BTreeSet<String>>`, and the
+difference between `None` and an empty set is the contract: an empty set means "no record carries this value", `None`
+means "I cannot help, scan for it". An excluded value holds no posting list precisely because it was not worth one, so
+returning that empty list would answer "no records" to a query that matches most of the file. It returns `None`
+instead — and the same applies to the `AND`/`OR` composition above: an excluded side is an *unknown* side, not an empty
+one, which is exactly how the existing code already treats a condition no index can resolve.
+
+That is sound because "I do not know" was already an answer the planner handled. The invariant is the one this whole
+feature rests on: the index only ever narrows, and the evaluation behind it decides. A query for an excluded value is
+therefore byte-identical to the same query with no index at all, and the tests assert that by running both.
+
+There is deliberately **no automatic variant** that skips any value covering more than some share of the file. It would
+make an index's contents depend on the data distribution at build time, so the same command would produce different
+indexes on different days, and a value could silently cross the threshold as the file grew. The exclusions stay
+explicit, and the diagnostics below suggest them.
+
+### Knowing whether one is earning its keep
+
+Three questions, in the order an operator meets them.
+
+**Which index should I be looking at?** `LIST.INDEXES` with no file names every index in the account, and every file
+and account listing carries a health verdict, so a badly shaped or stale index surfaces without anyone walking file by
+file. The dashboard's Overview tab shows the same roll-up.
+
+**Why is this one bad?** `INDEX.STATS <file> <field>` returns the values holding the most keys, largest first. That is
+what turns "this index is skewed" into "`STATUS = ACTIVE` is 91% of it", and the value it names is the one to exclude.
+Reading it costs one pass over the index section — values and record keys, never record bodies — which is why it is its
+own command rather than part of the per-file listing that is read on every navigation.
+
+**Is anything even using it?** `IndexStats.usage` counts what the read path has asked of each index **since the server
+started** — never persisted, because the question is "is anything querying this now" and a count carried over from a
+previous run answers it wrongly. Relaxed atomics, since nothing is decided by their exact interleaving.
+
+- `lookups` and `candidates` — how many lookups it answered and how many record keys those handed to the filter behind
+  them. A hit rate of zero is the clearest possible signal that an index is pure cost: it is maintained on every write
+  to its field whether or not anything queries it.
+- `matched` over `candidates` is how selective the index is *for the queries actually being run*, which is not the same
+  as how selective it is over the data. It is attributed only for a query one index resolved on its own
+  (`measured_lookups` counts those): once an `AND` intersects two indexes there is no honest way to say which of them a
+  surviving record is owed to.
+- `excluded_lookups` — lookups that fell back to a scan because the value asked for is excluded. A high count is not an
+  argument against the exclusion; the scan behind it was going to do that work either way.
+
+Every one of these is turned into a verdict — `good`, `watch` or `act` — by `db::health`, with the threshold that
+produced it. The rule lives there rather than in each interface: the CLI, the remote protocol and the web dashboard
+describe the same index, and three copies of "a quarter of the file is the line" is three chances to disagree.
+
 ### Managing them
 
-- CLI: `CREATE.INDEX <file> <field>`, `LIST.INDEXES <file>`, `REBUILD.INDEX <file> <field>`,
-  `DELETE.INDEX <file> <field>` — see [General Use Commands](general_commands.md).
-- Remote protocol: the same four commands; the three that change something are admin-only, like `CREATE.FILE`. See
+- CLI: `CREATE.INDEX <file> <field> [EXCLUDE <value>...]`, `LIST.INDEXES [<file>]`, `INDEX.STATS <file> <field> [<n>]`,
+  `SET.INDEX.EXCLUDE <file> <field> [<value>...]`, `REBUILD.INDEX <file> <field>`, `DELETE.INDEX <file> <field>` — see
+  [General Use Commands](general_commands.md).
+- Remote protocol: the same six commands; the ones that change something are admin-only, like `CREATE.FILE`. See
   [Remote Connection Protocol](protocol.md).
-- Web dashboard: the Accounts tab, under the file's dictionary — create, rebuild and drop, with the counts each index is
-  judged on. See [Web Management Dashboard](web_dashboard.md).
+- Web dashboard: the Accounts tab, under the file's dictionary — create, rebuild, drop, read one index's values and
+  exclude one of them from the row it is shown on. See [Web Management Dashboard](web_dashboard.md).
 
 `FILE.STATS` reports a file's indexes alongside its layout, and `LIST.INDEXES` reports them on their own. Both carry the
-same three counts: `values` (distinct values held), `postings` (total value-to-key pairs) and `largest_postings` (the
-biggest posting list). `values` against the file's record count is how selective the field is, `postings` is what
-maintaining the index costs per write, and `largest_postings` is the skew the average hides — an index whose biggest
-value covers half the file saves nothing on that value.
+same counts: `values` (distinct values held), `postings` (total value-to-key pairs) and `largest_postings` (the
+biggest posting list), plus `excluded`, `usage` and `health`. `values` against the file's record count is how selective
+the field is, `postings` is what maintaining the index costs per write, and `largest_postings` is the skew the average
+hides — an index whose biggest value covers half the file saves nothing on that value.
 
 ### Measurements
 
@@ -222,6 +328,23 @@ One record updated and flushed (`storage/indexed_write`, against `storage/increm
 So an index costs roughly ten to thirty microseconds a write here — a fifth to a half again on top of the flush — and
 that cost does not grow with the file. The higher figure in the small-file column is the index's own modulus doubling
 during the run, amortised into the average; it is a property of a section that is still growing, not of the file size.
+
+What excluding a dominant value is worth (`storage/excluded_write`). `STATUS` is `ACTIVE` on nine records in ten and
+one of five hundred rare values on the tenth; one record's status is flipped and flushed, which is the only kind of
+write an index pays for at all — re-storing a record with the value it already had compares two short lists and stops.
+
+| Index on `STATUS`             | 1,000 records | 10,000 records |
+|-------------------------------|---------------|----------------|
+| Every value                   | 1,856 µs      | 4,238 µs       |
+| Excluding `ACTIVE`            | 218 µs        | 2,244 µs       |
+
+The entry for `ACTIVE` is one record holding nine tenths of the file's keys, and it is rewritten whenever a record
+enters or leaves it. Excluding it also shrinks the section itself: on 10,000 records the index goes from about 84 KB to
+12 KB, and on 50,000 from 404 KB to 44 KB. Both are the same fact from two directions — the dominant value's entry is
+most of the index, and it is the part that was buying nothing.
+
+The two rows converge in the right-hand column because the flush of the *records* starts to dominate; the gap is
+widest exactly where the index was the problem.
 
 ## Write Buffering and Durability
 

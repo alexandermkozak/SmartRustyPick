@@ -1,5 +1,6 @@
 <script lang="ts" setup>
 import {computed} from 'vue'
+import AccountIndexes from './components/AccountIndexes.vue'
 import AccountList from './components/AccountList.vue'
 import FileList from './components/FileList.vue'
 import FileStatistics from './components/FileStatistics.vue'
@@ -9,6 +10,7 @@ import IndexTable from './components/IndexTable.vue'
 import IndexForm from './components/IndexForm.vue'
 import {useAccountBrowser} from './composables/useAccountBrowser'
 import {useFileDictionary} from './composables/useFileDictionary'
+import {useAccountIndexes} from './composables/useAccountIndexes'
 import {useFileIndexes} from './composables/useFileIndexes'
 
 const {
@@ -33,6 +35,10 @@ const dictionary = useFileDictionary(selectedAccount, selectedFile)
 // The index list is derived from the same dictionary the section above edits,
 // so the field a new index is offered on is one this page has already shown.
 const indexes = useFileIndexes(selectedAccount, selectedFile, dictionary.entries)
+// The account-wide view, which is the one that comes to you: a badly shaped or
+// unused index in any file surfaces here rather than waiting to be found by
+// somebody opening that file's page.
+const accountIndexes = useAccountIndexes(selectedAccount)
 
 const rows = computed(() => accounts.data.value ?? [])
 const entryNames = computed(() => dictionary.entries.value.map((entry) => entry.name))
@@ -44,7 +50,12 @@ const recordCount = computed(() => stats.value?.record_count ?? 0)
  * by the composable; this is the part of the page that sits outside it.
  */
 async function afterIndexChange(done: boolean): Promise<void> {
-  if (done && selectedFile.value) await selectFile(selectedFile.value)
+  if (!done) return
+  if (selectedFile.value) await selectFile(selectedFile.value)
+  // The account-wide list describes the index that has just changed too, and it
+  // is not polled, so it is re-read here rather than left saying what was true
+  // before the click.
+  await accountIndexes.load()
 }
 </script>
 
@@ -77,6 +88,18 @@ async function afterIndexChange(done: boolean): Promise<void> {
     <div>
       <FileStatistics :changing="changing" :stats="stats" @set-durable="setDurable" />
     </div>
+  </section>
+
+  <!-- Between the columns and the file's own detail: which index anywhere in
+       this account needs attention. It sits above the per-file sections because
+       it is read first - it is what says which file to open. -->
+  <section v-if="selectedAccount" class="account-indexes">
+    <AccountIndexes
+      :account="selectedAccount"
+      :indexes="accountIndexes.indexes.value"
+      :loaded="accountIndexes.loaded.value"
+      @open="selectFile"
+    />
   </section>
 
   <!-- The dictionary is the file's shape rather than its contents, so it is the
@@ -112,8 +135,12 @@ async function afterIndexChange(done: boolean): Promise<void> {
       :indexes="indexes.indexes.value"
       :loaded="indexes.loaded.value"
       :records="recordCount"
+      :report="indexes.report.value"
+      :report-field="indexes.inspecting.value"
       @rebuild="(field) => indexes.rebuild(field).then(afterIndexChange)"
       @drop="(field) => indexes.remove(field).then(afterIndexChange)"
+      @inspect="indexes.inspect"
+      @exclude="(field, values) => indexes.exclude(field, values).then(afterIndexChange)"
     />
     <IndexForm
       v-model="indexes.field.value"

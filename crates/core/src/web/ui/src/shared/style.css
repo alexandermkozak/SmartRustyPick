@@ -449,6 +449,7 @@ select {
 
 /* The dictionary sits under the three columns and uses the whole width. */
 .dictionary .form,
+.account-indexes .form,
 .indexes .form {
   margin-top: 1rem;
 }
@@ -607,4 +608,156 @@ td.actions {
 
 main section {
   display: block;
+}
+
+/* --- Health -----------------------------------------------------------------
+   A verdict is the one thing in a listing worth reading before the numbers, so
+   it is coloured rather than left as another grey row. Three states only:
+   healthy says nothing, watch is the accent, needs-attention is the danger
+   colour the drop buttons already use. */
+.tag.verdict.watch {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+.tag.verdict.act {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.tag.verdict.good {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.measures {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.55rem;
+}
+
+.measure {
+  border-left: 3px solid var(--line);
+  padding-left: 0.65rem;
+}
+
+.measure.watch {
+  border-left-color: var(--warn);
+}
+
+.measure.act {
+  border-left-color: var(--danger);
+}
+
+.measure .row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.measure .label {
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.measure .value {
+  margin-left: auto;
+  font-size: 0.85rem;
+}
+
+.measure .row .tag {
+  margin-left: 0;
+}
+
+.measure .detail,
+.measure .threshold {
+  margin: 0.15rem 0 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.measure .threshold {
+  font-style: italic;
+  opacity: 0.85;
+}
+
+/* The group distribution. Bars rather than numbers because the thing being
+   looked for is one column standing far out to the right, which two extremes
+   in a table could never show. */
+.distribution {
+  margin: 0.8rem 0 0;
+}
+
+.distribution .bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 5rem;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 1px;
+}
+
+.distribution .bar {
+  flex: 1 1 0;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  min-width: 3px;
+}
+
+.distribution .fill {
+  display: block;
+  width: 100%;
+  min-height: 1px;
+  background: var(--accent);
+  border-radius: 2px 2px 0 0;
+}
+
+.distribution figcaption {
+  margin-top: 0.4rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* One index's values, offered with the button that acts on the diagnosis: the
+   dashboard should not show someone which value is the problem and then send
+   them to the CLI to do something about it. */
+.value-histogram {
+  margin: 0.6rem 0 0;
+  width: 100%;
+}
+
+.value-histogram .share {
+  width: 8rem;
+}
+
+.value-histogram .meter {
+  display: block;
+  height: 0.55rem;
+  background: var(--accent);
+  border-radius: 2px;
+  min-width: 1px;
+}
+
+.value-histogram .empty-value {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.excluded-values {
+  margin: 0.5rem 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+/* The account-wide index view, and the health roll-up above it. */
+.health-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  font-size: 0.8rem;
+  color: var(--muted);
 }

@@ -150,6 +150,14 @@ def main():
                 listed,
                 "" if listed else json.dumps(sorted(accounts)),
             )
+            rollup = accounts.get(ACCOUNT, {})
+            suite.check(
+                "...and a health roll-up, so a problem account is findable from the list",
+                (rollup.get("health") or {}).get("verdict") in ("good", "watch", "act")
+                and isinstance(rollup.get("index_count"), int)
+                and isinstance(rollup.get("unhealthy_files"), int),
+                json.dumps(rollup),
+            )
 
             status, payload, _ = dashboard.call(f"/api/accounts/{ACCOUNT}/files")
             files = (payload or {}).get("keys") or []
@@ -158,10 +166,59 @@ def main():
                 FILE in files,
                 "" if FILE in files else json.dumps(files),
             )
+            per_file = {name: info for name, info in (payload or {}).get("results") or []}
+            suite.check(
+                "...each with a verdict, without opening any of them",
+                per_file.get(FILE, {}).get("health") in ("good", "watch", "act")
+                and isinstance(per_file.get(FILE, {}).get("health_reasons"), list),
+                json.dumps(per_file.get(FILE)),
+            )
 
             status, payload, _ = dashboard.call(f"/api/accounts/{ACCOUNT}/files/{FILE}")
             file_stats = (payload or {}).get("record") or {}
             suite.check_eq("File statistics count the records", file_stats.get("record_count"), 2)
+
+            # The derived measures: what the format already knew and never said.
+            groups = file_stats.get("group_records") or {}
+            counted = groups.get("groups", 0) - groups.get("unreadable", 0)
+            suite.check(
+                "Records per group are reported, read from the group trailers",
+                groups.get("groups") == file_stats.get("modulus")
+                and sum(bucket["groups"] for bucket in groups.get("buckets") or []) == counted
+                and groups.get("mean", -1) * groups.get("groups", 0) == file_stats.get("record_count"),
+                json.dumps(groups),
+            )
+            suite.check(
+                "Layout and headroom say what the file will do next",
+                isinstance(file_stats.get("load_factor"), (int, float))
+                and isinstance(file_stats.get("records_until_growth"), int)
+                and isinstance(file_stats.get("skew"), (int, float))
+                and isinstance(file_stats.get("group_bytes"), int),
+                json.dumps({k: file_stats.get(k) for k in
+                            ("load_factor", "records_until_growth", "skew", "group_bytes")}),
+            )
+
+            health = file_stats.get("health") or {}
+            measures = {m.get("id"): m for m in health.get("measures") or []}
+            suite.check(
+                "Every measure carries a verdict and the rule that produced it",
+                health.get("verdict") in ("good", "watch", "act")
+                and {"format", "checksums", "skew", "load_factor"} <= set(measures)
+                and all(
+                    m.get("verdict") in ("good", "watch", "act") and m.get("threshold") and m.get("detail")
+                    for m in measures.values()
+                ),
+                json.dumps(sorted(measures)),
+            )
+            # `legacy` and missing checksums used to render as neutral rows
+            # reading "no"; both mean the file is not yet protected by the
+            # current format's guarantees, so both are judged.
+            suite.check_eq(
+                "A current file's format and checksums are reported as healthy",
+                [measures["format"]["verdict"], measures["checksums"]["verdict"]],
+                ["good", "good"],
+            )
+
             leaked = "Alice" in json.dumps(payload)
             suite.check(
                 "File statistics carry no record contents",
@@ -368,9 +425,33 @@ def main():
             status, payload, _ = dashboard.call(index_path)
             listed = {name: info for name, info in (payload or {}).get("results") or []}
             suite.check_eq("It is listed with its statistics", listed.get("NAME", {}).get("values"), 4)
+            suite.check_eq("...and the file it belongs to", listed.get("NAME", {}).get("file"), FILE)
+            suite.check(
+                "...and a verdict on all of it, rather than counts to interpret",
+                (listed.get("NAME", {}).get("health") or {}).get("verdict")
+                in ("good", "watch", "act"),
+                json.dumps(listed.get("NAME", {}).get("health")),
+            )
+            usage = listed.get("NAME", {}).get("usage") or {}
+            suite.check(
+                "...and what the read path has asked of it",
+                set(usage) == {"lookups", "candidates", "matched", "measured_lookups", "excluded_lookups"},
+                json.dumps(usage),
+            )
+
+            # Every index in the account, without naming a file: the view that
+            # makes a badly shaped index findable without opening each file.
+            status, payload, _ = dashboard.call(f"/api/accounts/{ACCOUNT}/indexes")
+            keys = (payload or {}).get("keys") or []
+            suite.check(
+                "Every index in the account is listed by file and field",
+                status == 200 and f"{FILE}/NAME" in keys,
+                json.dumps(keys),
+            )
 
             _, payload, _ = dashboard.call(f"/api/accounts/{ACCOUNT}/files/{FILE}")
-            reported = ((payload or {}).get("record") or {}).get("indexes") or []
+            record = (payload or {}).get("record") or {}
+            reported = record.get("indexes") or []
             suite.check_eq(
                 "File statistics report the indexes too",
                 [entry.get("field") for entry in reported],
@@ -395,6 +476,71 @@ def main():
 
             status, payload, _ = dashboard.call(index_path, method="POST", payload={"field": "NOSUCH"})
             suite.check_eq("A field the dictionary does not define is refused", status, 400)
+
+            # --- the value histogram, and acting on it -----------------------
+            status, payload, _ = dashboard.call(f"{index_path}/NAME?limit=5")
+            report = (payload or {}).get("record") or {}
+            values = report.get("top_values") or []
+            suite.check(
+                "One index's values can be read, largest first",
+                status == 200
+                and report.get("values_available") is True
+                and len(values) > 0
+                and all(values[i]["keys"] >= values[i + 1]["keys"] for i in range(len(values) - 1)),
+                json.dumps(report)[:300],
+            )
+
+            # The answers must not change when a value stops being indexed. The
+            # baseline is taken first, because it is the thing being preserved.
+            def names_matching(value):
+                answer = protocol_call(
+                    port,
+                    admin_crt,
+                    admin_key,
+                    certs.ca_crt,
+                    {
+                        "command": "QUERY",
+                        "account": ACCOUNT,
+                        "file": FILE,
+                        "query_string": f'WITH NAME = "{value}"',
+                    },
+                )
+                return [key for key, _ in answer.get("results") or []]
+
+            dominant = values[0]["value"] if values else "Alice"
+            before = names_matching(dominant)
+
+            status, payload, _ = dashboard.call(
+                f"{index_path}/NAME/exclude", method="POST", payload={"values": [dominant]}
+            )
+            trimmed = (payload or {}).get("record") or {}
+            suite.check(
+                "A value can be excluded from an index, which rebuilds it",
+                status == 200 and trimmed.get("excluded") == [dominant] and trimmed.get("stale") is False,
+                json.dumps(trimmed)[:300],
+            )
+            suite.check_eq(
+                "...and the index no longer holds it",
+                trimmed.get("values"),
+                built.get("values") - 1,
+            )
+            # The whole risk of the feature: a lookup on an excluded value must
+            # fall back to a scan rather than trusting an empty posting list.
+            suite.check_eq(
+                "A query for an excluded value answers exactly as it did before",
+                names_matching(dominant),
+                before,
+            )
+
+            status, payload, _ = dashboard.call(
+                f"{index_path}/NAME/exclude", method="POST", payload={"values": []}
+            )
+            restored = (payload or {}).get("record") or {}
+            suite.check(
+                "Clearing the exclusions puts the index back",
+                status == 200 and restored.get("excluded") == [] and restored.get("values") == built.get("values"),
+                json.dumps(restored)[:200],
+            )
 
             status, payload, _ = dashboard.call(f"{index_path}/NAME/rebuild", method="POST")
             rebuilt = (payload or {}).get("record") or {}

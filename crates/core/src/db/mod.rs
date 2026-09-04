@@ -9,6 +9,9 @@ pub mod error;
 pub mod hashfile;
 #[cfg(test)]
 mod hashfile_tests;
+pub mod health;
+#[cfg(test)]
+mod health_tests;
 pub mod index;
 #[cfg(test)]
 mod index_tests;
@@ -24,5 +27,6 @@ mod report_tests;
 
 pub use engine::{Database, TableHandle, TableKey};
 pub use error::{DbError, DbResult};
-pub use index::{FileIndex, IndexStats};
+pub use health::{Health, HealthSummary, Measure, Verdict};
+pub use index::{FileIndex, IndexReport, IndexStats, IndexUsageStats, IndexValue};
 pub use models::*;

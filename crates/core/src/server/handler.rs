@@ -189,17 +189,31 @@ fn index_response(stats: IndexStats) -> Response {
 
 /// Every index of a file, paired with its field name the way the other listings
 /// pair a name with what is worth knowing about it.
+///
+/// Keyed by the bare field name, which is what it has always been and what a
+/// client keying off it expects. Each entry names its own file, so this and the
+/// account-wide listing below hand a client the same row.
 fn index_listing(indexes: Vec<IndexStats>) -> Response {
-    let keys: Vec<String> = indexes.iter().map(|stats| stats.field.clone()).collect();
-    let results: Vec<(String, serde_json::Value)> = indexes
+    listing_of(indexes.into_iter().map(|stats| (stats.field.clone(), stats)).collect())
+}
+
+/// Every index of an account, keyed `<file>/<field>` so two files indexing the
+/// same field name are still two rows.
+fn account_index_listing(indexes: Vec<(String, IndexStats)>) -> Response {
+    listing_of(
+        indexes
+            .into_iter()
+            .map(|(file, stats)| (format!("{}/{}", file, stats.field), stats))
+            .collect(),
+    )
+}
+
+fn listing_of(entries: Vec<(String, IndexStats)>) -> Response {
+    let results: Vec<(String, serde_json::Value)> = entries
         .into_iter()
-        .map(|stats| {
-            (
-                stats.field.clone(),
-                serde_json::to_value(stats).unwrap_or(serde_json::Value::Null),
-            )
-        })
+        .map(|(key, stats)| (key, serde_json::to_value(stats).unwrap_or(serde_json::Value::Null)))
         .collect();
+    let keys: Vec<String> = results.iter().map(|(key, _)| key.clone()).collect();
     let count = results.len();
     Response {
         status: "OK".to_string(),
@@ -876,8 +890,53 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 Ok(target) => target,
                 Err(response) => return response,
             };
-            match db.create_index_for_account(acc, &file, &field) {
+            let exclude = req.values.clone().unwrap_or_default();
+            match db.create_index_excluding(acc, &file, &field, &exclude) {
                 Ok(stats) => index_response(stats),
+                Err(e) => db_error(e),
+            }
+        }
+        // The remedy between leaving an index alone and dropping it: a field
+        // where one value covers most of the file is excellent to index for
+        // everything else, and excluding that value keeps what the index is
+        // good at without paying for the entry that saves nothing.
+        "SET.INDEX.EXCLUDE" => {
+            if !client_info.is_admin {
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            }
+            if target_account.is_none() {
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
+            }
+            let (file, field) = match index_target(&req) {
+                Ok(target) => target,
+                Err(response) => return response,
+            };
+            // Absent and empty mean the same thing here: the command replaces
+            // the set, so sending no values is how the set is cleared.
+            let values = req.values.clone().unwrap_or_default();
+            match db.set_index_exclusions(acc, &file, &field, &values) {
+                Ok(stats) => index_response(stats),
+                Err(e) => db_error(e),
+            }
+        }
+        // One index in full, with the values that dominate it. Its own command
+        // rather than a wider `LIST.INDEXES`, which is a per-file listing read
+        // on every navigation and should stay cheap.
+        "INDEX.STATS" => {
+            if target_account.is_none() {
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
+            }
+            let (file, field) = match index_target(&req) {
+                Ok(target) => target,
+                Err(response) => return response,
+            };
+            let limit = req.limit.unwrap_or(crate::db::health::thresholds::HISTOGRAM_DEFAULT);
+            match db.index_report(acc, &file, &field, limit) {
+                Ok(report) => Response {
+                    status: "OK".to_string(),
+                    record: Some(serde_json::to_value(report).unwrap_or(serde_json::Value::Null)),
+                    ..Default::default()
+                },
                 Err(e) => db_error(e),
             }
         }
@@ -916,17 +975,22 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 Err(e) => db_error(e),
             }
         }
+        // With a `file`, one file's indexes. Without one, every index in the
+        // account - the view that comes to you, so index health is visible
+        // without walking file by file through three columns of navigation.
         "LIST.INDEXES" => {
             if target_account.is_none() {
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
-            let file = match req.file.as_deref().map(str::trim) {
-                Some(file) if !file.is_empty() => file.to_string(),
-                _ => return error(ErrorCode::MissingField, "File not specified"),
-            };
-            match db.index_statistics(acc, &file) {
-                Ok(indexes) => index_listing(indexes),
-                Err(e) => db_error(e),
+            match req.file.as_deref().map(str::trim).filter(|file| !file.is_empty()) {
+                Some(file) => match db.index_statistics(acc, file) {
+                    Ok(indexes) => index_listing(indexes),
+                    Err(e) => db_error(e),
+                },
+                None => match db.index_statistics_for_account(acc) {
+                    Ok(indexes) => account_index_listing(indexes),
+                    Err(e) => db_error(e),
+                },
             }
         }
         "AUTHORIZE.CONN" => {
@@ -1079,7 +1143,18 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             let keys = files.iter().map(|(name, _)| name.clone()).collect();
             let results = files
                 .into_iter()
-                .map(|(name, durable)| (name, serde_json::json!({ "durable": durable })))
+                .map(|(name, durable)| {
+                    // The cheap verdict - section metadata and index `state`
+                    // files, no group trailers and no records - so a problem
+                    // file is findable without opening every file in turn.
+                    let health = db.file_health_summary(acc, &name);
+                    let value = serde_json::json!({
+                        "durable": durable,
+                        "health": health.verdict.as_str(),
+                        "health_reasons": health.reasons,
+                    });
+                    (name, value)
+                })
                 .collect::<Vec<_>>();
             Response {
                 status: "OK".to_string(),

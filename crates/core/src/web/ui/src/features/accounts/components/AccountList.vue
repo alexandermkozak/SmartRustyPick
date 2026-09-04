@@ -1,9 +1,17 @@
 <script lang="ts" setup>
-/** Every account, with the figures that say how big it is, and the two things
- *  an operator does to the list itself: add one, drop one. */
+/**
+ * Every account, with the figures that say how big it is, whether anything in
+ * it needs attention, and the two things an operator does to the list itself:
+ * add one, drop one.
+ *
+ * The verdict is the worst of the account's files, so a database with forty
+ * files does not need anyone to remember to go and look at each of them.
+ */
 import {ref} from 'vue'
+import HealthPill from '@shared/components/HealthPill.vue'
 import PanelState from '@shared/components/PanelState.vue'
 import {bytes, count} from '@shared/format'
+import {verdictOf} from '@shared/health'
 import type {AccountStats} from '../types'
 
 defineProps<{
@@ -35,6 +43,14 @@ function create(demo: boolean): void {
 
 // Dropping an account takes every file in it, and nothing here can put them
 // back, so the confirmation says what actually goes.
+/** What the roll-up says, when there is anything to say. */
+function concern(account: AccountStats): string {
+  const parts: string[] = []
+  if (account.unhealthy_files) parts.push(`${count(account.unhealthy_files)} files need attention`)
+  if (account.stale_indexes) parts.push(`${count(account.stale_indexes)} stale indexes`)
+  return parts.join(' · ')
+}
+
 function drop(account: AccountStats): void {
   const files = `${count(account.file_count)} file${account.file_count === 1 ? '' : 's'}`
   if (!window.confirm(`Drop "${account.name}" and its ${files}? This cannot be undone.`)) return
@@ -53,11 +69,18 @@ function drop(account: AccountStats): void {
         type="button"
         @click="$emit('select', account.name)"
       >
-        {{ account.name }}
+        <span class="row">
+          <span>{{ account.name }}</span>
+          <HealthPill :title="concern(account)" :verdict="verdictOf(account.health?.verdict)" />
+        </span>
         <span class="meta">
           {{ count(account.file_count) }} files · {{ count(account.record_count) }} records ·
           {{ bytes(account.disk_bytes) }}
+          <template v-if="account.index_count">
+            · {{ count(account.index_count) }} indexes
+          </template>
         </span>
+        <span v-if="concern(account)" class="meta">{{ concern(account) }}</span>
         <span class="meta">{{ account.directory }}</span>
       </button>
       <button :disabled="busy" class="small danger" type="button" @click="drop(account)">

@@ -205,6 +205,22 @@ Delete a table (both data and dictionary sections).
 - **Usage**: `DELETE.FILE <name>`
 - **Example**: `DELETE.FILE OLD_DATA`
 
+#### FILE.STATS
+
+Describe one file: what it is made of, whether that is healthy, and what to do about anything that is not.
+
+The layout half is the record and dictionary counts, the hash modulus and how the records are spread over its groups.
+The health half is a verdict per measure — `ok`, `watch` or `ACT` — with the rule that produced it, covering the storage
+format, the per-group checksums, the skew of the group distribution, how close the file is to the full rewrite a
+modulus change is, and the worst verdict among its indexes.
+
+The per-group record counts come from each group's trailer, so this reads no record.
+
+- **Usage**: `FILE.STATS <file>`
+- **Example**: `FILE.STATS ORDERS`
+- **Note**: The same measures reach the [remote protocol](protocol.md) as `FILE.STATS` and the
+  [web dashboard](web_dashboard.md)'s file panel, decided in one place so all three say the same thing.
+
 #### CREATE.INDEX
 
 Index a dictionary field, so `WITH <field> = <value>` resolves through the index instead of reading every record. The
@@ -214,22 +230,65 @@ cost of finding a record by that field then stops growing with the size of the f
 Building it reads the file once. After that the index is maintained on every write, and a query that cannot use it (a
 wildcard, an inequality, a field with no index) falls back to the scan it always had.
 
-- **Usage**: `CREATE.INDEX <file> <field>`
+- **Usage**: `CREATE.INDEX <file> <field> [EXCLUDE <value>...]`
 - **Example**: `CREATE.INDEX ORDERS CUSTOMER`
+- **Example**: `CREATE.INDEX ORDERS STATUS EXCLUDE ACTIVE ""` — index every status except the one nine records in ten
+  carry, and the empty one. See [SET.INDEX.EXCLUDE](#setindexexclude).
 - **Note**: The field has to be one the file's dictionary defines. `ID` cannot be indexed — it is the record key, which
   is already found without a scan.
 
 #### LIST.INDEXES
 
 List a file's indexes with the counts each one is judged on: how many distinct values it holds, how many record keys it
-indexes in total, the size of its largest posting list, and — where the file's record count is known — how many records
-an average lookup narrows the file to.
+indexes in total, the size of its largest posting list, how many records an average lookup narrows the file to, how many
+lookups it has served since the server started, and the verdict the database puts on all of that.
 
 An index over many values turns a scan into a lookup of a handful of records. One over two or three values turns it into
 a scan of a third of the file, and still costs a write every time the field changes.
 
-- **Usage**: `LIST.INDEXES <file>`
+With no file, every index in the account — so a database with forty files can be asked which of its indexes is worth
+your attention, rather than requiring you to remember to look at each file in turn.
+
+- **Usage**: `LIST.INDEXES [<file>]`
 - **Example**: `LIST.INDEXES ORDERS`
+- **Example**: `LIST.INDEXES` — every index in the current account, grouped by file.
+
+#### INDEX.STATS
+
+One index in full: its counts, the verdicts on them with the threshold behind each, and the values holding the most
+record keys.
+
+The value histogram is what turns "this index is skewed" into "`STATUS = ACTIVE` is 91% of it" — and the value it names
+is the one to hand to `SET.INDEX.EXCLUDE`. Reading it costs one pass over the index section, which holds values and
+record keys and never record bodies.
+
+- **Usage**: `INDEX.STATS <file> <field> [<how_many_values>]`
+- **Example**: `INDEX.STATS ORDERS STATUS`
+- **Example**: `INDEX.STATS ORDERS STATUS 25` — the twenty-five commonest values rather than the default ten.
+- **Note**: A stale index reports no values. Its postings do not describe the records, so listing them would be listing
+  fiction; rebuild it first.
+
+#### SET.INDEX.EXCLUDE
+
+Replace the values one index deliberately does not hold, and rebuild it.
+
+The remedy between leaving an index alone and dropping it. Take the shape `INDEX.STATS` usually finds: a field where
+90% of records carry one value and the remaining 10% are spread over hundreds. That field is *excellent* to index — for
+the 10%. Indexing the dominant value buys nothing, because the lookup hands the scan behind it most of the file and the
+scan does that work anyway, and it costs the most, because it is the longest posting list and so the entry rewritten
+most expensively on every write that touches it.
+
+**A query for an excluded value answers exactly what it answered before.** The planner is told "I cannot help, scan for
+it" rather than being handed an empty posting list it would read as "no records", so nothing about the results changes —
+only the cost of maintaining the index. See [Excluded values](storage.md#excluded-values).
+
+- **Usage**: `SET.INDEX.EXCLUDE <file> <field> [<value>...]`
+- **Example**: `SET.INDEX.EXCLUDE ORDERS STATUS ACTIVE` — stop indexing the dominant status.
+- **Example**: `SET.INDEX.EXCLUDE ORDERS NOTES ""` — index only the records that carry the field at all.
+- **Example**: `SET.INDEX.EXCLUDE ORDERS STATUS` — with no values, the index goes back to holding everything.
+- **Note**: The list *replaces* what was there, so an exclusion to be kept has to be named again. Quoted values are
+  unwrapped, which is how the empty value is spelled; the comparison trims, so `ACTIVE` and `" ACTIVE "` are the same
+  exclusion. Changing the set rebuilds the index, exactly as moving its field to another attribute does.
 
 #### REBUILD.INDEX
 
@@ -249,7 +308,7 @@ Drop an index and remove its section. The records are untouched; queries that we
 
 - **Usage**: `DELETE.INDEX <file> <field>`
 - **Example**: `DELETE.INDEX ORDERS CUSTOMER`
-- **Note**: Admin clients can do all four over the [remote protocol](protocol.md), and from the
+- **Note**: Admin clients can do all of these over the [remote protocol](protocol.md), and from the
   [web dashboard](web_dashboard.md).
 
 #### HELP

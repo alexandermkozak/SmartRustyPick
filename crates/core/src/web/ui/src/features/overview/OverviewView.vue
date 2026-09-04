@@ -1,13 +1,32 @@
 <script lang="ts" setup>
-import {computed} from 'vue'
+import {computed, onMounted, ref} from 'vue'
 import StatGrid from './components/StatGrid.vue'
+import StorageHealth from './components/StorageHealth.vue'
 import ConnectionsTable from './components/ConnectionsTable.vue'
 import {useServerStats} from './composables/useServerStats'
+import {overviewApi} from './api'
 import {duration, timestamp} from '@shared/format'
+import type {AccountHealth} from './types'
 
 const {data, error, loaded} = useServerStats()
 
 const connections = computed(() => data.value?.active_connections ?? [])
+
+// Read once on arrival rather than on the poll loop: the roll-up walks every
+// account's files, and a verdict that changes on a flush does not need a
+// five-second refresh. A failure here is reported where it happened and leaves
+// the rest of the tab alone - the server statistics above are a separate
+// request and are still true.
+const storage = ref<AccountHealth[]>([])
+const storageError = ref<string | null>(null)
+
+onMounted(async () => {
+  try {
+    storage.value = await overviewApi.storage()
+  } catch (cause) {
+    storageError.value = cause instanceof Error ? cause.message : String(cause)
+  }
+})
 </script>
 
 <template>
@@ -33,6 +52,8 @@ const connections = computed(() => data.value?.active_connections ?? [])
           <dd>{{ duration(data.uptime_seconds) }}</dd>
         </dl>
       </div>
+
+      <StorageHealth :accounts="storage" :error="storageError" />
 
       <h2>Active connections</h2>
       <ConnectionsTable :connections="connections" />
