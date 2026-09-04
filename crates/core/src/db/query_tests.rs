@@ -174,15 +174,11 @@ fn test_query_with_conversion() {
         let mut price_dict = Record::new();
         // Field 0: Attribute index (1-based)
         price_dict.fields.push(Field {
-            values: vec![Value {
-                sub_values: vec!["1".to_string()],
-            }],
+            values: vec![Value::text("1")],
         });
         // Field 1: Name
         price_dict.fields.push(Field {
-            values: vec![Value {
-                sub_values: vec!["PRICE".to_string()],
-            }],
+            values: vec![Value::text("PRICE")],
         });
         // Field 2-6: empty
         for _ in 0..5 {
@@ -190,9 +186,7 @@ fn test_query_with_conversion() {
         }
         // Field 7: Conversion MD2
         price_dict.fields.push(Field {
-            values: vec![Value {
-                sub_values: vec!["MD2".to_string()],
-            }],
+            values: vec![Value::text("MD2")],
         });
 
         table.dictionary.insert("PRICE".to_string(), price_dict);
@@ -204,9 +198,7 @@ fn test_query_with_conversion() {
         let mut table = table_handle.write();
         let mut record = Record::new();
         record.fields.push(Field {
-            values: vec![Value {
-                sub_values: vec!["200".to_string()],
-            }],
+            values: vec![Value::text("200")],
         });
         table.records.insert("P1".to_string(), record);
     }
@@ -251,39 +243,29 @@ fn test_query_with_wildcards() {
         let mut desc_dict = Record::new();
         // Field 0: Attribute index (1-based). Let's use 1.
         desc_dict.fields.push(Field {
-            values: vec![Value {
-                sub_values: vec!["1".to_string()],
-            }],
+            values: vec![Value::text("1")],
         });
         // Field 1: Name
         desc_dict.fields.push(Field {
-            values: vec![Value {
-                sub_values: vec!["DESC".to_string()],
-            }],
+            values: vec![Value::text("DESC")],
         });
         table.dictionary.insert("DESC".to_string(), desc_dict);
 
         let mut r1 = Record::new();
         r1.fields.push(Field {
-            values: vec![Value {
-                sub_values: vec!["brand new item".to_string()],
-            }],
+            values: vec![Value::text("brand new item")],
         });
         table.records.insert("1".to_string(), r1);
 
         let mut r2 = Record::new();
         r2.fields.push(Field {
-            values: vec![Value {
-                sub_values: vec!["old item".to_string()],
-            }],
+            values: vec![Value::text("old item")],
         });
         table.records.insert("2".to_string(), r2);
 
         let mut r3 = Record::new();
         r3.fields.push(Field {
-            values: vec![Value {
-                sub_values: vec!["newest thing".to_string()],
-            }],
+            values: vec![Value::text("newest thing")],
         });
         table.records.insert("3".to_string(), r3);
     }

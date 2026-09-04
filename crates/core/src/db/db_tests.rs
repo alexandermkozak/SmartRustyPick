@@ -144,11 +144,11 @@ fn test_error_logging() -> io::Result<()> {
 
         // Check contents
         let rec2 = logs.records.get(&keys[0]).unwrap();
-        assert_eq!(rec2.fields[0].values[0].sub_values[0], "Second error");
+        assert_eq!(text_of(&rec2.fields[0].values[0].sub_values[0]), "Second error");
         assert!(rec2.fields.len() > 1, "Should have detailed field");
 
         let rec3 = logs.records.get(&keys[1]).unwrap();
-        assert_eq!(rec3.fields[0].values[0].sub_values[0], "Third error");
+        assert_eq!(text_of(&rec3.fields[0].values[0].sub_values[0]), "Third error");
     }
 
     Ok(())
@@ -184,13 +184,13 @@ fn test_system_clients_file() -> io::Result<()> {
             );
 
             let rec1 = clients_table.records.get("CLIENT1").unwrap();
-            assert_eq!(rec1.fields[0].values[0].sub_values[0], "aabbccdd");
-            assert_eq!(rec1.fields[1].values[0].sub_values[0], "ACC1");
-            assert_eq!(rec1.fields[2].values[0].sub_values[0], "");
+            assert_eq!(text_of(&rec1.fields[0].values[0].sub_values[0]), "aabbccdd");
+            assert_eq!(text_of(&rec1.fields[1].values[0].sub_values[0]), "ACC1");
+            assert_eq!(text_of(&rec1.fields[2].values[0].sub_values[0]), "");
 
             let rec2 = clients_table.records.get("CLIENT2").unwrap();
-            assert_eq!(rec2.fields[0].values[0].sub_values[0], "11223344");
-            assert_eq!(rec2.fields[2].values[0].sub_values[0], "Y");
+            assert_eq!(text_of(&rec2.fields[0].values[0].sub_values[0]), "11223344");
+            assert_eq!(text_of(&rec2.fields[2].values[0].sub_values[0]), "Y");
         }
 
         // Verify in-memory map
@@ -212,7 +212,7 @@ fn test_system_clients_file() -> io::Result<()> {
             let clients_table = clients_table_handle.read();
             let rec1_v2 = clients_table.records.get("CLIENT1").unwrap();
             assert_eq!(rec1_v2.fields[1].values.len(), 2);
-            assert_eq!(rec1_v2.fields[1].values[1].sub_values[0], "ACC2");
+            assert_eq!(text_of(&rec1_v2.fields[1].values[1].sub_values[0]), "ACC2");
         }
         assert!(
             db.client_for_thumbprint("aabbccdd")
@@ -229,7 +229,7 @@ fn test_system_clients_file() -> io::Result<()> {
             let clients_table = clients_table_handle.read();
             let rec1_v3 = clients_table.records.get("CLIENT1").unwrap();
             assert_eq!(rec1_v3.fields[1].values.len(), 1);
-            assert_eq!(rec1_v3.fields[1].values[0].sub_values[0], "ACC2");
+            assert_eq!(text_of(&rec1_v3.fields[1].values[0].sub_values[0]), "ACC2");
         }
         assert!(
             !db.client_for_thumbprint("aabbccdd")
@@ -303,11 +303,11 @@ fn test_system_accounts_file() -> io::Result<()> {
             );
 
             let rec1 = accounts_table.records.get("USER1").unwrap();
-            assert!(rec1.fields[0].values[0].sub_values[0].contains("USER1"));
+            assert!(text_of(&rec1.fields[0].values[0].sub_values[0]).contains("USER1"));
 
             let rec2 = accounts_table.records.get("USER2").unwrap();
             assert_eq!(
-                rec2.fields[0].values[0].sub_values[0],
+                text_of(&rec2.fields[0].values[0].sub_values[0]),
                 format!("{}/custom_path/user2", base_dir)
             );
         }
@@ -416,7 +416,7 @@ fn test_dir_file_auto_creation() -> io::Result<()> {
 
             // Check record content
             let logs_dir_rec = dir_table.records.get("$LOGS").unwrap();
-            assert_eq!(logs_dir_rec.fields[0].values[0].sub_values[0], "F");
+            assert_eq!(text_of(&logs_dir_rec.fields[0].values[0].sub_values[0]), "F");
         }
 
         // Test create_test_account
@@ -558,9 +558,9 @@ fn test_record_serialization() -> io::Result<()> {
         // Test Round-trip
         let deserialized = db.deserialize_record("CUSTOM", &serialized).unwrap();
         assert_eq!(deserialized.fields.len(), 3);
-        assert_eq!(deserialized.fields[0].values[0].sub_values[0], "John");
-        assert_eq!(deserialized.fields[1].values[0].sub_values[0], "Doe");
-        assert_eq!(deserialized.fields[2].values[0].sub_values[0], "30");
+        assert_eq!(text_of(&deserialized.fields[0].values[0].sub_values[0]), "John");
+        assert_eq!(text_of(&deserialized.fields[1].values[0].sub_values[0]), "Doe");
+        assert_eq!(text_of(&deserialized.fields[2].values[0].sub_values[0]), "30");
     }
 
     Ok(())

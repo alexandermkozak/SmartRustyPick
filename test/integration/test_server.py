@@ -1,5 +1,6 @@
 """End-to-end coverage of the remote protocol: WRITE, READ, QUERY, SELECT, GET.NEXT, DELETE."""
 
+import base64
 import os
 import sys
 
@@ -193,6 +194,44 @@ def main():
                 resp = conn.request(command="READ", key="USER1", account=ACCOUNT)
                 suite.check_eq(
                     "READ without a file is rejected", resp.get("code"), "MISSING_FIELD"
+                )
+
+                # A record is a byte container. Bytes that are not valid UTF-8
+                # used to be replaced with U+FFFD on the way in and were gone
+                # for good; they travel in a tagged envelope now. The mark bytes
+                # (0xFC-0xFE) are excluded because they are the record's
+                # structure, not content - see docs/data_structures.md.
+                raw = bytes(b for b in range(256) if b not in (0xFC, 0xFD, 0xFE))
+                encoded = base64.b64encode(raw).decode("ascii")
+                resp = conn.request(
+                    command="WRITE",
+                    file=FILE,
+                    key="BINARY",
+                    account=ACCOUNT,
+                    structured_data={"name": {"$base64": encoded}},
+                )
+                suite.check_eq("A record of raw bytes is accepted", resp["status"], "OK")
+
+                resp = conn.request(command="READ", file=FILE, key="BINARY", account=ACCOUNT)
+                returned = resp.get("record", {}).get("name")
+                suite.check(
+                    "...and every byte comes back exactly as it went in",
+                    isinstance(returned, dict)
+                    and base64.b64decode(returned.get("$base64", "")) == raw,
+                    "got %r" % (returned,),
+                )
+
+                resp = conn.request(
+                    command="WRITE",
+                    file=FILE,
+                    key="BADBINARY",
+                    account=ACCOUNT,
+                    structured_data={"name": {"$base64": "not base64!"}},
+                )
+                suite.check_eq(
+                    "A binary envelope that does not decode is refused",
+                    resp.get("code"),
+                    "INVALID_DATA",
                 )
         except Exception as exc:  # noqa: BLE001 - report instead of aborting the whole run
             suite.error("Server protocol suite", exc)

@@ -314,7 +314,7 @@ impl Table {
             return Some(0);
         }
         let rec = self.dictionary.get(field_name)?;
-        let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.first()?.sub_values.first()?;
+        let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.first()?.first_text()?;
         match idx_str.parse::<usize>() {
             // Pick attribute 1 is 0-indexed 0 in our internal fields vector
             Ok(idx) if idx > 0 => Some(idx - 1),
@@ -333,7 +333,11 @@ impl Table {
     pub(crate) fn conversion_code_from_dict_record(dict_rec: &Record) -> Option<&str> {
         // Pick MDn conversion is in Field 8
         let code = dict_rec.fields.get(DICT_CONV_IDX)?.values.first()?.sub_values.first()?;
-        if code.is_empty() { None } else { Some(code.as_str()) }
+        // A conversion code that is not text is not a conversion code.
+        match std::str::from_utf8(code) {
+            Ok(code) if !code.is_empty() => Some(code),
+            _ => None,
+        }
     }
 
     /// The 0-based index and conversion code of a dictionary field in a single
@@ -343,7 +347,7 @@ impl Table {
             return Some((0, None));
         }
         let rec = self.dictionary.get(field_name)?;
-        let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.first()?.sub_values.first()?;
+        let idx_str = rec.fields.get(DICT_FIELD_IDX)?.values.first()?.first_text()?;
         let idx = match idx_str.parse::<usize>() {
             // Pick attribute 1 is 0-indexed 0 in our internal fields vector
             Ok(idx) if idx > 0 => idx - 1,
@@ -485,11 +489,11 @@ impl Database {
                 && let Some(dirs_field) = config.fields.get(1)
             {
                 for (i, v) in names_field.values.iter().enumerate() {
-                    if let Some(name) = v.sub_values.first()
+                    if let Some(name) = v.first_text()
                         && name != "SYSTEM"
-                        && let Some(dir) = dirs_field.values.get(i).and_then(|v| v.sub_values.first())
+                        && let Some(dir) = dirs_field.values.get(i).and_then(|v| v.first_text())
                     {
-                        accounts_to_list.push((name.clone(), dir.clone()));
+                        accounts_to_list.push((name.to_string(), dir.to_string()));
                     }
                 }
             }
@@ -500,9 +504,7 @@ impl Database {
         for (name, dir) in accounts_to_list {
             let mut record = Record::new();
             record.fields.resize_with(SYS_ACCOUNTS_PATH_IDX + 1, Field::default);
-            record.fields[SYS_ACCOUNTS_PATH_IDX]
-                .values
-                .push(Value { sub_values: vec![dir] });
+            record.fields[SYS_ACCOUNTS_PATH_IDX].values.push(Value::text(dir));
             accounts_table.records.insert(name, record);
         }
         accounts_table.touch_all();
@@ -525,27 +527,27 @@ impl Database {
             for v in &f.values {
                 for sv in &v.sub_values {
                     if !sv.is_empty() {
-                        let tp_lower = sv.to_lowercase();
+                        let thumbprint = text_of(sv);
+                        let tp_lower = thumbprint.to_lowercase();
                         // Migrate if not already present
                         let already_exists = table.records.values().any(|r| {
                             r.fields
                                 .first()
                                 .and_then(|f| f.values.first())
-                                .and_then(|v| v.sub_values.first())
-                                == Some(&tp_lower)
+                                .and_then(|v| v.first_text())
+                                .as_deref()
+                                == Some(tp_lower.as_str())
                         });
                         if !already_exists {
                             let mut rec = Record::new();
                             while rec.fields.len() <= SYS_CLIENTS_ADMIN_IDX {
                                 rec.fields.push(Field::default());
                             }
-                            rec.fields[SYS_CLIENTS_THUMBPRINT_IDX].values.push(Value {
-                                sub_values: vec![tp_lower],
-                            });
-                            rec.fields[SYS_CLIENTS_ADMIN_IDX].values.push(Value {
-                                sub_values: vec!["Y".to_string()],
-                            });
-                            table.insert_record(&format!("migrated_{}", &sv[..8]), rec);
+                            rec.fields[SYS_CLIENTS_THUMBPRINT_IDX]
+                                .values
+                                .push(Value::text(&tp_lower));
+                            rec.fields[SYS_CLIENTS_ADMIN_IDX].values.push(Value::text("Y"));
+                            table.insert_record(&format!("migrated_{}", &thumbprint[..8]), rec);
                         }
                     }
                 }
@@ -674,16 +676,16 @@ impl Database {
                 .fields
                 .get(SYS_CLIENTS_THUMBPRINT_IDX)
                 .and_then(|f| f.values.first())
-                .and_then(|v| v.sub_values.first())
+                .and_then(|v| v.first_text())
             {
                 let tp_lower = tp.to_lowercase();
                 let mut allowed_accounts = Vec::new();
                 if let Some(acc_field) = record.fields.get(SYS_CLIENTS_ACCOUNTS_IDX) {
                     for v in &acc_field.values {
-                        if let Some(acc) = v.sub_values.first()
+                        if let Some(acc) = v.first_text()
                             && !acc.is_empty()
                         {
-                            allowed_accounts.push(acc.clone());
+                            allowed_accounts.push(acc.to_string());
                         }
                     }
                 }
@@ -691,7 +693,7 @@ impl Database {
                     .fields
                     .get(SYS_CLIENTS_ADMIN_IDX)
                     .and_then(|f| f.values.first())
-                    .and_then(|v| v.sub_values.first())
+                    .and_then(|v| v.first_text())
                     .map(|s| s == "Y")
                     .unwrap_or(false);
                 clients.push(ClientInfo {
@@ -1017,12 +1019,8 @@ impl Database {
             while config.fields.len() < 2 {
                 config.fields.push(Field::default());
             }
-            config.fields[0].values.push(Value {
-                sub_values: vec![name.to_string()],
-            });
-            config.fields[1].values.push(Value {
-                sub_values: vec![dir.clone()],
-            });
+            config.fields[0].values.push(Value::text(name));
+            config.fields[1].values.push(Value::text(&dir));
         }
 
         self.persist_account_registry()?;
@@ -1039,9 +1037,7 @@ impl Database {
                     let mut accounts_table = handle.write();
                     let mut record = Record::new();
                     record.fields.resize_with(SYS_ACCOUNTS_PATH_IDX + 1, Field::default);
-                    record.fields[SYS_ACCOUNTS_PATH_IDX]
-                        .values
-                        .push(Value { sub_values: vec![dir] });
+                    record.fields[SYS_ACCOUNTS_PATH_IDX].values.push(Value::text(&dir));
                     accounts_table.insert_record(name, record);
                 }
                 db.save()?;
@@ -1087,12 +1083,10 @@ impl Database {
         // Remove from registry
         {
             let mut config = wlock(&self.accounts_config);
-            let position = config.fields.first().and_then(|names| {
-                names
-                    .values
-                    .iter()
-                    .position(|v| v.sub_values.first() == Some(&name.to_string()))
-            });
+            let position = config
+                .fields
+                .first()
+                .and_then(|names| names.values.iter().position(|v| v.first_bytes() == name.as_bytes()));
             if let Some(pos) = position {
                 config.fields[0].values.remove(pos);
                 if let Some(dirs_field) = config.fields.get_mut(1) {
@@ -1143,8 +1137,8 @@ impl Database {
         let pos = names_field
             .values
             .iter()
-            .position(|v| v.sub_values.first() == Some(&account_name.to_string()))?;
-        dirs_field.values.get(pos)?.sub_values.first().cloned()
+            .position(|v| v.first_bytes() == account_name.as_bytes())?;
+        dirs_field.values.get(pos)?.first_text().map(|dir| dir.to_string())
     }
 
     pub fn current_storage_dir(&self) -> String {
@@ -1684,7 +1678,12 @@ impl Database {
         let mut names: Vec<String> = rlock(&self.accounts_config)
             .fields
             .first()
-            .map(|f| f.values.iter().filter_map(|v| v.sub_values.first().cloned()).collect())
+            .map(|f| {
+                f.values
+                    .iter()
+                    .filter_map(|v| v.first_text().map(|name| name.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
         names.sort();
         names.dedup();
@@ -2348,12 +2347,8 @@ impl Database {
         while rec.fields.len() <= DIR_DURABLE_IDX {
             rec.fields.push(Field::default());
         }
-        rec.fields[DIR_TYPE_IDX].values = vec![Value {
-            sub_values: vec!["F".to_string()],
-        }];
-        rec.fields[DIR_DURABLE_IDX].values = vec![Value {
-            sub_values: vec![if durable { "Y".to_string() } else { String::new() }],
-        }];
+        rec.fields[DIR_TYPE_IDX].values = vec![Value::text("F")];
+        rec.fields[DIR_DURABLE_IDX].values = vec![Value::text(if durable { "Y" } else { "" })];
         rec
     }
 
@@ -2377,7 +2372,7 @@ impl Database {
             .fields
             .get(DIR_DURABLE_IDX)
             .and_then(|f| f.values.first())
-            .and_then(|v| v.sub_values.first())
+            .and_then(|v| v.first_text())
             .map(|s| matches!(s.trim().to_uppercase().as_str(), "Y" | "YES" | "1" | "TRUE" | "DURABLE"))
             .unwrap_or(false)
     }
@@ -2428,13 +2423,9 @@ impl Database {
                 rec.fields.push(Field::default());
             }
             if rec.fields[DIR_TYPE_IDX].values.is_empty() {
-                rec.fields[DIR_TYPE_IDX].values = vec![Value {
-                    sub_values: vec!["F".to_string()],
-                }];
+                rec.fields[DIR_TYPE_IDX].values = vec![Value::text("F")];
             }
-            rec.fields[DIR_DURABLE_IDX].values = vec![Value {
-                sub_values: vec![if durable { "Y".to_string() } else { String::new() }],
-            }];
+            rec.fields[DIR_DURABLE_IDX].values = vec![Value::text(if durable { "Y" } else { "" })];
             dir_table.insert_record(name, rec);
             Self::ensure_dir_dictionary(&mut dir_table);
         }
@@ -2497,10 +2488,8 @@ impl Database {
         let names_field = config.fields.first()?;
         let dirs_field = config.fields.get(1)?;
         for (i, v) in dirs_field.values.iter().enumerate() {
-            if let Some(d) = v.sub_values.first()
-                && d == dir
-            {
-                return names_field.values.get(i)?.sub_values.first().cloned();
+            if v.first_bytes() == dir.as_bytes() {
+                return names_field.values.get(i)?.first_text().map(|name| name.to_string());
             }
         }
         None
@@ -2547,10 +2536,10 @@ impl Database {
         if let Some(rec) = table.dictionary.get(field_name)
             && let Some(f2) = rec.fields.get(DICT_NAME_IDX)
             && let Some(v1) = f2.values.first()
-            && let Some(header) = v1.sub_values.first()
+            && let Some(header) = v1.first_text()
             && !header.is_empty()
         {
-            return header.clone();
+            return header.to_string();
         }
         field_name.to_string()
     }
@@ -2570,7 +2559,7 @@ impl Database {
         if let Some(rec) = table.dictionary.get(field_name)
             && let Some(f4) = rec.fields.get(DICT_WIDTH_IDX)
             && let Some(v1) = f4.values.first()
-            && let Some(width_str) = v1.sub_values.first()
+            && let Some(width_str) = v1.first_text()
             && let Ok(width) = width_str.parse::<usize>()
         {
             return width;
@@ -2598,10 +2587,10 @@ impl Database {
         if let Some(rec) = table.dictionary.get(field_name)
             && let Some(f3) = rec.fields.get(DICT_JUSTIFY_IDX)
             && let Some(v1) = f3.values.first()
-            && let Some(just) = v1.sub_values.first()
+            && let Some(just) = v1.first_text()
             && !just.is_empty()
         {
-            return just.clone();
+            return just.to_string();
         }
         "L".to_string()
     }
@@ -2626,7 +2615,7 @@ impl Database {
                     .fields
                     .get(DICT_FIELD_IDX)
                     .and_then(|f| f.values.first())
-                    .and_then(|v| v.sub_values.first())
+                    .and_then(|v| v.first_text())
                 && let Ok(idx) = field_idx_str.parse::<usize>()
                 && idx > 0
                 && !fields_map.contains_key(&idx)
@@ -2820,7 +2809,7 @@ impl Database {
                 .fields
                 .get(DICT_FIELD_IDX)
                 .and_then(|f| f.values.first())
-                .and_then(|v| v.sub_values.first())
+                .and_then(|v| v.first_text())
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|idx| *idx > 0);
             let Some(idx) = idx else { continue };
@@ -2865,11 +2854,20 @@ impl Database {
             return serde_json::Value::String(String::new());
         };
 
+        // A sub-value that is text is a JSON string, exactly as it always was.
+        // One that is not cannot be: JSON strings are UTF-8, and forcing it
+        // through would corrupt it silently, which is the bug this exists to
+        // stop. It travels tagged instead, and a conversion is not applied -
+        // there is no conversion of a byte string.
+        let emit = |sub: &[u8]| match std::str::from_utf8(sub) {
+            Ok(text) => serde_json::Value::String(convert(text)),
+            Err(_) => Self::binary_json(sub),
+        };
+
         match field.values.as_slice() {
             [] => return serde_json::Value::String(String::new()),
             [only] if only.sub_values.len() <= 1 => {
-                let text = only.sub_values.first().map(String::as_str).unwrap_or("");
-                return serde_json::Value::String(convert(text));
+                return emit(only.first_bytes());
             }
             _ => {}
         }
@@ -2880,13 +2878,57 @@ impl Database {
                 .iter()
                 .map(|value| match value.sub_values.as_slice() {
                     [] => serde_json::Value::String(String::new()),
-                    [only] => serde_json::Value::String(convert(only)),
-                    subs => serde_json::Value::Array(
-                        subs.iter().map(|sub| serde_json::Value::String(convert(sub))).collect(),
-                    ),
+                    [only] => emit(only),
+                    subs => serde_json::Value::Array(subs.iter().map(|sub| emit(sub)).collect()),
                 })
                 .collect(),
         )
+    }
+
+    /// One JSON scalar as the text a record stores for it.
+    fn scalar_text(val: &serde_json::Value, conversion: Option<&str>) -> String {
+        let text = match val {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => {
+                if *b {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            other => other.to_string(),
+        };
+        match conversion {
+            Some(code) => Self::apply_iconv(&text, code),
+            None => text,
+        }
+    }
+
+    /// The envelope a sub-value that is not valid UTF-8 travels in.
+    fn binary_json(sub: &[u8]) -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            BINARY_JSON_KEY.to_string(),
+            serde_json::Value::String(crate::db::base64::encode(sub)),
+        );
+        serde_json::Value::Object(object)
+    }
+
+    /// Whether the caller meant this to be bytes.
+    ///
+    /// Separate from decoding it, so that a malformed payload is told apart
+    /// from a value that was never binary in the first place.
+    fn is_binary_json(val: &serde_json::Value) -> bool {
+        val.as_object()
+            .is_some_and(|object| object.contains_key(BINARY_JSON_KEY))
+    }
+
+    /// The bytes inside a `{"$base64": "..."}` envelope, or `None` when the
+    /// payload is absent, not a string, or not valid base64.
+    fn binary_from_json(val: &serde_json::Value) -> Option<Vec<u8>> {
+        let encoded = val.as_object()?.get(BINARY_JSON_KEY)?.as_str()?;
+        crate::db::base64::decode(encoded)
     }
 
     /// Serializes `record` using `table`, which the caller has already
@@ -2904,42 +2946,38 @@ impl Database {
     ///
     /// A plain string is deliberately *not* re-split on `]`, so a client that
     /// genuinely means to store that character still can.
-    fn deserialize_field(val: &serde_json::Value, conversion: Option<&str>) -> Vec<Value> {
-        let scalar = |v: &serde_json::Value| -> String {
-            let text = match v {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Bool(b) => {
-                    if *b {
-                        "1".to_string()
-                    } else {
-                        "0".to_string()
-                    }
-                }
-                other => other.to_string(),
-            };
-            match conversion {
-                Some(code) => Self::apply_iconv(&text, code),
-                None => text,
+    ///
+    /// `None` when the caller sent a binary envelope that does not decode. That
+    /// is a refusal rather than a fallback on purpose: the alternative is
+    /// storing the envelope's *own JSON text* as the value, which is a write
+    /// that succeeds and reads back as something the client never sent - the
+    /// exact failure this codec exists to end.
+    fn deserialize_field(val: &serde_json::Value, conversion: Option<&str>) -> Option<Vec<Value>> {
+        let scalar = |v: &serde_json::Value| -> Option<SubValue> {
+            // The tagged envelope first: it is the only shape that can carry
+            // bytes, and a client that sent one meant exactly those bytes.
+            if Self::is_binary_json(v) {
+                return Self::binary_from_json(v);
             }
+            Some(Self::scalar_text(v, conversion).into_bytes())
         };
-
-        match val {
+        let values = match val {
             serde_json::Value::Array(values) => values
                 .iter()
                 .map(|value| match value {
-                    serde_json::Value::Array(subs) => Value {
-                        sub_values: subs.iter().map(&scalar).collect(),
-                    },
-                    other => Value {
-                        sub_values: vec![scalar(other)],
-                    },
+                    serde_json::Value::Array(subs) => Some(Value {
+                        sub_values: subs.iter().map(&scalar).collect::<Option<Vec<_>>>()?,
+                    }),
+                    other => Some(Value {
+                        sub_values: vec![scalar(other)?],
+                    }),
                 })
-                .collect(),
+                .collect::<Option<Vec<_>>>()?,
             other => vec![Value {
-                sub_values: vec![scalar(other)],
+                sub_values: vec![scalar(other)?],
             }],
-        }
+        };
+        Some(values)
     }
 
     pub fn deserialize_record(&self, table_name: &str, data: &serde_json::Value) -> Option<Record> {
@@ -2973,7 +3011,7 @@ impl Database {
         for (dict_key, dict_rec) in &table.dictionary {
             if let Some(f1) = dict_rec.fields.get(DICT_FIELD_IDX)
                 && let Some(v1) = f1.values.first()
-                && let Some(idx_str) = v1.sub_values.first()
+                && let Some(idx_str) = v1.first_text()
                 && let Ok(idx) = idx_str.parse::<usize>()
                 && idx > 0
             {
@@ -2994,7 +3032,7 @@ impl Database {
                 while record.fields.len() <= idx {
                     record.fields.push(Field::default());
                 }
-                record.fields[idx].values = Self::deserialize_field(val, conv_map.get(key).map(String::as_str));
+                record.fields[idx].values = Self::deserialize_field(val, conv_map.get(key).map(String::as_str))?;
             }
         }
 
@@ -3031,15 +3069,13 @@ impl Database {
             }
 
             // Field 1: Message
-            record.fields[SYS_LOGS_MESSAGE_IDX].values.push(Value {
-                sub_values: vec![message.to_string()],
-            });
+            record.fields[SYS_LOGS_MESSAGE_IDX].values.push(Value::text(message));
 
             // Field 2: Detail
             if db.log_detail == "detailed" {
-                record.fields[SYS_LOGS_DETAIL_IDX].values.push(Value {
-                    sub_values: vec![format!("UTC: {}", now)],
-                });
+                record.fields[SYS_LOGS_DETAIL_IDX]
+                    .values
+                    .push(Value::text(format!("UTC: {}", now)));
             }
 
             let max_records = db.max_log_records;
@@ -3082,19 +3118,17 @@ impl Database {
                     record.fields.push(Field::default());
                 }
                 // Field 0: Thumbprint
-                record.fields[SYS_CLIENTS_THUMBPRINT_IDX].values.push(Value {
-                    sub_values: vec![thumbprint_lower],
-                });
+                record.fields[SYS_CLIENTS_THUMBPRINT_IDX]
+                    .values
+                    .push(Value::text(&thumbprint_lower));
                 // Field 1: Allowed Accounts
                 for acc in &allowed_accounts {
-                    record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.push(Value {
-                        sub_values: vec![acc.clone()],
-                    });
+                    record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.push(Value::text(acc));
                 }
                 // Field 2: Admin flag
-                record.fields[SYS_CLIENTS_ADMIN_IDX].values.push(Value {
-                    sub_values: vec![if is_admin { "Y".to_string() } else { "".to_string() }],
-                });
+                record.fields[SYS_CLIENTS_ADMIN_IDX]
+                    .values
+                    .push(Value::text(if is_admin { "Y" } else { "" }));
 
                 table.insert_record(name, record);
             }
@@ -3124,12 +3158,12 @@ impl Database {
                     let already_exists = record.fields[SYS_CLIENTS_ACCOUNTS_IDX]
                         .values
                         .iter()
-                        .any(|v| v.sub_values.first() == Some(&account.to_string()));
+                        .any(|v| v.first_bytes() == account.as_bytes());
 
                     if !already_exists {
-                        record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.push(Value {
-                            sub_values: vec![account.to_string()],
-                        });
+                        record.fields[SYS_CLIENTS_ACCOUNTS_IDX]
+                            .values
+                            .push(Value::text(account));
                         table.mark_dirty(name);
                         success = true;
                     }
@@ -3157,7 +3191,7 @@ impl Database {
                     let original_len = record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len();
                     record.fields[SYS_CLIENTS_ACCOUNTS_IDX]
                         .values
-                        .retain(|v| v.sub_values.first().map(|s| s != account).unwrap_or(true));
+                        .retain(|v| v.first_bytes() != account.as_bytes());
 
                     if record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.len() < original_len {
                         table.mark_dirty(name);
@@ -3191,9 +3225,7 @@ impl Database {
         let mut certs_rec = Record::new();
         certs_rec.fields.push(Field::default());
         for tp in rlock(&self.clients).certs.iter() {
-            certs_rec.fields[0].values.push(Value {
-                sub_values: vec![tp.clone()],
-            });
+            certs_rec.fields[0].values.push(Value::text(tp));
         }
         let mut map = HashMap::new();
         map.insert("certs".to_string(), certs_rec);

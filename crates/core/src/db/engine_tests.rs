@@ -453,15 +453,88 @@ fn test_deserialize_does_not_resplit_a_plain_string() {
     let json = serde_json::json!({ "name": "Jane", "roles": "A]B" });
     let record = db.deserialize_record("USERS", &json).unwrap();
     assert_eq!(record.fields[1].values.len(), 1);
-    assert_eq!(record.fields[1].values[0].sub_values[0], "A]B");
+    assert_eq!(text_of(&record.fields[1].values[0].sub_values[0]), "A]B");
 
     // Numbers and booleans keep the scalar handling they always had.
     let json = serde_json::json!({ "roles": 7, "price": [true, 4.0] });
     let record = db.deserialize_record("USERS", &json).unwrap();
-    assert_eq!(record.fields[1].values[0].sub_values[0], "7");
+    assert_eq!(text_of(&record.fields[1].values[0].sub_values[0]), "7");
     assert_eq!(record.fields[2].values.len(), 2);
-    assert_eq!(record.fields[2].values[0].sub_values[0], "100");
-    assert_eq!(record.fields[2].values[1].sub_values[0], "400");
+    assert_eq!(text_of(&record.fields[2].values[0].sub_values[0]), "100");
+    assert_eq!(text_of(&record.fields[2].values[1].sub_values[0]), "400");
+}
+
+/// The other half of the corruption #32 describes.
+///
+/// A record could be stored intact and still come back wrong, because
+/// serialization put every sub-value into a JSON string and JSON strings are
+/// UTF-8. Such a value travels tagged now, and comes back as the same bytes.
+#[test]
+fn a_value_that_is_not_utf8_crosses_json_as_bytes_and_returns_unchanged() {
+    let (_dir, db) = json_shape_db("json_binary");
+
+    let raw = vec![0xFFu8, 0x80, 0x00, b'o', b'k'];
+    let mut original = Record::new();
+    original.fields.push(Value::bytes(raw.clone()).into_field());
+
+    let json = db.serialize_record("USERS", &original);
+    let name = &json["name"];
+    assert!(
+        name.is_object(),
+        "a value that is not text must not be forced into a JSON string, got {name}"
+    );
+    assert!(
+        name[BINARY_JSON_KEY].is_string(),
+        "expected the tagged envelope, got {name}"
+    );
+
+    let back = db.deserialize_record("USERS", &json).unwrap();
+    assert_eq!(
+        back.fields[0].values[0].sub_values[0], raw,
+        "the bytes did not survive the protocol boundary"
+    );
+}
+
+/// Text keeps travelling as a plain JSON string: no client sees a new shape
+/// for a value that never had a problem.
+#[test]
+fn a_text_value_still_crosses_json_as_a_plain_string() {
+    let (_dir, db) = json_shape_db("json_text");
+
+    let mut original = Record::new();
+    original.fields.push(Value::text("Jane").into_field());
+
+    let json = db.serialize_record("USERS", &original);
+    assert_eq!(json["name"], serde_json::json!("Jane"));
+
+    let back = db.deserialize_record("USERS", &json).unwrap();
+    assert_eq!(back.fields[0].values[0].sub_values[0], b"Jane".to_vec());
+}
+
+/// A malformed envelope is refused, not stored as a guess.
+///
+/// The tempting fallback - treat what did not decode as text - would store the
+/// envelope's own JSON as the value: a write that succeeds and reads back as
+/// something the client never sent, which is the failure this codec exists to
+/// end.
+#[test]
+fn a_binary_envelope_that_does_not_decode_is_refused() {
+    let (_dir, db) = json_shape_db("json_bad_binary");
+
+    for bad in [
+        serde_json::json!({ "name": { "$base64": "not base64!" } }),
+        serde_json::json!({ "name": { "$base64": "Zg=" } }),
+        serde_json::json!({ "name": { "$base64": 7 } }),
+    ] {
+        assert!(
+            db.deserialize_record("USERS", &bad).is_none(),
+            "{bad} should have been refused"
+        );
+    }
+
+    // An ordinary object that is not an envelope keeps the behaviour it had.
+    let other = serde_json::json!({ "name": { "something": "else" } });
+    assert!(db.deserialize_record("USERS", &other).is_some());
 }
 
 #[test]
