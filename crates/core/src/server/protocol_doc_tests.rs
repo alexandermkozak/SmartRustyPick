@@ -556,7 +556,16 @@ fn dictionary_entry_is_documented() {
     assert_documented_shape(
         "LIST.DICT / SET.DICT",
         value_keys(&value),
-        &["field", "heading", "justification", "width", "conversion", "definition"],
+        &[
+            "field",
+            "heading",
+            "justification",
+            "width",
+            "association",
+            "associationDepth",
+            "conversion",
+            "definition",
+        ],
     );
 }
 

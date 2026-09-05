@@ -763,6 +763,51 @@ fn test_select_explodes_and_get_next_carries_the_positions() {
 }
 
 #[test]
+fn test_query_explodes_an_association_group_in_lockstep() {
+    let (_dir, db_arc, client_info) = exploded_test_db("explode_group");
+
+    // The demo `PRODUCTS` file carries a group: SUPPLIERS controls, SUP.CODES
+    // pairs value for value and SUP.CONTACTS pairs at the second tier.
+    let query = |explode: Vec<&str>| Request {
+        command: "QUERY".to_string(),
+        account: Some("EXP_TEST".to_string()),
+        file: Some("PRODUCTS".to_string()),
+        query_string: Some("WITH DESC = Laptop".to_string()),
+        explode: Some(explode.into_iter().map(str::to_string).collect()),
+        ..Default::default()
+    };
+
+    let resp = handle_request(query(vec!["SUPPLIERS"]), &db_arc, &client_info);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    // Three suppliers; the second has two contacts, so it becomes two rows, and
+    // the third has neither a code nor a contact but is still a row of its own.
+    assert_eq!(
+        resp.positions.unwrap(),
+        vec![
+            Some(ValuePosition::sub_value(0, 0)),
+            Some(ValuePosition::sub_value(1, 0)),
+            Some(ValuePosition::sub_value(1, 1)),
+            Some(ValuePosition::value(2)),
+        ]
+    );
+
+    // Naming a dependent, or naming several members at once, asks the same
+    // question: it is the group that explodes, not the field that was named.
+    for spelling in [vec!["SUP.CONTACTS"], vec!["SUPPLIERS", "SUP.CODES", "SUP.CONTACTS"]] {
+        let resp = handle_request(query(spelling.clone()), &db_arc, &client_info);
+        assert_eq!(resp.status, "OK", "{:?}: {:?}", spelling, resp.message);
+        assert_eq!(resp.positions.unwrap().len(), 4, "{:?}", spelling);
+    }
+
+    // Two fields with no association between them still have no defined
+    // pairing, and are refused with both names.
+    let resp = handle_request(query(vec!["SUPPLIERS", "DESC"]), &db_arc, &client_info);
+    assert_eq!(resp.code, Some(ErrorCode::InvalidQuery));
+    let message = resp.message.unwrap();
+    assert!(message.contains("SUPPLIERS") && message.contains("DESC"), "{message}");
+}
+
+#[test]
 fn test_unexploded_select_sends_no_positions() {
     let (_dir, db_arc, client_info) = exploded_test_db("no_positions");
 
@@ -870,6 +915,30 @@ fn test_set_dict_stores_an_entry_and_fills_in_its_defaults() {
     assert_eq!(stored["justification"], "R");
     assert_eq!(stored["width"], 12);
     assert_eq!(stored["definition"], "2^Unit price^R^12^^^^MD2");
+
+    // An association is recorded on the dependent, naming its controller. A
+    // group that names no tier pairs value for value, and the stored entry says
+    // so rather than leaving attribute 6 blank for a reader to guess at.
+    let resp = set_dict(
+        &db_arc,
+        &client_info,
+        "PRICE.DATE",
+        serde_json::json!({ "field": 3, "association": "PRICE" }),
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let stored = resp.record.unwrap();
+    assert_eq!(stored["association"], "PRICE");
+    assert_eq!(stored["associationDepth"], "V");
+    assert_eq!(stored["definition"], "3^PRICE.DATE^L^10^PRICE^V");
+
+    let resp = set_dict(
+        &db_arc,
+        &client_info,
+        "PRICE.NOTE",
+        serde_json::json!({ "field": 4, "association": "PRICE", "associationDepth": "s" }),
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    assert_eq!(resp.record.unwrap()["definition"], "4^PRICE.NOTE^L^10^PRICE^S");
 }
 
 #[test]
@@ -897,6 +966,18 @@ fn test_set_dict_refuses_a_definition_no_query_could_use() {
         (
             serde_json::json!({ "field": 1, "justification": "centre" }),
             "Justification must be L or R",
+        ),
+        (
+            serde_json::json!({ "field": 1, "association": "NAME" }),
+            "A dictionary entry cannot be associated with itself",
+        ),
+        (
+            serde_json::json!({ "field": 1, "association": "PRICE", "associationDepth": "deep" }),
+            "Association depth must be V (value) or S (sub-value)",
+        ),
+        (
+            serde_json::json!({ "field": 1, "associationDepth": "S" }),
+            "Association depth given without a controlling field",
         ),
     ];
     for (attributes, expected) in cases {

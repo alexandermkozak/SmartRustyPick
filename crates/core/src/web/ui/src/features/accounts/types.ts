@@ -186,6 +186,10 @@ export interface DictionaryEntry {
     heading: string
     justification: string
     width: number | null
+    /** The controlling field this entry's values pair with, empty when it is in no group. */
+    association: string
+    /** `V` (value for value) or `S` (sub-value for sub-value); empty without an association. */
+    associationDepth: string
     conversion: string
     definition: string
 }
@@ -201,5 +205,7 @@ export interface DictionaryDraft {
     heading: string
     justification: string
     width: string
+    association: string
+    associationDepth: string
     conversion: string
 }

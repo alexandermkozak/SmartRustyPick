@@ -46,7 +46,7 @@ Remove a record from the database.
 List tables, keys, or records with formatted fields.
 
 - **Usage**:
-  `LIST [DICT] [<table> [<fields>...] [WITH <field> <op> <value> ...] [BY|BY.DSND <field> ...] [BY.EXP <field> [<op> <value>]]]`
+  `LIST [DICT] [<table> [<fields>...] [WITH <field> <op> <value> ...] [BY|BY.DSND <field> ...] [BY.EXP <field> [<op> <value>] ...]]`
 - **Example**: `LIST USERS First.Name Last.Name`
 - **Example**: `LIST PRODUCTS BY PRICE`
 - **Example**: `LIST PRODUCTS BY.DSND PRICE`
@@ -107,13 +107,65 @@ The rules in detail:
   unexploded. A record whose exploded field is empty does too.
 - With a criterion, the unit is the deepest thing that matched: a value, or a sub-value when the field has them. Two
   conditions on the same field union their positions, so `WITH ROLES = "DEV" OR ROLES = "ADMIN"` gives a row for each.
+  A field in an association group is the exception - see below.
 - `BY.EXP` does not sort. Rows come out in record-key order, and within a record in value order. Add `BY <field>` to
   order them - and when that field is the exploded one, it sorts on each row's own value rather than on the whole
   joined field.
-- Only one `BY.EXP` field may be given.
+- Only one field may be given, unless the fields are members of one association group - see below.
 
 Commands that act on records rather than on values - `GET`, `DELETE`, `CT` - take each record from an exploded list
 once, not once per matching value.
+
+#### Exploding an association group
+
+Where the dictionary records that several multivalued fields belong together - PICK's correlated multivalued
+attributes, described under [Association groups](data_structures.md#association-groups) - `BY.EXP` explodes the whole
+group in lockstep rather than one field of it. Row *n* is value *n* of every member, so the values that belong together
+appear on one line.
+
+Given a `$CLIENTS` record `WEB` whose `ACCOUNTS` holds `TEST]PAYROLL]LAB`, whose `ACCT.CODES` holds `T-1]P-7` and whose
+`ACCT.NOTES` - a second-tier member - holds `one]two\three`:
+
+```
+LIST $CLIENTS BY.EXP ACCOUNTS ACCOUNTS ACCT.CODES ACCT.NOTES
+
+ID         ACCOUNTS     CODE     NOTE
+---------- ------------ -------- ----------
+WEB        TEST         T-1      one
+WEB        PAYROLL      P-7      two
+WEB        PAYROLL      P-7      three
+WEB        LAB
+```
+
+The rules the group adds:
+
+- **Naming any member names the group.** `BY.EXP ACCOUNTS` and `BY.EXP ACCT.CODES` ask the same question, so a report
+  need not know which field is the controller.
+- **Several members may be named at once.** `BY.EXP ACCOUNTS BY.EXP ACCT.CODES` is the same clause again. Two fields
+  that are *not* associated are still refused: without an association there is no defined pairing between their values,
+  which is the whole reason the restriction exists.
+- **Ragged groups keep every value.** Three accounts beside two codes give three rows, the third showing an empty code.
+  A value is never dropped because a sibling ran out of them.
+- **The second tier nests inside the first.** A value whose second-tier members have sub-values becomes one row per
+  sub-value, and the value-tier columns repeat down those rows - `PAYROLL` and `P-7` above. A value with nothing below
+  it stays one row.
+- **A criterion on any member positions the whole group.** `BY.EXP ACCOUNTS WITH ACCT.CODES = "P-7"` gives the rows
+  where the *code* matched, carrying each row's account and note with it. Criteria on two members union their positions,
+  the same rule two criteria on one field already follow. A member no criterion names adds no rows of its own; it fills
+  in its column on the rows the criteria chose.
+- **`BY` on any member sorts on that row's own value**, not on the whole joined field, exactly as it does for a lone
+  exploded field.
+- **A member's tier decides how deep a criterion reaches.** A lone `BY.EXP` field gives a row for the deepest thing
+  that matched, down to a sub-value. Inside a group a `V` member gives a row for the whole *value* that matched, even
+  when a sub-value of it is what satisfied the criterion, because that is the tier its siblings are paired against.
+  Declaring an association on a sub-valued field therefore changes what `BY.EXP` on it returns - deliberately: it is
+  the price of the values lining up. A field that should still explode by sub-value inside the group is an `S` member.
+
+Everything else is as it is for a lone field: which records appear is the query's decision, a record the group cannot
+expand stays as one unexploded row, and `GET`, `DELETE` and `CT` still take each record once.
+
+Columns outside the group are untouched: they repeat the record's whole field down the rows, as they do for a lone
+`BY.EXP` field.
 
 #### Sorting
 

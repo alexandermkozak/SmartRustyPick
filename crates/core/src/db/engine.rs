@@ -340,6 +340,93 @@ impl Table {
         }
     }
 
+    /// The controlling field this entry names in attribute 5, and the tier it
+    /// pairs at, or `None` when it names none.
+    ///
+    /// An entry naming itself names nothing: it is a typo, and treating it as a
+    /// one-field group would be a way to hang the walk below rather than a
+    /// useful answer.
+    fn controller_of(&self, field_name: &str) -> Option<(String, AssociationDepth)> {
+        let rec = self.dictionary.get(field_name)?;
+        let controller = rec.get_field_display_string(DICT_ASSOC_IDX).trim().to_string();
+        if controller.is_empty() || controller == field_name {
+            return None;
+        }
+        let depth = AssociationDepth::from_attribute(&rec.get_field_display_string(DICT_ASSOC_DEPTH_IDX));
+        Some((controller, depth))
+    }
+
+    /// The field at the head of this one's chain of controllers, and the tier
+    /// it ends up pairing at.
+    ///
+    /// Following the chain rather than reading one link is what lets a
+    /// dictionary nest its tiers the way PICK does - a sub-value field hanging
+    /// off a value field that hangs off the controller - and still resolve to
+    /// one group. Any `S` on the way down makes the field a sub-value tier
+    /// member, because that is the tier it is ultimately paired at.
+    ///
+    /// A chain that has not ended within [`ASSOC_MAX_DEPTH`] steps is a cycle.
+    /// The field is then reported as its own root, so a dictionary that names
+    /// itself in a circle resolves to no association rather than to a hang.
+    fn association_root(&self, field_name: &str) -> (String, AssociationDepth) {
+        let mut name = field_name.to_string();
+        let mut depth = AssociationDepth::Value;
+        for _ in 0..ASSOC_MAX_DEPTH {
+            match self.controller_of(&name) {
+                Some((controller, link)) => {
+                    if link == AssociationDepth::SubValue {
+                        depth = AssociationDepth::SubValue;
+                    }
+                    name = controller;
+                }
+                None => return (name, depth),
+            }
+        }
+        (field_name.to_string(), AssociationDepth::Value)
+    }
+
+    /// The association group `field_name` belongs to, or `None` when it belongs
+    /// to none.
+    ///
+    /// Resolved by scanning the dictionary, because the relationship is
+    /// recorded on the dependents and a controller therefore does not know its
+    /// own group. That is the cost of the format that cannot fall out of step
+    /// with itself, and it is a scan of a small map held in memory, done once
+    /// per query rather than once per record.
+    ///
+    /// A controller with no dictionary entry of its own is not an error: the
+    /// dependents naming it still associate with each other. What is never a
+    /// group is a single field, so a lone `BY.EXP` field explodes exactly as it
+    /// always has.
+    pub fn association(&self, field_name: &str) -> Option<Association> {
+        if field_name == "ID" || !self.dictionary.contains_key(field_name) {
+            return None;
+        }
+        let (root, _) = self.association_root(field_name);
+        let mut members: Vec<AssociationMember> = Vec::new();
+        for name in self.dictionary.keys() {
+            let (name_root, depth) = self.association_root(name);
+            if name_root != root {
+                continue;
+            }
+            if let Some(index) = self.field_index(name) {
+                members.push(AssociationMember {
+                    name: name.clone(),
+                    index,
+                    depth,
+                });
+            }
+        }
+        if members.len() < 2 {
+            return None;
+        }
+        members.sort_by(|left, right| left.index.cmp(&right.index).then_with(|| left.name.cmp(&right.name)));
+        Some(Association {
+            controller: root,
+            members,
+        })
+    }
+
     /// The 0-based index and conversion code of a dictionary field in a single
     /// dictionary lookup, instead of one lookup per property.
     pub fn field_index_and_conversion(&self, field_name: &str) -> Option<(usize, Option<String>)> {
@@ -3276,12 +3363,31 @@ impl Database {
             table
                 .dictionary
                 .insert("PRICE".to_string(), Record::from_display_string("2^PRICE^R^10^^^^MD2"));
+            // An association group, so the fixture reaches correlated
+            // multivalues as well as plain ones: SUPPLIERS controls, SUP.CODES
+            // pairs with it value for value, and SUP.CONTACTS pairs at the
+            // second tier, sub-value for sub-value inside a supplier.
+            table
+                .dictionary
+                .insert("SUPPLIERS".to_string(), Record::from_display_string("3^SUPPLIER^L^12"));
+            table.dictionary.insert(
+                "SUP.CODES".to_string(),
+                Record::from_display_string("4^CODE^L^8^SUPPLIERS^V"),
+            );
+            table.dictionary.insert(
+                "SUP.CONTACTS".to_string(),
+                Record::from_display_string("5^CONTACT^L^10^SUPPLIERS^S"),
+            );
+            // P1's group is deliberately ragged - three suppliers, two codes -
+            // and its second supplier has two contacts, so exploding it shows
+            // both tiers and the empty cell a short member leaves behind.
+            table.records.insert(
+                "P1".to_string(),
+                Record::from_display_string("Laptop^120000^ACME]GLOBEX]INITECH^A-1]G-7^ann]bob\\cara"),
+            );
             table
                 .records
-                .insert("P1".to_string(), Record::from_display_string("Laptop^120000"));
-            table
-                .records
-                .insert("P2".to_string(), Record::from_display_string("Mouse^2500"));
+                .insert("P2".to_string(), Record::from_display_string("Mouse^2500^ACME^A-2^dan"));
             table.touch_all();
             table.mark_dict_dirty();
         }

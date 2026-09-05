@@ -365,10 +365,39 @@ def main():
                 json.dumps(stored),
             )
 
+            # An association is recorded on the dependent, naming its controller,
+            # and a group that names no tier pairs value for value.
+            status, payload, _ = dashboard.call(
+                dict_path,
+                method="POST",
+                payload={"name": "PRICE.DATE", "field": 4, "association": "PRICE"},
+            )
+            stored = (payload or {}).get("record") or {}
+            suite.check(
+                "An entry can be associated with a controlling field",
+                status == 200 and stored.get("definition") == "4^PRICE.DATE^L^10^PRICE^V",
+                json.dumps(stored),
+            )
+
+            status, _, _ = dashboard.call(
+                dict_path,
+                method="POST",
+                payload={"name": "PRICE.NOTE", "field": 5, "associationDepth": "S"},
+            )
+            suite.check_eq("A tier without a controlling field is refused", status, 400)
+
             status, payload, _ = dashboard.call(dict_path)
             listed = [name for name, _ in (payload or {}).get("results") or []]
             entries = {name: info for name, info in (payload or {}).get("results") or []}
-            suite.check_eq("Entries come back in attribute order", listed, ["NAME", "PRICE"])
+            suite.check_eq("Entries come back in attribute order", listed, ["NAME", "PRICE", "PRICE.DATE"])
+            suite.check_eq(
+                "...and an associated entry names its controller",
+                [
+                    entries.get("PRICE.DATE", {}).get("association"),
+                    entries.get("PRICE.DATE", {}).get("associationDepth"),
+                ],
+                ["PRICE", "V"],
+            )
             suite.check_eq("An entry is listed with its attributes", entries.get("PRICE", {}).get("field"), 3)
             suite.check_eq("...and its conversion", entries.get("PRICE", {}).get("conversion"), "MD2")
 
@@ -391,6 +420,7 @@ def main():
             status, _, _ = dashboard.call(dict_path, method="POST", payload={"name": "PRICE", "field": 0})
             suite.check_eq("A definition no query could use is refused", status, 400)
 
+            dashboard.call(f"{dict_path}/PRICE.DATE", method="DELETE")
             status, _, _ = dashboard.call(f"{dict_path}/PRICE", method="DELETE")
             _, payload, _ = dashboard.call(dict_path)
             left = [name for name, _ in (payload or {}).get("results") or []]

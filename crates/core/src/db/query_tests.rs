@@ -694,12 +694,9 @@ fn test_query_exploded_matches_every_position() {
     let (_dir, db) = roles_db("exploded_positions");
 
     let query = db.parse_query("USERS", &["WITH", "ROLES", "=", "[TEST]"]).unwrap();
-    let explode = ExplodeSpec {
-        field_name: "ROLES".to_string(),
-        condition: None,
-    };
     let table_handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
     let table = table_handle.read();
+    let explode = Database::explode_target_in(&table, "ROLES").unwrap();
 
     let rows = Database::query_exploded_in(&table, false, Some(&query), Some(&explode), None);
     let seen: Vec<(&str, Option<ValuePosition>)> = rows.iter().map(|(e, _)| (e.key.as_str(), e.position)).collect();
@@ -718,12 +715,9 @@ fn test_query_exploded_matches_every_position() {
 #[test]
 fn test_query_exploded_without_criterion_is_one_row_per_value() {
     let (_dir, db) = roles_db("exploded_bare");
-    let explode = ExplodeSpec {
-        field_name: "ROLES".to_string(),
-        condition: None,
-    };
     let table_handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
     let table = table_handle.read();
+    let explode = Database::explode_target_in(&table, "ROLES").unwrap();
 
     let rows = Database::query_exploded_in(&table, false, None, Some(&explode), None);
     let seen: Vec<(&str, Option<ValuePosition>)> = rows.iter().map(|(e, _)| (e.key.as_str(), e.position)).collect();
@@ -751,12 +745,9 @@ fn test_query_exploded_unions_positions_across_conditions() {
     let query = db
         .parse_query("USERS", &["WITH", "ROLES", "=", "DEV", "OR", "ROLES", "=", "ADMIN"])
         .unwrap();
-    let explode = ExplodeSpec {
-        field_name: "ROLES".to_string(),
-        condition: None,
-    };
     let table_handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
     let table = table_handle.read();
+    let explode = Database::explode_target_in(&table, "ROLES").unwrap();
 
     let rows = Database::query_exploded_in(&table, false, Some(&query), Some(&explode), None);
     let seen: Vec<(&str, Option<ValuePosition>)> = rows.iter().map(|(e, _)| (e.key.as_str(), e.position)).collect();
@@ -777,12 +768,9 @@ fn test_query_exploded_keeps_records_matched_on_another_field() {
     // The criterion names NAME, not the exploded ROLES. Inclusion is still the
     // query's decision, so the record survives - as one unexploded row.
     let query = db.parse_query("USERS", &["WITH", "NAME", "=", "Zed"]).unwrap();
-    let explode = ExplodeSpec {
-        field_name: "ROLES".to_string(),
-        condition: None,
-    };
     let table_handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
     let table = table_handle.read();
+    let explode = Database::explode_target_in(&table, "ROLES").unwrap();
 
     let rows = Database::query_exploded_in(&table, false, Some(&query), Some(&explode), None);
     assert_eq!(rows.len(), 1);
@@ -802,32 +790,30 @@ fn test_query_exploded_without_spec_is_an_ordinary_selection() {
     assert!(rows.iter().all(|(e, _)| e.position.is_none()));
 
     // An unknown explode field is no explode at all rather than an error.
-    let unknown = ExplodeSpec {
+    let unknown = [ExplodeSpec {
         field_name: "NOPE".to_string(),
         condition: None,
-    };
-    let rows = Database::query_exploded_in(&table, false, Some(&query), Some(&unknown), None);
+    }];
+    let target = Database::resolve_explode_in(&table, &unknown).unwrap();
+    assert!(target.is_none());
+    let rows = Database::query_exploded_in(&table, false, Some(&query), target.as_ref(), None);
     assert!(rows.iter().all(|(e, _)| e.position.is_none()));
 }
 
 #[test]
 fn test_sort_entries_uses_the_exploded_value() {
     let (_dir, db) = roles_db("sort_entries");
-    let explode = ExplodeSpec {
-        field_name: "ROLES".to_string(),
-        condition: None,
-    };
     let table_handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
     let table = table_handle.read();
+    let explode = Database::explode_target_in(&table, "ROLES").unwrap();
 
     let mut rows = Database::query_exploded_in(&table, false, None, Some(&explode), None);
-    let explode_idx = Database::explode_field_index(&table, Some(&explode));
-    assert_eq!(explode_idx, Some(1));
+    assert_eq!(explode.indices(), vec![1]);
     let specs = vec![SortSpec {
         field_name: "ROLES".to_string(),
         descending: false,
     }];
-    Database::sort_entries_in(&table, &mut rows, &specs, explode_idx);
+    Database::sort_entries_in(&table, &mut rows, &specs, Some(&explode));
 
     // Ordered by each row's own value, not by the whole joined field - which
     // would have kept every one of record 1's rows together.
@@ -927,18 +913,14 @@ fn test_select_entries_match_the_owning_path() {
 fn test_select_entries_explode_matches_the_sorted_rows() {
     let (_dir, db) = roles_db("select_keys_explode");
     let query = db.parse_query("USERS", &["WITH", "ROLES", "=", "[TEST]"]).unwrap();
-    let explode = ExplodeSpec {
-        field_name: "ROLES".to_string(),
-        condition: None,
-    };
     let (_, specs) = parse_sort_specs(&["BY.DSND", "ROLES"]);
 
     let handle = db.get_table_read_only_for_account("ACC", "USERS").unwrap();
     let table = handle.read();
+    let explode = Database::explode_target_in(&table, "ROLES").unwrap();
 
     let mut rows = Database::query_exploded_in(&table, false, Some(&query), Some(&explode), None);
-    let explode_idx = Database::explode_field_index(&table, Some(&explode));
-    Database::sort_entries_in(&table, &mut rows, &specs, explode_idx);
+    Database::sort_entries_in(&table, &mut rows, &specs, Some(&explode));
     let expected: Vec<SelectEntry> = rows.into_iter().map(|(entry, _)| entry).collect();
 
     let actual = Database::select_entries_in(&table, false, Some(&query), Some(&explode), None, &specs);
@@ -950,4 +932,322 @@ fn test_select_entries_explode_matches_the_sorted_rows() {
             .collect::<Vec<(String, Option<ValuePosition>)>>()
     };
     assert_eq!(shape(&actual), shape(&expected));
+}
+
+/// A file whose `ACCOUNTS`, `ACCT.CODES` and `ACCT.NOTES` are one association
+/// group: `ACCOUNTS` controls, `ACCT.CODES` pairs value for value, and
+/// `ACCT.NOTES` pairs at the second tier, sub-value for sub-value inside a
+/// value of the controller.
+///
+/// The records are deliberately ragged - `W` has three accounts and two codes -
+/// and `NAME` sits outside the group, so the tests below can tell a member from
+/// a bystander. The guard is returned alongside the database so callers keep
+/// the directory alive for as long as they use it.
+fn assoc_db(label: &str) -> (TempDir, Database) {
+    let dir = TempDir::new(label);
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_account("ACC", None).unwrap();
+    db.logto("ACC").unwrap();
+    db.create_table("CLIENTS").unwrap();
+    let table_handle = db.get_table_mut("CLIENTS").unwrap();
+    let mut table = table_handle.write();
+    for (name, definition) in [
+        ("NAME", "1^NAME^L^10"),
+        ("ACCOUNTS", "2^ACCOUNTS^L^12"),
+        ("ACCT.CODES", "3^CODE^L^8^ACCOUNTS^V"),
+        ("ACCT.NOTES", "4^NOTE^L^10^ACCOUNTS^S"),
+    ] {
+        table
+            .dictionary
+            .insert(name.to_string(), Record::from_display_string(definition));
+    }
+    table.records.insert(
+        "W".to_string(),
+        Record::from_display_string("Web^TEST]PAYROLL]LAB^T-1]P-7^one]two\\three"),
+    );
+    table
+        .records
+        .insert("X".to_string(), Record::from_display_string("Xen^TEST^T-2^solo"));
+    table.mark_dict_dirty();
+    table.touch_all();
+    drop(table);
+    (dir, db)
+}
+
+fn positions_of(rows: &[(SelectEntry, &Record)]) -> Vec<(String, Option<ValuePosition>)> {
+    rows.iter().map(|(e, _)| (e.key.clone(), e.position)).collect()
+}
+
+#[test]
+fn test_association_is_resolved_from_the_dependents() {
+    let (_dir, db) = assoc_db("assoc_resolve");
+    let handle = db.get_table_read_only_for_account("ACC", "CLIENTS").unwrap();
+    let table = handle.read();
+
+    // Naming the controller, or either dependent, resolves to the same group.
+    let group = table.association("ACCOUNTS").unwrap();
+    assert_eq!(group.controller, "ACCOUNTS");
+    assert_eq!(
+        group
+            .members
+            .iter()
+            .map(|m| (m.name.as_str(), m.index, m.depth))
+            .collect::<Vec<_>>(),
+        vec![
+            ("ACCOUNTS", 1, AssociationDepth::Value),
+            ("ACCT.CODES", 2, AssociationDepth::Value),
+            ("ACCT.NOTES", 3, AssociationDepth::SubValue),
+        ]
+    );
+    assert_eq!(table.association("ACCT.CODES"), Some(group.clone()));
+    assert_eq!(table.association("ACCT.NOTES"), Some(group));
+
+    // A field naming no controller and named by none is in no group at all, so
+    // it explodes alone exactly as it always has.
+    assert_eq!(table.association("NAME"), None);
+    assert!(matches!(
+        Database::explode_target_in(&table, "NAME"),
+        Some(ExplodeTarget::Field { index: 0, .. })
+    ));
+}
+
+#[test]
+fn test_association_ignores_a_cycle_rather_than_hanging() {
+    let (_dir, db) = assoc_db("assoc_cycle");
+    {
+        let handle = db.get_table_mut("CLIENTS").unwrap();
+        let mut table = handle.write();
+        // The controller now names its own dependent: the chain has no head.
+        table.dictionary.insert(
+            "ACCOUNTS".to_string(),
+            Record::from_display_string("2^ACCOUNTS^L^12^ACCT.CODES^V"),
+        );
+        table.mark_dict_dirty();
+    }
+    let handle = db.get_table_read_only_for_account("ACC", "CLIENTS").unwrap();
+    let table = handle.read();
+
+    // Each field of the cycle is its own root, so no group forms - and the walk
+    // returns rather than following the circle.
+    assert_eq!(table.association("ACCOUNTS"), None);
+    assert_eq!(table.association("ACCT.CODES"), None);
+}
+
+#[test]
+fn test_group_explodes_its_members_in_lockstep() {
+    let (_dir, db) = assoc_db("assoc_lockstep");
+    let handle = db.get_table_read_only_for_account("ACC", "CLIENTS").unwrap();
+    let table = handle.read();
+    let explode = Database::explode_target_in(&table, "ACCOUNTS").unwrap();
+
+    let rows = Database::query_exploded_in(&table, false, None, Some(&explode), None);
+
+    // W's first account has one note, its second has two, and its third has
+    // neither a code nor a note. The second tier nests inside the first: value
+    // 1 becomes two rows rather than one, and the value-tier members repeat
+    // down them. Value 2 has nothing at the second tier, so it stays one row.
+    assert_eq!(
+        positions_of(&rows),
+        vec![
+            ("W".to_string(), Some(ValuePosition::sub_value(0, 0))),
+            ("W".to_string(), Some(ValuePosition::sub_value(1, 0))),
+            ("W".to_string(), Some(ValuePosition::sub_value(1, 1))),
+            ("W".to_string(), Some(ValuePosition::value(2))),
+            ("X".to_string(), Some(ValuePosition::sub_value(0, 0))),
+        ]
+    );
+}
+
+#[test]
+fn test_group_rows_come_from_the_longest_member() {
+    let (_dir, db) = assoc_db("assoc_ragged");
+    {
+        // Drop the second tier so the group pairs value for value only, which
+        // is where raggedness is easiest to read.
+        let handle = db.get_table_mut("CLIENTS").unwrap();
+        handle.write().dictionary.remove("ACCT.NOTES");
+    }
+    let handle = db.get_table_read_only_for_account("ACC", "CLIENTS").unwrap();
+    let table = handle.read();
+    let explode = Database::explode_target_in(&table, "ACCT.CODES").unwrap();
+
+    let rows = Database::query_exploded_in(&table, false, None, Some(&explode), None);
+
+    // Three accounts beside two codes give three rows, not two: a value is not
+    // dropped because a sibling ran out of them.
+    assert_eq!(
+        positions_of(&rows),
+        vec![
+            ("W".to_string(), Some(ValuePosition::value(0))),
+            ("W".to_string(), Some(ValuePosition::value(1))),
+            ("W".to_string(), Some(ValuePosition::value(2))),
+            ("X".to_string(), Some(ValuePosition::value(0))),
+        ]
+    );
+}
+
+#[test]
+fn test_a_criterion_on_one_member_positions_the_whole_group() {
+    let (_dir, db) = assoc_db("assoc_criterion");
+    let handle = db.get_table_read_only_for_account("ACC", "CLIENTS").unwrap();
+    let table = handle.read();
+    let explode = Database::explode_target_in(&table, "ACCOUNTS").unwrap();
+
+    // The criterion names the dependent, and the group explodes at the
+    // positions it matched - one row, carrying its controller's value with it.
+    let query = db.parse_query("CLIENTS", &["WITH", "ACCT.CODES", "=", "P-7"]).unwrap();
+    let rows = Database::query_exploded_in(&table, false, Some(&query), Some(&explode), None);
+    assert_eq!(
+        positions_of(&rows),
+        vec![
+            ("W".to_string(), Some(ValuePosition::sub_value(1, 0))),
+            ("W".to_string(), Some(ValuePosition::sub_value(1, 1))),
+        ]
+    );
+
+    // Criteria on two members union their positions, which is the rule a single
+    // field already follows for two criteria on it.
+    let query = db
+        .parse_query(
+            "CLIENTS",
+            &["WITH", "ACCT.CODES", "=", "T-1", "OR", "ACCOUNTS", "=", "LAB"],
+        )
+        .unwrap();
+    let rows = Database::query_exploded_in(&table, false, Some(&query), Some(&explode), None);
+    assert_eq!(
+        positions_of(&rows),
+        vec![
+            ("W".to_string(), Some(ValuePosition::sub_value(0, 0))),
+            ("W".to_string(), Some(ValuePosition::value(2))),
+        ]
+    );
+}
+
+#[test]
+fn test_a_value_tier_member_matches_through_its_sub_values() {
+    let (_dir, db) = assoc_db("assoc_value_tier_match");
+    let handle = db.get_table_read_only_for_account("ACC", "CLIENTS").unwrap();
+    let table = handle.read();
+    let explode = Database::explode_target_in(&table, "ACCOUNTS").unwrap();
+
+    // `three` is a sub-value of the second-tier member's second value. A
+    // criterion on it positions the group at that sub-value, and no deeper -
+    // there is nothing below the second tier to reach.
+    let query = db
+        .parse_query("CLIENTS", &["WITH", "ACCT.NOTES", "=", "three"])
+        .unwrap();
+    let rows = Database::query_exploded_in(&table, false, Some(&query), Some(&explode), None);
+    assert_eq!(
+        positions_of(&rows),
+        vec![("W".to_string(), Some(ValuePosition::sub_value(1, 1)))]
+    );
+}
+
+#[test]
+fn test_several_by_exp_fields_are_accepted_only_when_associated() {
+    let (_dir, db) = assoc_db("assoc_multi_by_exp");
+    let handle = db.get_table_read_only_for_account("ACC", "CLIENTS").unwrap();
+    let table = handle.read();
+    let spec = |name: &str| ExplodeSpec {
+        field_name: name.to_string(),
+        condition: None,
+    };
+
+    // Two members of one group name that group, which is the whole point: with
+    // an association there is a defined pairing between their values.
+    let both = [spec("ACCOUNTS"), spec("ACCT.CODES")];
+    assert_eq!(
+        Database::resolve_explode_in(&table, &both).unwrap(),
+        Database::explode_target_in(&table, "ACCOUNTS")
+    );
+
+    // Two fields with nothing pairing them are still refused, and the refusal
+    // names both of them.
+    let unrelated = [spec("ACCOUNTS"), spec("NAME")];
+    let message = Database::resolve_explode_in(&table, &unrelated).unwrap_err();
+    assert!(message.contains("ACCOUNTS") && message.contains("NAME"), "{message}");
+
+    // A field the dictionary does not know explodes nothing, and is passed over
+    // rather than made to disagree with one that does.
+    let with_unknown = [spec("NOPE"), spec("ACCOUNTS")];
+    assert_eq!(
+        Database::resolve_explode_in(&table, &with_unknown).unwrap(),
+        Database::explode_target_in(&table, "ACCOUNTS")
+    );
+}
+
+#[test]
+fn test_sorting_an_exploded_group_uses_each_row_own_value() {
+    let (_dir, db) = assoc_db("assoc_sort");
+    let handle = db.get_table_read_only_for_account("ACC", "CLIENTS").unwrap();
+    let table = handle.read();
+    let explode = Database::explode_target_in(&table, "ACCOUNTS").unwrap();
+
+    let mut rows = Database::query_exploded_in(&table, false, None, Some(&explode), None);
+    let (_, specs) = parse_sort_specs(&["BY", "ACCT.NOTES"]);
+    Database::sort_entries_in(&table, &mut rows, &specs, Some(&explode));
+
+    // A `BY` on a group member orders by that row's own value - here the
+    // second-tier notes, one per row - rather than by the whole joined field,
+    // which would leave every row of a record tied.
+    let notes: Vec<String> = rows
+        .iter()
+        .map(|(entry, record)| {
+            Database::format_record_field_at_in(&table, record, "ACCT.NOTES", explode.position_at(3, entry.position))
+        })
+        .collect();
+    assert_eq!(notes, vec!["", "one", "solo", "three", "two"]);
+}
+
+#[test]
+fn test_and_condition_with_nothing_to_add_keeps_the_node() {
+    let node = QueryNode::Condition(QueryCondition {
+        field_name: "NAME".to_string(),
+        op: "=".to_string(),
+        value: "Web".to_string(),
+    });
+
+    // A clause folds every `BY.EXP` spec's criterion in, and most specs carry
+    // none. Dropping the node for those would throw away the `WITH` clause of
+    // the specs that do - silently, and only when there is more than one.
+    let kept = Database::and_condition(Some(node.clone()), None).unwrap();
+    assert!(matches!(kept, QueryNode::Condition(cond) if cond.value == "Web"));
+    assert!(Database::and_condition(None, None).is_none());
+
+    let joined = Database::and_condition(
+        Some(node),
+        Some(QueryCondition {
+            field_name: "ACCOUNTS".to_string(),
+            op: "=".to_string(),
+            value: "TEST".to_string(),
+        }),
+    );
+    assert!(matches!(joined, Some(QueryNode::Logical { op: LogicalOp::And, .. })));
+}
+
+/// The compact `BY.EXP <field> <op> <value>` and the explicit
+/// `BY.EXP <field> WITH <field> <op> <value>` are meant to be the same
+/// question, and a group is where that is easiest to get wrong: the clause
+/// folds one criterion in beside two members that carry none.
+#[test]
+fn test_a_group_clause_keeps_the_criterion_it_absorbed() {
+    let (_dir, db) = assoc_db("assoc_clause");
+    let handle = db.get_table_read_only_for_account("ACC", "CLIENTS").unwrap();
+    let table = handle.read();
+
+    let (_, _, specs) = Database::parse_clause_specs(&["BY.EXP", "ACCT.CODES", "=", "P-7"]);
+    let mut query = None;
+    for spec in &specs {
+        query = Database::and_condition(query, spec.condition.clone());
+    }
+    let explode = Database::resolve_explode_in(&table, &specs).unwrap();
+
+    let rows = Database::query_exploded_in(&table, false, query.as_ref(), explode.as_ref(), None);
+    assert_eq!(
+        positions_of(&rows),
+        vec![
+            ("W".to_string(), Some(ValuePosition::sub_value(1, 0))),
+            ("W".to_string(), Some(ValuePosition::sub_value(1, 1))),
+        ]
+    );
 }

@@ -1,6 +1,6 @@
 use crate::db::engine::Database;
 use crate::db::models::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Debug)]
 pub struct FieldQueryInfo {
@@ -134,8 +134,17 @@ impl Database {
     /// `AND`s a condition absorbed from a `BY.EXP` clause onto whatever the
     /// `WITH` clause parsed, so the compact spelling filters exactly as the
     /// explicit one does.
+    ///
+    /// Nothing to add leaves the node as it was. That is worth saying, because
+    /// the obvious spelling, `let condition = QueryNode::Condition(condition?)`,
+    /// instead *discards* the node. It stays invisible until a caller folds in a
+    /// clause of several `BY.EXP` specs, whereupon the ones carrying no
+    /// criterion throw away the `WITH` clause of the ones that do.
     pub fn and_condition(node: Option<QueryNode>, condition: Option<QueryCondition>) -> Option<QueryNode> {
-        let condition = QueryNode::Condition(condition?);
+        let Some(condition) = condition else {
+            return node;
+        };
+        let condition = QueryNode::Condition(condition);
         Some(match node {
             Some(existing) => QueryNode::Logical {
                 op: LogicalOp::And,
@@ -289,29 +298,37 @@ impl Database {
 
     /// Builds the pre-calculated sort values of a single record, one per sort spec.
     fn sort_key_for(id: &str, record: &Record, resolved: &[(Option<usize>, bool)]) -> Vec<SortValue> {
-        Self::sort_key_at(id, record, resolved, None, None)
+        Self::sort_key_at(id, record, resolved, &[], None)
     }
 
-    /// Same, for one row of an exploded result. A spec naming the exploded
-    /// field (`explode_idx`) sorts on that row's own value rather than on the
-    /// whole joined field, so `BY.EXP ACCOUNTS BY ACCOUNTS` orders the rows the
-    /// way the reader expects.
+    /// Same, for one row of an exploded result. A spec naming a field that
+    /// exploded sorts on that row's own value rather than on the whole joined
+    /// field, so `BY.EXP ACCOUNTS BY ACCOUNTS` orders the rows the way the
+    /// reader expects - and, with an association, so does `BY` on any member of
+    /// the group.
+    ///
+    /// `narrowings` is index-aligned with `resolved` and says how much of the
+    /// row's position each spec reads; a spec past its end reads the whole
+    /// field, which is what an unexploded sort does.
     fn sort_key_at(
         id: &str,
         record: &Record,
         resolved: &[(Option<usize>, bool)],
-        explode_idx: Option<usize>,
+        narrowings: &[Narrowing],
         position: Option<ValuePosition>,
     ) -> Vec<SortValue> {
         resolved
             .iter()
-            .map(|(idx, _)| match idx {
+            .enumerate()
+            .map(|(spec, (idx, _))| match idx {
                 None => SortValue::new(id),
                 // An unknown field compares equal, so `sorted_order` skips it
                 // entirely; there is nothing to resolve.
                 Some(i) if *i == usize::MAX => SortValue::default(),
-                Some(i) if Some(*i) == explode_idx => SortValue::new(&record.get_value_display_string(*i, position)),
-                Some(i) => SortValue::new(&record.get_field_display_string(*i)),
+                Some(i) => match narrowings.get(spec).copied().unwrap_or(Narrowing::Whole) {
+                    Narrowing::Whole => SortValue::new(&record.get_field_display_string(*i)),
+                    narrowing => SortValue::new(&record.get_value_display_string(*i, narrowing.apply(position))),
+                },
             })
             .collect()
     }
@@ -323,18 +340,27 @@ impl Database {
         table: &Table,
         rows: &mut Vec<(SelectEntry, T)>,
         specs: &[SortSpec],
-        explode_idx: Option<usize>,
+        explode: Option<&ExplodeTarget>,
     ) {
         if specs.is_empty() {
             return;
         }
 
         let resolved = Self::resolve_sort_fields(table, specs);
+        // How much of a row's position each spec reads, resolved once per spec
+        // rather than once per row: it depends only on the dictionary.
+        let narrowings: Vec<Narrowing> = resolved
+            .iter()
+            .map(|(idx, _)| match (explode, idx) {
+                (Some(target), Some(i)) if *i != usize::MAX => target.narrowing_at(*i),
+                _ => Narrowing::Whole,
+            })
+            .collect();
 
         let sort_keys: Vec<Vec<SortValue>> = rows
             .iter()
             .map(|(entry, record)| {
-                Self::sort_key_at(&entry.key, record.borrow(), &resolved, explode_idx, entry.position)
+                Self::sort_key_at(&entry.key, record.borrow(), &resolved, &narrowings, entry.position)
             })
             .collect();
 
@@ -639,13 +665,58 @@ impl Database {
         }
     }
 
+    /// What a `BY.EXP` field name resolves to against a dictionary: the
+    /// association group it belongs to, or the field on its own.
+    pub fn explode_target_in(table: &Table, field_name: &str) -> Option<ExplodeTarget> {
+        if let Some(group) = table.association(field_name) {
+            return Some(ExplodeTarget::Group(group));
+        }
+        let index = table.field_index(field_name)?;
+        Some(ExplodeTarget::Field {
+            name: field_name.to_string(),
+            index,
+        })
+    }
+
+    /// The one target a whole `BY.EXP` clause names, however many fields it
+    /// spells out.
+    ///
+    /// More than one field used to be refused outright, and for a good reason:
+    /// two independent fields have no defined pairing, so three accounts and
+    /// three dates could mean three rows or nine and nothing said which. An
+    /// association says which - so several fields are accepted exactly when
+    /// they are members of one, and what they name is that one group.
+    ///
+    /// `Err` names the two fields that are not associated, which is the whole
+    /// of what is wrong. A field the dictionary does not know explodes nothing
+    /// and is passed over rather than made to disagree with one that does.
+    pub fn resolve_explode_in(table: &Table, specs: &[ExplodeSpec]) -> Result<Option<ExplodeTarget>, String> {
+        let mut resolved: Option<(&str, ExplodeTarget)> = None;
+        for spec in specs {
+            let Some(target) = Self::explode_target_in(table, &spec.field_name) else {
+                continue;
+            };
+            match &resolved {
+                None => resolved = Some((&spec.field_name, target)),
+                Some((_, existing)) if *existing == target => {}
+                Some((first, _)) => {
+                    return Err(format!(
+                        "BY.EXP fields must belong to one association: {} and {} are not associated",
+                        first, spec.field_name
+                    ));
+                }
+            }
+        }
+        Ok(resolved.map(|(_, target)| target))
+    }
+
     /// Runs `query` (if any) and expands each surviving record into one entry
     /// per exploded position.
     ///
     /// Record inclusion is decided exactly as it always was, by evaluating the
     /// whole node. The positions are collected separately, so a record kept by
-    /// an `AND` over two fields still explodes only on the field `BY.EXP` named.
-    /// With no explode spec this degenerates to [`query_in`](Self::query_in)
+    /// an `AND` over two fields still explodes only on what `BY.EXP` named.
+    /// With no explode target this degenerates to [`query_in`](Self::query_in)
     /// with a `None` position on every entry, which is what an ordinary
     /// selection has always produced.
     ///
@@ -655,7 +726,7 @@ impl Database {
         table: &'a Table,
         use_dict_section: bool,
         query: Option<&QueryNode>,
-        explode: Option<&ExplodeSpec>,
+        explode: Option<&ExplodeTarget>,
         keys_to_filter: Option<&[String]>,
     ) -> Vec<(SelectEntry, &'a Record)> {
         let matches: Vec<(String, &Record)> = match query {
@@ -663,33 +734,51 @@ impl Database {
             None => Self::all_in(table, use_dict_section, keys_to_filter),
         };
 
-        let resolved = explode.and_then(|spec| {
-            let (index, _) = table.field_index_and_conversion(&spec.field_name)?;
-            let mut conditions = Vec::new();
-            if let Some(q) = query {
-                Self::collect_conditions_for(q, &spec.field_name, &mut conditions);
-            }
-            Some((index, conditions))
-        });
-
-        let Some((index, conditions)) = resolved else {
+        let Some(target) = explode else {
             return matches
                 .into_iter()
                 .map(|(key, record)| (SelectEntry::new(key), record))
                 .collect();
         };
 
-        // Resolve the exploded field's conversion once, rather than per record.
+        // Resolve the exploding fields' conversions once, rather than per
+        // record: the criteria they are compared against do not change.
         let mut field_map = HashMap::new();
         if let Some(q) = query {
             Self::collect_field_indices(table, q, &mut field_map);
         }
+        let conditions_for = |name: &str| {
+            let mut conditions = Vec::new();
+            if let Some(q) = query {
+                Self::collect_conditions_for(q, name, &mut conditions);
+            }
+            conditions
+        };
+        // Every member of a group contributes, so its criteria are gathered
+        // once here rather than re-walked for each record.
+        let axes: Vec<(&AssociationMember, Vec<&QueryCondition>)> = match target {
+            ExplodeTarget::Field { .. } => Vec::new(),
+            ExplodeTarget::Group(group) => group
+                .members
+                .iter()
+                .map(|member| (member, conditions_for(&member.name)))
+                .collect(),
+        };
+        let lone = match target {
+            ExplodeTarget::Field { name, index } => Some((*index, conditions_for(name))),
+            ExplodeTarget::Group(_) => None,
+        };
 
         let mut results = Vec::new();
         let mut positions = Vec::new();
         for (key, record) in matches {
             positions.clear();
-            Self::collect_positions(record, index, &conditions, &field_map, &mut positions);
+            match &lone {
+                Some((index, conditions)) => {
+                    Self::collect_positions(record, *index, conditions, &field_map, &mut positions)
+                }
+                None => Self::collect_group_positions(record, &axes, &field_map, &mut positions),
+            }
             if positions.is_empty() {
                 // Either the field is absent, or the record was kept by a
                 // condition on some other field. Keep it as one unexploded row:
@@ -702,14 +791,6 @@ impl Database {
             }
         }
         results
-    }
-
-    /// The field index an exploded list's positions refer to, so a `BY` spec
-    /// naming that field can sort on the row's own value rather than on the
-    /// whole joined field.
-    pub fn explode_field_index(table: &Table, explode: Option<&ExplodeSpec>) -> Option<usize> {
-        let spec = explode?;
-        table.field_index(&spec.field_name)
     }
 
     /// Every key of the section, filtered to `keys_to_filter` when given, in the
@@ -773,14 +854,13 @@ impl Database {
         table: &Table,
         use_dict_section: bool,
         query: Option<&QueryNode>,
-        explode: Option<&ExplodeSpec>,
+        explode: Option<&ExplodeTarget>,
         keys_to_filter: Option<&[String]>,
         specs: &[SortSpec],
     ) -> Vec<SelectEntry> {
         if explode.is_some() {
             let mut rows = Self::query_exploded_in(table, use_dict_section, query, explode, keys_to_filter);
-            let explode_idx = Self::explode_field_index(table, explode);
-            Self::sort_entries_in(table, &mut rows, specs, explode_idx);
+            Self::sort_entries_in(table, &mut rows, specs, explode);
             return rows.into_iter().map(|(entry, _)| entry).collect();
         }
 
@@ -841,15 +921,7 @@ impl Database {
         }
 
         // Input conversion of each search value is resolved once for the field.
-        let search_vals: Vec<String> = conditions
-            .iter()
-            .map(
-                |cond| match field_map.get(&cond.field_name).and_then(|i| i.conversion.as_ref()) {
-                    Some(code) => Self::apply_iconv(&cond.value, code),
-                    None => cond.value.clone(),
-                },
-            )
-            .collect();
+        let search_vals = Self::search_values(conditions, field_map);
 
         for (v_idx, value) in field.values.iter().enumerate() {
             // A value with one sub-value is an ordinary value, not a sub-valued
@@ -867,6 +939,121 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// The positions an association group explodes a record into.
+    ///
+    /// Two questions, in order. **Which values**: the members a criterion names
+    /// select them, and when no criterion names any member every member does,
+    /// which is what makes a bare explode of a ragged group safe - three
+    /// accounts beside two dates give three rows, the third showing an empty
+    /// date, rather than losing an account because a sibling ran out of values.
+    /// Criteria on two members union their selections, the rule a single field
+    /// already follows for two criteria on it; a member no criterion names adds
+    /// nothing, or a criterion on one member would be drowned out by the
+    /// siblings it was meant to narrow.
+    ///
+    /// **How deep**: a selected value becomes one row per sub-value wherever
+    /// the group has a second tier, and the value-tier members repeat down
+    /// them. A criterion on a second-tier member says which of its sub-values;
+    /// otherwise the tier is structural, filling in the depth of a value some
+    /// other member selected. A value with nothing below it stays one row, so a
+    /// group whose second tier is empty for one value still shows it.
+    ///
+    /// Rows come out in value order and, within a value, in sub-value order -
+    /// the same order a single exploded field produces.
+    fn collect_group_positions(
+        record: &Record,
+        members: &[(&AssociationMember, Vec<&QueryCondition>)],
+        field_map: &HashMap<String, FieldQueryInfo>,
+        out: &mut Vec<ValuePosition>,
+    ) {
+        let selective = members.iter().any(|(_, conditions)| !conditions.is_empty());
+
+        let mut values: BTreeSet<usize> = BTreeSet::new();
+        let mut narrowed: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        // Second-tier members that no criterion names: they do not select rows,
+        // they say how deep the selected ones go.
+        let mut structural: Vec<usize> = Vec::new();
+
+        for (member, conditions) in members {
+            if selective && conditions.is_empty() {
+                if member.depth == AssociationDepth::SubValue {
+                    structural.push(member.index);
+                }
+                continue;
+            }
+            let Some(field) = record.fields.get(member.index) else {
+                continue;
+            };
+            let search_vals = Self::search_values(conditions, field_map);
+            for (v_idx, value) in field.values.iter().enumerate() {
+                match member.depth {
+                    // The value tier does not care which sub-value satisfied a
+                    // criterion, only that the value did.
+                    AssociationDepth::Value => {
+                        if conditions.is_empty() || Self::value_matches(value, conditions, &search_vals) {
+                            values.insert(v_idx);
+                        }
+                    }
+                    AssociationDepth::SubValue => {
+                        for (s_idx, sub) in value.sub_values.iter().enumerate() {
+                            let text = crate::db::models::text_of(sub);
+                            if conditions.is_empty() || Self::any_condition_matches(&text, conditions, &search_vals) {
+                                values.insert(v_idx);
+                                narrowed.entry(v_idx).or_default().insert(s_idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for v_idx in values {
+            if let Some(subs) = narrowed.get(&v_idx) {
+                out.extend(subs.iter().map(|s_idx| ValuePosition::sub_value(v_idx, *s_idx)));
+                continue;
+            }
+            let mut subs: BTreeSet<usize> = BTreeSet::new();
+            for index in &structural {
+                if let Some(value) = record.fields.get(*index).and_then(|field| field.values.get(v_idx)) {
+                    subs.extend(0..value.sub_values.len());
+                }
+            }
+            if subs.is_empty() {
+                out.push(ValuePosition::value(v_idx));
+            } else {
+                out.extend(subs.into_iter().map(|s_idx| ValuePosition::sub_value(v_idx, s_idx)));
+            }
+        }
+    }
+
+    /// Each condition's search value, with the field's input conversion
+    /// applied, resolved once for the field rather than per value.
+    fn search_values(conditions: &[&QueryCondition], field_map: &HashMap<String, FieldQueryInfo>) -> Vec<String> {
+        conditions
+            .iter()
+            .map(
+                |cond| match field_map.get(&cond.field_name).and_then(|i| i.conversion.as_ref()) {
+                    Some(code) => Self::apply_iconv(&cond.value, code),
+                    None => cond.value.clone(),
+                },
+            )
+            .collect()
+    }
+
+    /// Whether a whole value satisfies any of `conditions`: as itself, or - when
+    /// it has sub-values - through any one of them, which is how a selection
+    /// has always matched a sub-valued field.
+    fn value_matches(value: &Value, conditions: &[&QueryCondition], search_vals: &[String]) -> bool {
+        if value.sub_values.len() <= 1 {
+            let text = crate::db::models::text_of(value.first_bytes());
+            return Self::any_condition_matches(&text, conditions, search_vals);
+        }
+        value
+            .sub_values
+            .iter()
+            .any(|sub| Self::any_condition_matches(&crate::db::models::text_of(sub), conditions, search_vals))
     }
 
     fn any_condition_matches(text: &str, conditions: &[&QueryCondition], search_vals: &[String]) -> bool {
