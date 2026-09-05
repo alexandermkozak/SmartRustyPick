@@ -40,7 +40,7 @@ matched case-insensitively.
 | Field             | Type             | Used by                                                                                                            | Notes                                                                                                                                                                                                                                                                                     |
 |-------------------|------------------|--------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `command`         | string           | all                                                                                                                | Required. See [Commands](#commands).                                                                                                                                                                                                                                                      |
-| `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `GET.NEXT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `LIST.INDEXES`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`, `ENQUEUE`, `DEQUEUE`, `ACK`, `NACK`, `PEEK` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
+| `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `LIST.INDEXES`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`, `ENQUEUE`, `DEQUEUE`, `ACK`, `NACK`, `PEEK` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. `GET.NEXT` is the exception: it takes the account from the select list, and checks this against it rather than using it. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
 | `target_account`  | string           | `CREATE.ACCOUNT`, `CREATE.TEST.ACCOUNT`, `DELETE.ACCOUNT`                                                          | Name of the account to create or drop. (Distinct from `account`, which selects an existing context.)                                                                                                                                                                                      |
 | `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`, `ENQUEUE`, `DEQUEUE`, `ACK`, `NACK`, `PEEK` | Table (file) name. Optional on `LIST.INDEXES`, which lists the whole account without it. |                                                                                                                                                                                                                                                                        |
 | `key`             | string           | `READ`, `WRITE`, `DELETE`, `SET.DICT`, `ACK`, `NACK`, `PEEK`                                                                              | Record key; for `SET.DICT`, the name of the dictionary entry; for `ACK` and `NACK`, the claimed record. Optional on `PEEK`, which reads the head of the queue without it. Never sent on `ENQUEUE`, whose key the engine mints.                                                                                                                                                                                                                                                                               |
@@ -253,7 +253,7 @@ three are not repeated in the per-command lists below.
 | `DELETE`                |       |   yes   | `file`, `key`                                        | `status: "OK"`                          |
 | `QUERY`                 |       |   yes   | `file`                                               | `results`                               |
 | `SELECT`                |       |   yes   | `file`                                               | `count`                                 |
-| `GET.NEXT`              |       |   yes   | `list_name` (defaults to `"DEFAULT"`)¹               | `results` + `count`, or `status: "EOF"` |
+| `GET.NEXT`              |       |  yes¹   | `list_name` (defaults to `"DEFAULT"`)                | `results` + `count`, or `status: "EOF"` |
 | `ENQUEUE`               |       |   yes   | `file`, and one of `data` / `structured_data`        | `claim`                                 |
 | `DEQUEUE`               |       |   yes   | `file`                                               | `record` + `claim`, or `status: "EMPTY"` |
 | `ACK`                   |       |   yes   | `file`, `key`                                        | `status: "OK"`                          |
@@ -284,9 +284,9 @@ three are not repeated in the per-command lists below.
 | `SET.INDEX.EXCLUDE`     |  yes  |   yes   | `account`, `file`, `field`, `values`                 | `record`                                |
 | `SERVER.STATS`          |  yes  |    —    | —                                                    | `record`                                |
 
-¹ A select list names the *file* it selected from, so `GET.NEXT` does not need `file` — but it
-does resolve an account, exactly as the commands above it do, and so it takes `account` on the
-same terms. See [GET.NEXT](#getnext).
+¹ A select list records the account and the file its `SELECT` ran against, so `GET.NEXT` needs
+neither on the request. The account is still checked against the client's own. See
+[GET.NEXT](#getnext).
 
 ### READ
 
@@ -374,6 +374,8 @@ list for paged retrieval with `GET.NEXT`. Only the count is returned.
 - Required: `file`. Optional: `account`, `is_dict`, `query_string`, `query_node`,
   `sort_specs`, `explode`, `list_name` (default `"DEFAULT"`).
 - Re-using a `list_name` replaces the previous list and resets its cursor.
+- The list records the account and the file it selected from, so [`GET.NEXT`](#getnext) pages
+  it without being told either again.
 - With `explode`, `count` is the number of exploded rows, not of distinct records, and the
   positions are remembered for `GET.NEXT`.
 - Errors: `MISSING_FIELD` (no `file`), `INVALID_QUERY`, `ACCOUNT_NOT_SPECIFIED`,
@@ -392,22 +394,25 @@ list for paged retrieval with `GET.NEXT`. Only the count is returned.
 
 Fetch the next batch of records from a select list. Advances the list's cursor.
 
-- Required: `list_name` (default `"DEFAULT"`). Optional: `account`, `batch_size` (default `1`).
-- A select list remembers the *file* it selected from, not the account. `GET.NEXT` resolves
-  the account the way every other command in an account does — from `account`, or from the
-  client's single allowed account when it has exactly one. **Send the same `account` the
-  `SELECT` carried.** A client with more than one allowed account, or an admin, has no single
-  one to fall back to and is answered `ACCOUNT_NOT_FOUND` for the empty name; and naming a
-  *different* account looks up keys selected from one file in the same-named file of another,
-  which quietly returns the wrong records rather than refusing.
+- Required: `list_name` (default `"DEFAULT"`). Optional: `batch_size` (default `1`), `account`.
+- **The list carries its own account and file**, both recorded by the `SELECT` that built it,
+  so the request needs neither. A list's keys were chosen from one file in one account and mean
+  nothing anywhere else, which is why they are not re-resolved from whatever the paging request
+  happens to say.
+- The client must still be allowed that account, and is answered `ACCESS_DENIED` if not — the
+  lists are held by name across every connection, so this is what keeps one client from paging
+  a list another selected somewhere it may not reach.
+- Sending `account` is allowed and is checked rather than used: matching the list's is accepted,
+  and naming a different one is refused with `INVALID_REQUEST` rather than answered from a file
+  the caller did not ask about.
 - Response: `results` (`[key, record]` pairs) and `count` (batch size), plus `positions`
   when the list was exploded. When the cursor is already at the end, `status: "EOF"` with
   no other fields.
-- Errors: `SELECT_LIST_NOT_FOUND`, `ACCOUNT_NOT_SPECIFIED`, `ACCOUNT_NOT_FOUND`,
-  `ACCESS_DENIED`, `FILE_NOT_FOUND`.
+- Errors: `SELECT_LIST_NOT_FOUND`, `ACCESS_DENIED`, `INVALID_REQUEST` (an `account` that is not
+  the list's), `FILE_NOT_FOUND`.
 
 ```json
-{"command": "GET.NEXT", "account": "SALES", "list_name": "MYLIST", "batch_size": 50}
+{"command": "GET.NEXT", "list_name": "MYLIST", "batch_size": 50}
 ```
 
 ```json

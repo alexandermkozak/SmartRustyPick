@@ -917,6 +917,39 @@ pub struct SelectList {
     pub entries: Vec<SelectEntry>,
 }
 
+/// A select list held for the remote protocol, and how far a client has read it.
+///
+/// The account is here rather than on [`SelectList`] because it is the remote
+/// protocol that has to answer the question. A CLI list belongs to whatever
+/// account the session is already in; these are held by the server, keyed by
+/// name across every connection, and `GET.NEXT` has to page one against the
+/// account its `SELECT` ran in rather than whichever account the paging request
+/// happens to mention. Reading a list's keys against a different account finds
+/// the same-named file over there and answers from whatever matches - a wrong
+/// answer rather than a refusal, which is the worst shape a bug can take.
+///
+/// The cursor sits beside the list for the same kind of reason: as a parallel
+/// map it was a second lookup that had to exist for every list and be removed
+/// with it, and the code read it with an `unwrap`.
+#[derive(Clone, Debug)]
+pub struct RemoteSelectList {
+    /// The account the `SELECT` ran in.
+    pub account: String,
+    pub list: SelectList,
+    /// How far `GET.NEXT` has read. `SELECT` resets it by replacing the entry.
+    pub cursor: usize,
+}
+
+impl RemoteSelectList {
+    pub fn new(account: String, list: SelectList) -> Self {
+        RemoteSelectList {
+            account,
+            list,
+            cursor: 0,
+        }
+    }
+}
+
 impl SelectList {
     /// Builds an unexploded list, which is what every caller that has only keys
     /// wants.

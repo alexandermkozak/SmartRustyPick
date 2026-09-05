@@ -874,6 +874,8 @@ fn resolve_clause(db: &Database, table_name: &str, req: &Request) -> Result<Clau
 /// only read still go through here whenever the shared path could not serve
 /// them, for instance because the table had to be loaded first.
 pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crate::db::ClientInfo) -> Response {
+    let command = req.command.to_uppercase();
+
     let target_account = if let Some(acc) = req.account.clone() {
         // Client specified an account
         if !client_info.is_admin && !client_info.allowed_accounts.contains(&acc) {
@@ -890,6 +892,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         } else if client_info.is_admin {
             // Admin can access SYSTEM or other accounts, but must specify one if multiple are possible.
             None
+        } else if command == "GET.NEXT" {
+            // GET.NEXT takes its account from the select list, so there is
+            // nothing to resolve from the request and nothing to refuse. Any
+            // client with more than one allowed account would otherwise be
+            // turned away here for not naming what it does not need to name.
+            None
         } else {
             return error(ErrorCode::AccountNotSpecified, "Account not specified");
         }
@@ -900,7 +908,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         None => "", // Some commands might not need an account, or will fail later
     };
 
-    match req.command.to_uppercase().as_str() {
+    match command.as_str() {
         // The record commands carry their own file lock, so they run
         // identically here and on the shared path in [`handle_request`]. These
         // arms are for the callers that hold the database exclusively already:
@@ -991,8 +999,11 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 entries,
             };
             let count = list.len();
-            db.remote_select_lists.insert(list_name.clone(), list);
-            db.remote_select_cursors.insert(list_name, 0);
+            // The account is stored with the list, because it is what the list's
+            // keys mean: they were chosen from this file in this account, and
+            // reading them against another one answers a question nobody asked.
+            db.remote_select_lists
+                .insert(list_name, crate::db::RemoteSelectList::new(acc.to_string(), list));
 
             Response {
                 status: "OK".to_string(),
@@ -1004,32 +1015,63 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             let list_name = req.list_name.unwrap_or_else(|| "DEFAULT".to_string());
             let batch_size = req.batch_size.unwrap_or(1);
 
+            // The account comes from the list rather than from this request: the
+            // list's keys were chosen from one file in one account, and that is
+            // the only account they mean anything in.
+            let list_account = match db.remote_select_lists.get(&list_name) {
+                Some(l) => l.account.clone(),
+                None => {
+                    return error(ErrorCode::SelectListNotFound, "Select list not found");
+                }
+            };
+
+            // Which is why it is checked here rather than trusted. The lists are
+            // held by name across every connection, so without this a client
+            // could page one somebody else selected in an account it may not
+            // reach - the account check at the top of this function never saw it,
+            // because the request never named the account.
+            if !client_info.is_admin && !client_info.allowed_accounts.contains(&list_account) {
+                let msg = format!("Access denied for account {}: Not in allowed list", list_account);
+                let _ = db.log_error("REMOTE", &msg);
+                return error(ErrorCode::AccessDenied, msg);
+            }
+
+            // A request naming some other account is not describing this list.
+            // Paging it anyway would answer from a file the caller did not ask
+            // about, and silently, so it is refused instead.
+            if let Some(named) = req.account.as_deref()
+                && named != list_account
+            {
+                return error(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "Select list '{}' was selected in account '{}', not '{}'",
+                        list_name, list_account, named
+                    ),
+                );
+            }
+
             let (entries_batch, table_name, is_dict) = {
-                let list = match db.remote_select_lists.get(&list_name) {
-                    Some(l) => l,
-                    None => {
-                        return error(ErrorCode::SelectListNotFound, "Select list not found");
-                    }
-                };
+                let held = db.remote_select_lists.get_mut(&list_name).expect("checked above");
 
-                let list_len = list.len();
-                let table_name = list.table_name.clone();
-                let is_dict = list.is_dict;
+                let list_len = held.list.len();
+                let table_name = held.list.table_name.clone();
+                let is_dict = held.list.is_dict;
 
-                let cursor = *db.remote_select_cursors.get(&list_name).unwrap();
-                if cursor >= list_len {
+                if held.cursor >= list_len {
                     return Response {
                         status: "EOF".to_string(),
                         ..Default::default()
                     };
                 }
 
-                let end = std::cmp::min(cursor + batch_size, list_len);
-                let entries = list.entries[cursor..end].to_vec();
-                db.remote_select_cursors.insert(list_name, end);
+                let end = std::cmp::min(held.cursor + batch_size, list_len);
+                let entries = held.list.entries[held.cursor..end].to_vec();
+                held.cursor = end;
                 (entries, table_name, is_dict)
             };
 
+            let acc = list_account.as_str();
             if let Err(e) = db.get_table_mut_for_account(acc, &table_name) {
                 return db_error(e);
             }

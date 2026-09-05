@@ -256,8 +256,10 @@ pub struct Database {
     lru_order: Mutex<VecDeque<TableKey>>,
     pub max_loaded: usize,
     pub active_select_list: Option<SelectList>,
-    pub remote_select_lists: HashMap<String, SelectList>,
-    pub remote_select_cursors: HashMap<String, usize>,
+    /// Select lists built by the remote protocol's `SELECT`, by list name. Each
+    /// carries the account it was selected in and its own cursor - see
+    /// [`RemoteSelectList`].
+    pub remote_select_lists: HashMap<String, RemoteSelectList>,
     clients: RwLock<ClientRegistry>,
     registry_stamp: Mutex<Option<(Option<SystemTime>, u64)>>,
     pub log_detail: String,
@@ -467,7 +469,6 @@ impl Database {
                 .unwrap_or(crate::config::DEFAULT_MAX_LOADED_TABLES),
             active_select_list: None,
             remote_select_lists: HashMap::new(),
-            remote_select_cursors: HashMap::new(),
             clients: RwLock::new(ClientRegistry::default()),
             registry_stamp: Mutex::new(None),
             log_detail: config.log_detail.unwrap_or_else(|| "normal".to_string()),
