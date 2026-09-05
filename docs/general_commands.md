@@ -313,8 +313,10 @@ stands, so returning a record for the last time it is allowed dead-letters it.
 
 #### PEEK
 
-Read a record without claiming it: the head of the queue, or the one under a named key. Peeking counts no delivery,
-and shows who is holding a record when somebody is - which is how a stuck consumer is found.
+Read a record without claiming it: the head of the queue, or the one under a named key. Peeking counts no delivery and
+does not hold up the consumers draining the queue, and it shows who is holding a record when somebody is - which is how
+a stuck consumer is found. The head of the queue is the oldest record *available* to be claimed, so a queue whose
+records are all in flight peeks as empty; name the key to look at one that is held.
 
 - **Usage**: `PEEK <queue> [<key>]`
 - **Example**: `PEEK JOBS`

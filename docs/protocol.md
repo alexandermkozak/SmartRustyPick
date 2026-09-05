@@ -559,7 +559,13 @@ Read a record without claiming it.
 - Required: `file`. Optional: `key` — without it, the head of the queue.
 - Response: `record` and `claim`. The `claim` names an `owner` when somebody is holding the
   record, which is how a stuck consumer is found.
-- Peeking claims nothing and counts no delivery, so it is safe to poll.
+- Peeking claims nothing and counts no delivery, so it is safe to poll — and it takes a
+  *shared* lock on the file unless a claim has actually lapsed, so polling a queue does not
+  hold up the consumers draining it. A peek that finds a lapsed claim puts it back before
+  answering, which is a write and takes the file exclusively for as long as that takes.
+- Without a `key` this reads the head of the queue, which is the oldest record *available* to
+  be claimed. A record somebody is holding is not at the head, so a peek at a queue whose
+  records are all claimed answers `"EMPTY"`; name the `key` to look at one that is held.
 - Errors: `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`, `MISSING_FIELD` (no `file`),
   `RECORD_NOT_FOUND` (a named `key` that is not there), `FILE_NOT_FOUND`, `INVALID_REQUEST`
   (the file is not a queue). An empty queue with no `key` named answers `status: "EMPTY"`.

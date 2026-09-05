@@ -494,3 +494,65 @@ fn a_file_that_stops_being_a_queue_loses_its_bookkeeping_too() {
     let next = enqueue(&db, "QF", "OUTBOX", "another");
     assert!(next > key, "and the sequence still rises past what is there");
 }
+
+#[test]
+fn peeking_does_not_exclude_another_reader_of_the_same_queue() {
+    let guard = TempDir::new("queue_peek_shared");
+    let base = guard.path();
+    let db = open_account(base, "QG");
+    queue_file(&db, "QG", "JOBS", 3_600, 5);
+    let key = enqueue(&db, "QG", "JOBS", "waiting");
+    // Peeked once first, so the order is attached and reconciled: those are
+    // the two things that would take the file exclusively for reasons of their
+    // own and confuse what this is measuring.
+    assert_eq!(db.peek("QG", "JOBS", None).unwrap().unwrap().key, key);
+
+    let handle = db.get_table_mut_for_account("QG", "JOBS").unwrap();
+    // Somebody else is reading the file - a QUERY, a LIST, another PEEK.
+    let mut reading = Some(handle.read());
+
+    let (sender, answers) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _ = sender.send(db.peek("QG", "JOBS", None).map(|found| found.map(|d| d.key)));
+        });
+        let answered = answers.recv_timeout(Duration::from_secs(10));
+        // Released before the scope joins the thread, and before anything is
+        // asserted. A peek that took the file exclusively would be waiting on
+        // this guard, and the join at the end of the scope would then wait on
+        // that peek - so holding it any longer would turn a regression into a
+        // hang, which is the one failure that arrives with nothing to read.
+        drop(reading.take());
+        let answered = answered.expect("PEEK must not wait for a reader of the same queue");
+        assert_eq!(answered.unwrap(), Some(key));
+    });
+}
+
+#[test]
+fn peeking_still_puts_back_a_claim_that_has_lapsed() {
+    let guard = TempDir::new("queue_peek_sweeps");
+    let base = guard.path();
+    let db = open_account(base, "QH");
+    queue_file(&db, "QH", "JOBS", 1, 5);
+    let key = enqueue(&db, "QH", "JOBS", "slow");
+
+    let claimed = db.dequeue("QH", "JOBS", "alice", None).unwrap().unwrap();
+    assert_eq!(claimed.key, key);
+    // Named, because a claimed record is not at the head of the queue - it is
+    // not in the queue at all until its claim ends, which is what a peek with
+    // no key says by finding nothing.
+    let held = db.peek("QH", "JOBS", Some(&key)).unwrap().unwrap();
+    assert_eq!(held.owner.as_deref(), Some("alice"), "peeked while it is held");
+    assert!(db.peek("QH", "JOBS", None).unwrap().is_none(), "nothing to hand out");
+
+    std::thread::sleep(Duration::from_millis(1_100));
+
+    // Now the shared path is not enough: the peek has to take the lapsed claim
+    // back before it can say what the head of the queue is.
+    let swept = db.peek("QH", "JOBS", None).unwrap().unwrap();
+    assert_eq!(swept.key, key);
+    assert!(swept.owner.is_none(), "the lapsed claim was put back on the way past");
+    assert_eq!(db.file_statistics("QH", "JOBS").unwrap().queue.unwrap().in_flight, 0);
+    // And the record really is available again, not merely reported as such.
+    assert_eq!(db.dequeue("QH", "JOBS", "bob", None).unwrap().unwrap().key, key);
+}

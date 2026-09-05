@@ -553,6 +553,11 @@ into the order, the oldest available key is taken out of it, and the claim is re
 released in between. A second consumer arriving at any point either has not got the lock yet or is looking at a queue
 the record has already left. Two consumers therefore cannot come away with the same key.
 
+`PEEK` is the exception, and deliberately so: it claims nothing and counts no delivery, so it takes a *shared* lock
+unless a claim has actually lapsed - which is a cheap question, asked over the in-flight set rather than the backlog.
+Polling a queue to see what is on it therefore does not hold up the consumers draining it. A peek that does find a
+lapsed claim puts it back before answering, and that part takes the file exclusively.
+
 That lock is the *file's*, not the database's, so consumers of one queue contend only with each other. The queue
 commands take the same shared path as `READ` and `WRITE` for exactly this reason: a queue is the most contended file in
 any system that has one, and taking the database exclusively to claim from it would serialise every consumer against

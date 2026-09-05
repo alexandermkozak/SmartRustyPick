@@ -185,6 +185,18 @@ pub struct Claim {
     pub expires_millis: u64,
 }
 
+impl Claim {
+    /// Whether this claim has lapsed and its record is due back.
+    ///
+    /// One definition, because two callers ask: the sweep that returns the
+    /// record, and the cheap check that decides whether a sweep is needed at
+    /// all. Two spellings of "expired" that drifted apart would mean a command
+    /// deciding it had nothing to do and then finding something.
+    pub fn has_lapsed(&self, now_millis: u64) -> bool {
+        self.expires_millis <= now_millis
+    }
+}
+
 /// What a sweep of the expired claims decided.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Expired {
@@ -319,7 +331,7 @@ impl QueueState {
         let lapsed: Vec<String> = self
             .claims
             .iter()
-            .filter(|(_, claim)| claim.expires_millis <= now_millis)
+            .filter(|(_, claim)| claim.has_lapsed(now_millis))
             .map(|(key, _)| key.clone())
             .collect();
         let mut outcome = Expired::default();
@@ -360,6 +372,16 @@ impl QueueState {
         );
         self.dirty = true;
         Some((key, deliveries))
+    }
+
+    /// Whether any claim has lapsed and is waiting to be swept.
+    ///
+    /// Cheap - it is over the in-flight set, which is the number of consumers
+    /// rather than the depth - and that is the point of it: it lets a command
+    /// that only reads take a shared lock in the ordinary case, and an
+    /// exclusive one only when there is actually something to put back.
+    pub fn has_lapsed_claim(&self, now_millis: u64) -> bool {
+        self.claims.values().any(|claim| claim.has_lapsed(now_millis))
     }
 
     /// The oldest available key, without claiming it.

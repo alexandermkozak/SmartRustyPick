@@ -306,31 +306,57 @@ impl Database {
         let (handle, policy) = self.queue_file(account, name)?;
         let policy = Self::effective_policy(name, policy);
         let now = queue::now_millis();
+
+        // The ordinary case, under a shared lock. `PEEK` claims nothing and
+        // counts no delivery, so it is the one queue command with any business
+        // not excluding the others - and polling a queue to see what is on it
+        // should not take the lock the consumers draining it are waiting for.
+        // The sweep is the only part that writes, and only when a claim has
+        // actually lapsed, which is a cheap question to ask first.
+        {
+            let table = handle.read();
+            let state = table.queue.as_ref().expect("queue_file attaches the queue state");
+            if !state.has_lapsed_claim(now) {
+                return Ok(Self::delivery_in(&table, key));
+            }
+        }
+
+        // Something has lapsed, so this peek has to put it back before it can
+        // answer. Another peek may have swept it between the two locks, which
+        // costs this one an exclusive lock it turned out not to need - the
+        // alternative is holding a lock across the check, which is the thing
+        // being avoided.
         let (delivery, dead) = {
             let mut table = handle.write();
             let dead = Self::take_expired(&mut table, now, policy);
-            let table = &mut *table;
-            let state = table.queue.as_ref().expect("queue_file attaches the queue state");
-            let wanted = match key {
-                Some(key) => Some(key.to_string()),
-                None => state.head().cloned(),
-            };
-            let delivery = wanted.and_then(|key| {
-                let record = table.records.get(&key)?.clone();
-                let claim = state.claim_on(&key);
-                Some(QueueDelivery {
-                    deliveries: state.deliveries(&key),
-                    enqueued_millis: queue::key_enqueued_millis(&key),
-                    expires_millis: claim.map(|claim| claim.expires_millis),
-                    owner: claim.map(|claim| claim.owner.clone()),
-                    record,
-                    key,
-                })
-            });
-            (delivery, dead)
+            (Self::delivery_in(&table, key), dead)
         };
         self.bury(account, name, dead)?;
         Ok(delivery)
+    }
+
+    /// Reads one delivery out of a table whose queue state is attached: the
+    /// record under `key`, or the head of the queue when it names none.
+    ///
+    /// Takes the table by shared reference so both of [`peek`](Self::peek)'s
+    /// paths can use it, which is what keeps the answer the same whichever lock
+    /// was taken to reach it.
+    fn delivery_in(table: &Table, key: Option<&str>) -> Option<QueueDelivery> {
+        let state = table.queue.as_ref().expect("queue_file attaches the queue state");
+        let wanted = match key {
+            Some(key) => key.to_string(),
+            None => state.head().cloned()?,
+        };
+        let record = table.records.get(&wanted)?.clone();
+        let claim = state.claim_on(&wanted);
+        Some(QueueDelivery {
+            deliveries: state.deliveries(&wanted),
+            enqueued_millis: queue::key_enqueued_millis(&wanted),
+            expires_millis: claim.map(|claim| claim.expires_millis),
+            owner: claim.map(|claim| claim.owner.clone()),
+            record,
+            key: wanted,
+        })
     }
 
     /// What a queue is doing, for `FILE.STATS` and the dashboard.
