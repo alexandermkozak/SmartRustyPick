@@ -996,9 +996,16 @@ flight and an oldest entry an hour old means nobody is draining it.
 dead-lettered one. `dead_letter` is true when *this* file is another queue's dead-letter
 file, which is also why it reports no dead letters of its own.
 
-None of it costs a scan: the numbers come from the queue's in-memory order, and reading them
-sweeps the claims that have lapsed first, so an `in_flight` count never includes a claim that
-expired ten minutes ago.
+None of it costs a scan of the backlog. The numbers come from the queue's in-memory order —
+the depth and in-flight count are counters, and the oldest age is read from the front of an
+order that is already sorted — so asking for them costs the same on a queue of ten records
+and a queue of a hundred thousand. Reading them sweeps the claims that have lapsed first, so
+an `in_flight` count never includes a claim that expired ten minutes ago; that sweep is over
+the in-flight set, which is the number of consumers rather than the depth.
+
+This matters more than it looks: the sweep runs under the queue's own lock, the one every
+consumer of it is waiting on, so a cost that grew with the backlog would mean a dashboard
+polling a deep queue slowed down the workers draining it.
 
 **Bytes.** `disk_bytes` is the whole file directory. `group_bytes` is the record groups alone
 and `index_bytes` the index sections, so the remainder is the dictionary and the small

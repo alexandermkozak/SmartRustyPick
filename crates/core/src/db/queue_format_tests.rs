@@ -271,6 +271,52 @@ fn attaching_reconciles_the_remembered_state_with_the_records_that_are_there() {
 }
 
 #[test]
+fn the_oldest_record_is_found_from_the_front_rather_than_by_scanning() {
+    // The available keys are sorted, so the oldest is at the front - but only
+    // among the keys that are sequence keys. A record written by hand may sort
+    // either side of them, and must be stepped over rather than answered with
+    // or allowed to end the search. Taking a `min` over every parsed key gave
+    // the right answer too; it just walked the whole backlog to do it, inside
+    // the lock every consumer of the queue is waiting on.
+    let mut state = QueueState::attach(
+        &records(&[
+            "!written-by-hand",     // sorts ahead of every digit
+            "0000000000000000000x", // the right width, not a number
+            "00000000000005000000", // sequence 5_000_000, so 5ms
+            "00000000000009000000", // 9ms
+            "ZZZ",                  // sorts after every digit
+        ]),
+        PersistedQueue::default(),
+    );
+    assert_eq!(state.depth(), 5);
+    assert_eq!(
+        state.oldest_unacknowledged_seconds(10_000),
+        Some(9),
+        "10s minus the 5ms the oldest sequence key carries"
+    );
+
+    // A claim is part of the queue's age too: the in-flight set is separate
+    // from the available one, so an answer taken only from the front of the
+    // order would forget the record a consumer is holding.
+    let claimed = state.claim("worker", 10_000, QueuePolicy::default()).unwrap();
+    assert_eq!(claimed.0, "!written-by-hand", "the front of the order, whatever it is");
+    let (key, _) = state.claim("worker", 10_000, QueuePolicy::default()).unwrap();
+    assert_eq!(key, "0000000000000000000x");
+    let (key, _) = state.claim("worker", 10_000, QueuePolicy::default()).unwrap();
+    assert_eq!(key, "00000000000005000000", "the oldest minted record");
+    assert_eq!(
+        state.oldest_unacknowledged_seconds(10_000),
+        Some(9),
+        "still the oldest, now that it is claimed rather than waiting"
+    );
+
+    // Nothing minted left anywhere: no arrival time to report, rather than a
+    // guess.
+    let none = QueueState::attach(&records(&["ZZZ"]), PersistedQueue::default());
+    assert_eq!(none.oldest_unacknowledged_seconds(10_000), None);
+}
+
+#[test]
 fn a_dead_letter_file_is_named_from_its_queue_and_recognises_itself() {
     assert_eq!(queue::dead_letter_name("JOBS"), "JOBS.DEAD");
     assert!(!queue::is_dead_letter_name("JOBS"));

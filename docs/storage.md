@@ -530,6 +530,22 @@ hand, and written to the dead-letter file — which is flushed *before* the queu
 duplicates a dead letter rather than losing a record, and because the copy keeps its original sequence key, the retry
 that follows overwrites it rather than adding a second one.
 
+### What the statistics cost
+
+`FILE.STATS` on a queue reads its depth, in-flight count, oldest unacknowledged age and
+dead-letter count, and it does so under that file's own lock - the one every consumer of the queue is waiting on. So
+none of it may grow with the backlog.
+
+The depth and the in-flight count are counters. The oldest age is read from the *front* of the available set, which is
+already ordered, rather than by taking a minimum over every key: a sequence key is twenty ASCII digits, so among the
+keys that are sequence keys, sorting by text is sorting by number and the first one found is the smallest. A key written
+by hand carries no arrival time and is stepped over rather than ending the search. The sweep of lapsed claims is over
+the in-flight set, which is the number of consumers rather than the depth.
+
+What is left is the cost `FILE.STATS` has on any file: one seek per group trailer, which grows with the group count and
+not with this. `test/performance/test_concurrency.py` measures a queue's statistics against an ordinary file holding the
+same records for exactly that reason - the shared cost is on both sides, and what the ratio reports is the queue's own.
+
 ### Why a claim is atomic
 
 Everything that decides who gets a record happens inside one write lock on that file: the lapsed claims are swept back

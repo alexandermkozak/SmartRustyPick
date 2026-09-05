@@ -463,12 +463,25 @@ impl QueueState {
     /// millisecond it was minted in. A key that this did not mint has no
     /// enqueue time and is skipped rather than guessed at.
     pub fn oldest_unacknowledged_seconds(&self, now_millis: u64) -> Option<u64> {
-        let oldest = self
-            .available
-            .iter()
-            .chain(self.claims.keys())
-            .filter_map(|key| key_enqueued_millis(key))
-            .min()?;
+        // The available keys are already in order, and a sequence key is twenty
+        // ASCII digits - so among the keys that *are* sequence keys, sorting by
+        // text is sorting by number, and the first one found scanning from the
+        // front is the smallest. Taking a `min` over all of them instead walked
+        // and parsed the whole queue, which put a scan proportional to the
+        // backlog inside the lock every consumer of that queue is waiting on.
+        //
+        // The scan is not simply `next()` because a key written by hand is a
+        // perfectly good record that carries no arrival time, and one that
+        // sorts ahead of the minted keys must be stepped over rather than
+        // ending the search.
+        let oldest_waiting = self.available.iter().find_map(|key| key_enqueued_millis(key));
+        // The claims are the in-flight set, which is the number of consumers
+        // rather than the depth, so this one is cheap as it stands.
+        let oldest_claimed = self.claims.keys().filter_map(|key| key_enqueued_millis(key)).min();
+        let oldest = match (oldest_waiting, oldest_claimed) {
+            (Some(waiting), Some(claimed)) => waiting.min(claimed),
+            (waiting, claimed) => waiting.or(claimed)?,
+        };
         Some(now_millis.saturating_sub(oldest) / 1000)
     }
 

@@ -35,6 +35,9 @@ import harness
 ACCOUNT = "CONC_ACC"
 FILE = "CONC"
 QUEUE = "CONC_Q"
+# An ordinary file the queue's statistics are measured against, so the group
+# trailers both of them read are on both sides of the comparison.
+PLAIN = "CONC_P"
 SEED_RECORDS = int(os.environ.get("SRP_CONC_RECORDS", "1000"))
 CLIENTS = int(os.environ.get("SRP_CONC_CLIENTS", "8"))
 OPS_PER_CLIENT = int(os.environ.get("SRP_CONC_OPS", "200"))
@@ -42,6 +45,20 @@ HANDSHAKES = int(os.environ.get("SRP_CONC_HANDSHAKES", "20"))
 # Records pushed through the queue by the concurrent consumers. Enough that the
 # consumers overlap on the file many times over rather than each taking a turn.
 QUEUE_RECORDS = int(os.environ.get("SRP_CONC_QUEUE_RECORDS", "600"))
+# `FILE.STATS` on a queue sweeps the lapsed claims and reads the depth, in-flight
+# count and oldest age, and it does that under the file's own write lock - the
+# lock every consumer of that queue is waiting on. So being a queue must not add
+# a cost that grows with the backlog, or a dashboard polling a deep queue would
+# stall the consumers draining it.
+#
+# The comparison is a queue against an *ordinary* file holding the same records,
+# rather than a shallow queue against a deep one. `FILE.STATS` reads one group
+# trailer per group whatever the file is, so it grows with the group count on its
+# own; measuring a queue against itself at two depths would report that growth
+# and say nothing about the queue. Against a plain file of the same size, that
+# shared cost is on both sides and what is left is the queue's own.
+QUEUE_STATS_RECORDS = int(os.environ.get("SRP_CONC_QUEUE_STATS_RECORDS", "8000"))
+QUEUE_STATS_OVERHEAD = float(os.environ.get("SRP_CONC_QUEUE_STATS_OVERHEAD", "1.6"))
 
 # Fraction of the single-client throughput that N clients must still achieve in
 # aggregate. Serialised execution alone costs nothing here; only pathological
@@ -588,6 +605,48 @@ def main():
                 and queue_stats.get("dead_letters") == 0,
                 f"depth {queue_stats.get('depth')}, in flight {queue_stats.get('in_flight')}, "
                 f"dead-lettered {queue_stats.get('dead_letters')}",
+            )
+
+            # What being a queue adds to a file's statistics, at a depth where a
+            # scan of the backlog would be plainly visible.
+            with make_client() as producer:
+                producer.request(command="CREATE.FILE", file=PLAIN, account=ACCOUNT)
+                for index in range(QUEUE_STATS_RECORDS):
+                    producer.request(
+                        command="ENQUEUE", file=QUEUE, data=f"depth^{index}", account=ACCOUNT
+                    )
+                    producer.request(
+                        command="WRITE",
+                        file=PLAIN,
+                        key=f"D{index}",
+                        data=f"depth^{index}",
+                        account=ACCOUNT,
+                    )
+
+                def stats_cost(file):
+                    return harness.benchmark(
+                        lambda _: producer.request(
+                            command="FILE.STATS", file=file, account=ACCOUNT
+                        ),
+                        30,
+                        warmup=3,
+                    )
+
+                plain_stats, _ = stats_cost(PLAIN)
+                queue_stats_timing, last = stats_cost(QUEUE)
+
+            reported = ((last.get("record") or {}).get("queue") or {}).get("depth")
+            suite.check_eq(
+                "FILE.STATS reports the depth the queue was filled to",
+                reported,
+                QUEUE_STATS_RECORDS,
+            )
+            suite.check_ratio(
+                "A queue's statistics cost no more than an ordinary file's",
+                queue_stats_timing.p50 / plain_stats.p50 if plain_stats.p50 else 0.0,
+                QUEUE_STATS_OVERHEAD,
+                detail=f"{QUEUE_STATS_RECORDS} records, plain p50 {plain_stats.p50:.2f}ms "
+                f"vs queue p50 {queue_stats_timing.p50:.2f}ms",
             )
 
             loaded, handshake_ratio, load_errors = handshakes_during_slow_flush(
