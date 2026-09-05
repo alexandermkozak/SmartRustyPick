@@ -1,4 +1,6 @@
 mod cache;
+#[cfg(test)]
+mod cache_tests;
 
 use crate::db::error::{DbError, DbResult};
 use crate::db::hashfile::{self, FsyncPolicy, SectionMeta};
