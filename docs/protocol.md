@@ -253,7 +253,7 @@ three are not repeated in the per-command lists below.
 | `DELETE`                |       |   yes   | `file`, `key`                                        | `status: "OK"`                          |
 | `QUERY`                 |       |   yes   | `file`                                               | `results`                               |
 | `SELECT`                |       |   yes   | `file`                                               | `count`                                 |
-| `GET.NEXT`              |       |  yes¹   | `list_name` (defaults to `"DEFAULT"`)                | `results` + `count`, or `status: "EOF"` |
+| `GET.NEXT`              |       |   yes   | `list_name` (defaults to `"DEFAULT"`)¹               | `results` + `count`, or `status: "EOF"` |
 | `ENQUEUE`               |       |   yes   | `file`, and one of `data` / `structured_data`        | `claim`                                 |
 | `DEQUEUE`               |       |   yes   | `file`                                               | `record` + `claim`, or `status: "EMPTY"` |
 | `ACK`                   |       |   yes   | `file`, `key`                                        | `status: "OK"`                          |
@@ -284,8 +284,9 @@ three are not repeated in the per-command lists below.
 | `SET.INDEX.EXCLUDE`     |  yes  |   yes   | `account`, `file`, `field`, `values`                 | `record`                                |
 | `SERVER.STATS`          |  yes  |    —    | —                                                    | `record`                                |
 
-¹ `GET.NEXT` resolves its account from the select list created by `SELECT`, so it does not
-need `account` on the request itself.
+¹ A select list names the *file* it selected from, so `GET.NEXT` does not need `file` — but it
+does resolve an account, exactly as the commands above it do, and so it takes `account` on the
+same terms. See [GET.NEXT](#getnext).
 
 ### READ
 
@@ -391,14 +392,22 @@ list for paged retrieval with `GET.NEXT`. Only the count is returned.
 
 Fetch the next batch of records from a select list. Advances the list's cursor.
 
-- Required: `list_name` (default `"DEFAULT"`). Optional: `batch_size` (default `1`).
+- Required: `list_name` (default `"DEFAULT"`). Optional: `account`, `batch_size` (default `1`).
+- A select list remembers the *file* it selected from, not the account. `GET.NEXT` resolves
+  the account the way every other command in an account does — from `account`, or from the
+  client's single allowed account when it has exactly one. **Send the same `account` the
+  `SELECT` carried.** A client with more than one allowed account, or an admin, has no single
+  one to fall back to and is answered `ACCOUNT_NOT_FOUND` for the empty name; and naming a
+  *different* account looks up keys selected from one file in the same-named file of another,
+  which quietly returns the wrong records rather than refusing.
 - Response: `results` (`[key, record]` pairs) and `count` (batch size), plus `positions`
   when the list was exploded. When the cursor is already at the end, `status: "EOF"` with
   no other fields.
-- Errors: `SELECT_LIST_NOT_FOUND`, `FILE_NOT_FOUND`.
+- Errors: `SELECT_LIST_NOT_FOUND`, `ACCOUNT_NOT_SPECIFIED`, `ACCOUNT_NOT_FOUND`,
+  `ACCESS_DENIED`, `FILE_NOT_FOUND`.
 
 ```json
-{"command": "GET.NEXT", "list_name": "MYLIST", "batch_size": 50}
+{"command": "GET.NEXT", "account": "SALES", "list_name": "MYLIST", "batch_size": 50}
 ```
 
 ```json
@@ -444,6 +453,13 @@ dead-letter file is how you find out what went wrong, and burying a record one l
 each time somebody looks at it is the opposite of that. `FILE.STATS` on such a file still
 reports the `max_deliveries` its `DIR` entry carries, which is what its records were given
 before they got there.
+
+**"A dead-letter file" is decided by the name.** Any queue whose name ends in `.DEAD` is one,
+whether the engine created it or `CREATE.FILE` did — there is no separate flag, because a
+dead-letter file has to be recognised as one on a server that has only just read it off disk.
+So a queue named `NIGHTLY.DEAD` will never dead-letter a record of its own: it keeps handing
+the same one back with its delivery count climbing past `max_deliveries`. Name a queue that way
+only when that is what it is; `FILE.STATS` reports which a file is as `queue.dead_letter`.
 
 **A restart releases every claim.** A claim belongs to a connection and a restarted server
 has none, so a record that was claimed and not acknowledged is available again as soon as the
