@@ -1,3 +1,4 @@
+use crate::db::engine::dictionary::DEFAULT_FIELD_WIDTH;
 use crate::db::{Database, DbError, ExplodeSpec, IndexStats, QueryNode, Record, SortSpec, Table};
 use crate::server::models::{ErrorCode, Request, Response};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -53,7 +54,13 @@ fn db_error_in(context: &str, e: DbError) -> Response {
 }
 
 /// The default display width `SET.DICT` gives an entry that does not name one.
-const DEFAULT_DICT_WIDTH: i64 = 10;
+///
+/// Derived from the width `LIST` renders an entry at when it carries no width,
+/// rather than declared as a second `10`, because the two are one rule: were
+/// they different, "no width given" would mean one width for an entry created
+/// over the protocol and another for one written by hand. See
+/// [`crate::db::engine::dictionary`].
+const DEFAULT_DICT_WIDTH: i64 = DEFAULT_FIELD_WIDTH as i64;
 /// The justifications a dictionary entry may carry, as `LIST` understands them.
 const DICT_JUSTIFICATIONS: [&str; 2] = ["L", "R"];
 /// The tiers an association may pair on, as the engine reads them.
