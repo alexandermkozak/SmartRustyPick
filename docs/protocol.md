@@ -437,6 +437,14 @@ against: this is at-least-once delivery, not exactly-once.
 being acknowledged moves to `<file>.DEAD`, keeping its sequence key and its delivery count.
 That file is a queue itself, so a fixed consumer drains it with these same commands.
 
+A dead-letter file is the end of the line: its own records are never dead-lettered again. A
+`NACK` or a lapsed claim there puts the record back on the file it is already on, with its
+delivery count still rising, rather than moving it to a `<file>.DEAD.DEAD` — draining a
+dead-letter file is how you find out what went wrong, and burying a record one level deeper
+each time somebody looks at it is the opposite of that. `FILE.STATS` on such a file still
+reports the `max_deliveries` its `DIR` entry carries, which is what its records were given
+before they got there.
+
 **A restart releases every claim.** A claim belongs to a connection and a restarted server
 has none, so a record that was claimed and not acknowledged is available again as soon as the
 server is back, with its delivery count intact. Records that were acknowledged do not come
@@ -667,7 +675,9 @@ policy retuned, all while keeping the records it holds.
   flag never gets ahead of the data it promises to protect. `durable: false` returns the file
   to the database's buffering policy. See [Storage Engine](storage.md).
 - `queue: true` attaches an order to the records the file already holds, in key order.
-  `queue: false` detaches it and leaves every record where it is.
+  `queue: false` detaches it and leaves every record where it is, removing the queue's
+  bookkeeping with it — so a file promoted again later starts its delivery counts over rather
+  than resurrecting counts from before it stopped being a queue.
 - The one exception to "only what is named changes": a file *becoming* a queue becomes
   durable with it unless `durable: false` says otherwise, for the reason a queue is created
   durable. A file that is already a queue keeps the durability it has, so retuning its

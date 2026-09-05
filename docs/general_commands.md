@@ -251,7 +251,7 @@ claim policy.
 Only the flags you name change, so a `SET.FILE JOBS DURABLE` cannot quietly stop `JOBS` being a queue. Promoting a
 file flushes what it still had buffered as part of the change, so the flag never gets ahead of the data it protects.
 `BUFFERED` returns the file to the database's ordinary flush policy, and `NOQUEUE` returns a queue to an ordinary
-file without touching a record. The one exception to "only what you name": a file becoming a queue becomes `DURABLE`
+file without touching a record, dropping the order and the delivery counts with it. The one exception to "only what you name": a file becoming a queue becomes `DURABLE`
 with it unless `BUFFERED` says otherwise, for the reason a queue is created durable. `DIR` carries the attributes for the other files and cannot be set itself. See
 [Storage Engine](storage.md).
 
@@ -272,7 +272,8 @@ keys sort into arrival order. `DEQUEUE` claims the oldest unclaimed record for t
 `NACK` gives it straight back. A claim that is not settled within the queue's `TIMEOUT` lapses on its own, and the
 record is delivered again with its retry count one higher - so a consumer that dies mid-job costs a redelivery rather
 than a lost record. A record that has used up its `RETRIES` moves to `<name>.DEAD`, which is a queue itself, keeping
-its key and its failure count.
+its key and its failure count. That file is the end of the line: `NACK` a record while draining it and the record stays
+there, counted, rather than moving on to a `<name>.DEAD.DEAD`.
 
 Everything else still works on the file: `LIST`, `SELECT`, `READ` and the dictionary commands treat a queue as the
 ordinary file it also is. `FILE.STATS` adds the queue's depth, in-flight count, oldest unacknowledged age and

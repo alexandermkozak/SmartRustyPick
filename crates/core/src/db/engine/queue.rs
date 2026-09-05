@@ -83,10 +83,19 @@ impl Database {
             .unwrap_or_default()
     }
 
-    /// Attaches or drops a loaded table's queue state after its `DIR` entry
-    /// changed. A file that is not in memory picks the change up when it is
-    /// next loaded.
+    /// Attaches or drops a file's queue state after its `DIR` entry changed.
+    ///
+    /// A file that stops being a queue loses its bookkeeping with it: the
+    /// `queue` file beside the records is removed, so nothing is left on disk
+    /// describing an order the file no longer has. That happens whether or not
+    /// the table is in memory - the entry has already changed, and a file left
+    /// on disk that only the next promotion would read is exactly the kind of
+    /// state that goes stale unnoticed. A file that is not loaded picks the rest
+    /// of the change up when it next is.
     pub(crate) fn reattach_queue(&self, account: &str, name: &str, queue: bool) -> DbResult<()> {
+        if !queue {
+            queue::remove_state(&self.file_dir(account, name))?;
+        }
         let Some(handle) = self.get_table_read_only_for_account(account, name) else {
             return Ok(());
         };
@@ -100,6 +109,27 @@ impl Database {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The policy a file is actually run under, which is its own except on a
+    /// dead-letter file.
+    ///
+    /// A dead-letter file is the end of the line. A record that fails there has
+    /// already failed everywhere else, and moving it on to `<name>.DEAD.DEAD`
+    /// would bury it one level deeper each time an operator looked at it -
+    /// which is the opposite of what a dead-letter file is for, since draining
+    /// one is how you find out what went wrong. So its records are never dead
+    /// lettered again: a `NACK` or a lapsed claim puts one back on the file it
+    /// is already on, with its delivery count still rising.
+    fn effective_policy(name: &str, policy: QueuePolicy) -> QueuePolicy {
+        if queue::is_dead_letter_name(name) {
+            QueuePolicy {
+                max_deliveries: u32::MAX,
+                ..policy
+            }
+        } else {
+            policy
+        }
     }
 
     /// The queue file a command names, refusing a file that is not one.
@@ -185,7 +215,7 @@ impl Database {
         let (handle, policy) = self.queue_file(account, name)?;
         let policy = QueuePolicy {
             visibility: visibility.unwrap_or(policy.visibility),
-            ..policy
+            ..Self::effective_policy(name, policy)
         };
         let now = queue::now_millis();
         let (delivery, dead) = {
@@ -240,6 +270,7 @@ impl Database {
     /// rather than made available again.
     pub fn nack(&self, account: &str, name: &str, key: &str, owner: &str) -> DbResult<()> {
         let (handle, policy) = self.queue_file(account, name)?;
+        let policy = Self::effective_policy(name, policy);
         let dead = {
             let mut table = handle.write();
             let present = table.records.contains_key(key);
@@ -273,6 +304,7 @@ impl Database {
     /// rather than the one behind it.
     pub fn peek(&self, account: &str, name: &str, key: Option<&str>) -> DbResult<Option<QueueDelivery>> {
         let (handle, policy) = self.queue_file(account, name)?;
+        let policy = Self::effective_policy(name, policy);
         let now = queue::now_millis();
         let (delivery, dead) = {
             let mut table = handle.write();
@@ -311,7 +343,10 @@ impl Database {
         let now = queue::now_millis();
         let (stats, dead) = {
             let mut table = handle.write();
-            let dead = Self::take_expired(&mut table, now, policy);
+            // Swept under the effective policy, but reported under the file's
+            // own: a dead-letter file's entry says what its records were given
+            // before they got there, and that is what an operator is reading.
+            let dead = Self::take_expired(&mut table, now, Self::effective_policy(name, policy));
             let state = table.queue.as_ref().expect("queue_file attaches the queue state");
             let stats = QueueStats {
                 depth: state.depth() as u64,

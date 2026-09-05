@@ -24,6 +24,8 @@ pub mod query;
 mod query_tests;
 pub mod queue;
 #[cfg(test)]
+mod queue_format_tests;
+#[cfg(test)]
 mod queue_tests;
 pub mod report;
 #[cfg(test)]

@@ -493,6 +493,15 @@ every claim is released on load and its record becomes available again with its 
 `queue` file stays small in a queue that is being drained normally: it is the size of the trouble, not the size of the
 backlog.
 
+A file that stops being a queue loses the `queue` file with it, so nothing is left on disk describing an order the file
+no longer has. Its records are untouched; promoting it again rebuilds the order from them and starts the delivery counts
+over.
+
+A `queue` file that does not check out — a bad checksum, a truncation, anything unreadable — is treated as absent rather
+than as an error. The records are the queue; this only says where the sequence had got to and how often each record had
+been delivered, so losing it costs a few redeliveries and a sequence recovered from the largest key already present.
+Refusing to open the queue would cost the queue.
+
 What that buys, against a hard kill of the server:
 
 - A record that was acknowledged does not come back. `ACK` removes it from the records, and the records are flushed
@@ -508,6 +517,12 @@ A record delivered `QUEUE.RETRIES` times without being acknowledged moves to `<n
 first one and is a queue file itself. The record keeps its sequence key and its delivery count, so what failed and how
 often is readable with `PEEK`, and a fixed consumer drains the file with the same commands it drains the live queue
 with.
+
+A dead-letter file is the end of the line: its own records are never dead-lettered again. A `NACK` or a lapsed claim
+there returns the record to the file it is already on, with its delivery count still rising, rather than creating a
+`<name>.DEAD.DEAD` — draining a dead-letter file is how an operator finds out what went wrong, and burying a record one
+level deeper each time they look at it would defeat that. The file's `DIR` entry still carries the retry limit its
+records were given before they arrived, and that is what `FILE.STATS` reports.
 
 The move crosses two files, and a thread holds one file's lock at a time (see [Concurrency and Lock
 Ordering](#concurrency-and-lock-ordering)). So the records are taken out of the queue under its own lock, carried in

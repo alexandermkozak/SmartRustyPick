@@ -223,6 +223,28 @@ def main():
                 1,
             )
 
+            # A dead-letter file is the end of the line. Draining it and failing
+            # again must leave the record where an operator can still find it.
+            replay = admin.request(command="DEQUEUE", file=DEAD, account=ACCOUNT)
+            suite.check(
+                "The dead-letter file is drained with the same commands",
+                claim_key(replay) == keys[0] and replay["claim"]["deliveries"] == 3,
+                str(replay.get("claim") or replay.get("message")),
+            )
+            admin.request(command="NACK", file=DEAD, account=ACCOUNT, key=keys[0])
+            listed = admin.request(command="LIST.FILES", account=ACCOUNT).get("keys") or []
+            suite.check(
+                "It does not get a dead-letter file of its own",
+                f"{DEAD}.DEAD" not in listed,
+                f"account holds {listed}",
+            )
+            suite.check(
+                "The record stays on it, still counted",
+                queue_stats(admin, DEAD).get("depth") == 1
+                and queue_stats(admin, DEAD).get("dead_letters") == 0,
+                str(queue_stats(admin, DEAD)),
+            )
+
             # --- Hard kill ------------------------------------------------------
             # One record acknowledged, one claimed and left in flight, and the
             # rest still waiting - then SIGKILL, with the flush timers disabled

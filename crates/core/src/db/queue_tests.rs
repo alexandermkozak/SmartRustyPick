@@ -399,3 +399,98 @@ fn records_written_or_deleted_outside_the_queue_are_reconciled_into_the_order() 
     }
     assert!(db.dequeue("QD", "JOBS", "bob", None).unwrap().is_none());
 }
+
+#[test]
+fn a_dead_letter_file_is_the_end_of_the_line() {
+    let guard = TempDir::new("queue_dead_end");
+    let base = guard.path();
+    let db = open_account(base, "QE");
+    // One delivery, so a record dies on its first failure and the operator
+    // draining the dead-letter file is working with a record that has already
+    // used everything it was given.
+    queue_file(&db, "QE", "JOBS", 60, 1);
+    let key = enqueue(&db, "QE", "JOBS", "poison");
+
+    let claimed = db.dequeue("QE", "JOBS", "alice", None).unwrap().unwrap();
+    db.nack("QE", "JOBS", &claimed.key, "alice").unwrap();
+    let dead = queue::dead_letter_name("JOBS");
+    let has = |file: &str| db.list_tables_for_account("QE").iter().any(|name| name == file);
+    assert!(has(&dead), "the record died and the dead-letter file was made for it");
+
+    // Draining the dead-letter file and failing again must leave the record
+    // where an operator can still find it, not push it into JOBS.DEAD.DEAD.
+    let letter = db.dequeue("QE", &dead, "operator", None).unwrap().unwrap();
+    assert_eq!(letter.key, key);
+    assert_eq!(letter.deliveries, 2, "the count keeps rising even here");
+    db.nack("QE", &dead, &key, "operator").unwrap();
+
+    assert!(
+        !has(&queue::dead_letter_name(&dead)),
+        "a dead-letter file does not get a dead-letter file of its own"
+    );
+    let back = db.peek("QE", &dead, Some(&key)).unwrap().unwrap();
+    assert_eq!(back.deliveries, 2, "still there, still counted");
+    assert_eq!(db.file_statistics("QE", &dead).unwrap().queue.unwrap().depth, 1);
+
+    // A lapsed claim on a dead letter does the same thing.
+    db.dequeue("QE", &dead, "operator", Some(Duration::from_millis(1)))
+        .unwrap()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+    let again = db.dequeue("QE", &dead, "operator", None).unwrap().unwrap();
+    assert_eq!(again.key, key, "redelivered rather than buried a level deeper");
+    assert!(!has(&queue::dead_letter_name(&dead)));
+
+    // The file still reports the policy its DIR entry carries, rather than the
+    // unlimited one its records are actually run under.
+    let stats = db.file_statistics("QE", &dead).unwrap().queue.unwrap();
+    assert_eq!(stats.max_deliveries, 1);
+    assert!(stats.dead_letter);
+}
+
+#[test]
+fn a_file_that_stops_being_a_queue_loses_its_bookkeeping_too() {
+    let guard = TempDir::new("queue_state_cleared");
+    let base = guard.path();
+    let db = open_account(base, "QF");
+    queue_file(&db, "QF", "OUTBOX", 60, 5);
+    let key = enqueue(&db, "QF", "OUTBOX", "letter");
+    let claimed = db.dequeue("QF", "OUTBOX", "alice", None).unwrap().unwrap();
+    db.nack("QF", "OUTBOX", &claimed.key, "alice").unwrap();
+    db.save().unwrap();
+
+    let file_dir = format!("{}/OUTBOX", base);
+    let remembered = queue::read_state(&file_dir).expect("a queue writes its book");
+    assert_eq!(remembered.deliveries, vec![(key.clone(), 1)]);
+
+    db.set_file_attributes(
+        "QF",
+        "OUTBOX",
+        FileAttributes {
+            durable: true,
+            queue: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        !queue::state_path(&file_dir).exists(),
+        "nothing on disk should describe an order the file no longer has"
+    );
+
+    // Promoting it again starts the counts over rather than resurrecting them,
+    // and the sequence is recovered from the keys that are still there.
+    db.set_file_attributes(
+        "QF",
+        "OUTBOX",
+        FileAttributes {
+            durable: true,
+            queue: Some(QueuePolicy::default()),
+        },
+    )
+    .unwrap();
+    let delivery = db.dequeue("QF", "OUTBOX", "bob", None).unwrap().unwrap();
+    assert_eq!(delivery.key, key, "the record itself was never touched");
+    assert_eq!(delivery.deliveries, 1, "a fresh count, not the one from before");
+    let next = enqueue(&db, "QF", "OUTBOX", "another");
+    assert!(next > key, "and the sequence still rises past what is there");
+}
