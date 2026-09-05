@@ -2277,3 +2277,226 @@ fn test_file_stats_reports_the_queue_over_the_protocol() {
         .unwrap();
     assert!(stats["queue"].is_null());
 }
+
+// ------------------------------------------------------------- GET.NEXT and its account
+
+/// Two accounts holding a same-named file with different records, and a client
+/// that may reach both. That is the shape in which paging a list against the
+/// wrong account answers rather than refuses.
+fn two_accounts_one_file_name() -> (TempDir, Arc<RwLock<Database>>, ClientInfo) {
+    let dir = TempDir::new("getnext_account");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+
+    for account in ["ALPHA", "BETA"] {
+        db.create_account(account, None).unwrap();
+        db.create_table_for_account(account, "USERS").unwrap();
+    }
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let client = ClientInfo {
+        name: "both".to_string(),
+        thumbprint: "tp_both".to_string(),
+        allowed_accounts: vec!["ALPHA".to_string(), "BETA".to_string()],
+        is_admin: false,
+    };
+
+    for (account, key, name) in [("ALPHA", "1", "alpha one"), ("BETA", "9", "beta nine")] {
+        let write = Request {
+            command: "WRITE".to_string(),
+            account: Some(account.to_string()),
+            file: Some("USERS".to_string()),
+            key: Some(key.to_string()),
+            data: Some(serde_json::Value::String(name.to_string())),
+            ..Default::default()
+        };
+        assert_eq!(handle_request(write, &db_arc, &client).status, "OK");
+    }
+
+    (dir, db_arc, client)
+}
+
+fn select_in(db: &Arc<RwLock<Database>>, client: &ClientInfo, account: &str, list: &str) -> i64 {
+    let select = Request {
+        command: "SELECT".to_string(),
+        account: Some(account.to_string()),
+        file: Some("USERS".to_string()),
+        list_name: Some(list.to_string()),
+        ..Default::default()
+    };
+    let response = handle_request(select, db, client);
+    assert_eq!(response.status, "OK");
+    response.count.unwrap() as i64
+}
+
+#[test]
+fn get_next_pages_the_account_the_select_ran_in_without_being_told_it_again() {
+    let (_dir, db_arc, client) = two_accounts_one_file_name();
+    assert_eq!(select_in(&db_arc, &client, "ALPHA", "MYLIST"), 1);
+
+    // No account on the request, and the client has two allowed accounts, so
+    // there is no single one to fall back to. The list knows.
+    let response = handle_request(
+        Request {
+            command: "GET.NEXT".to_string(),
+            list_name: Some("MYLIST".to_string()),
+            batch_size: Some(10),
+            ..Default::default()
+        },
+        &db_arc,
+        &client,
+    );
+
+    assert_eq!(response.status, "OK");
+    let results = response.results.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, "1");
+}
+
+#[test]
+fn get_next_refuses_a_request_that_names_a_different_account_than_the_list() {
+    let (_dir, db_arc, client) = two_accounts_one_file_name();
+    select_in(&db_arc, &client, "ALPHA", "MYLIST");
+
+    // BETA has a USERS file too. Reading ALPHA's keys against it used to answer
+    // from whatever happened to match over there - silently, and short, because
+    // a key that is not present is skipped rather than reported.
+    let response = handle_request(
+        Request {
+            command: "GET.NEXT".to_string(),
+            account: Some("BETA".to_string()),
+            list_name: Some("MYLIST".to_string()),
+            batch_size: Some(10),
+            ..Default::default()
+        },
+        &db_arc,
+        &client,
+    );
+
+    assert_eq!(response.status, "ERROR");
+    assert_eq!(response.code, Some(ErrorCode::InvalidRequest));
+    assert!(response.message.unwrap().contains("ALPHA"));
+}
+
+#[test]
+fn get_next_accepts_the_account_the_list_was_selected_in() {
+    let (_dir, db_arc, client) = two_accounts_one_file_name();
+    select_in(&db_arc, &client, "ALPHA", "MYLIST");
+
+    // Naming the right one is not an error: a client that sends the account it
+    // selected with - which every client written against the old wording does -
+    // keeps working.
+    let response = handle_request(
+        Request {
+            command: "GET.NEXT".to_string(),
+            account: Some("ALPHA".to_string()),
+            list_name: Some("MYLIST".to_string()),
+            batch_size: Some(10),
+            ..Default::default()
+        },
+        &db_arc,
+        &client,
+    );
+
+    assert_eq!(response.status, "OK");
+    assert_eq!(response.results.unwrap().len(), 1);
+}
+
+#[test]
+fn get_next_denies_a_client_that_may_not_reach_the_account_the_list_belongs_to() {
+    let (_dir, db_arc, owner) = two_accounts_one_file_name();
+    select_in(&db_arc, &owner, "ALPHA", "SHARED.NAME");
+
+    // The lists are held by name across every connection, so taking the account
+    // off the request means this is the only thing standing between a stranger
+    // and somebody else's selection.
+    let outsider = ClientInfo {
+        name: "outsider".to_string(),
+        thumbprint: "tp_out".to_string(),
+        allowed_accounts: vec!["BETA".to_string()],
+        is_admin: false,
+    };
+
+    let response = handle_request(
+        Request {
+            command: "GET.NEXT".to_string(),
+            list_name: Some("SHARED.NAME".to_string()),
+            batch_size: Some(10),
+            ..Default::default()
+        },
+        &db_arc,
+        &outsider,
+    );
+
+    assert_eq!(response.status, "ERROR");
+    assert_eq!(response.code, Some(ErrorCode::AccessDenied));
+}
+
+#[test]
+fn get_next_walks_an_admins_list_without_an_account_on_any_request() {
+    let (_dir, db_arc, _client) = two_accounts_one_file_name();
+    let admin = ClientInfo {
+        name: "admin".to_string(),
+        thumbprint: "tp_admin".to_string(),
+        allowed_accounts: vec![],
+        is_admin: true,
+    };
+
+    select_in(&db_arc, &admin, "ALPHA", "ADMINLIST");
+
+    let batch = handle_request(
+        Request {
+            command: "GET.NEXT".to_string(),
+            list_name: Some("ADMINLIST".to_string()),
+            batch_size: Some(10),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(batch.status, "OK");
+    assert_eq!(batch.results.unwrap().len(), 1);
+
+    // And the cursor still ends the list, rather than the account change losing it.
+    let end = handle_request(
+        Request {
+            command: "GET.NEXT".to_string(),
+            list_name: Some("ADMINLIST".to_string()),
+            batch_size: Some(10),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(end.status, "EOF");
+}
+
+#[test]
+fn selecting_into_a_list_again_resets_its_cursor() {
+    let (_dir, db_arc, client) = two_accounts_one_file_name();
+    select_in(&db_arc, &client, "ALPHA", "MYLIST");
+
+    let page = |db: &Arc<RwLock<Database>>| {
+        handle_request(
+            Request {
+                command: "GET.NEXT".to_string(),
+                list_name: Some("MYLIST".to_string()),
+                batch_size: Some(10),
+                ..Default::default()
+            },
+            db,
+            &client,
+        )
+    };
+
+    assert_eq!(page(&db_arc).status, "OK");
+    assert_eq!(page(&db_arc).status, "EOF");
+
+    // Re-using a list name replaces the previous list and resets its cursor -
+    // which is the cursor living with the list rather than in a map beside it.
+    select_in(&db_arc, &client, "BETA", "MYLIST");
+    let response = page(&db_arc);
+    assert_eq!(response.status, "OK");
+
+    // And it is BETA's list now, not ALPHA's.
+    assert_eq!(response.results.unwrap()[0].0, "9");
+}
