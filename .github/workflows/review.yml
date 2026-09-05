@@ -2,8 +2,10 @@
 name: Code Review
 
 on:
-  pull_request:
-    types: [ opened, synchronize ]
+  workflow_dispatch:
+    
+#  pull_request:
+#    types: [ opened, synchronize ]
 
 # Three pushes to a pull request used to start three reviews and let the first
 # two run to completion - paid API calls for output nobody reads, since only the
