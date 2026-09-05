@@ -62,12 +62,19 @@ AI agents have been responsible for several critical improvements and fixes in t
   [Association groups](#7-association-groups-correlated-multivalues-for-free) below.
 - **Dictionary Support:** Logic for field formatting and conversions (Dates, Numbers).
 - **Query Engine:** Implementation of `SELECT` and `QUERY` commands for data retrieval.
+- **Queue Files:** An ordering primitive beside the hashed one. A file created `QUEUE` mints a sequence key per
+  enqueued record - twenty digits carrying the millisecond it arrived, so arrival order is recoverable without a sort
+  and the oldest unacknowledged age is readable off the smallest live key. `ENQUEUE`, `DEQUEUE`, `ACK`, `NACK` and
+  `PEEK` divide work between consumers: a claim is taken inside the file's own write lock, so two consumers cannot come
+  away with the same record, and one that lapses is redelivered rather than lost with the process that took it. A
+  record that uses up its deliveries moves to `<name>.DEAD`, itself a queue, with its failure count intact.
 - **Test Infrastructure:** Added `CREATE.TEST.ACCOUNT` command in the `SYSTEM` account to quickly spin up pre-populated
   accounts for feature verification and regression testing. It is reachable over the remote protocol and from the web
   dashboard as well, so the fixture is one command away from any interface. This command must be maintained and updated as new data
   structures or features are added to the system - the `USERS` file now carries a multivalued `ROLES` field, one of
-  whose values is sub-valued, and `PRODUCTS` carries an association group whose members are deliberately ragged, so the
-  fixture reaches every level of the hierarchy and both tiers of an association.
+  whose values is sub-valued, `PRODUCTS` carries an association group whose members are deliberately ragged, and a
+  `JOBS` queue file arrives with three records already enqueued, so the fixture reaches every level of the hierarchy,
+  both tiers of an association, and the ordering primitive as well as the record ones.
 - **Certificate Management:** Implemented `GENERATE.CERT` in the `SYSTEM` account, allowing users to create signed
   client certificates and PKCS#12 (.pfx) files directly from the database CLI for simplified secure remote access setup.
 - **Typed errors:** The engine reports a `DbError` variant - `FileNotFound`, `AccountExists`, `IndexNotFound`, `Io` and

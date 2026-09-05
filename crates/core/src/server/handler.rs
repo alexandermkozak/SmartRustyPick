@@ -263,7 +263,15 @@ fn listing_of(entries: Vec<(String, IndexStats)>) -> Response {
 /// authorizations, the stateful select lists) still takes the database
 /// exclusively, which is cheap because none of it is on the hot path.
 fn is_record_command(command: &str) -> bool {
-    matches!(command, "READ" | "WRITE" | "DELETE" | "QUERY")
+    matches!(
+        command,
+        // The queue commands belong here for the reason the record commands do,
+        // and rather more so: a queue is the most contended file in any system
+        // that has one, and taking the database exclusively to claim from it
+        // would serialise every consumer against every other connection in the
+        // server rather than against the other consumers of that one queue.
+        "READ" | "WRITE" | "DELETE" | "QUERY" | "ENQUEUE" | "DEQUEUE" | "ACK" | "NACK" | "PEEK"
+    )
 }
 
 pub fn handle_request(req: Request, db: &SharedDb, client_info: &crate::db::ClientInfo) -> Response {
@@ -277,7 +285,7 @@ pub fn handle_request(req: Request, db: &SharedDb, client_info: &crate::db::Clie
         let account = allowed_account(&req, client_info).map(str::to_string);
         if let Some(acc) = account {
             let db = read_lock(db);
-            return record_command(&command, req, &db, &acc);
+            return record_command(&command, req, &db, &acc, &client_info.name);
         }
     }
 
@@ -290,12 +298,192 @@ pub fn handle_request(req: Request, db: &SharedDb, client_info: &crate::db::Clie
 ///
 /// Shared by both paths, so a request served under the shared lock and one that
 /// fell through to the exclusive lock cannot drift apart.
-fn record_command(command: &str, req: Request, db: &Database, acc: &str) -> Response {
+fn record_command(command: &str, req: Request, db: &Database, acc: &str, owner: &str) -> Response {
     match command {
         "READ" => read_record(db, acc, &req),
         "WRITE" => write_record(db, acc, req),
         "DELETE" => delete_record(db, acc, req),
+        "ENQUEUE" => enqueue_record(db, acc, req),
+        "DEQUEUE" => dequeue_record(db, acc, &req, owner),
+        "ACK" => settle_claim(db, acc, &req, owner, Settle::Ack),
+        "NACK" => settle_claim(db, acc, &req, owner, Settle::Nack),
+        "PEEK" => peek_record(db, acc, &req),
         _ => query_records(db, acc, &req),
+    }
+}
+
+/// Which way a claim is being settled. The two commands differ only in this, so
+/// they share [`settle_claim`] rather than duplicating the ownership check.
+#[derive(Clone, Copy)]
+enum Settle {
+    /// The work succeeded: the record leaves the queue.
+    Ack,
+    /// The work failed: the record goes back, or to the dead-letter file if it
+    /// has used up its deliveries.
+    Nack,
+}
+
+/// The bookkeeping a queue command reports beside the record, as the `claim`
+/// field of the response.
+///
+/// Times are milliseconds since the epoch, which is what the record's sequence
+/// key already carries, so a client that wants an age subtracts rather than
+/// parsing a format. `expires` and `owner` are populated only by `DEQUEUE`:
+/// `ENQUEUE` and `PEEK` take no claim, and saying nothing is more honest than
+/// reporting a claim of zero length.
+fn claim_json(file: &str, delivery: &crate::db::QueueDelivery) -> serde_json::Value {
+    let mut claim = serde_json::json!({
+        "queue": file,
+        "key": delivery.key,
+        "deliveries": delivery.deliveries,
+    });
+    let object = claim.as_object_mut().expect("built as an object");
+    if let Some(enqueued) = delivery.enqueued_millis {
+        object.insert("enqueued".to_string(), enqueued.into());
+    }
+    if let Some(expires) = delivery.expires_millis {
+        object.insert("expires".to_string(), expires.into());
+    }
+    if let Some(owner) = &delivery.owner {
+        object.insert("owner".to_string(), owner.as_str().into());
+    }
+    claim
+}
+
+/// The response a queue command that found nothing sends.
+///
+/// A distinct status rather than an error, exactly as `GET.NEXT` answers a list
+/// it has walked to the end of: an empty queue is the ordinary state of a queue
+/// that is keeping up, and a consumer polling one should not have to tell a
+/// drained queue from a broken request by reading prose.
+fn queue_empty() -> Response {
+    Response {
+        status: "EMPTY".to_string(),
+        count: Some(0),
+        ..Default::default()
+    }
+}
+
+/// The queue file and the record a queue command carries, or the error to send.
+#[allow(clippy::result_large_err)]
+fn queued_record(db: &Database, acc: &str, req: Request) -> Result<(String, Record), Response> {
+    let file = requested_file(&req)?.to_string();
+    // Deserialized against this queue's dictionary, so an object payload maps
+    // to attributes the same way `WRITE` maps one.
+    let handle = resolve_file(db, acc, &file)?;
+    let record = match (req.structured_data, req.data) {
+        (Some(structured), _) => db
+            .deserialize_record_in(&handle.read(), &structured)
+            .ok_or_else(|| error(ErrorCode::InvalidData, "Invalid structured data"))?,
+        (None, Some(serde_json::Value::String(text))) => Record::from_display_string(&text),
+        (None, Some(object @ serde_json::Value::Object(_))) => db
+            .deserialize_record_in(&handle.read(), &object)
+            .ok_or_else(|| error(ErrorCode::InvalidData, "Invalid structured data in data field"))?,
+        (None, Some(_)) => {
+            return Err(error(
+                ErrorCode::InvalidData,
+                "Invalid data type in data field: expected string or object",
+            ));
+        }
+        (None, None) => return Err(error(ErrorCode::MissingField, "Data not specified")),
+    };
+    Ok((file, record))
+}
+
+fn enqueue_record(db: &Database, acc: &str, req: Request) -> Response {
+    let (file, record) = match queued_record(db, acc, req) {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match db.enqueue(acc, &file, record) {
+        Ok(key) => {
+            let delivery = crate::db::QueueDelivery {
+                enqueued_millis: crate::db::queue::key_enqueued_millis(&key),
+                key,
+                record: Record::new(),
+                deliveries: 0,
+                expires_millis: None,
+                owner: None,
+            };
+            Response {
+                status: "OK".to_string(),
+                claim: Some(claim_json(&file, &delivery)),
+                ..Default::default()
+            }
+        }
+        Err(e) => db_error_in("Enqueue error", e),
+    }
+}
+
+fn dequeue_record(db: &Database, acc: &str, req: &Request, owner: &str) -> Response {
+    let file = match requested_file(req) {
+        Ok(name) => name,
+        Err(resp) => return resp,
+    };
+    let visibility = match req.visibility_timeout {
+        Some(seconds) if seconds == 0 || seconds > crate::db::queue::MAX_VISIBILITY_SECONDS => {
+            return error(
+                ErrorCode::InvalidData,
+                format!(
+                    "visibility_timeout must be between 1 and {} seconds",
+                    crate::db::queue::MAX_VISIBILITY_SECONDS
+                ),
+            );
+        }
+        Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
+        None => None,
+    };
+    match db.dequeue(acc, file, owner, visibility) {
+        Ok(Some(delivery)) => Response {
+            status: "OK".to_string(),
+            record: Some(db.serialize_record_for_account(acc, file, &delivery.record)),
+            claim: Some(claim_json(file, &delivery)),
+            ..Default::default()
+        },
+        Ok(None) => queue_empty(),
+        Err(e) => db_error_in("Dequeue error", e),
+    }
+}
+
+fn settle_claim(db: &Database, acc: &str, req: &Request, owner: &str, how: Settle) -> Response {
+    let file = match requested_file(req) {
+        Ok(name) => name,
+        Err(resp) => return resp,
+    };
+    let key = match req.key.as_deref() {
+        Some(key) => key,
+        None => return error(ErrorCode::MissingField, "Key not specified"),
+    };
+    let settled = match how {
+        Settle::Ack => db.ack(acc, file, key, owner),
+        Settle::Nack => db.nack(acc, file, key, owner),
+    };
+    match settled {
+        Ok(()) => Response {
+            status: "OK".to_string(),
+            ..Default::default()
+        },
+        Err(e) => db_error(e),
+    }
+}
+
+fn peek_record(db: &Database, acc: &str, req: &Request) -> Response {
+    let file = match requested_file(req) {
+        Ok(name) => name,
+        Err(resp) => return resp,
+    };
+    match db.peek(acc, file, req.key.as_deref()) {
+        Ok(Some(delivery)) => Response {
+            status: "OK".to_string(),
+            record: Some(db.serialize_record_for_account(acc, file, &delivery.record)),
+            claim: Some(claim_json(file, &delivery)),
+            ..Default::default()
+        },
+        // A named key that is not there is a client mistake; an empty queue is
+        // not, so the two do not share an answer.
+        Ok(None) if req.key.is_some() => error(ErrorCode::RecordNotFound, "Record not found"),
+        Ok(None) => queue_empty(),
+        Err(e) => db_error_in("Peek error", e),
     }
 }
 
@@ -306,6 +494,79 @@ fn record_command(command: &str, req: Request, db: &Database, acc: &str) -> Resp
 #[allow(clippy::result_large_err)]
 fn resolve_file(db: &Database, acc: &str, name: &str) -> Result<crate::db::TableHandle, Response> {
     db.get_table_mut_for_account(acc, name).map_err(db_error)
+}
+
+/// The `DIR` attributes a `CREATE.FILE` or `SET.FILE` request asks for, applied
+/// over what the file carries now.
+///
+/// `current` is the default attributes on a create and the file's own on a set,
+/// which is what makes an omitted field mean "leave it" rather than "clear it".
+/// The two policy numbers are validated here rather than clamped in the engine:
+/// a queue given a timeout of zero would hand every record to two consumers at
+/// once, and finding that out from the behaviour is far worse than being told.
+#[allow(clippy::result_large_err)]
+fn file_attributes(req: &Request, current: crate::db::FileAttributes) -> Result<crate::db::FileAttributes, Response> {
+    use crate::db::queue::{MAX_DELIVERY_LIMIT, MAX_VISIBILITY_SECONDS, QueuePolicy};
+
+    let durable = req.durable.unwrap_or(current.durable);
+    let wants_queue = req
+        .queue
+        .unwrap_or(current.queue.is_some() || req.visibility_timeout.is_some() || req.max_deliveries.is_some());
+    if !wants_queue {
+        return Ok(crate::db::FileAttributes { durable, queue: None });
+    }
+
+    let existing = current.queue.unwrap_or_default();
+    let visibility = match req.visibility_timeout {
+        None => existing.visibility,
+        Some(seconds) if (1..=MAX_VISIBILITY_SECONDS).contains(&seconds) => std::time::Duration::from_secs(seconds),
+        Some(_) => {
+            return Err(error(
+                ErrorCode::InvalidData,
+                format!(
+                    "visibility_timeout must be between 1 and {} seconds",
+                    MAX_VISIBILITY_SECONDS
+                ),
+            ));
+        }
+    };
+    let max_deliveries = match req.max_deliveries {
+        None => existing.max_deliveries,
+        Some(count) if (1..=MAX_DELIVERY_LIMIT).contains(&count) => count,
+        Some(_) => {
+            return Err(error(
+                ErrorCode::InvalidData,
+                format!("max_deliveries must be between 1 and {}", MAX_DELIVERY_LIMIT),
+            ));
+        }
+    };
+    Ok(crate::db::FileAttributes {
+        // A file *becoming* a queue defaults to durable, because acknowledging
+        // a claim that a crash then loses is the failure a queue exists to
+        // prevent. An explicit `durable: false` is still honoured - the caller
+        // has said so - and a file that is already a queue keeps the durability
+        // it has, so a request about the claim policy does not silently undo a
+        // deliberate demotion.
+        durable: req
+            .durable
+            .unwrap_or_else(|| if current.queue.is_some() { current.durable } else { true }),
+        queue: Some(QueuePolicy {
+            visibility,
+            max_deliveries,
+        }),
+    })
+}
+
+/// What `CREATE.FILE` and `SET.FILE` report back about the file they settled.
+fn file_attributes_json(account: &str, name: &str, attributes: crate::db::FileAttributes) -> serde_json::Value {
+    serde_json::json!({
+        "account": account,
+        "name": name,
+        "durable": attributes.durable,
+        "queue": attributes.queue.is_some(),
+        "visibility_timeout_seconds": attributes.queue.map(|policy| policy.visibility_seconds()),
+        "max_deliveries": attributes.queue.map(|policy| policy.max_deliveries),
+    })
 }
 
 /// The file a request names, or the error to send back when it names none.
@@ -669,6 +930,17 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
             query_records(db, acc, &req)
         }
+        // The queue commands, for the same callers as the record arms above:
+        // the shared path in [`handle_request`] serves them whenever it can
+        // resolve the account on its own.
+        "ENQUEUE" | "DEQUEUE" | "ACK" | "NACK" | "PEEK" => {
+            if target_account.is_none() {
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
+            }
+            let command = req.command.to_uppercase();
+            let owner = client_info.name.clone();
+            record_command(&command, req, db, acc, &owner)
+        }
         "SELECT" => {
             if target_account.is_none() {
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
@@ -863,16 +1135,20 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             if target_account.is_none() {
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
-            let name = match req.file {
+            let name = match req.file.clone() {
                 Some(n) => n,
                 None => {
                     return error(ErrorCode::MissingField, "File name not specified");
                 }
             };
-            let durable = req.durable.unwrap_or(false);
-            match db.create_table_for_account_durable(acc, &name, durable) {
+            let attributes = match file_attributes(&req, crate::db::FileAttributes::default()) {
+                Ok(attributes) => attributes,
+                Err(resp) => return resp,
+            };
+            match db.create_table_with(acc, &name, attributes) {
                 Ok(_) => Response {
                     status: "OK".to_string(),
+                    record: Some(file_attributes_json(acc, &name, attributes)),
                     ..Default::default()
                 },
                 Err(e) => db_error(e),
@@ -887,24 +1163,35 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             if target_account.is_none() {
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
-            let name = match req.file {
+            let name = match req.file.clone() {
                 Some(n) => n,
                 None => {
                     return error(ErrorCode::MissingField, "File name not specified");
                 }
             };
-            // Absent rather than false: an omitted flag would otherwise quietly
-            // demote a file the caller only meant to name.
-            let durable = match req.durable {
-                Some(d) => d,
-                None => {
-                    return error(ErrorCode::MissingField, "Durability flag not specified");
-                }
+            // At least one of them, and only the ones named are changed: an
+            // omitted flag would otherwise quietly demote a file the caller
+            // only meant to promote, or turn a queue back into a plain file
+            // because the request was about durability.
+            if req.durable.is_none()
+                && req.queue.is_none()
+                && req.visibility_timeout.is_none()
+                && req.max_deliveries.is_none()
+            {
+                return error(
+                    ErrorCode::MissingField,
+                    "Nothing to set: name durable, queue, visibility_timeout or max_deliveries",
+                );
+            }
+            let current = db.file_attributes_for_account(acc, &name);
+            let attributes = match file_attributes(&req, current) {
+                Ok(attributes) => attributes,
+                Err(resp) => return resp,
             };
-            match db.set_table_durable_for_account(acc, &name, durable) {
+            match db.set_file_attributes_for_account(acc, &name, attributes, "attributes") {
                 Ok(_) => Response {
                     status: "OK".to_string(),
-                    record: Some(serde_json::json!({ "account": acc, "name": name, "durable": durable })),
+                    record: Some(file_attributes_json(acc, &name, attributes)),
                     ..Default::default()
                 },
                 Err(e) => db_error(e),
@@ -1192,19 +1479,23 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
             // `keys` is the plain listing every client already reads; `results`
             // carries what is worth knowing about a file beside its name, so
-            // durability is answerable without reading the account's DIR file.
-            let files = db.list_tables_with_durability_for_account(acc);
+            // durability and the queue flag are answerable without reading the
+            // account's DIR file.
+            let files = db.list_tables_with_attributes_for_account(acc);
             let count = files.len();
             let keys = files.iter().map(|(name, _)| name.clone()).collect();
             let results = files
                 .into_iter()
-                .map(|(name, durable)| {
+                .map(|(name, attributes)| {
                     // The cheap verdict - section metadata and index `state`
                     // files, no group trailers and no records - so a problem
-                    // file is findable without opening every file in turn.
+                    // file is findable without opening every file in turn. The
+                    // queue's own numbers cost a load and belong to
+                    // `FILE.STATS`; the flag is free and belongs here.
                     let health = db.file_health_summary(acc, &name);
                     let value = serde_json::json!({
-                        "durable": durable,
+                        "durable": attributes.durable,
+                        "queue": attributes.queue.is_some(),
                         "health": health.verdict.as_str(),
                         "health_reasons": health.reasons,
                     });

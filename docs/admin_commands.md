@@ -20,8 +20,9 @@ Delete an account and all its contained data files.
 
 #### CREATE.TEST.ACCOUNT
 
-Create a new test account with the specified name and populate it with sample tables (e.g., USERS, PRODUCTS) and
-dictionary definitions. This command is restricted to the `SYSTEM` account.
+Create a new test account with the specified name and populate it with sample tables (`USERS`, `PRODUCTS` and a `JOBS`
+[queue file](general_commands.md#queue-files)) and dictionary definitions. This command is restricted to the `SYSTEM`
+account.
 
 - **Usage**: `CREATE.TEST.ACCOUNT <account name>`
 - **Example**: `CREATE.TEST.ACCOUNT TESTDB`

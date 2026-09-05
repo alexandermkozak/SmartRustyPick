@@ -323,11 +323,14 @@ fn test_set_file_promotes_and_demotes_an_existing_file() {
         "a demoted file buffers again"
     );
 
-    // A request that names no flag must not be read as a demotion.
+    // A request that names no attribute at all must not be read as a demotion.
     let resp = set(None, &admin);
     assert_eq!(resp.status, "ERROR");
     assert_eq!(resp.code, Some(ErrorCode::MissingField));
-    assert_eq!(resp.message.unwrap(), "Durability flag not specified");
+    assert_eq!(
+        resp.message.unwrap(),
+        "Nothing to set: name durable, queue, visibility_timeout or max_deliveries"
+    );
 
     // Storage decisions are administrative, like creating the file was.
     let resp = set(Some(true), &client);
@@ -1282,7 +1285,33 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
     let created = resp.record.unwrap();
     assert_eq!(created["account"], "DEMO");
-    assert_eq!(created["files"], serde_json::json!(["DIR", "PRODUCTS", "USERS"]));
+    assert_eq!(
+        created["files"],
+        serde_json::json!(["DIR", "JOBS", "PRODUCTS", "USERS"])
+    );
+
+    // The fixture reaches the ordering primitive as well as the record ones, so
+    // a queue is one command away from any interface.
+    let stats = handle_request(
+        Request {
+            command: "FILE.STATS".to_string(),
+            account: Some("DEMO".to_string()),
+            file: Some("JOBS".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    )
+    .record
+    .unwrap();
+    assert_eq!(stats["queue"]["depth"], serde_json::json!(3));
+    assert_eq!(stats["queue"]["in_flight"], serde_json::json!(0));
+    assert_eq!(
+        stats["queue"]["visibility_timeout_seconds"],
+        serde_json::json!(90),
+        "the fixture's policy is not the default, so a reader can see it is read"
+    );
+    assert_eq!(stats["queue"]["max_deliveries"], serde_json::json!(3));
 
     // Populated, not just created: a record read back carries the dictionary's
     // names, its multivalues and the MD2 conversion the fixture exists to show.
@@ -1946,4 +1975,305 @@ fn a_query_string_that_is_not_a_query_is_refused_rather_than_read_as_no_query() 
     let resp = ask("QUERY", Some("WITH NAME = [John]"));
     assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
     assert_eq!(resp.results.unwrap().len(), 1);
+}
+
+/// A database with one account, an admin client and a worker client, for the
+/// queue tests below.
+fn queue_fixture(label: &str) -> (TempDir, Arc<RwLock<Database>>, ClientInfo, ClientInfo) {
+    let dir = TempDir::new(label);
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_account("QUEUE_TEST", Some(dir.path())).unwrap();
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "admin".to_string(),
+        thumbprint: "admin_tp".to_string(),
+        allowed_accounts: vec!["QUEUE_TEST".to_string()],
+        is_admin: true,
+    };
+    let worker = ClientInfo {
+        name: "worker-1".to_string(),
+        thumbprint: "worker_tp".to_string(),
+        allowed_accounts: vec!["QUEUE_TEST".to_string()],
+        is_admin: false,
+    };
+    (dir, db_arc, admin, worker)
+}
+
+fn queue_request(command: &str, file: &str) -> Request {
+    Request {
+        command: command.to_string(),
+        account: Some("QUEUE_TEST".to_string()),
+        file: Some(file.to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_create_file_makes_a_queue_and_the_listing_says_so() {
+    let (_dir, db_arc, admin, worker) = queue_fixture("handler_queue_create");
+
+    let mut create = queue_request("CREATE.FILE", "JOBS");
+    create.queue = Some(true);
+    create.visibility_timeout = Some(300);
+    create.max_deliveries = Some(3);
+    let resp = handle_request(create, &db_arc, &admin);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let record = resp.record.unwrap();
+    assert_eq!(record["queue"], serde_json::json!(true));
+    assert_eq!(record["visibility_timeout_seconds"], serde_json::json!(300));
+    assert_eq!(record["max_deliveries"], serde_json::json!(3));
+    assert_eq!(
+        record["durable"],
+        serde_json::json!(true),
+        "a queue is durable by default"
+    );
+
+    handle_request(queue_request("CREATE.FILE", "PLAIN"), &db_arc, &admin);
+
+    // The flag is in the listing, so a client finds the queues without reading DIR.
+    let resp = handle_request(
+        Request {
+            command: "LIST.FILES".to_string(),
+            account: Some("QUEUE_TEST".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &worker,
+    );
+    let results = resp.results.unwrap();
+    let flag = |name: &str| results.iter().find(|(key, _)| key == name).unwrap().1["queue"].clone();
+    assert_eq!(flag("JOBS"), serde_json::json!(true));
+    assert_eq!(flag("PLAIN"), serde_json::json!(false));
+
+    // Creating one is a storage decision, like any other CREATE.FILE.
+    let mut denied = queue_request("CREATE.FILE", "SNEAKY");
+    denied.queue = Some(true);
+    assert_eq!(
+        handle_request(denied, &db_arc, &worker).code,
+        Some(ErrorCode::AdminRequired)
+    );
+}
+
+#[test]
+fn test_a_queue_hands_each_record_to_one_consumer_over_the_protocol() {
+    let (_dir, db_arc, admin, worker) = queue_fixture("handler_queue_claim");
+    let mut create = queue_request("CREATE.FILE", "JOBS");
+    create.queue = Some(true);
+    assert_eq!(handle_request(create, &db_arc, &admin).status, "OK");
+
+    let other = ClientInfo {
+        name: "worker-2".to_string(),
+        ..worker.clone()
+    };
+
+    // An empty queue is not an error.
+    let resp = handle_request(queue_request("DEQUEUE", "JOBS"), &db_arc, &worker);
+    assert_eq!(resp.status, "EMPTY");
+    assert_eq!(resp.count, Some(0));
+    assert!(resp.record.is_none());
+
+    for order in ["first", "second"] {
+        let mut enqueue = queue_request("ENQUEUE", "JOBS");
+        enqueue.structured_data = Some(serde_json::json!({ "1": order }));
+        enqueue.data = Some(serde_json::Value::String(order.to_string()));
+        let resp = handle_request(enqueue, &db_arc, &worker);
+        assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+        let claim = resp.claim.unwrap();
+        assert_eq!(claim["queue"], serde_json::json!("JOBS"));
+        assert_eq!(claim["deliveries"], serde_json::json!(0));
+        assert!(claim["key"].as_str().unwrap().len() == 20, "a minted sequence key");
+    }
+
+    // In order, and to one consumer each.
+    let first = handle_request(queue_request("DEQUEUE", "JOBS"), &db_arc, &worker);
+    let second = handle_request(queue_request("DEQUEUE", "JOBS"), &db_arc, &other);
+    let key_of =
+        |resp: &crate::server::models::Response| resp.claim.as_ref().unwrap()["key"].as_str().unwrap().to_string();
+    assert_ne!(key_of(&first), key_of(&second));
+    assert!(key_of(&first) < key_of(&second), "arrival order");
+    assert_eq!(first.claim.as_ref().unwrap()["owner"], serde_json::json!("worker-1"));
+    assert_eq!(second.claim.as_ref().unwrap()["owner"], serde_json::json!("worker-2"));
+    assert_eq!(first.claim.as_ref().unwrap()["deliveries"], serde_json::json!(1));
+    assert!(first.record.is_some(), "the payload comes back beside the claim");
+    assert_eq!(
+        handle_request(queue_request("DEQUEUE", "JOBS"), &db_arc, &worker).status,
+        "EMPTY",
+        "both records are claimed"
+    );
+
+    // Only the holder may settle it.
+    let mut steal = queue_request("ACK", "JOBS");
+    steal.key = Some(key_of(&first));
+    let resp = handle_request(steal, &db_arc, &other);
+    assert_eq!(resp.code, Some(ErrorCode::InvalidRequest));
+    assert!(resp.message.unwrap().contains("claimed by worker-1"));
+
+    let mut ack = queue_request("ACK", "JOBS");
+    ack.key = Some(key_of(&first));
+    assert_eq!(handle_request(ack, &db_arc, &worker).status, "OK");
+
+    // NACK puts the other one straight back, and PEEK sees it without claiming.
+    let mut nack = queue_request("NACK", "JOBS");
+    nack.key = Some(key_of(&second));
+    assert_eq!(handle_request(nack, &db_arc, &other).status, "OK");
+    let peeked = handle_request(queue_request("PEEK", "JOBS"), &db_arc, &worker);
+    assert_eq!(peeked.status, "OK");
+    assert_eq!(key_of(&peeked), key_of(&second));
+    assert!(
+        peeked.claim.as_ref().unwrap().get("owner").is_none(),
+        "a returned record is held by nobody"
+    );
+}
+
+#[test]
+fn test_queue_commands_refuse_an_ordinary_file_and_a_bad_timeout() {
+    let (_dir, db_arc, admin, worker) = queue_fixture("handler_queue_refusals");
+    assert_eq!(
+        handle_request(queue_request("CREATE.FILE", "PLAIN"), &db_arc, &admin).status,
+        "OK"
+    );
+
+    let mut enqueue = queue_request("ENQUEUE", "PLAIN");
+    enqueue.data = Some(serde_json::Value::String("x".to_string()));
+    let resp = handle_request(enqueue, &db_arc, &worker);
+    assert_eq!(resp.code, Some(ErrorCode::InvalidRequest));
+    assert!(resp.message.unwrap().contains("is not a queue file"));
+
+    let mut create = queue_request("CREATE.FILE", "JOBS");
+    create.queue = Some(true);
+    create.visibility_timeout = Some(0);
+    assert_eq!(
+        handle_request(create, &db_arc, &admin).code,
+        Some(ErrorCode::InvalidData),
+        "a zero timeout would hand every record to two consumers at once"
+    );
+
+    let mut create = queue_request("CREATE.FILE", "JOBS");
+    create.queue = Some(true);
+    assert_eq!(handle_request(create, &db_arc, &admin).status, "OK");
+    let mut dequeue = queue_request("DEQUEUE", "JOBS");
+    dequeue.visibility_timeout = Some(999_999);
+    assert_eq!(
+        handle_request(dequeue, &db_arc, &worker).code,
+        Some(ErrorCode::InvalidData)
+    );
+
+    // ACK and NACK need the key of a claim.
+    assert_eq!(
+        handle_request(queue_request("ACK", "JOBS"), &db_arc, &worker).code,
+        Some(ErrorCode::MissingField)
+    );
+    let mut peek = queue_request("PEEK", "JOBS");
+    peek.key = Some("nosuchkey".to_string());
+    assert_eq!(
+        handle_request(peek, &db_arc, &worker).code,
+        Some(ErrorCode::RecordNotFound)
+    );
+}
+
+#[test]
+fn test_set_file_changes_only_what_it_names() {
+    let (_dir, db_arc, admin, _worker) = queue_fixture("handler_queue_set");
+    let mut create = queue_request("CREATE.FILE", "JOBS");
+    create.queue = Some(true);
+    create.visibility_timeout = Some(120);
+    create.max_deliveries = Some(2);
+    assert_eq!(handle_request(create, &db_arc, &admin).status, "OK");
+
+    // A request about durability leaves the queue - and its policy - alone.
+    let mut set = queue_request("SET.FILE", "JOBS");
+    set.durable = Some(false);
+    let record = handle_request(set, &db_arc, &admin).record.unwrap();
+    assert_eq!(record["durable"], serde_json::json!(false));
+    assert_eq!(record["queue"], serde_json::json!(true));
+    assert_eq!(record["visibility_timeout_seconds"], serde_json::json!(120));
+    assert_eq!(record["max_deliveries"], serde_json::json!(2));
+
+    // And one about the policy leaves durability alone.
+    let mut set = queue_request("SET.FILE", "JOBS");
+    set.visibility_timeout = Some(30);
+    let record = handle_request(set, &db_arc, &admin).record.unwrap();
+    assert_eq!(record["durable"], serde_json::json!(false));
+    assert_eq!(record["visibility_timeout_seconds"], serde_json::json!(30));
+    assert_eq!(record["max_deliveries"], serde_json::json!(2));
+
+    // Turning the queue off keeps the records; turning it back on re-attaches
+    // the order to them.
+    let mut enqueue = queue_request("ENQUEUE", "JOBS");
+    enqueue.data = Some(serde_json::Value::String("payload".to_string()));
+    let key = handle_request(enqueue, &db_arc, &admin).claim.unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut set = queue_request("SET.FILE", "JOBS");
+    set.queue = Some(false);
+    assert_eq!(
+        handle_request(set, &db_arc, &admin).record.unwrap()["queue"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        handle_request(queue_request("PEEK", "JOBS"), &db_arc, &admin).code,
+        Some(ErrorCode::InvalidRequest)
+    );
+    let mut read = queue_request("READ", "JOBS");
+    read.key = Some(key.clone());
+    assert_eq!(
+        handle_request(read, &db_arc, &admin).status,
+        "OK",
+        "the record is still there"
+    );
+
+    let mut set = queue_request("SET.FILE", "JOBS");
+    set.queue = Some(true);
+    assert_eq!(handle_request(set, &db_arc, &admin).status, "OK");
+    let peeked = handle_request(queue_request("PEEK", "JOBS"), &db_arc, &admin);
+    assert_eq!(peeked.claim.unwrap()["key"], serde_json::json!(key));
+}
+
+#[test]
+fn test_file_stats_reports_the_queue_over_the_protocol() {
+    let (_dir, db_arc, admin, worker) = queue_fixture("handler_queue_stats");
+    let mut create = queue_request("CREATE.FILE", "JOBS");
+    create.queue = Some(true);
+    create.max_deliveries = Some(1);
+    assert_eq!(handle_request(create, &db_arc, &admin).status, "OK");
+
+    for n in 0..3 {
+        let mut enqueue = queue_request("ENQUEUE", "JOBS");
+        enqueue.data = Some(serde_json::Value::String(format!("job {}", n)));
+        assert_eq!(handle_request(enqueue, &db_arc, &worker).status, "OK");
+    }
+    let claim = handle_request(queue_request("DEQUEUE", "JOBS"), &db_arc, &worker)
+        .claim
+        .unwrap();
+
+    let stats = handle_request(queue_request("FILE.STATS", "JOBS"), &db_arc, &worker)
+        .record
+        .unwrap();
+    let queue = &stats["queue"];
+    assert_eq!(queue["depth"], serde_json::json!(2));
+    assert_eq!(queue["in_flight"], serde_json::json!(1));
+    assert_eq!(queue["dead_letters"], serde_json::json!(0));
+    assert_eq!(queue["max_deliveries"], serde_json::json!(1));
+    assert!(queue["oldest_unacknowledged_seconds"].is_number());
+
+    // One delivery allowed, so giving it back dead-letters it.
+    let mut nack = queue_request("NACK", "JOBS");
+    nack.key = Some(claim["key"].as_str().unwrap().to_string());
+    assert_eq!(handle_request(nack, &db_arc, &worker).status, "OK");
+    let stats = handle_request(queue_request("FILE.STATS", "JOBS"), &db_arc, &worker)
+        .record
+        .unwrap();
+    assert_eq!(stats["queue"]["dead_letters"], serde_json::json!(1));
+
+    // An ordinary file reports no queue rather than a queue of zero.
+    assert_eq!(
+        handle_request(queue_request("CREATE.FILE", "PLAIN"), &db_arc, &admin).status,
+        "OK"
+    );
+    let stats = handle_request(queue_request("FILE.STATS", "PLAIN"), &db_arc, &worker)
+        .record
+        .unwrap();
+    assert!(stats["queue"].is_null());
 }

@@ -6,8 +6,8 @@ The project has five layers of tests, all runnable from the `Makefile` and all e
 | Layer       | Command                 | What it covers                                                                                                                                  |
 |-------------|-------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
 | Unit        | `make test-unit`        | `cargo test --workspace` — the engine, query parser, dictionaries and the request handler.                                                      |
-| Integration | `make test-integration` | The real binaries over the TLS protocol: CRUD, queries, select lists, headless mode, access control, per-file durability and the web dashboard. |
-| Performance | `make test-performance` | End-to-end latency distributions, throughput, scaling ratios, concurrency and resource usage.                                                   |
+| Integration | `make test-integration` | The real binaries over the TLS protocol: CRUD, queries, select lists, headless mode, access control, per-file durability, queue files and the web dashboard. |
+| Performance | `make test-performance` | End-to-end latency distributions, throughput, scaling ratios, concurrency, concurrent queue consumers and resource usage.                       |
 | Benchmarks  | `make bench`            | Criterion micro-benchmarks of the engine: record codec, query execution, sorting, persistence.                                                  |
 | Front end   | `make ui-test`          | The dashboard's Vue slices under jsdom, plus the architecture test that keeps features from importing each other.                               |
 
@@ -220,6 +220,8 @@ you what to install if neither is present. Narrow it down with `make profile FIL
 | `SRP_CONC_CLIENTS`       | `8`      | Parallel clients in the concurrency suite.                        |
 | `SRP_CONC_OPS`           | `200`    | Operations each concurrent client performs.                       |
 | `SRP_CONC_DISTINCT_WRITES`| `400`   | Writes per client in the per-file locking comparison.             |
+| `SRP_CONC_QUEUE_RECORDS` | `600`    | Records the concurrent consumers drain from one queue file.       |
+| `SRP_CONC_QUEUE_STATS_RECORDS` | `8000` | Depth at which a queue's `FILE.STATS` cost is compared with a plain file's. |
 | `SRP_STARTUP_TIMEOUT`    | `30`     | Seconds to wait for a server to accept connections.               |
 | `SRP_PROFILE`            | `debug`  | Which `target/<profile>` directory to take the binaries from.     |
 | `CARGO_TARGET_DIR`       | `target` | Where to look for the built binaries.                             |

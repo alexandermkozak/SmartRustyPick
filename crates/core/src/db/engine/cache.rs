@@ -97,6 +97,32 @@ impl Database {
         }
     }
 
+    /// The stamp for a table this thread has just written, built from what the
+    /// flush already knows.
+    ///
+    /// [`disk_stamp`](Self::disk_stamp) opens and parses `meta` to learn the
+    /// version. A flush has just written that version and is holding the
+    /// table's guard, so re-reading it would put a file read inside the one
+    /// critical section every writer to that file queues on. The two
+    /// modification times still come from the filesystem - they are metadata
+    /// lookups, not reads - and a section that is still a legacy flat file has
+    /// no version to reuse, so it falls back.
+    pub(super) fn stamp_after_flush(&self, account: &str, name: &str, table: &Table) -> TableStamp {
+        if table.legacy_data {
+            return self.disk_stamp(account, name);
+        }
+        let storage = self.account_storage_dir(account);
+        let data_path = format!("{}/{}/data", storage, name);
+        let meta_path = hashfile::section_dir(&data_path).join("meta");
+        let (dict_modified, dict_len) = Self::file_stamp(&format!("{}/{}/dict", storage, name));
+        TableStamp {
+            data_modified: Self::file_stamp(meta_path.to_str().unwrap_or_default()).0,
+            data_len: table.data_meta.version,
+            dict_modified,
+            dict_len,
+        }
+    }
+
     pub(super) fn disk_stamp(&self, account: &str, name: &str) -> TableStamp {
         let storage = self.account_storage_dir(account);
         let data_path = format!("{}/{}/data", storage, name);
@@ -322,6 +348,14 @@ impl Database {
             };
             // The map's own handle, our clone, and nothing else.
             if handle.refs() > 2 {
+                skipped.push(key);
+                continue;
+            }
+            // A queue somebody is holding a record from stays, however cold it
+            // looks. Claims live in memory, so evicting the table would release
+            // every one of them without telling the consumer that has the work
+            // in hand, and the ACK it sends back would be refused.
+            if handle.read().queue.as_ref().is_some_and(|queue| queue.in_flight() > 0) {
                 skipped.push(key);
                 continue;
             }

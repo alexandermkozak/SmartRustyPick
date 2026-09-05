@@ -24,7 +24,7 @@ const {
   maintaining,
   selectAccount,
   selectFile,
-  setDurable,
+  setFile,
   createAccount,
   deleteAccount,
   createFile,
@@ -86,7 +86,7 @@ async function afterIndexChange(done: boolean): Promise<void> {
       />
     </div>
     <div>
-      <FileStatistics :changing="changing" :stats="stats" @set-durable="setDurable" />
+      <FileStatistics :changing="changing" :stats="stats" @set-file="setFile" />
     </div>
   </section>
 

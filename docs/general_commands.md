@@ -232,23 +232,95 @@ acknowledged, while the rest of the database keeps buffering writes. The flag is
 the file's `DIR`
 entry - see [Storage Engine](storage.md).
 
-- **Usage**: `CREATE.FILE <name> [DURABLE]`
+`QUEUE` makes it a [queue file](#queue-files): records keep their arrival order and are handed out one at a time. A
+queue is `DURABLE` unless `BUFFERED` says otherwise. `TIMEOUT` sets how long a claim on it is held, in seconds
+(default 60), and `RETRIES` how many times a record is delivered before it moves to the dead-letter file (default 5);
+naming either implies `QUEUE`.
+
+- **Usage**: `CREATE.FILE <name> [DURABLE] [QUEUE [TIMEOUT <seconds>] [RETRIES <n>]]`
 - **Example**: `CREATE.FILE ORDERS`
 - **Example**: `CREATE.FILE LEDGER DURABLE`
+- **Example**: `CREATE.FILE JOBS QUEUE`
+- **Example**: `CREATE.FILE JOBS QUEUE TIMEOUT 300 RETRIES 3`
 
 #### SET.FILE
 
-Turn durable writes on or off for a file that already exists, keeping the records it holds.
+Change what a file already is, keeping the records it holds: its durability, whether it is a queue, and that queue's
+claim policy.
 
-Promoting a file flushes what it still had buffered as part of the change, so the flag never gets ahead of the data it
-protects. `BUFFERED` returns the file to the database's ordinary flush policy. `DIR` carries the flags for the other
-files and cannot be set itself. See [Storage Engine](storage.md).
+Only the flags you name change, so a `SET.FILE JOBS DURABLE` cannot quietly stop `JOBS` being a queue. Promoting a
+file flushes what it still had buffered as part of the change, so the flag never gets ahead of the data it protects.
+`BUFFERED` returns the file to the database's ordinary flush policy, and `NOQUEUE` returns a queue to an ordinary
+file without touching a record, dropping the order and the delivery counts with it. The one exception to "only what you name": a file becoming a queue becomes `DURABLE`
+with it unless `BUFFERED` says otherwise, for the reason a queue is created durable. `DIR` carries the attributes for the other files and cannot be set itself. See
+[Storage Engine](storage.md).
 
-- **Usage**: `SET.FILE <name> DURABLE | BUFFERED`
+- **Usage**: `SET.FILE <name> [DURABLE | BUFFERED] [QUEUE | NOQUEUE] [TIMEOUT <seconds>] [RETRIES <n>]`
 - **Example**: `SET.FILE LEDGER DURABLE`
 - **Example**: `SET.FILE LEDGER BUFFERED`
+- **Example**: `SET.FILE OUTBOX QUEUE TIMEOUT 120`
 - **Note**: Admin clients can do the same over the [remote protocol](protocol.md) with `SET.FILE`, and from the
   [web dashboard](web_dashboard.md).
+
+#### Queue files
+
+A `SELECT` is a snapshot, so two clients that select the same pending work both get all of it. A queue file is the
+other thing: an order, and a claim only one consumer can hold at a time.
+
+`ENQUEUE` appends a record and the engine mints its key - twenty digits carrying the millisecond it arrived, so the
+keys sort into arrival order. `DEQUEUE` claims the oldest unclaimed record for this session, `ACK` consumes it and
+`NACK` gives it straight back. A claim that is not settled within the queue's `TIMEOUT` lapses on its own, and the
+record is delivered again with its retry count one higher - so a consumer that dies mid-job costs a redelivery rather
+than a lost record. A record that has used up its `RETRIES` moves to `<name>.DEAD`, which is a queue itself, keeping
+its key and its failure count. That file is the end of the line: `NACK` a record while draining it and the record stays
+there, counted, rather than moving on to a `<name>.DEAD.DEAD`.
+
+Everything else still works on the file: `LIST`, `SELECT`, `READ` and the dictionary commands treat a queue as the
+ordinary file it also is. `FILE.STATS` adds the queue's depth, in-flight count, oldest unacknowledged age and
+dead-letter count. See [Storage Engine](storage.md#queue-files) for what is on disk and what survives a crash.
+
+#### ENQUEUE
+
+Append a record to a queue. The key is minted by the engine and printed back.
+
+- **Usage**: `ENQUEUE <queue> <data>`
+- **Example**: `ENQUEUE JOBS invoice^4471`
+
+#### DEQUEUE
+
+Claim the oldest unclaimed record, printing its key, its delivery count and its contents. An optional number of
+seconds overrides the queue's own visibility timeout for this one claim.
+
+- **Usage**: `DEQUEUE <queue> [<visibility seconds>]`
+- **Example**: `DEQUEUE JOBS`
+- **Example**: `DEQUEUE JOBS 300`
+
+#### ACK
+
+The work succeeded: consume the claimed record, which leaves the queue for good. Only the session holding the claim
+may acknowledge it, and only while the claim stands.
+
+- **Usage**: `ACK <queue> <key>`
+- **Example**: `ACK JOBS 01764950412345000001`
+
+#### NACK
+
+The work failed: give the record back now rather than waiting for the claim to lapse. The delivery already counted
+stands, so returning a record for the last time it is allowed dead-letters it.
+
+- **Usage**: `NACK <queue> <key>`
+- **Example**: `NACK JOBS 01764950412345000001`
+
+#### PEEK
+
+Read a record without claiming it: the head of the queue, or the one under a named key. Peeking counts no delivery and
+does not hold up the consumers draining the queue, and it shows who is holding a record when somebody is - which is how
+a stuck consumer is found. The head of the queue is the oldest record *available* to be claimed, so a queue whose
+records are all in flight peeks as empty; name the key to look at one that is held.
+
+- **Usage**: `PEEK <queue> [<key>]`
+- **Example**: `PEEK JOBS`
+- **Example**: `PEEK JOBS.DEAD 01764950412345000001`
 
 #### DELETE.FILE
 
@@ -266,7 +338,12 @@ The health half is a verdict per measure — `ok`, `watch` or `ACT` — with the
 format, the per-group checksums, the skew of the group distribution, how close the file is to the full rewrite a
 modulus change is, and the worst verdict among its indexes.
 
-The per-group record counts come from each group's trailer, so this reads no record.
+The per-group record counts come from each group's trailer, so this reads no record - unless the file is a queue,
+whose depth and in-flight count live in the order held in memory and so cost a load.
+
+A [queue file](#queue-files) adds a line of its own: how many records are waiting, how many are claimed and not yet
+acknowledged, how old the oldest one still in the queue is, and how many have been dead-lettered - followed by the
+claim policy those numbers are under.
 
 - **Usage**: `FILE.STATS <file>`
 - **Example**: `FILE.STATS ORDERS`

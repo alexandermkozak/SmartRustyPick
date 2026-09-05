@@ -63,7 +63,7 @@ by default), so they follow `ca_path` rather than littering the working director
 | Overview       | Uptime, listener, connection and request totals, pending writes, tables in memory, every connection open right now, and a storage roll-up naming the accounts that need attention. |
 | Authorizations | Every authorized client: name, thumbprint, allowed accounts, admin flag. Authorize a thumbprint, add or remove accounts, revoke. |
 | Certificates   | Issue a certificate signed by the server's CA, authorized in the same step, with its key downloadable once.                      |
-| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Accounts and files can be created and dropped, durable files are tagged in the listing and the flag can be turned on or off, and the selected file's dictionary and indexes are listed and managed below. |
+| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Accounts and files can be created and dropped, durable and queue files are tagged in the listing and either flag can be turned on or off, a queue's depth and in-flight count are reported, and the selected file's dictionary and indexes are listed and managed below. |
 
 File statistics cover the record and dictionary counts, the indexes the file carries, the hash modulus and group
 distribution, bytes on disk, the durability flag and whether the file is currently held in the server's cache. Record
@@ -115,23 +115,40 @@ coloured pill, and the Overview tab has a **Storage** card naming the accounts t
 listing can afford. The full measures arrive when a file is opened. A healthy row shows no pill at all — forty green
 badges would hide the one that matters.
 
-Durability is the one thing about a file the dashboard changes rather than reports: beside the statistics, **Make
-durable** promotes the file so every write to it is flushed before being acknowledged, and **Buffer writes** returns it
-to the database's flush policy. Promoting flushes what the file still had buffered, so no data is at risk while the flag
-lands, and the file keeps its records either way. The change goes out as the ordinary `SET.FILE` command, so it is
-refused unless the dashboard's own certificate is an admin one, and the page re-reads the flag from the database rather
-than assuming the click took effect — a server running with `durable_writes = true` reports every file as durable
-whatever the button asked for. See [Storage Engine](storage.md).
+**Queues.** A [queue file](storage.md#queue-files) gets a panel of its own above the layout, because a queue nobody is
+draining is the thing an administrator most needs to see and it is not visible in a record count: how many records are
+waiting, how many are claimed and not yet acknowledged, how old the oldest one still in the queue is, and how many have
+given up and gone to `<file>.DEAD`. The same depth with nothing in flight and an oldest entry an hour old is a stalled
+queue; with three claims a few seconds old it is a working one. The claim policy the numbers are under — how long a
+claim is held and how many deliveries a record gets — is listed with them. Reading the panel sweeps the claims that
+have lapsed, so an in-flight count never includes one that expired ten minutes ago.
+
+**What the dashboard changes rather than reports.** Two things, both beside the statistics. **Make durable** promotes
+the file so every write to it is flushed before being acknowledged, and **Buffer writes** returns it to the database's
+flush policy; promoting flushes what the file still had buffered, so no data is at risk while the flag lands. **Make a
+queue** attaches an arrival order to the records the file already holds, and **Stop being a queue** detaches it — the
+records stay put either way, which is why the second one confirms first: what it drops is the order and any claim a
+consumer is holding.
+
+Both go out as the ordinary `SET.FILE` command, so they are refused unless the dashboard's own certificate is an admin
+one, and only the attribute the button names is sent — the database leaves an omitted one alone, so making a file a
+queue cannot quietly change its durability back. The page re-reads the file from the database rather than assuming the
+click took effect: a server running with `durable_writes = true` reports every file as durable whatever the button
+asked for. See [Storage Engine](storage.md).
 
 ### Creating and dropping
 
 Under the account list is a field that creates one. **Create account** makes an empty one (`CREATE.ACCOUNT`) and
 **Create demo** makes the populated fixture (`CREATE.TEST.ACCOUNT`) — the same one the CLI creates, with `USERS` and
 `PRODUCTS` files, their dictionaries, a multivalued field whose values go one level deeper still, a price carrying
-an `MD2` conversion, and an [association group](data_structures.md#association-groups) over the `PRODUCTS` suppliers. It is the quickest way to have something real to point the file statistics and the dictionary
-editor at. Each row carries a **Drop** (`DELETE.ACCOUNT`). The same pair sits under the file list: a name and a **Durable** tick create a file
-(`CREATE.FILE`, durable from its first write), and each file has its own **Drop** (`DELETE.FILE`). All four are admin
-commands, so a dashboard whose certificate is not an admin one is refused by the database and says so.
+an `MD2` conversion, an [association group](data_structures.md#association-groups) over the `PRODUCTS` suppliers, and a
+`JOBS` [queue](storage.md#queue-files) with three records already on it. It is the quickest way to have something real to point the file statistics and the dictionary
+editor at. Each row carries a **Drop** (`DELETE.ACCOUNT`). The same pair sits under the file list: a name with **Durable** and
+**Queue** ticks creates a file (`CREATE.FILE`, with whichever it is given from its first write), and each file has its
+own **Drop** (`DELETE.FILE`). Ticking **Queue** reveals two more fields — how long a claim is held and how many
+deliveries a record gets — which travel with the create rather than following it, so a queue is never briefly running on
+a timeout nobody asked for; left blank, the database's own defaults apply. All four are admin commands, so a dashboard
+whose certificate is not an admin one is refused by the database and says so.
 
 Both drops confirm first, naming what goes with them — an account drop names the number of files it takes. Two things
 are deliberately not offered:

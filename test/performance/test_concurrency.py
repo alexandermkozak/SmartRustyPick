@@ -6,6 +6,8 @@ scale with the client count. That is why this suite asserts properties rather th
 fixed speedup:
 
 * correctness under contention - no lost updates, no cross-talk between connections;
+* exclusive queue claims - N consumers draining one queue file must between them receive
+  every record exactly once, which is the property a queue exists to provide;
 * per-file locking - writers to *different* files must beat a single writer, and must
   see a shorter tail than the same writers all queueing on one file;
 * no throughput collapse - N clients must still get at least a fraction of the
@@ -32,10 +34,31 @@ import harness
 
 ACCOUNT = "CONC_ACC"
 FILE = "CONC"
+QUEUE = "CONC_Q"
+# An ordinary file the queue's statistics are measured against, so the group
+# trailers both of them read are on both sides of the comparison.
+PLAIN = "CONC_P"
 SEED_RECORDS = int(os.environ.get("SRP_CONC_RECORDS", "1000"))
 CLIENTS = int(os.environ.get("SRP_CONC_CLIENTS", "8"))
 OPS_PER_CLIENT = int(os.environ.get("SRP_CONC_OPS", "200"))
 HANDSHAKES = int(os.environ.get("SRP_CONC_HANDSHAKES", "20"))
+# Records pushed through the queue by the concurrent consumers. Enough that the
+# consumers overlap on the file many times over rather than each taking a turn.
+QUEUE_RECORDS = int(os.environ.get("SRP_CONC_QUEUE_RECORDS", "600"))
+# `FILE.STATS` on a queue sweeps the lapsed claims and reads the depth, in-flight
+# count and oldest age, and it does that under the file's own write lock - the
+# lock every consumer of that queue is waiting on. So being a queue must not add
+# a cost that grows with the backlog, or a dashboard polling a deep queue would
+# stall the consumers draining it.
+#
+# The comparison is a queue against an *ordinary* file holding the same records,
+# rather than a shallow queue against a deep one. `FILE.STATS` reads one group
+# trailer per group whatever the file is, so it grows with the group count on its
+# own; measuring a queue against itself at two depths would report that growth
+# and say nothing about the queue. Against a plain file of the same size, that
+# shared cost is on both sides and what is left is the queue's own.
+QUEUE_STATS_RECORDS = int(os.environ.get("SRP_CONC_QUEUE_STATS_RECORDS", "8000"))
+QUEUE_STATS_OVERHEAD = float(os.environ.get("SRP_CONC_QUEUE_STATS_OVERHEAD", "1.6"))
 
 # Fraction of the single-client throughput that N clients must still achieve in
 # aggregate. Serialised execution alone costs nothing here; only pathological
@@ -84,6 +107,7 @@ SETUP_COMMANDS = [
     f"CREATE.ACCOUNT {ACCOUNT}",
     f"LOGTO {ACCOUNT}",
     f"CREATE.FILE {FILE}",
+    f"CREATE.FILE {QUEUE} QUEUE TIMEOUT 300",
     f"SET DICT {FILE} VAL1 1",
     f"SET DICT {FILE} SEQ 2",
     "SAVE",
@@ -145,6 +169,67 @@ def run_parallel(make_client, clients, ops, op=None, op_for_slot=None):
     merged = [s for group in samples for s in (group or [])]
     problems = errors + [f for group in failures for f in (group or [])]
     return harness.Stats(merged), problems, wall
+
+
+def drain_queue_concurrently(make_client, clients, expected):
+    """Drain one queue with `clients` consumers and report exactly what each received.
+
+    The whole point of a queue file is that this cannot double-deliver, so the check
+    is a total across the consumers rather than a per-client one: every key handed
+    out, counted, with duplicates kept rather than collapsed into a set. A record
+    delivered twice shows up as a duplicate here even if both consumers succeed.
+
+    Consumers acknowledge what they take, so nothing is redelivered by a lapsed
+    claim - the queue is created with a 300 second visibility timeout, far longer
+    than the run, so a redelivery here would mean a broken claim and not a slow test.
+    """
+    delivered = [None] * clients
+    errors = []
+    lock = threading.Lock()
+    drained = {"count": 0}
+
+    def worker(slot):
+        keys = []
+        try:
+            with make_client() as conn:
+                while True:
+                    with lock:
+                        if drained["count"] >= expected:
+                            break
+                    resp = conn.request(command="DEQUEUE", file=QUEUE, account=ACCOUNT)
+                    status = resp.get("status")
+                    if status == "EMPTY":
+                        # Another consumer may still be holding one it has not yet
+                        # acknowledged, so an empty read is not the end of the queue.
+                        with lock:
+                            if drained["count"] >= expected:
+                                break
+                        continue
+                    if status != "OK":
+                        errors.append(f"client {slot}: DEQUEUE said {resp.get('message')}")
+                        break
+                    key = resp["claim"]["key"]
+                    keys.append(key)
+                    ack = conn.request(command="ACK", file=QUEUE, key=key, account=ACCOUNT)
+                    if ack.get("status") != "OK":
+                        errors.append(f"client {slot}: ACK said {ack.get('message')}")
+                        break
+                    with lock:
+                        drained["count"] += 1
+        except Exception as exc:  # noqa: BLE001 - surfaced as a suite failure
+            errors.append(f"client {slot}: {exc}")
+        delivered[slot] = keys
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(clients)]
+    start = time.perf_counter()
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    wall = time.perf_counter() - start
+
+    every_key = [key for group in delivered for key in (group or [])]
+    return every_key, [len(group or []) for group in delivered], wall, errors
 
 
 def handshakes_during_slow_flush(make_client, handshake_stats):
@@ -452,6 +537,117 @@ def main():
                     landed,
                     CLIENTS * DISTINCT_WRITES,
                 )
+
+            # N consumers against one queue: between them they must receive every
+            # record exactly once. This is the acceptance property of a queue
+            # file, and the only place in the suite where two clients are
+            # deliberately racing for the *same* record rather than for the same
+            # lock on different ones.
+            with make_client() as producer:
+                enqueue_failures = [
+                    resp.get("message")
+                    for resp in (
+                        producer.request(
+                            command="ENQUEUE",
+                            file=QUEUE,
+                            data=f"job^{index}",
+                            account=ACCOUNT,
+                        )
+                        for index in range(QUEUE_RECORDS)
+                    )
+                    if resp.get("status") != "OK"
+                ]
+            suite.check(
+                f"Every one of {QUEUE_RECORDS} records enqueues",
+                not enqueue_failures,
+                "as expected" if not enqueue_failures else f"{len(enqueue_failures)} failed ({enqueue_failures[0]})",
+            )
+
+            every_key, per_client, queue_wall, queue_errors = drain_queue_concurrently(
+                make_client, CLIENTS, QUEUE_RECORDS
+            )
+            duplicates = len(every_key) - len(set(every_key))
+            suite.record(
+                "Queue drain",
+                {
+                    "clients": CLIENTS,
+                    "records": QUEUE_RECORDS,
+                    "delivered": len(every_key),
+                    "distinct": len(set(every_key)),
+                    "per_client": per_client,
+                    "seconds": round(queue_wall, 3),
+                    "records_per_second": round(QUEUE_RECORDS / queue_wall, 2) if queue_wall else 0.0,
+                },
+            )
+            suite.check(
+                f"{CLIENTS} consumers never receive the same record twice",
+                not queue_errors and duplicates == 0 and len(every_key) == QUEUE_RECORDS,
+                f"{len(every_key)} deliveries of {QUEUE_RECORDS} records, {duplicates} duplicated, "
+                f"split {per_client} across {CLIENTS} consumers in {queue_wall:.2f}s"
+                if not queue_errors
+                else f"{len(queue_errors)} failures ({queue_errors[0]})",
+            )
+            # Every consumer has to have done some of the work: one client that
+            # took all of it would satisfy the count above while proving nothing
+            # about concurrent claims.
+            suite.check(
+                "Every consumer gets a share of the queue",
+                bool(per_client) and min(per_client) > 0,
+                f"smallest share {min(per_client) if per_client else 0} records of {QUEUE_RECORDS}",
+            )
+            with make_client() as checker:
+                stats = checker.request(command="FILE.STATS", file=QUEUE, account=ACCOUNT)
+                queue_stats = (stats.get("record") or {}).get("queue") or {}
+            suite.check(
+                "A fully drained queue reports nothing left",
+                queue_stats.get("depth") == 0
+                and queue_stats.get("in_flight") == 0
+                and queue_stats.get("dead_letters") == 0,
+                f"depth {queue_stats.get('depth')}, in flight {queue_stats.get('in_flight')}, "
+                f"dead-lettered {queue_stats.get('dead_letters')}",
+            )
+
+            # What being a queue adds to a file's statistics, at a depth where a
+            # scan of the backlog would be plainly visible.
+            with make_client() as producer:
+                producer.request(command="CREATE.FILE", file=PLAIN, account=ACCOUNT)
+                for index in range(QUEUE_STATS_RECORDS):
+                    producer.request(
+                        command="ENQUEUE", file=QUEUE, data=f"depth^{index}", account=ACCOUNT
+                    )
+                    producer.request(
+                        command="WRITE",
+                        file=PLAIN,
+                        key=f"D{index}",
+                        data=f"depth^{index}",
+                        account=ACCOUNT,
+                    )
+
+                def stats_cost(file):
+                    return harness.benchmark(
+                        lambda _: producer.request(
+                            command="FILE.STATS", file=file, account=ACCOUNT
+                        ),
+                        30,
+                        warmup=3,
+                    )
+
+                plain_stats, _ = stats_cost(PLAIN)
+                queue_stats_timing, last = stats_cost(QUEUE)
+
+            reported = ((last.get("record") or {}).get("queue") or {}).get("depth")
+            suite.check_eq(
+                "FILE.STATS reports the depth the queue was filled to",
+                reported,
+                QUEUE_STATS_RECORDS,
+            )
+            suite.check_ratio(
+                "A queue's statistics cost no more than an ordinary file's",
+                queue_stats_timing.p50 / plain_stats.p50 if plain_stats.p50 else 0.0,
+                QUEUE_STATS_OVERHEAD,
+                detail=f"{QUEUE_STATS_RECORDS} records, plain p50 {plain_stats.p50:.2f}ms "
+                f"vs queue p50 {queue_stats_timing.p50:.2f}ms",
+            )
 
             loaded, handshake_ratio, load_errors = handshakes_during_slow_flush(
                 make_client, handshake_stats

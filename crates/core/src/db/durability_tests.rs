@@ -342,10 +342,11 @@ fn test_the_listing_carries_each_files_durability() {
     db.create_table("NORMAL").unwrap();
     db.create_table_durable("CRITICAL", true).unwrap();
 
-    let listed = db.list_tables_with_durability_for_account("DUR9");
+    let listed = db.list_tables_with_attributes_for_account("DUR9");
     let of_ours: Vec<(String, bool)> = listed
         .into_iter()
         .filter(|(name, _)| name == "CRITICAL" || name == "NORMAL" || name == "DIR")
+        .map(|(name, attributes)| (name, attributes.durable))
         .collect();
     assert_eq!(
         of_ours,
@@ -360,8 +361,8 @@ fn test_the_listing_carries_each_files_durability() {
     // reporting DIR entries that no longer describe what a write does.
     db.durable_writes = true;
     assert!(
-        db.list_tables_with_durability_for_account("DUR9")
+        db.list_tables_with_attributes_for_account("DUR9")
             .iter()
-            .all(|(_, durable)| *durable)
+            .all(|(_, attributes)| attributes.durable)
     );
 }

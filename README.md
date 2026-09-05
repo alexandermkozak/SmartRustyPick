@@ -42,6 +42,9 @@ field formatting, and complex select operations.
 - **Dictionary Support**: Define field indices, display headers, justifications, column widths, and
   formatting/conversions (Dates, Numbers).
 - **Active Select Lists**: Perform queries and refine them through sequential `SELECT` commands.
+- **Queue Files**: A file created `QUEUE` keeps its records in arrival order and hands them out one at a time, so
+  several consumers can divide work between them: a claim is exclusive, an unacknowledged one comes back after a
+  timeout, and a record that keeps failing lands in a dead-letter file rather than looping forever.
 - **Remote Access**: TCP SSL server with certificate authentication and CRUD protocol.
 - **Web Dashboard**: Browser-based management of connections, certificates, accounts, files, their dictionaries and live
   server activity, started automatically with the server.

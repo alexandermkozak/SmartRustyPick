@@ -384,6 +384,15 @@ button:disabled {
   border-color: var(--accent);
 }
 
+/* What a file *is*, beside how its writes are flushed. Filled rather than
+   outlined so the two tags on one row are told apart at a glance without
+   introducing a third colour. */
+.tag.queue {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
 .file-actions {
   margin-top: 0.9rem;
   border-top: 1px solid var(--line);

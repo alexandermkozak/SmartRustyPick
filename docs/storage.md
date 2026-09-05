@@ -382,6 +382,10 @@ The flag lives in the account's `DIR` file, as attribute 2 (`DURABLE`) of the fi
 that file is flushed before it is acknowledged, an empty value means the file follows the global buffering policy. The
 flag is metadata, so setting it is itself flushed at once, and it is preserved when the `DIR` listing is rebuilt.
 
+A `DIR` entry carries five attributes in all — the entry type, this flag, and the three that describe a
+[queue file](#queue-files). A rebuild of the listing reconstructs it from the filesystem, which knows none of them, so
+every attribute of the old entry is carried across in one piece.
+
 Set it when creating the file:
 
 - CLI: `CREATE.FILE LEDGER DURABLE`
@@ -427,6 +431,141 @@ flag costs nothing on the write path — it is cached per file after the first l
 A file marked `DURABLE` (and a database running with `durable_writes = true`) uses `always`, because "flushed before the
 write is acknowledged" has to mean on disk and not merely in the page cache. Setting `fsync` explicitly overrides that
 too, for an operator who knowingly trades the guarantee for throughput.
+
+## Queue Files
+
+A hash file has no order to walk: a record's key decides its group, so "the oldest record" is not a question the layout
+can answer. A queue file adds the two things that are missing from that for work several consumers divide between them
+— an order, and a claim only one of them can hold.
+
+A file is made a queue by its `DIR` entry, exactly as it is made durable: attribute 3 (`QUEUE`) is `Y`, attribute 4
+(`QUEUE.TIMEOUT`) is how many seconds a claim is held, and attribute 5 (`QUEUE.RETRIES`) is how many times a record is
+delivered before it is dead-lettered. Both numbers are written out even when they are the defaults (60 and 5), because
+the entry is what an administrator reads to find out what the queue will do, and "blank, which means sixty" is a worse
+answer than "60". The policy is per file rather than per server: a queue of thirty-second jobs and a queue of hour-long
+ones need different answers.
+
+Nothing else about the file changes. Its records are ordinary records in the ordinary hashed layout, its dictionary
+describes them the usual way, and `READ`, `LIST`, `SELECT` and the index commands all work on it unchanged.
+
+### Sequence keys
+
+The engine mints the key of every enqueued record, as twenty decimal digits:
+
+```text
+ 01764950412345 000001
+ ^ milliseconds ^ counter within that millisecond
+```
+
+`milliseconds-since-the-epoch * 1000000 + counter`, zero padded, so the keys sort into arrival order both as text and as
+numbers. Claiming the oldest record is then the first entry of an ordered set, not a scan.
+
+The clock is deliberately *in* the key. That is what lets the oldest unacknowledged age be read off the smallest live
+key rather than from a timestamp stored per record — and that is the difference between persistent queue state the size
+of the in-flight set and state the size of the queue's depth. Two consequences follow, and are worth stating plainly:
+
+- The sequence is forced upwards, so a clock that steps backwards still yields keys in arrival order — but the time
+  those keys carry is behind the wall clock until it catches up, and a reported age is off by that much in the meantime.
+- A millisecond holds a million keys. Enqueueing faster than that borrows from the next millisecond rather than
+  colliding.
+
+A record put into a queue file by hand — `WRITE` under a key of your own — is not refused. It joins the order in key
+order like any other, and a record deleted out from under a claim is forgotten rather than handed out with nothing
+behind it. A queue that cannot be repaired by hand would be worse than one that can.
+
+### What is on disk, and what is not
+
+Beside the records, a queue file carries one small `queue` file:
+
+```text
+<account>/JOBS/data.hf/        the records
+<account>/JOBS/dict            the dictionary
+<account>/JOBS/queue           the next sequence number and the delivery counts
+```
+
+It holds two things: the next sequence number, and the delivery count of each record that has been delivered at least
+once. Written checksum-first through a temporary file and a rename, like an index's `state`, and written *after* the
+records for the same reason — it names records, so it must never get ahead of them. A count naming a record the data
+section has not got is dropped on the next load; a record with no count merely starts its retries again.
+
+**Claims are not persisted at all.** A claim belongs to a connection, and a server that has restarted has none, so
+every claim is released on load and its record becomes available again with its delivery count intact. This is why the
+`queue` file stays small in a queue that is being drained normally: it is the size of the trouble, not the size of the
+backlog.
+
+A file that stops being a queue loses the `queue` file with it, so nothing is left on disk describing an order the file
+no longer has. Its records are untouched; promoting it again rebuilds the order from them and starts the delivery counts
+over.
+
+A `queue` file that does not check out — a bad checksum, a truncation, anything unreadable — is treated as absent rather
+than as an error. The records are the queue; this only says where the sequence had got to and how often each record had
+been delivered, so losing it costs a few redeliveries and a sequence recovered from the largest key already present.
+Refusing to open the queue would cost the queue.
+
+What that buys, against a hard kill of the server:
+
+- A record that was acknowledged does not come back. `ACK` removes it from the records, and the records are flushed
+  before the acknowledgement returns — a queue is durable by default precisely so this holds.
+- A record that was claimed and not acknowledged does not disappear. It never left the records; only the claim did, and
+  the claim was in memory.
+- A record redelivered after a restart carries the deliveries it had already used, so a poison record still reaches the
+  dead-letter file rather than looping forever.
+
+### Dead letters
+
+A record delivered `QUEUE.RETRIES` times without being acknowledged moves to `<name>.DEAD`, which is created on the
+first one and is a queue file itself. The record keeps its sequence key and its delivery count, so what failed and how
+often is readable with `PEEK`, and a fixed consumer drains the file with the same commands it drains the live queue
+with.
+
+A dead-letter file is the end of the line: its own records are never dead-lettered again. A `NACK` or a lapsed claim
+there returns the record to the file it is already on, with its delivery count still rising, rather than creating a
+`<name>.DEAD.DEAD` — draining a dead-letter file is how an operator finds out what went wrong, and burying a record one
+level deeper each time they look at it would defeat that. The file's `DIR` entry still carries the retry limit its
+records were given before they arrived, and that is what `FILE.STATS` reports.
+
+The move crosses two files, and a thread holds one file's lock at a time (see [Concurrency and Lock
+Ordering](#concurrency-and-lock-ordering)). So the records are taken out of the queue under its own lock, carried in
+hand, and written to the dead-letter file — which is flushed *before* the queue is. A crash in between therefore
+duplicates a dead letter rather than losing a record, and because the copy keeps its original sequence key, the retry
+that follows overwrites it rather than adding a second one.
+
+### What the statistics cost
+
+`FILE.STATS` on a queue reads its depth, in-flight count, oldest unacknowledged age and
+dead-letter count, and it does so under that file's own lock - the one every consumer of the queue is waiting on. So
+none of it may grow with the backlog.
+
+The depth and the in-flight count are counters. The oldest age is read from the *front* of the available set, which is
+already ordered, rather than by taking a minimum over every key: a sequence key is twenty ASCII digits, so among the
+keys that are sequence keys, sorting by text is sorting by number and the first one found is the smallest. A key written
+by hand carries no arrival time and is stepped over rather than ending the search. The sweep of lapsed claims is over
+the in-flight set, which is the number of consumers rather than the depth.
+
+What is left is the cost `FILE.STATS` has on any file: one seek per group trailer, which grows with the group count and
+not with this. `test/performance/test_concurrency.py` measures a queue's statistics against an ordinary file holding the
+same records for exactly that reason - the shared cost is on both sides, and what the ratio reports is the queue's own.
+
+### Why a claim is atomic
+
+Everything that decides who gets a record happens inside one write lock on that file: the lapsed claims are swept back
+into the order, the oldest available key is taken out of it, and the claim is recorded — without the lock being
+released in between. A second consumer arriving at any point either has not got the lock yet or is looking at a queue
+the record has already left. Two consumers therefore cannot come away with the same key.
+
+`PEEK` is the exception, and deliberately so: it claims nothing and counts no delivery, so it takes a *shared* lock
+unless a claim has actually lapsed - which is a cheap question, asked over the in-flight set rather than the backlog.
+Polling a queue to see what is on it therefore does not hold up the consumers draining it. A peek that does find a
+lapsed claim puts it back before answering, and that part takes the file exclusively.
+
+That lock is the *file's*, not the database's, so consumers of one queue contend only with each other. The queue
+commands take the same shared path as `READ` and `WRITE` for exactly this reason: a queue is the most contended file in
+any system that has one, and taking the database exclusively to claim from it would serialise every consumer against
+every other connection in the server.
+
+Delivery is therefore **at least once, not exactly once**. A consumer that finishes its work and dies before
+acknowledging leaves a claim that lapses and a record that is handed out again; the delivery count on every claim is
+what a consumer should be idempotent against.
 
 ## Concurrency and Lock Ordering
 
