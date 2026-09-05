@@ -1,5 +1,6 @@
 use crate::db::hashfile::SectionMeta;
 use crate::db::index::FileIndex;
+use crate::db::queue::QueueState;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -15,9 +16,86 @@ pub const SYS_CLIENTS_ADMIN_IDX: usize = 2;
 pub const SYS_LOGS_MESSAGE_IDX: usize = 0;
 pub const SYS_LOGS_DETAIL_IDX: usize = 1;
 // DIR entries describe the files of an account: field 1 is the entry type,
-// field 2 the per-file durability flag ("Y" = flush every write immediately).
+// field 2 the per-file durability flag ("Y" = flush every write immediately),
+// field 3 the queue flag, and fields 4 and 5 that queue's claim policy. A file
+// carries its own policy because a queue of thirty-second jobs and a queue of
+// hour-long ones need different answers, and DIR is where a per-file answer
+// already survives a rebuild of the listing.
 pub const DIR_TYPE_IDX: usize = 0;
 pub const DIR_DURABLE_IDX: usize = 1;
+pub const DIR_QUEUE_IDX: usize = 2;
+/// Attribute 4: seconds a claim on this queue is held before it lapses. Empty
+/// means [`crate::db::queue::DEFAULT_VISIBILITY`].
+pub const DIR_QUEUE_TIMEOUT_IDX: usize = 3;
+/// Attribute 5: deliveries this queue gives a record before dead lettering it.
+/// Empty means [`crate::db::queue::DEFAULT_MAX_DELIVERIES`].
+pub const DIR_QUEUE_RETRIES_IDX: usize = 4;
+
+/// One `DIR` entry, read as what it says about the file rather than as five
+/// attributes to be picked apart at each call site.
+///
+/// Three places need all of this at once - creating a file, changing it, and
+/// rebuilding the listing - and the rebuild is the one that matters: it
+/// reconstructs every entry from the filesystem, which knows none of this, so
+/// each attribute has to be carried across in one piece or be lost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileAttributes {
+    /// Every write to this file is flushed before it is acknowledged.
+    pub durable: bool,
+    /// The claim policy, for a file that is a queue. `None` for an ordinary one.
+    pub queue: Option<crate::db::queue::QueuePolicy>,
+}
+
+impl FileAttributes {
+    /// What a `DIR` record says. Anything unreadable reads as the default, so a
+    /// hand-edited entry degrades to an ordinary buffered file rather than
+    /// making the account's listing unopenable.
+    pub fn of(record: &Record) -> Self {
+        let attribute = |idx: usize| record.get_field_display_string(idx);
+        let flag = |idx: usize| {
+            matches!(
+                attribute(idx).trim().to_uppercase().as_str(),
+                "Y" | "YES" | "1" | "TRUE" | "DURABLE" | "QUEUE"
+            )
+        };
+        FileAttributes {
+            durable: flag(DIR_DURABLE_IDX),
+            queue: flag(DIR_QUEUE_IDX).then(|| {
+                crate::db::queue::QueuePolicy::from_attributes(
+                    &attribute(DIR_QUEUE_TIMEOUT_IDX),
+                    &attribute(DIR_QUEUE_RETRIES_IDX),
+                )
+            }),
+        }
+    }
+
+    /// The `DIR` record that says this.
+    ///
+    /// A queue's timeout and retry limit are written out even when they are the
+    /// defaults: the entry is what an administrator reads to find out what a
+    /// queue will do, and "blank, which means sixty" is a worse answer than
+    /// "60".
+    pub fn to_record(self) -> Record {
+        let mut rec = Record::new();
+        while rec.fields.len() <= DIR_QUEUE_RETRIES_IDX {
+            rec.fields.push(Field::default());
+        }
+        let mut set = |idx: usize, text: String| rec.fields[idx].values = vec![Value::text(text)];
+        set(DIR_TYPE_IDX, "F".to_string());
+        set(DIR_DURABLE_IDX, if self.durable { "Y" } else { "" }.to_string());
+        set(DIR_QUEUE_IDX, if self.queue.is_some() { "Y" } else { "" }.to_string());
+        let (timeout, retries) = match self.queue {
+            Some(policy) => (
+                policy.visibility_seconds().to_string(),
+                policy.max_deliveries.to_string(),
+            ),
+            None => (String::new(), String::new()),
+        };
+        set(DIR_QUEUE_TIMEOUT_IDX, timeout);
+        set(DIR_QUEUE_RETRIES_IDX, retries);
+        rec
+    }
+}
 
 // Dictionary record field indices
 pub const DICT_FIELD_IDX: usize = 0;
@@ -351,6 +429,12 @@ pub struct Table {
     /// see the record a write replaces to know which value to withdraw, and
     /// that record is only still available at the moment of the write.
     pub indexes: BTreeMap<String, FileIndex>,
+    /// The order and the claims, for a file whose `DIR` entry marks it a queue.
+    ///
+    /// `None` for every ordinary file, which is what keeps a queue's cost off
+    /// the path every other file takes. Attached when the table is loaded and
+    /// rebuilt from the records each time - see [`crate::db::queue`].
+    pub queue: Option<QueueState>,
 }
 
 impl Default for Table {
@@ -371,11 +455,28 @@ impl Table {
             dirty_all: false,
             dict_dirty: false,
             indexes: BTreeMap::new(),
+            queue: None,
         }
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty_all || self.dict_dirty || !self.dirty_keys.is_empty() || self.indexes_dirty()
+        self.dirty_all || self.dict_dirty || !self.dirty_keys.is_empty() || self.indexes_dirty() || self.queue_dirty()
+    }
+
+    /// Brings a queue's order back in line with its records - see
+    /// [`QueueState::reconcile`]. A no-op on a file that is not a queue.
+    pub fn reconcile_queue(&mut self) {
+        if let Some(state) = self.queue.as_mut() {
+            state.reconcile(&self.records);
+        }
+    }
+
+    /// True when a queue has claimed, returned or minted something the `queue`
+    /// file beside the records does not yet say. A dequeue changes no record,
+    /// so without this a delivery count could be lost to a restart that the
+    /// table did not otherwise think it had anything to write.
+    pub fn queue_dirty(&self) -> bool {
+        self.queue.as_ref().is_some_and(|queue| queue.is_dirty())
     }
 
     /// True when an index has changes to write out, or has fallen behind the
@@ -889,6 +990,35 @@ pub struct AccountStats {
     pub health: crate::db::health::HealthSummary,
 }
 
+/// What a queue file is doing, as `FILE.STATS` reports it.
+///
+/// A queue nobody is draining is the thing an administrator most needs to see,
+/// and it does not show up in a record count: a queue at a steady depth with
+/// nothing in flight and an oldest entry an hour old is stalled, and one at the
+/// same depth with three claims a few seconds old is working. All four numbers
+/// are read from the in-memory queue state, so none of them costs a scan.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct QueueStats {
+    /// Records available to be claimed.
+    pub depth: u64,
+    /// Records claimed and not yet acknowledged.
+    pub in_flight: u64,
+    /// Age of the oldest record still in the queue, claimed or not, taken from
+    /// the millisecond its sequence key carries. `None` for an empty queue, or
+    /// one holding only records whose keys the engine did not mint.
+    pub oldest_unacknowledged_seconds: Option<u64>,
+    /// Records in this queue's dead-letter file. `0` when it has none yet.
+    pub dead_letters: u64,
+    /// The sequence number the next enqueue will use.
+    pub next_sequence: u64,
+    /// Seconds a claim on this queue is held before it lapses.
+    pub visibility_timeout_seconds: u64,
+    /// Deliveries a record gets before it is moved to the dead-letter file.
+    pub max_deliveries: u32,
+    /// True when this file is itself the dead-letter file of another queue.
+    pub dead_letter: bool,
+}
+
 /// Statistics for a single data file. Deliberately record free: the dashboard
 /// navigates files, it does not browse their contents.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -921,6 +1051,14 @@ pub struct FileStats {
     pub modified_seconds_ago: Option<u64>,
     /// The secondary indexes this file carries, in field order.
     pub indexes: Vec<crate::db::index::IndexStats>,
+    /// What this file is doing as a queue, or `None` when it is not one. The
+    /// numbers an administrator needs about a queue are not the numbers they
+    /// need about a hash file, so they arrive as their own object rather than
+    /// as null columns on every other file's statistics. Sent as `null` for a
+    /// file that is not a queue, like the other optional measures here, so a
+    /// reader can tell "not a queue" from "a build that does not know about
+    /// queues".
+    pub queue: Option<QueueStats>,
 
     // --- Derived measures. Everything below is computed from the section
     // metadata and the group trailers; none of it reads a record.

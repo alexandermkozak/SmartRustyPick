@@ -24,7 +24,7 @@ import {NO_HEALTH, verdictLabel} from '@shared/health'
 import type {FileStats} from '../types'
 
 const props = defineProps<{stats: FileStats | null; changing: boolean}>()
-const emit = defineEmits<{setDurable: [durable: boolean]}>()
+const emit = defineEmits<{setFile: [changes: {durable?: boolean; queue?: boolean}]}>()
 
 const health = computed(() => props.stats?.health ?? NO_HEALTH)
 
@@ -77,6 +77,7 @@ const rows = computed<Array<[string, string]>>(() => {
     ['On disk', bytes(file.disk_bytes)],
     ['Flush version', count(file.version)],
     ['Durable writes', file.durable ? 'yes' : 'no'],
+    ['Queue', file.queue ? (file.queue.dead_letter ? 'yes (dead letters)' : 'yes') : 'no'],
     ['In memory', file.loaded ? 'yes' : 'no'],
     [
       'Last modified',
@@ -89,10 +90,48 @@ const rows = computed<Array<[string, string]>>(() => {
 // database refuses to set. Saying so beats offering a button that always fails.
 const settable = computed(() => props.stats !== null && props.stats.name !== 'DIR')
 
-function toggle(): void {
+function toggleDurable(): void {
   if (!props.stats) return
-  emit('setDurable', !props.stats.durable)
+  emit('setFile', {durable: !props.stats.durable})
 }
+
+function toggleQueue(): void {
+  if (!props.stats) return
+  const becoming = !props.stats.queue
+  if (
+    !becoming &&
+    !window.confirm(
+      `Stop ${props.stats.name} being a queue? Its records stay, but the order and any ` +
+        'outstanding claims are dropped.',
+    )
+  ) {
+    return
+  }
+  emit('setFile', {queue: becoming})
+}
+
+/**
+ * The queue's own rows. Depth and in flight rather than a single record count,
+ * because the two together are what say whether anybody is draining it - and
+ * the oldest age is what says so even when the depth is steady.
+ */
+const queueRows = computed<Array<[string, string]>>(() => {
+  const queue = props.stats?.queue
+  if (!queue) return []
+  return [
+    ['Waiting', count(queue.depth)],
+    ['In flight', count(queue.in_flight)],
+    [
+      'Oldest unacknowledged',
+      queue.oldest_unacknowledged_seconds === null
+        ? '—'
+        : `${duration(queue.oldest_unacknowledged_seconds)} ago`,
+    ],
+    ['Dead-lettered', count(queue.dead_letters)],
+    ['Claim held for', duration(queue.visibility_timeout_seconds)],
+    ['Deliveries before dead-lettering', count(queue.max_deliveries)],
+  ]
+})
 </script>
 
 <template>
@@ -124,12 +163,28 @@ function toggle(): void {
         </p>
       </template>
 
+      <!-- Above the layout, not below it: a queue nobody is draining is the
+           thing an administrator most needs to see, and it is not visible in
+           any of the numbers underneath. -->
+      <template v-if="stats.queue">
+        <h4>Queue</h4>
+        <StatList :rows="queueRows" />
+        <p v-if="stats.queue.dead_letters" class="note">
+          {{ count(stats.queue.dead_letters) }} record(s) gave up in
+          <span class="mono">{{ stats.name }}.DEAD</span>, which is a queue itself — drain it to see
+          what failed.
+        </p>
+      </template>
+
       <h4>Layout</h4>
       <StatList :rows="rows" />
 
       <div v-if="settable" class="file-actions">
-        <button :disabled="changing" class="small" type="button" @click="toggle">
+        <button :disabled="changing" class="small" type="button" @click="toggleDurable">
           {{ stats.durable ? 'Buffer writes' : 'Make durable' }}
+        </button>
+        <button :disabled="changing" class="small" type="button" @click="toggleQueue">
+          {{ stats.queue ? 'Stop being a queue' : 'Make a queue' }}
         </button>
         <p class="note">
           {{
@@ -138,9 +193,16 @@ function toggle(): void {
               : 'Durable flushes every write to this file to disk before acknowledging it, and flushes what it still has buffered now.'
           }}
         </p>
+        <p class="note">
+          {{
+            stats.queue
+              ? 'The records stay where they are; only the order and the claims go.'
+              : 'A queue keeps its records in arrival order and hands them out one at a time. Making one also makes the file durable.'
+          }}
+        </p>
       </div>
       <p v-else class="note">
-        DIR carries the durability flags; its own writes are always flushed.
+        DIR carries the other files’ attributes; its own writes are always flushed.
       </p>
     </template>
   </div>

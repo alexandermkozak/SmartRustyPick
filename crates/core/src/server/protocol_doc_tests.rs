@@ -41,6 +41,9 @@ const REQUEST_FIELDS: &[&str] = &[
     "field",
     "values",
     "limit",
+    "queue",
+    "visibility_timeout",
+    "max_deliveries",
 ];
 
 /// Every JSON key a `Response` can carry.
@@ -53,6 +56,7 @@ const RESPONSE_FIELDS: &[&str] = &[
     "keys",
     "count",
     "positions",
+    "claim",
 ];
 
 /// Every command string accepted by `handle_request_locked`.
@@ -63,6 +67,11 @@ const COMMANDS: &[&str] = &[
     "QUERY",
     "SELECT",
     "GET.NEXT",
+    "ENQUEUE",
+    "DEQUEUE",
+    "ACK",
+    "NACK",
+    "PEEK",
     "CREATE.ACCOUNT",
     "CREATE.TEST.ACCOUNT",
     "DELETE.ACCOUNT",
@@ -124,6 +133,7 @@ fn response_struct_serializes_to_exactly_the_documented_fields() {
         keys: Some(Vec::new()),
         count: Some(0),
         positions: Some(Vec::new()),
+        claim: Some(serde_json::Value::Null),
     };
     let mut actual = json_keys(&populated);
     actual.sort();
@@ -250,11 +260,19 @@ fn commands_in_handler() -> Vec<String> {
         .lines()
         .filter_map(|line| {
             // The arms of that `match`, and only those: they sit at one indent
-            // inside `handle_request_locked`.
-            let arm = line.strip_prefix("        \"")?;
-            let (command, rest) = arm.split_once('"')?;
-            rest.trim_start().starts_with("=>").then(|| command.to_string())
+            // inside `handle_request_locked`. An arm may name several commands
+            // that share a body, so each alternative counts as its own command
+            // - otherwise grouping two arms would quietly undocument both.
+            let arm = line.strip_prefix("        ")?;
+            let (patterns, _) = arm.strip_prefix('"').and_then(|_| arm.split_once("=>"))?;
+            let commands: Vec<String> = patterns
+                .split('|')
+                .map(str::trim)
+                .filter_map(|pattern| pattern.strip_prefix('"')?.strip_suffix('"').map(str::to_string))
+                .collect();
+            (!commands.is_empty()).then_some(commands)
         })
+        .flatten()
         .collect()
 }
 
@@ -342,6 +360,7 @@ fn file_stats_record_is_documented() {
             "loaded",
             "modified_seconds_ago",
             "indexes",
+            "queue",
             "group_bytes",
             "index_bytes",
             "group_records",
@@ -374,6 +393,20 @@ fn file_stats_derived_objects_are_documented() {
             "overweight",
             "unreadable",
             "buckets",
+        ],
+    );
+    assert_documented_shape(
+        "FILE.STATS queue",
+        value_keys(&serde_json::to_value(crate::db::QueueStats::default()).unwrap()),
+        &[
+            "depth",
+            "in_flight",
+            "oldest_unacknowledged_seconds",
+            "dead_letters",
+            "next_sequence",
+            "visibility_timeout_seconds",
+            "max_deliveries",
+            "dead_letter",
         ],
     );
     assert_documented_shape(

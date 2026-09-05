@@ -40,12 +40,12 @@ matched case-insensitively.
 | Field             | Type             | Used by                                                                                                            | Notes                                                                                                                                                                                                                                                                                     |
 |-------------------|------------------|--------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `command`         | string           | all                                                                                                                | Required. See [Commands](#commands).                                                                                                                                                                                                                                                      |
-| `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `GET.NEXT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `LIST.INDEXES`, `INDEX.STATS`, `SET.INDEX.EXCLUDE` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
+| `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `GET.NEXT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `LIST.INDEXES`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`, `ENQUEUE`, `DEQUEUE`, `ACK`, `NACK`, `PEEK` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
 | `target_account`  | string           | `CREATE.ACCOUNT`, `CREATE.TEST.ACCOUNT`, `DELETE.ACCOUNT`                                                          | Name of the account to create or drop. (Distinct from `account`, which selects an existing context.)                                                                                                                                                                                      |
-| `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `INDEX.STATS`, `SET.INDEX.EXCLUDE` | Table (file) name. Optional on `LIST.INDEXES`, which lists the whole account without it. |                                                                                                                                                                                                                                                                        |
-| `key`             | string           | `READ`, `WRITE`, `DELETE`, `SET.DICT`                                                                              | Record key; for `SET.DICT`, the name of the dictionary entry.                                                                                                                                                                                                                                                                               |
-| `data`            | string \| object | `WRITE`                                                                                                            | Record contents. A string is parsed as a display-format record (`^` field mark, `]` value mark, `\` sub-value mark). An object maps field names — original dictionary names or their camelCase form — to values, applying the dictionary's input conversions (ICONV).                     |
-| `structured_data` | object           | `WRITE`, `SET.DICT`                                                                                                | `WRITE`: same object form as `data`, checked first when present — use either this or `data`, not both. `SET.DICT`: the dictionary attributes of one entry.                                                                                                                                 |
+| `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`, `ENQUEUE`, `DEQUEUE`, `ACK`, `NACK`, `PEEK` | Table (file) name. Optional on `LIST.INDEXES`, which lists the whole account without it. |                                                                                                                                                                                                                                                                        |
+| `key`             | string           | `READ`, `WRITE`, `DELETE`, `SET.DICT`, `ACK`, `NACK`, `PEEK`                                                                              | Record key; for `SET.DICT`, the name of the dictionary entry; for `ACK` and `NACK`, the claimed record. Optional on `PEEK`, which reads the head of the queue without it. Never sent on `ENQUEUE`, whose key the engine mints.                                                                                                                                                                                                                                                                               |
+| `data`            | string \| object | `WRITE`, `ENQUEUE`                                                                                                            | Record contents. A string is parsed as a display-format record (`^` field mark, `]` value mark, `\` sub-value mark). An object maps field names — original dictionary names or their camelCase form — to values, applying the dictionary's input conversions (ICONV).                     |
+| `structured_data` | object           | `WRITE`, `SET.DICT`, `ENQUEUE`                                                                                                | `WRITE` and `ENQUEUE`: same object form as `data`, checked first when present — use either this or `data`, not both. `SET.DICT`: the dictionary attributes of one entry.                                                                                                                                 |
 | `is_dict`         | bool             | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`                                                                       | Operate on the file's dictionary section instead of its data section. Default `false`.                                                                                                                                                                                                    |
 | `query_string`    | string           | `QUERY`, `SELECT`                                                                                                  | Pick-style query, e.g. `WITH NAME = "John" BY NAME`. Alternative to `query_node`. A bare command with neither selects every record; a `query_string` that is not a query is refused with `INVALID_QUERY` rather than read as one.                                                          |
 | `query_node`      | object           | `QUERY`, `SELECT`                                                                                                  | Structured query tree. Takes precedence over `query_string`. See [Query node](#query-node).                                                                                                                                                                                               |
@@ -57,7 +57,10 @@ matched case-insensitively.
 | `name`            | string           | `AUTHORIZE.CONN`, `DEAUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`, `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT`               | Human-readable client name; the identifier for later management. For `GENERATE.CERT` it is also the certificate's common name, so it is limited to letters, digits, `.`, `-` and `_`.                                                                                                     |
 | `accounts_list`   | array of strings | `AUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`, `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT`                                   | Allowed accounts for the client. Default `[]`.                                                                                                                                                                                                                                            |
 | `is_admin`        | bool             | `AUTHORIZE.CONN`, `GENERATE.CERT`                                                                                  | Grant the client admin rights. Default `false`.                                                                                                                                                                                                                                           |
-| `durable`         | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Per-file durable writes. Optional for `CREATE.FILE`, default `false`; required for `SET.FILE`, where an absent flag is refused rather than read as a demotion. See [Storage Engine](storage.md).                                                                                          |
+| `durable`         | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Per-file durable writes. Optional for `CREATE.FILE`, default `false` - except on a queue, which defaults to `true`. On `SET.FILE` an absent flag leaves the file's durability alone. See [Storage Engine](storage.md). |
+| `queue`           | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Make the file a [queue file](#queue-files): ordered records, claimed one at a time. Optional; on `SET.FILE` an absent flag leaves the file as it is, and `false` returns a queue to an ordinary file without touching its records. |
+| `visibility_timeout` | number        | `CREATE.FILE`, `SET.FILE`, `DEQUEUE`                                                                               | Seconds a claim is held before it lapses. On the file commands it sets the queue's own timeout (default 60, maximum 86400); on `DEQUEUE` it overrides that timeout for the one claim being taken. Out of range is refused with `INVALID_DATA`. |
+| `max_deliveries`  | number           | `CREATE.FILE`, `SET.FILE`                                                                                          | Deliveries a record of this queue gets before it moves to the dead-letter file. Default 5, maximum 1000. Out of range is refused with `INVALID_DATA`. |
 | `field`           | string           | `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`                                | The dictionary field the index is on. Required by all of them. See [Storage Engine](storage.md#secondary-indexes).                                                                                                                                                                         |
 | `values`          | array of strings | `CREATE.INDEX`, `SET.INDEX.EXCLUDE`                                                                                | Values the index is to skip. Optional on `CREATE.INDEX`. On `SET.INDEX.EXCLUDE` it replaces the set, and an absent or empty list clears it.                                                                                                                                                |
 | `limit`           | number           | `INDEX.STATS`                                                                                                      | How many of the commonest values to return. Defaults to 10 and is clamped to 200, so one request cannot ask the server to sort and send every distinct value an index holds.                                                                                                               |
@@ -70,14 +73,15 @@ older server sent in its place.
 
 | Field       | Type                      | Populated by                                                                                         | Notes                                                                                                                                                                                                            |
 |-------------|---------------------------|------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `status`    | string                    | all                                                                                                  | `"OK"`, `"ERROR"` or `"EOF"`.                                                                                                                                                                                    |
+| `status`    | string                    | all                                                                                                  | `"OK"`, `"ERROR"`, `"EOF"` (`GET.NEXT` walked its list to the end) or `"EMPTY"` (`DEQUEUE` or `PEEK` found nothing to hand out).                                                                                                                                                                                    |
 | `message`   | string                    | errors                                                                                               | Human-readable error text; set whenever `status` is `"ERROR"`. For a person to read, not for a client to match on - the wording may change.                                                                       |
 | `code`      | string                    | errors                                                                                               | The error's stable classification, set whenever `status` is `"ERROR"`. This is what a client branches on. See [Error codes](#error-codes).                                                                        |
-| `record`    | object                    | `READ`, `CREATE.TEST.ACCOUNT`, `SET.FILE`, `FILE.STATS`, `SET.DICT`, `SERVER.STATS`, `GENERATE.CERT` | For `READ`, the record as field-name → display-formatted string (see [Record shape](#record-shape)). The management commands use it for their single result object, whose shape is documented with each command. |
+| `record`    | object                    | `READ`, `DEQUEUE`, `PEEK`, `CREATE.TEST.ACCOUNT`, `CREATE.FILE`, `SET.FILE`, `FILE.STATS`, `SET.DICT`, `SERVER.STATS`, `GENERATE.CERT` | For `READ`, the record as field-name → display-formatted string (see [Record shape](#record-shape)). The management commands use it for their single result object, whose shape is documented with each command. |
 | `results`   | array of `[key, record]`  | `QUERY`, `GET.NEXT`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES`, `LIST.DICT`                        | Ordered `[string, object]` pairs. For `QUERY` and `GET.NEXT` each `record` has the same shape as `READ`; the management commands document their own.                                                             |
 | `keys`      | array of strings          | `LIST.FILES`, `LIST.DICT`                                                                            | Plain list of names: the files in the account, or the file's dictionary entries. Both commands fill `results` as well, with what is known about each name.                                                       |
-| `count`     | integer                   | `SELECT`, `GET.NEXT`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES`, `LIST.DICT`                       | `SELECT`: number of keys selected into the list. `GET.NEXT`: number of records in the batch just returned. The list commands: number of entries returned.                                                        |
+| `count`     | integer                   | `SELECT`, `GET.NEXT`, `DEQUEUE`, `PEEK`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES`, `LIST.DICT`    | `SELECT`: number of keys selected into the list. `GET.NEXT`: number of records in the batch just returned. `DEQUEUE` and `PEEK`: `0`, beside an `"EMPTY"` status. The list commands: number of entries returned. |
 | `positions` | array of objects or nulls | `QUERY`, `GET.NEXT`                                                                                  | Present only for an exploded result. Index-aligned with `results`: the position within the exploded field that put each row there. See [Exploded results](#exploded-results).                                    |
+| `claim`     | object                    | `ENQUEUE`, `DEQUEUE`, `PEEK`                                                                         | What the queue knows about the record: its `key`, its `deliveries` count, when it was `enqueued`, and — for `DEQUEUE` — who holds it and when the claim `expires`. Its own field rather than more keys in `record`, so a payload with a field called `key` can be queued and read back unchanged. See [Queue files](#queue-files). |
 
 There is no `NOT_FOUND` status. A missing record, table or list yields
 `status: "ERROR"` with the `code` that says which, and a `message` that says it
@@ -250,11 +254,16 @@ three are not repeated in the per-command lists below.
 | `QUERY`                 |       |   yes   | `file`                                               | `results`                               |
 | `SELECT`                |       |   yes   | `file`                                               | `count`                                 |
 | `GET.NEXT`              |       |  yes¹   | `list_name` (defaults to `"DEFAULT"`)                | `results` + `count`, or `status: "EOF"` |
+| `ENQUEUE`               |       |   yes   | `file`, and one of `data` / `structured_data`        | `claim`                                 |
+| `DEQUEUE`               |       |   yes   | `file`                                               | `record` + `claim`, or `status: "EMPTY"` |
+| `ACK`                   |       |   yes   | `file`, `key`                                        | `status: "OK"`                          |
+| `NACK`                  |       |   yes   | `file`, `key`                                        | `status: "OK"`                          |
+| `PEEK`                  |       |   yes   | `file`                                               | `record` + `claim`, or `status: "EMPTY"` |
 | `CREATE.ACCOUNT`        |  yes  |    —    | `target_account`                                     | `status: "OK"`                          |
 | `CREATE.TEST.ACCOUNT`   |  yes  |    —    | `target_account`                                     | `record`                                |
 | `DELETE.ACCOUNT`        |  yes  |    —    | `target_account`                                     | `status: "OK"`                          |
-| `CREATE.FILE`           |  yes  |   yes   | `account`, `file`                                    | `status: "OK"`                          |
-| `SET.FILE`              |  yes  |   yes   | `account`, `file`, `durable`                         | `record`                                |
+| `CREATE.FILE`           |  yes  |   yes   | `account`, `file`                                    | `record`                                |
+| `SET.FILE`              |  yes  |   yes   | `account`, `file`, one attribute to change           | `record`                                |
 | `DELETE.FILE`           |  yes  |   yes   | `account`, `file`                                    | `status: "OK"`                          |
 | `AUTHORIZE.CONN`        |  yes  |    —    | `thumbprint`, `name`                                 | `status: "OK"`                          |
 | `DEAUTHORIZE.CONN`      |  yes  |    —    | `name`                                               | `status: "OK"`                          |
@@ -400,6 +409,166 @@ Fetch the next batch of records from a select list. Advances the list's cursor.
 {"status": "EOF"}
 ```
 
+## Queue files
+
+A `SELECT` is a snapshot: two clients that select the same pending work get the same keys and
+both process it. A queue file is the other thing — an order that two clients can divide
+between them.
+
+A file created with `queue: true` ([`CREATE.FILE`](#createfile--admin)) keeps its records in
+arrival order and hands them out one at a time. `ENQUEUE` appends, `DEQUEUE` claims the
+oldest unclaimed record, `ACK` consumes it and `NACK` gives it back; `PEEK` reads without
+claiming anything. Everything else about the file is unchanged: `READ`, `QUERY`, `SELECT`
+and `LIST.DICT` work on it exactly as they do on any other file.
+
+**Keys are minted by the engine.** `ENQUEUE` never carries a `key`. The server assigns one as
+twenty decimal digits — `milliseconds-since-the-epoch * 1000000 + a counter within that
+millisecond` — so the keys sort into arrival order both as text and as numbers, and carry the
+time the record arrived. `DEQUEUE` walks them in that order.
+
+**A claim is exclusive and it expires.** `DEQUEUE` marks the record as held by the client's
+authorised name for the queue's `visibility_timeout` (60 seconds by default, overridable per
+claim). Until that lapses no other consumer can be given it. When it lapses the record
+becomes available again and its delivery count goes up — so a consumer that dies mid-job
+costs a redelivery rather than a lost record. The count is what a client should be idempotent
+against: this is at-least-once delivery, not exactly-once.
+
+**Failure has a floor.** A record delivered `max_deliveries` times (5 by default) without
+being acknowledged moves to `<file>.DEAD`, keeping its sequence key and its delivery count.
+That file is a queue itself, so a fixed consumer drains it with these same commands.
+
+**A restart releases every claim.** A claim belongs to a connection and a restarted server
+has none, so a record that was claimed and not acknowledged is available again as soon as the
+server is back, with its delivery count intact. Records that were acknowledged do not come
+back. See [Storage Engine](storage.md#queue-files).
+
+`FILE.STATS` reports a queue's depth, in-flight count, oldest unacknowledged age and
+dead-letter count — see [FILE.STATS](#filestats).
+
+### The claim object
+
+`ENQUEUE`, `DEQUEUE` and `PEEK` answer with a `claim` object beside the ordinary `record`:
+
+| Key           | Populated by                 | Notes                                                                             |
+|---------------|------------------------------|-----------------------------------------------------------------------------------|
+| `"queue"`     | all three                    | The file the record is in.                                                        |
+| `"key"`       | all three                    | The record's sequence key. `ACK` and `NACK` send this back.                       |
+| `"deliveries"`| all three                    | Times the record has been handed to a consumer, this delivery included. `0` from `ENQUEUE`, and from a `PEEK` at a record nobody has taken yet. |
+| `"enqueued"`  | all three                    | When it was enqueued, in milliseconds since the epoch, read from its key.         |
+| `"expires"`   | `DEQUEUE`                    | When this claim lapses, in milliseconds since the epoch.                          |
+| `"owner"`     | `DEQUEUE`, and `PEEK` at a claimed record | The authorised name holding it.                                      |
+
+Times are milliseconds since the epoch rather than a formatted date, so a client subtracts
+rather than parses.
+
+### ENQUEUE
+
+Append a record to a queue. The engine mints its key.
+
+- Required: `file`, and one of `data` or `structured_data` — the same two forms `WRITE`
+  takes, mapped through the queue's own dictionary.
+- Response: `claim`, carrying the key the record was stored under.
+- Errors: `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`, `MISSING_FIELD` (no `file`, or no data),
+  `INVALID_DATA`, `FILE_NOT_FOUND`, `INVALID_REQUEST` (the file is not a queue).
+
+```json
+{"command": "ENQUEUE", "account": "SALES", "file": "JOBS",
+ "structured_data": {"kind": "invoice", "orderId": "4471"}}
+```
+
+```json
+{"status": "OK", "claim": {"queue": "JOBS", "key": "01764950412345000001",
+                           "deliveries": 0, "enqueued": 1764950412345}}
+```
+
+### DEQUEUE
+
+Claim the oldest unclaimed record.
+
+- Required: `file`. Optional: `visibility_timeout`, which applies to this claim only.
+- Response: `record` (the payload, shaped as `READ` shapes one) and `claim`. When there is
+  nothing to claim, `status: "EMPTY"` with `count: 0` and no record — an empty queue is the
+  ordinary state of one that is keeping up, not an error.
+- Errors: `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`, `MISSING_FIELD` (no `file`),
+  `INVALID_DATA` (`visibility_timeout` out of range), `FILE_NOT_FOUND`, `INVALID_REQUEST`
+  (the file is not a queue).
+
+```json
+{"command": "DEQUEUE", "account": "SALES", "file": "JOBS", "visibility_timeout": 300}
+```
+
+```json
+{"status": "OK",
+ "record": {"kind": "invoice", "orderId": "4471"},
+ "claim": {"queue": "JOBS", "key": "01764950412345000001", "deliveries": 1,
+           "enqueued": 1764950412345, "expires": 1764950712345, "owner": "worker-2"}}
+```
+
+```json
+{"status": "EMPTY", "count": 0}
+```
+
+### ACK
+
+The work succeeded: consume the claimed record, which leaves the queue for good.
+
+- Required: `file`, `key`.
+- Only the client holding the claim may acknowledge it, and only while the claim stands. A
+  claim that has already lapsed is refused — by then the record may be with somebody else.
+- Errors: `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`, `MISSING_FIELD`, `FILE_NOT_FOUND`,
+  `INVALID_REQUEST` (no such record, the claim has lapsed, or another client holds it — the
+  `message` says which).
+
+```json
+{"command": "ACK", "account": "SALES", "file": "JOBS", "key": "01764950412345000001"}
+```
+
+```json
+{"status": "OK"}
+```
+
+### NACK
+
+The work failed: give the record back now rather than waiting for the claim to lapse.
+
+- Required: `file`, `key`. Same ownership rules as `ACK`.
+- The delivery already counted at `DEQUEUE` stands, so a record returned for the last time it
+  is allowed moves to the dead-letter file instead of back onto the queue.
+- Errors: as `ACK`.
+
+```json
+{"command": "NACK", "account": "SALES", "file": "JOBS", "key": "01764950412345000001"}
+```
+
+```json
+{"status": "OK"}
+```
+
+### PEEK
+
+Read a record without claiming it.
+
+- Required: `file`. Optional: `key` — without it, the head of the queue.
+- Response: `record` and `claim`. The `claim` names an `owner` when somebody is holding the
+  record, which is how a stuck consumer is found.
+- Peeking claims nothing and counts no delivery, so it is safe to poll.
+- Errors: `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`, `MISSING_FIELD` (no `file`),
+  `RECORD_NOT_FOUND` (a named `key` that is not there), `FILE_NOT_FOUND`, `INVALID_REQUEST`
+  (the file is not a queue). An empty queue with no `key` named answers `status: "EMPTY"`.
+
+```json
+{"command": "PEEK", "account": "SALES", "file": "JOBS"}
+```
+
+```json
+{"status": "OK",
+ "record": {"kind": "invoice", "orderId": "4471"},
+ "claim": {"queue": "JOBS", "key": "01764950412345000001", "deliveries": 1,
+           "enqueued": 1764950412345, "owner": "worker-2"}}
+```
+
+## Management commands
+
 ### CREATE.ACCOUNT / DELETE.ACCOUNT — admin
 
 Create or drop an account. Names the account with `target_account`, not `account`.
@@ -437,6 +606,9 @@ Create an account already populated with the demo fixture — the same one the C
   pairs with it value for value and `SUP.CONTACTS` at the sub-value tier, with one record
   deliberately ragged. So the fixture exercises multivalues, conversions and correlated
   multivalues rather than only flat text.
+- It also gets a `JOBS` [queue file](#queue-files) holding three enqueued records, on a
+  ninety-second visibility timeout and three deliveries — deliberately not the defaults, so
+  anywhere the policy is displayed it can be seen to be read rather than assumed.
 - `record` names the account and the files it was given, read back after the fact rather than
   listed from a constant, so it describes whatever the fixture creates today.
 - The account must not already exist; nothing is written when it does.
@@ -447,53 +619,75 @@ Create an account already populated with the demo fixture — the same one the C
 ```
 
 ```json
-{"status": "OK", "record": {"account": "DEMO", "files": ["DIR", "PRODUCTS", "USERS"]}}
+{"status": "OK", "record": {"account": "DEMO", "files": ["DIR", "JOBS", "PRODUCTS", "USERS"]}}
 ```
 
 ### CREATE.FILE — admin
 
 Create a table (data and dictionary sections) in `account`.
 
-- Required: `account`, `file`. Optional: `durable`. Admin only.
+- Required: `account`, `file`. Optional: `durable`, `queue`, `visibility_timeout`,
+  `max_deliveries`. Admin only.
 - The file is added to the account's `DIR` listing, which is created first if the account
   has not got one.
 - With `durable: true` the file is marked mission critical in the account's `DIR` entry, so
   every write to it is flushed to disk before it is acknowledged while the rest of the
   database keeps buffering writes. See [Storage Engine](storage.md).
+- With `queue: true` the file is a [queue file](#queue-files): records keep their arrival
+  order and are handed out one at a time. A queue is durable unless `durable: false` says
+  otherwise, because acknowledging a claim that a crash then loses is the failure a queue
+  exists to prevent. `visibility_timeout` and `max_deliveries` set that queue's own claim
+  policy; naming either implies `queue: true`.
 - Errors: `ADMIN_REQUIRED`, `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`),
-  `FILE_EXISTS`.
+  `INVALID_DATA` (a timeout or delivery limit out of range), `FILE_EXISTS`.
 
 ```json
-{"command": "CREATE.FILE", "account": "SALES", "file": "LEDGER", "durable": true}
+{"command": "CREATE.FILE", "account": "SALES", "file": "JOBS", "queue": true,
+ "visibility_timeout": 300, "max_deliveries": 3}
 ```
 
 ```json
-{"status": "OK"}
+{"status": "OK", "record": {"account": "SALES", "name": "JOBS", "durable": true,
+                            "queue": true, "visibility_timeout_seconds": 300,
+                            "max_deliveries": 3}}
 ```
 
 ### SET.FILE — admin
 
-Change the durability of a file that already exists, without recreating it — so a file can be
-promoted to mission critical, or demoted back, while keeping the records it holds.
+Change what a file already is, without recreating it — so a file can be promoted to mission
+critical or demoted back, made a queue or returned to an ordinary file, and a queue's claim
+policy retuned, all while keeping the records it holds.
 
-- Required: `account`, `file`, `durable`. Admin only.
+- Required: `account`, `file`, and at least one of `durable`, `queue`, `visibility_timeout`
+  or `max_deliveries`. Admin only.
+- **Only what is named changes.** An omitted field leaves that attribute alone, so a request
+  about durability cannot quietly stop a file being a queue, and one about a queue's timeout
+  cannot quietly demote it to buffered writes.
 - With `durable: true` the file's pending writes are flushed as part of the change, so the
   flag never gets ahead of the data it promises to protect. `durable: false` returns the file
   to the database's buffering policy. See [Storage Engine](storage.md).
-- The flag is stored in the account's `DIR` entry for the file; an account without a `DIR`
-  file gets one.
-- `DIR` itself cannot be set: it carries the flags rather than one of its own, and its writes
-  are always flushed at once.
-- Errors: `ADMIN_REQUIRED`, `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`, or no
-  `durable` - an absent flag is refused rather than read as a demotion), `FILE_NOT_FOUND`,
-  `INVALID_REQUEST` (naming `DIR`).
+- `queue: true` attaches an order to the records the file already holds, in key order.
+  `queue: false` detaches it and leaves every record where it is.
+- The one exception to "only what is named changes": a file *becoming* a queue becomes
+  durable with it unless `durable: false` says otherwise, for the reason a queue is created
+  durable. A file that is already a queue keeps the durability it has, so retuning its
+  timeout cannot undo a deliberate demotion.
+- The attributes are stored in the account's `DIR` entry for the file; an account without a
+  `DIR` file gets one.
+- `DIR` itself cannot be set: it carries the other files' attributes rather than any of its
+  own, and its writes are always flushed at once.
+- Errors: `ADMIN_REQUIRED`, `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`, or nothing
+  to change — an empty request is refused rather than read as a demotion), `INVALID_DATA` (a
+  timeout or delivery limit out of range), `FILE_NOT_FOUND`, `INVALID_REQUEST` (naming `DIR`).
 
 ```json
 {"command": "SET.FILE", "account": "SALES", "file": "LEDGER", "durable": true}
 ```
 
 ```json
-{"status": "OK", "record": {"account": "SALES", "name": "LEDGER", "durable": true}}
+{"status": "OK", "record": {"account": "SALES", "name": "LEDGER", "durable": true,
+                            "queue": false, "visibility_timeout_seconds": null,
+                            "max_deliveries": null}}
 ```
 
 ### DELETE.FILE — admin
@@ -645,10 +839,14 @@ The files in one account, sorted.
 
 - Required: `account` (or a client with exactly one allowed account).
 - `keys` is the plain list of names. `results` pairs each name with what is known about the
-  file beside its name: `durable`, so a client can see which files flush every write without
-  reading the account's `DIR` file, and a [health](#health-verdicts-and-measures) verdict, so
-  a problem file can be found without opening every file in turn. A database running with
-  `durable_writes = true` reports every file as durable, because every write then is.
+  file beside its name: `durable` and `queue`, so a client can see which files flush every
+  write and which are [queues](#queue-files) without reading the account's `DIR` file, and a
+  [health](#health-verdicts-and-measures) verdict, so a problem file can be found without
+  opening every file in turn. A database running with `durable_writes = true` reports every
+  file as durable, because every write then is.
+- The queue *flag* is here because it is free — it is read from the same `DIR` entry the
+  durability flag is. A queue's depth and in-flight count are not, so they arrive with
+  [`FILE.STATS`](#filestats) rather than making a listing open every file.
 - `health` here is the *cheap* verdict — one of `good`, `watch` or `act`, derived from the
   section metadata and the index `state` files alone. It reads no group trailer and no
   record, because a listing must not cost what opening a file costs. `health_reasons` names
@@ -661,10 +859,11 @@ The files in one account, sorted.
 ```
 
 ```json
-{"status": "OK", "count": 3, "keys": ["DIR", "LEDGER", "USERS"], "results": [
-  ["DIR", {"durable": false, "health": "good", "health_reasons": []}],
-  ["LEDGER", {"durable": true, "health": "good", "health_reasons": []}],
-  ["USERS", {"durable": false, "health": "act",
+{"status": "OK", "count": 4, "keys": ["DIR", "JOBS", "LEDGER", "USERS"], "results": [
+  ["DIR", {"durable": false, "queue": false, "health": "good", "health_reasons": []}],
+  ["JOBS", {"durable": true, "queue": true, "health": "good", "health_reasons": []}],
+  ["LEDGER", {"durable": true, "queue": false, "health": "good", "health_reasons": []}],
+  ["USERS", {"durable": false, "queue": false, "health": "act",
              "health_reasons": ["1 of 2 indexes stale"]}]
 ]}
 ```
@@ -713,7 +912,8 @@ reports `good` and says so in its `detail` rather than inventing a verdict.
 
 Describe one file: how many records it holds, how they are spread across hash groups, what it costs on disk — and
 whether any of that is a problem. No record is returned, and none is read to answer it unless the file is still in the
-pre-hashfile flat format.
+pre-hashfile flat format, or is a [queue](#queue-files) — a queue's depth and in-flight count live in the order held in
+memory, so asking for them loads the file.
 
 - Required: `account` (or a single-account client), `file`.
 - Errors: `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`), `ACCESS_DENIED`,
@@ -731,7 +931,7 @@ pre-hashfile flat format.
   "group_count": 128, "smallest_group_bytes": 96, "largest_group_bytes": 512,
   "disk_bytes": 262144, "group_bytes": 212992, "index_bytes": 20480,
   "checksums": true, "legacy": false,
-  "durable": false, "loaded": true, "modified_seconds_ago": 12,
+  "durable": false, "loaded": true, "modified_seconds_ago": 12, "queue": null,
   "records_per_group_target": 16, "load_factor": 0.625,
   "records_until_growth": 769, "records_until_shrink": 768,
   "largest_group_share": 0.021, "skew": 2.7,
@@ -764,6 +964,31 @@ pre-hashfile flat format.
 order, with the same objects `LIST.INDEXES` returns. It is `[]` for a file that has none. The
 worst index verdict is rolled into the file's own `health`, so a badly shaped index is
 visible from the file rather than only from the index table.
+
+**Queues.** `queue` is `null` for an ordinary file. For a [queue file](#queue-files) it is
+the four numbers an administrator needs about one, plus the policy behind them:
+
+```json
+{"queue": {
+  "depth": 128, "in_flight": 3, "oldest_unacknowledged_seconds": 41,
+  "dead_letters": 2, "next_sequence": 1764950412345000131,
+  "visibility_timeout_seconds": 300, "max_deliveries": 3, "dead_letter": false
+}}
+```
+
+`depth` is the records available to be claimed and `in_flight` the ones claimed and not yet
+acknowledged; together they are the file's record count.
+`oldest_unacknowledged_seconds` is the age of the oldest record still in the queue, claimed
+or not, read from the millisecond its sequence key carries — `null` for an empty queue. It is
+the number that separates a stalled queue from a busy one: the same `depth` with nothing in
+flight and an oldest entry an hour old means nobody is draining it.
+`dead_letters` counts the records in `<file>.DEAD`, and is `0` for a queue that has never
+dead-lettered one. `dead_letter` is true when *this* file is another queue's dead-letter
+file, which is also why it reports no dead letters of its own.
+
+None of it costs a scan: the numbers come from the queue's in-memory order, and reading them
+sweeps the claims that have lapsed first, so an `in_flight` count never includes a claim that
+expired ten minutes ago.
 
 **Bytes.** `disk_bytes` is the whole file directory. `group_bytes` is the record groups alone
 and `index_bytes` the index sections, so the remainder is the dictionary and the small

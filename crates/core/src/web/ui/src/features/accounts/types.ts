@@ -22,6 +22,10 @@ export interface AccountStats {
 export interface FileEntry {
     name: string
     durable: boolean
+    /** A queue file: ordered records, claimed one at a time. The flag is free -
+     *  it is in the same `DIR` entry the durability flag is - while a queue's
+     *  depth and in-flight count cost a load and arrive with `FILE.STATS`. */
+    queue: boolean
     /**
      * The *cheap* verdict: section metadata and index `state` files only, no
      * group trailers and no records. Enough to say which file is worth
@@ -126,6 +130,8 @@ export interface FileStats {
     modified_seconds_ago: number | null
     /** Absent from an older server's reply, which is why these are optional. */
     indexes?: IndexStats[]
+    /** Null for a file that is not a queue. */
+    queue?: QueueStats | null
 
     // Derived measures. All of it comes from the section metadata and the group
     // trailers; none of it reads a record.
@@ -142,6 +148,38 @@ export interface FileStats {
      *  same on a file of any size. */
     skew?: number
     health?: Health
+}
+
+/**
+ * What a queue file is doing.
+ *
+ * A queue nobody is draining does not show up in a record count: the same depth
+ * with nothing in flight and an oldest entry an hour old is stalled, while with
+ * three claims a few seconds old it is working. That is why all four are here
+ * rather than only the depth.
+ */
+export interface QueueStats {
+    depth: number
+    in_flight: number
+    /** Age of the oldest record still in the queue, claimed or not. Null for an
+     *  empty one. */
+    oldest_unacknowledged_seconds: number | null
+    dead_letters: number
+    next_sequence: number
+    visibility_timeout_seconds: number
+    max_deliveries: number
+    /** True when this file is itself another queue's dead-letter file. */
+    dead_letter: boolean
+}
+
+/**
+ * The queue attributes a create or a change may carry. Both are optional, and
+ * an omitted one leaves the database's own default - or, on a change, whatever
+ * the file already has.
+ */
+export interface QueueDraft {
+    visibility_timeout?: number
+    max_deliveries?: number
 }
 
 /**

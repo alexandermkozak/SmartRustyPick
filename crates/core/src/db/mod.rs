@@ -22,12 +22,17 @@ pub mod models;
 pub mod query;
 #[cfg(test)]
 mod query_tests;
+pub mod queue;
+#[cfg(test)]
+mod queue_tests;
 pub mod report;
 #[cfg(test)]
 mod report_tests;
 
+pub use engine::queue::QueueDelivery;
 pub use engine::{Database, TableHandle, TableKey};
 pub use error::{DbError, DbResult};
 pub use health::{Health, HealthSummary, Measure, Verdict};
 pub use index::{FileIndex, IndexReport, IndexStats, IndexUsageStats, IndexValue};
 pub use models::*;
+pub use queue::{QueuePolicy, QueueState};

@@ -179,15 +179,17 @@ def main():
                 )
 
                 # An omitted flag must not be read as "make it buffered".
+                # An empty request must not be read as "make everything false":
+                # an omitted attribute is left alone, so naming none is refused.
                 resp = conn.request(command="SET.FILE", file=BUFFERED_FILE, account=ACCOUNT)
                 suite.check_eq("SET.FILE without a flag is refused", resp["status"], "ERROR")
                 suite.check_eq(
                     "SET.FILE classifies the refusal", resp.get("code"), "MISSING_FIELD"
                 )
                 suite.check_eq(
-                    "SET.FILE says which field is missing",
+                    "SET.FILE says what it could have been asked to change",
                     resp.get("message"),
-                    "Durability flag not specified",
+                    "Nothing to set: name durable, queue, visibility_timeout or max_deliveries",
                 )
 
                 resp = conn.request(

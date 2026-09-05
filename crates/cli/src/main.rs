@@ -1,8 +1,12 @@
 use smart_rusty_pick_core::config::Config;
-use smart_rusty_pick_core::db::{Database, ExplodeSpec, Record, SelectEntry, SelectList, ValuePosition, report};
+use smart_rusty_pick_core::db::{
+    Database, ExplodeSpec, Field, FileAttributes, QueueDelivery, Record, SelectEntry, SelectList, ValuePosition, queue,
+    report,
+};
 use smart_rusty_pick_core::server;
 use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// Lifetime of a certificate issued by `GENERATE.CERT`, matching the server's.
 const CLIENT_CERT_DAYS: u32 = 365;
@@ -191,6 +195,21 @@ fn main() -> io::Result<()> {
             "SET.FILE" => {
                 let mut db_lock = db.write().unwrap();
                 handle_set_file(&mut db_lock, &parts);
+            }
+            "ENQUEUE" => {
+                handle_enqueue(&db.read().unwrap(), &parts);
+            }
+            "DEQUEUE" => {
+                handle_dequeue(&db.read().unwrap(), &parts);
+            }
+            "ACK" => {
+                handle_ack(&db.read().unwrap(), &parts, false);
+            }
+            "NACK" => {
+                handle_ack(&db.read().unwrap(), &parts, true);
+            }
+            "PEEK" => {
+                handle_peek(&db.read().unwrap(), &parts);
             }
             "DELETE.FILE" => {
                 let mut db_lock = db.write().unwrap();
@@ -963,10 +982,19 @@ fn print_help(current_account: &str) {
     println!("  HELP                                  - Show this help.");
     println!("  SAVE-LIST <name>                      - Save active select list.");
     println!("  GET-LIST <name>                       - Restore a saved select list.");
-    println!("  CREATE.FILE <name> [DURABLE]          - Create a new file (data and dict) (SYSTEM only).");
+    println!("  CREATE.FILE <name> [DURABLE] [QUEUE [TIMEOUT <s>] [RETRIES <n>]]");
+    println!("                                        - Create a new file (data and dict) (SYSTEM only).");
     println!("                                          DURABLE flushes every write to that file immediately.");
-    println!("  SET.FILE <name> DURABLE | BUFFERED    - Turn durable writes on or off for an existing file.");
-    println!("                                          Turning it on flushes what the file still had buffered.");
+    println!("                                          QUEUE keeps arrival order and hands records out one at a");
+    println!("                                          time; it implies DURABLE unless BUFFERED is given.");
+    println!("  SET.FILE <name> [DURABLE | BUFFERED] [QUEUE | NOQUEUE] [TIMEOUT <s>] [RETRIES <n>]");
+    println!("                                        - Change an existing file's attributes, keeping its records.");
+    println!("                                          Turning durability on flushes what the file had buffered.");
+    println!("  ENQUEUE <queue> <data>                - Append a record; the engine mints its sequence key.");
+    println!("  DEQUEUE <queue> [<seconds>]           - Claim the oldest unclaimed record for <seconds>.");
+    println!("  ACK <queue> <key>                     - The work succeeded: remove the record for good.");
+    println!("  NACK <queue> <key>                    - The work failed: give it back now rather than on timeout.");
+    println!("  PEEK <queue> [<key>]                  - Read the head of the queue, or one record, claiming nothing.");
     println!("  DELETE.FILE <name>                    - Delete a file (data and dict) (SYSTEM only).");
     println!("  CREATE.INDEX <file> <field> [EXCLUDE <value>...] - Index a dictionary field, so WITH <field> = ...");
     println!("                                          stops scanning. EXCLUDE names values not worth indexing.");
@@ -1119,61 +1147,261 @@ fn handle_get_list(db: &mut Database, parts: &[&str]) {
     }
 }
 
+const CREATE_FILE_USAGE: &str = "Usage: CREATE.FILE <file_name> [DURABLE] [QUEUE [TIMEOUT <seconds>] [RETRIES <n>]]";
+const SET_FILE_USAGE: &str =
+    "Usage: SET.FILE <file_name> [DURABLE | BUFFERED] [QUEUE | NOQUEUE] [TIMEOUT <seconds>] [RETRIES <n>]";
+
+/// Reads the flags `CREATE.FILE` and `SET.FILE` share, over the attributes the
+/// file carries now.
+///
+/// One parser for both, so the two commands cannot come to disagree about what
+/// `QUEUE TIMEOUT 300` means. `Err` carries the message to print: a mistyped
+/// flag is refused rather than ignored, because a `CREATE.FILE JOBS QUEEU` that
+/// quietly made an ordinary file would not be found out until the first
+/// `DEQUEUE`.
+fn parse_file_flags(
+    parts: &[&str],
+    mut attributes: FileAttributes,
+    usage: &str,
+) -> Result<(FileAttributes, bool), String> {
+    let mut policy = attributes.queue.unwrap_or_default();
+    let mut wants_queue = attributes.queue.is_some();
+    let mut durability_named = false;
+    let mut index = 2;
+    while index < parts.len() {
+        let flag = parts[index].to_uppercase();
+        let mut number = |what: &str, limit: u64| -> Result<u64, String> {
+            let value = parts
+                .get(index + 1)
+                .ok_or_else(|| format!("{} needs a number. {}", what, usage))?;
+            let parsed: u64 = value
+                .parse()
+                .map_err(|_| format!("'{}' is not a whole number of {}. {}", value, what, usage))?;
+            if parsed < 1 || parsed > limit {
+                return Err(format!("{} must be between 1 and {}. {}", what, limit, usage));
+            }
+            index += 1;
+            Ok(parsed)
+        };
+        match flag.as_str() {
+            "DURABLE" | "-D" => {
+                attributes.durable = true;
+                durability_named = true;
+            }
+            "BUFFERED" | "NODURABLE" | "-B" => {
+                attributes.durable = false;
+                durability_named = true;
+            }
+            "QUEUE" | "-Q" => wants_queue = true,
+            "NOQUEUE" => wants_queue = false,
+            "TIMEOUT" => {
+                policy.visibility = Duration::from_secs(number("TIMEOUT", queue::MAX_VISIBILITY_SECONDS)?);
+                wants_queue = true;
+            }
+            "RETRIES" => {
+                policy.max_deliveries = number("RETRIES", u64::from(queue::MAX_DELIVERY_LIMIT))? as u32;
+                wants_queue = true;
+            }
+            other => return Err(format!("Unknown option '{}'. {}", other, usage)),
+        }
+        index += 1;
+    }
+    attributes.queue = wants_queue.then_some(policy);
+    Ok((attributes, durability_named))
+}
+
+/// How a file's attributes read back to a person.
+fn describe_file(attributes: FileAttributes) -> String {
+    let durability = if attributes.durable {
+        "durable writes"
+    } else {
+        "buffered writes"
+    };
+    match attributes.queue {
+        Some(policy) => format!(
+            "queue, {}, {}s visibility, {} deliveries before dead-lettering",
+            durability,
+            policy.visibility_seconds(),
+            policy.max_deliveries
+        ),
+        None => durability.to_string(),
+    }
+}
+
 fn handle_create_file(db: &mut Database, parts: &[&str]) {
     if parts.len() < 2 {
-        println!("Usage: CREATE.FILE <file_name> [DURABLE]");
+        println!("{}", CREATE_FILE_USAGE);
         return;
     }
     let file_name = parts[1];
-    let mut durable = false;
-    for flag in &parts[2..] {
-        match flag.to_uppercase().as_str() {
-            "DURABLE" | "-D" => durable = true,
-            other => {
-                println!("Unknown option '{}'. Usage: CREATE.FILE <file_name> [DURABLE]", other);
-                return;
-            }
+    let (mut attributes, durability_named) = match parse_file_flags(parts, FileAttributes::default(), CREATE_FILE_USAGE)
+    {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            println!("{}", message);
+            return;
         }
-    }
-    match db.create_table_durable(file_name, durable) {
-        Ok(_) => {
-            if durable {
-                println!("[{}] created (data and dict, durable writes)", file_name);
-            } else {
-                println!("[{}] created (data and dict)", file_name);
-            }
-        }
+    };
+    // A queue defaults to durable: acknowledging a claim that a crash then
+    // loses is the failure a queue exists to prevent. An explicit BUFFERED is
+    // still honoured - the operator has said so.
+    attributes.durable |= attributes.queue.is_some() && !durability_named;
+    match db.create_table_with(&db.current_account(), file_name, attributes) {
+        Ok(_) => println!("[{}] created (data and dict, {})", file_name, describe_file(attributes)),
         Err(e) => println!("Error: {}", e),
     }
 }
 
 fn handle_set_file(db: &mut Database, parts: &[&str]) {
     if parts.len() < 3 {
-        println!("Usage: SET.FILE <file_name> DURABLE | BUFFERED");
+        println!("{}", SET_FILE_USAGE);
         return;
     }
     let file_name = parts[1];
-    let durable = match parts[2].to_uppercase().as_str() {
-        "DURABLE" | "-D" => true,
-        "BUFFERED" | "NODURABLE" | "-B" => false,
-        other => {
-            println!(
-                "Unknown option '{}'. Usage: SET.FILE <file_name> DURABLE | BUFFERED",
-                other
-            );
+    let account = db.current_account();
+    let current = db.file_attributes_for_account(&account, file_name);
+    let (mut attributes, durability_named) = match parse_file_flags(parts, current, SET_FILE_USAGE) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            println!("{}", message);
             return;
         }
     };
-    match db.set_table_durable(file_name, durable) {
-        Ok(_) => {
-            if durable {
-                println!("[{}] now flushes every write before acknowledging it", file_name);
-            } else {
-                println!("[{}] now follows the database's buffering policy", file_name);
-            }
-        }
+    // A file becoming a queue becomes durable with it, for the reason a queue
+    // is created durable. One that was already a queue keeps the durability it
+    // has, so retuning its timeout does not undo a deliberate BUFFERED.
+    attributes.durable |= attributes.queue.is_some() && current.queue.is_none() && !durability_named;
+    match db.set_file_attributes(&account, file_name, attributes) {
+        Ok(_) => println!("[{}] now {}", file_name, describe_file(attributes)),
         Err(e) => println!("Error: {}", e),
     }
+}
+
+/// The name a locally minted claim is held under.
+///
+/// A remote consumer is identified by the name its certificate is authorised
+/// as; the CLI has no certificate, so it holds claims under one fixed name.
+/// That is enough for the check that matters - a record claimed here cannot be
+/// acknowledged by a remote consumer that never had it.
+const CLI_OWNER: &str = "CLI";
+
+fn handle_enqueue(db: &Database, parts: &[&str]) {
+    if parts.len() < 3 {
+        println!("Usage: ENQUEUE <queue> <data>");
+        return;
+    }
+    let account = db.current_account();
+    let record = Record::from_display_string(&parts[2..].join(" "));
+    match db.enqueue(&account, parts[1], record) {
+        Ok(key) => println!("[{}] enqueued as {}", parts[1], key),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_dequeue(db: &Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: DEQUEUE <queue> [<visibility seconds>]");
+        return;
+    }
+    let visibility = match parts.get(2) {
+        None => None,
+        Some(text) => match text.parse::<u64>() {
+            Ok(seconds) if (1..=queue::MAX_VISIBILITY_SECONDS).contains(&seconds) => Some(Duration::from_secs(seconds)),
+            _ => {
+                println!(
+                    "Visibility must be a whole number of seconds between 1 and {}",
+                    queue::MAX_VISIBILITY_SECONDS
+                );
+                return;
+            }
+        },
+    };
+    let account = db.current_account();
+    match db.dequeue(&account, parts[1], CLI_OWNER, visibility) {
+        Ok(Some(delivery)) => print_delivery(parts[1], &delivery, "claimed"),
+        Ok(None) => println!("[{}] empty", parts[1]),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_peek(db: &Database, parts: &[&str]) {
+    if parts.len() < 2 {
+        println!("Usage: PEEK <queue> [<key>]");
+        return;
+    }
+    let account = db.current_account();
+    match db.peek(&account, parts[1], parts.get(2).copied()) {
+        Ok(Some(delivery)) => print_delivery(parts[1], &delivery, "head"),
+        Ok(None) if parts.len() > 2 => println!("[{}] no record {}", parts[1], parts[2]),
+        Ok(None) => println!("[{}] empty", parts[1]),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn handle_ack(db: &Database, parts: &[&str], nack: bool) {
+    let command = if nack { "NACK" } else { "ACK" };
+    if parts.len() < 3 {
+        println!("Usage: {} <queue> <key>", command);
+        return;
+    }
+    let account = db.current_account();
+    let settled = if nack {
+        db.nack(&account, parts[1], parts[2], CLI_OWNER)
+    } else {
+        db.ack(&account, parts[1], parts[2], CLI_OWNER)
+    };
+    match settled {
+        Ok(()) if nack => println!("[{}] {} returned to the queue", parts[1], parts[2]),
+        Ok(()) => println!("[{}] {} acknowledged and removed", parts[1], parts[2]),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+/// Prints one delivery: what the queue knows about it, then the record itself
+/// field by field, the way `CT` prints one.
+fn print_delivery(file: &str, delivery: &QueueDelivery, what: &str) {
+    let age = delivery
+        .enqueued_millis
+        .map(|enqueued| {
+            format!(
+                ", enqueued {}s ago",
+                queue::now_millis().saturating_sub(enqueued) / 1000
+            )
+        })
+        .unwrap_or_default();
+    let held = delivery
+        .expires_millis
+        .map(|expires| {
+            format!(
+                ", claim lapses in {}s",
+                expires.saturating_sub(queue::now_millis()) / 1000
+            )
+        })
+        .unwrap_or_default();
+    println!(
+        "[{}] {} {} (delivery {}{}{})",
+        file, what, delivery.key, delivery.deliveries, age, held
+    );
+    for (index, field) in delivery.record.fields.iter().enumerate() {
+        println!("  {:>3}: {}", index + 1, field_display(field));
+    }
+}
+
+/// One field of a record as a single line, values separated the way `CT` does.
+fn field_display(field: &Field) -> String {
+    field
+        .values
+        .iter()
+        .map(|value| {
+            value
+                .sub_values
+                .iter()
+                .map(|sub| String::from_utf8_lossy(sub).to_string())
+                .collect::<Vec<_>>()
+                .join("\\")
+        })
+        .collect::<Vec<_>>()
+        .join("]")
 }
 
 /// Prints one index the way `LIST.INDEXES` does, so creating one and listing it
@@ -1401,6 +1629,24 @@ fn handle_file_stats(db: &Database, parts: &[&str]) {
         smart_rusty_pick_core::db::health::ratio(groups.mean),
         groups.max,
     );
+    if let Some(queue) = &stats.queue {
+        let age = match queue.oldest_unacknowledged_seconds {
+            Some(seconds) => format!("{}s", seconds),
+            None => "-".to_string(),
+        };
+        println!(
+            "  queue{}: {} waiting, {} in flight, oldest {}, {} dead-lettered",
+            if queue.dead_letter { " (dead letters)" } else { "" },
+            queue.depth,
+            queue.in_flight,
+            age,
+            queue.dead_letters,
+        );
+        println!(
+            "  {}s visibility, {} deliveries before dead-lettering, next sequence {}",
+            queue.visibility_timeout_seconds, queue.max_deliveries, queue.next_sequence,
+        );
+    }
     println!();
     print_health(&stats.health);
     if !stats.indexes.is_empty() {

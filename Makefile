@@ -98,6 +98,7 @@ test-integration: build
 	$(PYTHON) test/integration/test_headless.py
 	$(PYTHON) test/integration/test_security.py
 	$(PYTHON) test/integration/test_durability.py
+	$(PYTHON) test/integration/test_queue.py
 	$(PYTHON) test/integration/test_web.py
 
 test-performance: build

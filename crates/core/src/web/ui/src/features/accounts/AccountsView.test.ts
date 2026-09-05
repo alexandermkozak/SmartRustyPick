@@ -113,15 +113,32 @@ function stubFetch(routes: Record<string, unknown>) {
     })
 }
 
-const fileList = (durable: boolean, usersHealth = 'good', reasons: string[] = []) =>
+const fileList = (durable: boolean, usersHealth = 'good', reasons: string[] = [], queue = false) =>
     envelope({
         keys: ['DIR', 'USERS'],
         results: [
-            ['DIR', {durable: false, health: 'good', health_reasons: []}],
-            ['USERS', {durable, health: usersHealth, health_reasons: reasons}],
+            ['DIR', {durable: false, queue: false, health: 'good', health_reasons: []}],
+            ['USERS', {durable, queue, health: usersHealth, health_reasons: reasons}],
         ],
         count: 2,
     })
+
+/** `FILE.STATS` for a queue file, with the four numbers the panel reports. */
+const queueStats = (over: Record<string, unknown> = {}) => ({
+    ...fileStats,
+    durable: true,
+    queue: {
+        depth: 128,
+        in_flight: 3,
+        oldest_unacknowledged_seconds: 41,
+        dead_letters: 2,
+        next_sequence: 1764950412345000131,
+        visibility_timeout_seconds: 300,
+        max_deliveries: 3,
+        dead_letter: false,
+        ...over,
+    },
+})
 
 const dictionary: DictionaryEntry[] = [
     {
@@ -420,6 +437,50 @@ describe('the accounts view', () => {
         expect(entries[1].text()).toContain('durable')
     })
 
+    it('marks the queue files in the listing', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubFetch({...routes, '/api/accounts/SALES/files': fileList(true, 'good', [], true)}),
+        )
+        const wrapper = mount(View)
+        await flushPromises()
+        await selectors(wrapper, 0)[0].trigger('click')
+        await flushPromises()
+
+        const entries = wrapper.findAll('.list')[1].findAll('li')
+        expect(entries[0].text()).not.toContain('queue')
+        expect(entries[1].text()).toContain('queue')
+    })
+
+    it('reports a queue’s depth, in-flight count, age and dead letters', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubFetch({
+                ...routes,
+                '/api/accounts/SALES/files': fileList(true, 'good', [], true),
+                '/api/accounts/SALES/files/USERS': envelope({record: queueStats()}),
+            }),
+        )
+        const wrapper = await openUsers(View)
+
+        const text = wrapper.text()
+        expect(text).toContain('Queue')
+        expect(text).toContain('Waiting')
+        expect(text).toContain('128')
+        expect(text).toContain('In flight')
+        expect(text).toContain('Oldest unacknowledged')
+        expect(text).toContain('Dead-lettered')
+        // The dead-letter file is named, because that is where the reader goes next.
+        expect(text).toContain('USERS.DEAD')
+        expect(wrapper.findAll('.file-actions button')[1].text()).toBe('Stop being a queue')
+    })
+
+    it('reports nothing about queues for an ordinary file', async () => {
+        const wrapper = await openUsers(View)
+        expect(wrapper.text()).not.toContain('Oldest unacknowledged')
+        expect(wrapper.findAll('.file-actions button')[1].text()).toBe('Make a queue')
+    })
+
     it('promotes a file to durable writes and shows what the database then says', async () => {
         // The button reports the server's answer, not the click: the flag is the
         // database's to decide, and a global durable_writes overrules the request.
@@ -447,11 +508,11 @@ describe('the accounts view', () => {
         const wrapper = await openUsers(View)
         expect(wrapper.text()).toContain('Make durable')
 
-        await wrapper.find('.file-actions button').trigger('click')
+        await wrapper.findAll('.file-actions button')[0].trigger('click')
         await flushPromises()
 
         expect(posted).toEqual([['/api/accounts/SALES/files/USERS', '{"durable":true}']])
-        expect(wrapper.find('.file-actions button').text()).toBe('Buffer writes')
+        expect(wrapper.findAll('.file-actions button')[0].text()).toBe('Buffer writes')
         expect(wrapper.findAll('.list')[1].findAll('li')[1].text()).toContain('durable')
     })
 
@@ -477,7 +538,7 @@ describe('the accounts view', () => {
         await wrapper.find('.file-actions button').trigger('click')
         await flushPromises()
 
-        expect(wrapper.find('.file-actions button').text()).toBe('Make durable')
+        expect(wrapper.findAll('.file-actions button')[0].text()).toBe('Make durable')
         expect(alerts.message.value).toBe('Admin privileges required')
     })
 
@@ -500,7 +561,7 @@ describe('the accounts view', () => {
 
         expect(wrapper.text()).toContain('SALES/DIR')
         expect(wrapper.find('.file-actions').exists()).toBe(false)
-        expect(wrapper.text()).toContain('DIR carries the durability flags')
+        expect(wrapper.text()).toContain('DIR carries the other files’ attributes')
     })
 
     it('clears the selection when the account disappears from under it', async () => {
@@ -622,6 +683,47 @@ describe('account and file maintenance', () => {
                 method: 'POST',
                 path: '/api/accounts/SALES/files',
                 body: '{"name":"LEDGER","durable":true}',
+            },
+        ])
+    })
+
+    it('creates a queue with the claim policy the form asks for', async () => {
+        const wrapper = mount(View)
+        await flushPromises()
+        await selectors(wrapper, 0)[0].trigger('click')
+        await flushPromises()
+
+        const checkboxes = wrapper.findAll('.new-file input[type="checkbox"]')
+        await checkboxes[1].setValue(true)
+        await wrapper.find('.new-file input:not([type="checkbox"])').setValue('JOBS')
+        // The policy inputs only appear once the file is to be a queue.
+        const policy = wrapper.findAll('.new-file')[1].findAll('input')
+        await policy[0].setValue('300')
+        await policy[1].setValue('3')
+        await wrapper.findAll('.new-file')[0].trigger('submit')
+        await flushPromises()
+
+        expect(sent).toEqual([
+            {
+                method: 'POST',
+                path: '/api/accounts/SALES/files',
+                body: '{"name":"JOBS","durable":false,"queue":true,"visibility_timeout":300,"max_deliveries":3}',
+            },
+        ])
+    })
+
+    it('sends only the attribute the queue switch changes', async () => {
+        // The database leaves an omitted attribute alone, so a page that sent
+        // the whole set would undo a deliberate demotion on every click.
+        const wrapper = await openUsers(View)
+        await wrapper.findAll('.file-actions button')[1].trigger('click')
+        await flushPromises()
+
+        expect(sent).toEqual([
+            {
+                method: 'POST',
+                path: '/api/accounts/SALES/files/USERS',
+                body: '{"queue":true}',
             },
         ])
     })

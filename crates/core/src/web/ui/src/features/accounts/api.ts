@@ -8,6 +8,7 @@ import type {
     FileStats,
     IndexReport,
     IndexStats,
+    QueueDraft,
 } from './types'
 
 /**
@@ -38,12 +39,16 @@ export const accountsApi = {
      * than only by opening every file in turn.
      */
     async files(account: string): Promise<FileEntry[]> {
-        const results = await pairs<{durable: boolean; health?: string; health_reasons?: string[]}>(
-            `/api/accounts/${encode(account)}/files`,
-        )
+        const results = await pairs<{
+            durable: boolean
+            queue?: boolean
+            health?: string
+            health_reasons?: string[]
+        }>(`/api/accounts/${encode(account)}/files`)
         return results.map(([name, info]) => ({
             name,
             durable: info.durable === true,
+            queue: info.queue === true,
             health: summaryOf(info.health, info.health_reasons),
         }))
     },
@@ -53,13 +58,22 @@ export const accountsApi = {
         record<FileStats>(`/api/accounts/${encode(account)}/files/${encode(file)}`),
 
     /**
-     * `SET.FILE`: promote a file to durable writes, or demote it back. Admin
-     * only, like creating one - the database decides that, not this page.
+     * `SET.FILE`: change what an existing file is - durable or buffered, a queue
+     * or an ordinary file, and a queue's claim policy. Admin only, like
+     * creating one; the database decides that, not this page.
+     *
+     * Only the fields given are sent, because the database leaves an omitted
+     * attribute alone: a change of durability must not quietly stop a file
+     * being a queue.
      */
-    setDurable: (account: string, file: string, durable: boolean): Promise<unknown> =>
+    setFile: (
+        account: string,
+        file: string,
+        changes: {durable?: boolean; queue?: boolean} & QueueDraft,
+    ): Promise<unknown> =>
         call(`/api/accounts/${encode(account)}/files/${encode(file)}`, {
             method: 'POST',
-            body: JSON.stringify({durable}),
+            body: JSON.stringify(changes),
         }),
 
     /**
@@ -74,11 +88,22 @@ export const accountsApi = {
     deleteAccount: (name: string): Promise<unknown> =>
         call(`/api/accounts/${encode(name)}`, {method: 'DELETE'}),
 
-    /** `CREATE.FILE`, optionally durable from the start. Admin only. */
-    createFile: (account: string, name: string, durable: boolean): Promise<unknown> =>
+    /**
+     * `CREATE.FILE`, optionally durable, and optionally a queue with its claim
+     * policy. Admin only.
+     *
+     * The policy travels with the create rather than following it, so a queue is
+     * never briefly running on a timeout nobody asked for.
+     */
+    createFile: (
+        account: string,
+        name: string,
+        durable: boolean,
+        queue?: QueueDraft | null,
+    ): Promise<unknown> =>
         call(`/api/accounts/${encode(account)}/files`, {
             method: 'POST',
-            body: JSON.stringify({name, durable}),
+            body: JSON.stringify(queue ? {name, durable, queue: true, ...queue} : {name, durable}),
         }),
 
     /** `DELETE.FILE`: the file, its records and its dictionary. Admin only. */

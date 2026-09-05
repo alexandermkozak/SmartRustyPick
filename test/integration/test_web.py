@@ -309,7 +309,7 @@ def main():
             created = (payload or {}).get("record") or {}
             suite.check(
                 "A demo account can be created",
-                status == 200 and created.get("files") == ["DIR", "PRODUCTS", "USERS"],
+                status == 200 and created.get("files") == ["DIR", "JOBS", "PRODUCTS", "USERS"],
                 json.dumps(created),
             )
 

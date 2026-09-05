@@ -14,7 +14,13 @@ import {ref, watch} from 'vue'
 import {usePolling} from '@shared/composables/usePolling'
 import {useAlerts} from '@shared/composables/useAlerts'
 import {accountsApi} from '../api'
-import type {AccountStats, FileEntry, FileStats} from '../types'
+import type {AccountStats, FileEntry, FileStats, QueueDraft} from '../types'
+
+/**
+ * What one `SET.FILE` changes. Every field is optional and only the ones
+ * present are sent, because the database leaves an omitted attribute alone.
+ */
+export type FileChanges = {durable?: boolean; queue?: boolean} & QueueDraft
 
 export function useAccountBrowser() {
     // Accounts and files change when someone creates or drops one, so a slow
@@ -27,7 +33,8 @@ export function useAccountBrowser() {
     const files = ref<FileEntry[]>([])
     const filesLoaded = ref(false)
     const stats = ref<FileStats | null>(null)
-    /** True while a durability change is in flight, so the button cannot be double-fired. */
+    /** True while a change to the file's attributes is in flight, so the
+     *  buttons cannot be double-fired. */
     const changing = ref(false)
     /** True while an account or file is being created or dropped. */
     const maintaining = ref(false)
@@ -70,12 +77,13 @@ export function useAccountBrowser() {
     }
 
     /**
-     * Promotes the selected file to durable writes, or demotes it back, then
-     * re-reads both views of the flag from the database rather than assuming the
-     * change took: the server is the one that knows, and a global
-     * `durable_writes` makes every file durable whatever this page just asked for.
+     * Changes what the selected file is - durable or buffered, a queue or an
+     * ordinary file, a queue's claim policy - then re-reads both views of it
+     * from the database rather than assuming the change took: the server is the
+     * one that knows, and a global `durable_writes` makes every file durable
+     * whatever this page just asked for.
      */
-    async function setDurable(durable: boolean): Promise<boolean> {
+    async function setFile(changes: FileChanges): Promise<boolean> {
         const account = selectedAccount.value
         const file = selectedFile.value
         if (!account || !file || changing.value) return false
@@ -85,7 +93,7 @@ export function useAccountBrowser() {
         // the very reload that shows the file unchanged.
         let failure: unknown = null
         try {
-            await accountsApi.setDurable(account, file, durable)
+            await accountsApi.setFile(account, file, changes)
         } catch (cause) {
             failure = cause
         }
@@ -140,10 +148,14 @@ export function useAccountBrowser() {
         return maintain(() => accountsApi.deleteAccount(name), false)
     }
 
-    async function createFile(name: string, durable: boolean): Promise<boolean> {
+    async function createFile(
+        name: string,
+        durable: boolean,
+        queue?: QueueDraft | null,
+    ): Promise<boolean> {
         const account = selectedAccount.value
         if (!account) return false
-        return maintain(() => accountsApi.createFile(account, name, durable), true)
+        return maintain(() => accountsApi.createFile(account, name, durable, queue), true)
     }
 
     async function deleteFile(name: string): Promise<boolean> {
@@ -175,7 +187,7 @@ export function useAccountBrowser() {
         maintaining,
         selectAccount,
         selectFile,
-        setDurable,
+        setFile,
         createAccount,
         deleteAccount,
         createFile,

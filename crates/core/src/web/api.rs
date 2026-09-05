@@ -113,6 +113,20 @@ fn values(body: &Value, name: &str) -> Vec<String> {
 /// A flag the caller must actually have sent. `SET.FILE` reads an absent
 /// durability flag as a mistake rather than as "off", so the endpoint has to
 /// tell "false" and "not there" apart before it forwards anything.
+/// A whole number from the body, accepting the string a form field holds as
+/// well as a JSON number.
+///
+/// `None` for absent, null, empty or unparsable - the database is the one place
+/// a queue's timeout and delivery limit are judged, and a value it would refuse
+/// is better refused there, with its reason, than silently dropped here.
+fn number(body: &Value, name: &str) -> Option<u64> {
+    match body.get(name) {
+        Some(Value::Number(value)) => value.as_u64(),
+        Some(Value::String(text)) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 fn optional_flag(body: &Value, name: &str) -> Option<bool> {
     match body.get(name) {
         Some(Value::Null) | None => None,
@@ -271,16 +285,25 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                 Some(name) => name,
                 None => return Response::error(400, "A file name is required"),
             };
-            run(
-                client,
-                json!({
-                    "command": "CREATE.FILE",
-                    "account": account,
-                    "file": name,
-                    "durable": flag(&body, "durable"),
-                }),
-            )
-            .await
+            let mut request = json!({
+                "command": "CREATE.FILE",
+                "account": account,
+                "file": name,
+                "durable": flag(&body, "durable"),
+            });
+            // A queue is created with its claim policy, so the file is never
+            // briefly a queue running on defaults nobody asked for.
+            if flag(&body, "queue") {
+                let object = request.as_object_mut().expect("built as an object");
+                object.insert("queue".to_string(), json!(true));
+                if let Some(seconds) = number(&body, "visibility_timeout") {
+                    object.insert("visibility_timeout".to_string(), json!(seconds));
+                }
+                if let Some(count) = number(&body, "max_deliveries") {
+                    object.insert("max_deliveries".to_string(), json!(count));
+                }
+            }
+            run(client, request).await
         }
         ("GET", ["api", "accounts", account, "files", file]) => {
             run(
@@ -289,19 +312,33 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
             )
             .await
         }
-        // The one thing about an existing file the dashboard changes rather
-        // than reports: whether its writes are flushed before they are
-        // acknowledged.
+        // What the dashboard changes about an existing file rather than
+        // reports: whether its writes are flushed before they are
+        // acknowledged, whether it is a queue, and that queue's claim policy.
+        // Only the fields the request carries are sent on, so the database's
+        // "an omitted attribute is left alone" rule reaches the page unchanged.
         ("POST", ["api", "accounts", account, "files", file]) => {
-            let durable = match optional_flag(&body, "durable") {
-                Some(durable) => durable,
-                None => return Response::error(400, "A durable flag is required"),
-            };
-            run(
-                client,
-                json!({ "command": "SET.FILE", "account": account, "file": file, "durable": durable }),
-            )
-            .await
+            let mut request = json!({ "command": "SET.FILE", "account": account, "file": file });
+            let object = request.as_object_mut().expect("built as an object");
+            if let Some(durable) = optional_flag(&body, "durable") {
+                object.insert("durable".to_string(), json!(durable));
+            }
+            if let Some(queue) = optional_flag(&body, "queue") {
+                object.insert("queue".to_string(), json!(queue));
+            }
+            if let Some(seconds) = number(&body, "visibility_timeout") {
+                object.insert("visibility_timeout".to_string(), json!(seconds));
+            }
+            if let Some(count) = number(&body, "max_deliveries") {
+                object.insert("max_deliveries".to_string(), json!(count));
+            }
+            if object.len() <= 3 {
+                return Response::error(
+                    400,
+                    "Nothing to set: name durable, queue, visibility_timeout or max_deliveries",
+                );
+            }
+            run(client, request).await
         }
         ("DELETE", ["api", "accounts", account, "files", file]) => {
             run(

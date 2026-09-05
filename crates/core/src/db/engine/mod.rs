@@ -1,6 +1,7 @@
 mod cache;
 #[cfg(test)]
 mod cache_tests;
+pub mod queue;
 
 use crate::db::error::{DbError, DbResult};
 use crate::db::hashfile::{self, FsyncPolicy, SectionMeta};
@@ -230,7 +231,7 @@ struct ClientRegistry {
 /// 4. `tables` - the map of loaded tables;
 /// 5. `lru_order`;
 /// 6. a single table, through its [`TableHandle`];
-/// 7. `durable_tables`, `clients`, `pending_writes`, `last_flush`.
+/// 7. `file_attributes`, `clients`, `pending_writes`, `last_flush`.
 ///
 /// A thread holds **at most one table lock at a time**. Nothing in the engine
 /// needs two, and a command that ever does must take them in `(account, name)`
@@ -284,9 +285,10 @@ pub struct Database {
     last_flush: Mutex<Instant>,
     /// Per-file flush batching, for the writes that name the file they touch.
     write_marks: Mutex<HashMap<TableKey, WriteMark>>,
-    /// Per-file durability flags read from the DIR file, cached so the write
-    /// path does not touch the filesystem on every request.
-    durable_tables: RwLock<HashMap<TableKey, bool>>,
+    /// What each file's DIR entry says about it - durable, queue, and a
+    /// queue's claim policy - cached so the write path does not read the DIR
+    /// file on every request.
+    file_attributes: RwLock<HashMap<TableKey, FileAttributes>>,
 }
 
 /// The display width a field without a dictionary width is rendered at.
@@ -485,7 +487,7 @@ impl Database {
             pending_writes: AtomicUsize::new(0),
             last_flush: Mutex::new(Instant::now()),
             write_marks: Mutex::new(HashMap::new()),
-            durable_tables: RwLock::new(HashMap::new()),
+            file_attributes: RwLock::new(HashMap::new()),
         };
 
         if !Path::new(&db.storage_dir).exists() {
@@ -1032,7 +1034,7 @@ impl Database {
         };
         for key in keys_to_remove {
             self.forget_lru(&key);
-            wlock(&self.durable_tables).remove(&key);
+            wlock(&self.file_attributes).remove(&key);
         }
         wlock(&self.available_tables).remove(name);
         wlock(&self.available_stamps).remove(name);
@@ -1080,7 +1082,12 @@ impl Database {
         // before the write is acknowledged" has to mean on disk, not merely in
         // the page cache. Read from the cache rather than the DIR file so the
         // flush path stays free of I/O.
-        let fsync = if self.durable_writes || rlock(&self.durable_tables).get(key).copied().unwrap_or(false) {
+        let fsync = if self.durable_writes
+            || rlock(&self.file_attributes)
+                .get(key)
+                .map(|attributes| attributes.durable)
+                .unwrap_or(false)
+        {
             self.durable_fsync
         } else {
             self.fsync
@@ -1130,7 +1137,26 @@ impl Database {
         for (field, index) in table.indexes.iter_mut() {
             index.save(&index::section_path(&file_dir, field), data_version, per_group, fsync)?;
         }
+        // The queue's book last, for the same reason the indexes' `state` files
+        // are: it names records, so it must never be written ahead of the
+        // records it names. A delivery count for a record that is not there is
+        // dropped on the next load; a record with no delivery count merely
+        // starts its retries again.
+        if let Some(state) = table.queue.as_mut()
+            && state.is_dirty()
+        {
+            queue::persist(&file_dir, state, fsync)?;
+        }
         table.clear_dirty();
+        // Stamped here, under the guard that did the writing, rather than by
+        // the caller afterwards. Two threads flushing the same file take this
+        // guard in turn, so the stamp can only ever move forwards; read after
+        // the guard was released, the older flush could record its stamp last
+        // and leave the table looking stale. It would then be dropped from the
+        // cache and read back from disk - which for records is merely wasted
+        // work, but for a queue file throws away every claim held in memory and
+        // fails the next ACK.
+        table.stamp = Some(self.stamp_after_flush(account, name, table));
         Ok(())
     }
 
@@ -1172,14 +1198,14 @@ impl Database {
                 clients_updated = true;
             }
             if !was_dirty {
-                // Never refresh the stamp of a table we did not write: doing so would
-                // mark a snapshot that is already stale on disk as up to date and the
-                // freshness check would stop reloading it.
+                // A table we did not write keeps the stamp it has. Refreshing it
+                // would mark a snapshot that is already stale on disk as up to
+                // date, and the freshness check would stop reloading it - which
+                // is why the stamp is now taken inside `flush_handle`, where it
+                // can only follow a write this thread actually made.
                 continue;
             }
             self.flush_handle(&key, &handle)?;
-            let stamp = self.disk_stamp(&key.0, &key.1);
-            handle.write().stamp = Some(stamp);
         }
         self.pending_writes.store(0, Ordering::Relaxed);
         mlock(&self.write_marks).clear();
@@ -1268,8 +1294,6 @@ impl Database {
             && handle.read().is_dirty()
         {
             self.flush_handle(key, &handle)?;
-            let stamp = self.disk_stamp(&key.0, &key.1);
-            handle.write().stamp = Some(stamp);
             if key.0 == "SYSTEM" && key.1 == "$CLIENTS" {
                 self.load_clients_from_table()?;
             }
@@ -1370,17 +1394,23 @@ impl Database {
         tables
     }
 
-    /// Every file in the account with its durability flag, sorted by name.
+    /// Every file in the account with what its `DIR` entry says about it,
+    /// sorted by name.
     ///
-    /// The flag is otherwise only readable by reading the account's `DIR` file,
-    /// which is an obscure interface for something a client may reasonably want
-    /// beside the name.
-    pub fn list_tables_with_durability_for_account(&self, account: &str) -> Vec<(String, bool)> {
+    /// The attributes are otherwise only readable by reading the account's
+    /// `DIR` file, which is an obscure interface for something a client may
+    /// reasonably want beside the name - and "which of these is a queue" is a
+    /// question a listing should answer without opening every file.
+    pub fn list_tables_with_attributes_for_account(&self, account: &str) -> Vec<(String, FileAttributes)> {
         self.list_tables_for_account(account)
             .into_iter()
             .map(|name| {
-                let durable = self.is_table_durable_for_account(account, &name);
-                (name, durable)
+                let mut attributes = self.file_attributes_for_account(account, &name);
+                // A database running wholly in durable mode makes every file
+                // durable whatever its entry says, and a listing that reported
+                // otherwise would be describing the entry rather than the file.
+                attributes.durable |= self.durable_writes;
+                (name, attributes)
             })
             .collect()
     }
@@ -1542,6 +1572,16 @@ impl Database {
         };
         let (disk_bytes, modified) = Self::tree_stats(Path::new(&file_dir));
 
+        // Before the cache is looked at, because answering it loads the file: a
+        // queue's depth and in-flight count live in the order held in memory,
+        // which is the one figure here that cannot be read off the disk. Swept
+        // on the way past, so `FILE.STATS` sees what a consumer arriving now
+        // would - a lapsed claim is not still in flight.
+        let queue = self
+            .is_table_queue_for_account(account, name)
+            .then(|| self.queue_statistics(account, name).ok())
+            .flatten();
+
         let loaded_table = self.get_table_read_only_for_account(account, name);
         let loaded = loaded_table.is_some();
         let record_count = match &loaded_table {
@@ -1566,6 +1606,7 @@ impl Database {
         let capacity = modulus.saturating_mul(per_group as u64);
         let mut stats = FileStats {
             indexes,
+            queue,
             account: account.to_string(),
             name: name.to_string(),
             record_count,
@@ -1936,9 +1977,20 @@ impl Database {
     }
 
     pub fn create_table_for_account_durable(&self, account: &str, name: &str, durable: bool) -> DbResult<()> {
+        self.create_table_with(account, name, FileAttributes { durable, queue: None })
+    }
+
+    /// Creates a file with the `DIR` attributes it is to carry.
+    ///
+    /// The attributes are written after the file exists but before anything can
+    /// be put in it, so a queue is a queue from its first record rather than
+    /// from whenever its flag caught up. Attributes that say nothing - an
+    /// ordinary buffered file - are not written at all, which leaves the entry
+    /// `sync_dir_file_for_account` already makes.
+    pub fn create_table_with(&self, account: &str, name: &str, attributes: FileAttributes) -> DbResult<()> {
         self.create_table_for_account(account, name)?;
-        if durable {
-            self.set_table_durable_for_account(account, name, true)?;
+        if attributes != FileAttributes::default() {
+            self.set_file_attributes_for_account(account, name, attributes, "attributes")?;
         }
         Ok(())
     }
@@ -2016,7 +2068,7 @@ impl Database {
 
         let key = (account.to_string(), name.to_string());
         wlock(&self.tables).remove(&key);
-        wlock(&self.durable_tables).remove(&key);
+        wlock(&self.file_attributes).remove(&key);
         if let Some(available) = wlock(&self.available_tables).get_mut(account) {
             available.remove(name);
         }
@@ -2037,18 +2089,21 @@ impl Database {
         let tables = self.list_tables_for_account(account);
         let handle = self.get_table_mut_for_account(account, "DIR")?;
         let mut dir_table = handle.write();
-        // The listing is rebuilt from scratch, but the durability flag is not
-        // derived from the filesystem, so it has to be carried over.
-        let durable: HashMap<String, bool> = dir_table
+        // The listing is rebuilt from the filesystem, but nothing on the
+        // filesystem says whether a file is durable or a queue, so every
+        // attribute of the old entry is carried over to the new one. A rebuild
+        // that dropped them would silently demote a queue to an ordinary file
+        // holding some oddly named records.
+        let attributes: HashMap<String, FileAttributes> = dir_table
             .records
             .iter()
-            .map(|(k, r)| (k.clone(), Self::record_is_durable(r)))
+            .map(|(k, r)| (k.clone(), FileAttributes::of(r)))
             .collect();
         dir_table.records.clear();
         for t in tables {
             if t != "DIR" {
-                let flag = durable.get(&t).copied().unwrap_or(false);
-                dir_table.records.insert(t, Self::dir_entry(flag));
+                let carried = attributes.get(&t).copied().unwrap_or_default();
+                dir_table.records.insert(t, carried.to_record());
             }
         }
         // The listing is rebuilt from scratch, so every group has to be rewritten.
@@ -2056,39 +2111,24 @@ impl Database {
         Ok(())
     }
 
-    fn dir_entry(durable: bool) -> Record {
-        let mut rec = Record::new();
-        while rec.fields.len() <= DIR_DURABLE_IDX {
-            rec.fields.push(Field::default());
-        }
-        rec.fields[DIR_TYPE_IDX].values = vec![Value::text("F")];
-        rec.fields[DIR_DURABLE_IDX].values = vec![Value::text(if durable { "Y" } else { "" })];
-        rec
-    }
-
     fn ensure_dir_dictionary(dir_table: &mut Table) {
-        if !dir_table.dictionary.contains_key("TYPE") {
-            dir_table
-                .dictionary
-                .insert("TYPE".to_string(), Record::from_display_string("1^TYPE^L^1"));
-            dir_table.mark_dict_dirty();
+        // Attribute number, heading, justification and width, in the order
+        // `DIR`'s attributes are defined in `models.rs`.
+        const ENTRIES: [(&str, &str); 5] = [
+            ("TYPE", "1^TYPE^L^1"),
+            ("DURABLE", "2^DURABLE^L^7"),
+            ("QUEUE", "3^QUEUE^L^5"),
+            ("QUEUE.TIMEOUT", "4^TIMEOUT^R^7"),
+            ("QUEUE.RETRIES", "5^RETRIES^R^7"),
+        ];
+        for (name, definition) in ENTRIES {
+            if !dir_table.dictionary.contains_key(name) {
+                dir_table
+                    .dictionary
+                    .insert(name.to_string(), Record::from_display_string(definition));
+                dir_table.mark_dict_dirty();
+            }
         }
-        if !dir_table.dictionary.contains_key("DURABLE") {
-            dir_table
-                .dictionary
-                .insert("DURABLE".to_string(), Record::from_display_string("2^DURABLE^L^7"));
-            dir_table.mark_dict_dirty();
-        }
-    }
-
-    fn record_is_durable(record: &Record) -> bool {
-        record
-            .fields
-            .get(DIR_DURABLE_IDX)
-            .and_then(|f| f.values.first())
-            .and_then(|v| v.first_text())
-            .map(|s| matches!(s.trim().to_uppercase().as_str(), "Y" | "YES" | "1" | "TRUE" | "DURABLE"))
-            .unwrap_or(false)
     }
 
     pub fn set_table_durable(&self, name: &str, durable: bool) -> DbResult<()> {
@@ -2105,6 +2145,38 @@ impl Database {
     /// flag never gets ahead of the data it promises to protect. Demoting is
     /// safe either way - it only ever relaxes what a later write has to do.
     pub fn set_table_durable_for_account(&self, account: &str, name: &str, durable: bool) -> DbResult<()> {
+        let mut attributes = self.file_attributes_for_account(account, name);
+        attributes.durable = durable;
+        self.set_file_attributes_for_account(account, name, attributes, "durability")
+    }
+
+    /// Replaces one file's `DIR` attributes wholesale: durability, whether it
+    /// is a queue, and that queue's claim policy.
+    ///
+    /// The caller reads the current attributes with
+    /// [`file_attributes_for_account`](Self::file_attributes_for_account) and
+    /// hands back the whole set, so nothing is changed by omission.
+    pub fn set_file_attributes(&self, account: &str, name: &str, attributes: FileAttributes) -> DbResult<()> {
+        self.set_file_attributes_for_account(account, name, attributes, "attributes")
+    }
+
+    /// Writes one file's `DIR` entry and refreshes the cache the write path
+    /// reads it from.
+    ///
+    /// `what` names the thing being changed, for the refusal on `DIR` itself.
+    /// The entry is written before the flush this ends with, so the flush is
+    /// already the one the new attributes ask for: anything the file had
+    /// buffered reaches the disk under the durability being turned on, and the
+    /// flag never gets ahead of the data it promises to protect. Relaxing an
+    /// attribute is safe either way - it only ever loosens what a later write
+    /// has to do.
+    pub(crate) fn set_file_attributes_for_account(
+        &self,
+        account: &str,
+        name: &str,
+        attributes: FileAttributes,
+        what: &str,
+    ) -> DbResult<()> {
         if account.is_empty() {
             return Err(DbError::NoAccount);
         }
@@ -2115,35 +2187,28 @@ impl Database {
             });
         }
         if name == "DIR" {
-            // DIR holds the flags; it is not one of the files they describe, and
-            // an entry for itself would be dropped the next time the listing is
-            // rebuilt. Recording a promise nothing honours is worse than saying no.
-            return Err(DbError::InvalidRequest(
-                "The DIR file's durability is not settable: its own writes are always flushed at once".to_string(),
-            ));
+            // DIR holds the attributes; it is not one of the files they
+            // describe, and an entry for itself would be dropped the next time
+            // the listing is rebuilt. Recording a promise nothing honours is
+            // worse than saying no.
+            return Err(DbError::InvalidRequest(format!(
+                "The DIR file's {} is not settable: it carries the other files' attributes rather than one of its own",
+                what
+            )));
         }
-        // The flag lives in DIR, so an account without one gets it now rather
-        // than silently losing the requested durability.
+        // The attributes live in DIR, so an account without one gets it now
+        // rather than silently losing what was asked for.
         self.ensure_dir_file_for_account(account)?;
         {
             let handle = self.get_table_mut_for_account(account, "DIR")?;
             let mut dir_table = handle.write();
-            let mut rec = dir_table
-                .records
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| Self::dir_entry(false));
-            while rec.fields.len() <= DIR_DURABLE_IDX {
-                rec.fields.push(Field::default());
-            }
-            if rec.fields[DIR_TYPE_IDX].values.is_empty() {
-                rec.fields[DIR_TYPE_IDX].values = vec![Value::text("F")];
-            }
-            rec.fields[DIR_DURABLE_IDX].values = vec![Value::text(if durable { "Y" } else { "" })];
-            dir_table.insert_record(name, rec);
+            dir_table.insert_record(name, attributes.to_record());
             Self::ensure_dir_dictionary(&mut dir_table);
         }
-        wlock(&self.durable_tables).insert((account.to_string(), name.to_string()), durable);
+        wlock(&self.file_attributes).insert((account.to_string(), name.to_string()), attributes);
+        // A file that has just become - or stopped being - a queue has to pick
+        // up or drop its in-memory ordering before the next command reaches it.
+        self.reattach_queue(account, name, attributes.queue.is_some())?;
         self.save()
     }
 
@@ -2154,29 +2219,31 @@ impl Database {
     /// True when this file must be flushed on every write, either because the
     /// whole database runs in durable mode or because its DIR entry says so.
     pub fn is_table_durable_for_account(&self, account: &str, name: &str) -> bool {
-        if self.durable_writes {
-            return true;
-        }
+        self.durable_writes || self.file_attributes_for_account(account, name).durable
+    }
+
+    /// What the account's `DIR` says about one of its files, from the cache
+    /// when it can be and from the `DIR` file itself the first time.
+    ///
+    /// `DIR` describes the other files rather than itself, so asking about
+    /// `DIR` answers with the defaults instead of reading its own entry - which
+    /// is also what stops loading `DIR` from having to load `DIR`.
+    pub fn file_attributes_for_account(&self, account: &str, name: &str) -> FileAttributes {
         let key = (account.to_string(), name.to_string());
-        if let Some(flag) = rlock(&self.durable_tables).get(&key) {
-            return *flag;
+        if let Some(attributes) = rlock(&self.file_attributes).get(&key) {
+            return *attributes;
         }
         let has_dir = name != "DIR" && self.account_has_table(account, "DIR");
-        let flag = if has_dir {
+        let attributes = if has_dir {
             match self.get_table_mut_for_account(account, "DIR") {
-                Ok(dir) => dir
-                    .read()
-                    .records
-                    .get(name)
-                    .map(Self::record_is_durable)
-                    .unwrap_or(false),
-                Err(_) => false,
+                Ok(dir) => dir.read().records.get(name).map(FileAttributes::of).unwrap_or_default(),
+                Err(_) => FileAttributes::default(),
             }
         } else {
-            false
+            FileAttributes::default()
         };
-        wlock(&self.durable_tables).insert(key, flag);
-        flag
+        wlock(&self.file_attributes).insert(key, attributes);
+        attributes
     }
 
     /// Creates the account's DIR file if it does not have one yet.
@@ -3017,6 +3084,41 @@ impl Database {
                 .insert("P2".to_string(), Record::from_display_string("Mouse^2500^ACME^A-2^dan"));
             table.touch_all();
             table.mark_dict_dirty();
+        }
+        // A queue file, so the fixture reaches the ordering primitive as well
+        // as the record ones. Its policy is deliberately not the default -
+        // ninety seconds and three deliveries - so anywhere the policy is shown
+        // is somewhere it can be seen to be read rather than assumed.
+        self.create_table_with(
+            name,
+            "JOBS",
+            FileAttributes {
+                durable: true,
+                queue: Some(crate::db::queue::QueuePolicy {
+                    visibility: Duration::from_secs(90),
+                    max_deliveries: 3,
+                }),
+            },
+        )?;
+        {
+            let handle = self.get_table_mut("JOBS")?;
+            let mut table = handle.write();
+            table
+                .dictionary
+                .insert("KIND".to_string(), Record::from_display_string("1^KIND^L^12"));
+            table
+                .dictionary
+                .insert("REF".to_string(), Record::from_display_string("2^REFERENCE^L^12"));
+            table.mark_dict_dirty();
+        }
+        // Enqueued through the queue itself rather than inserted, so the keys
+        // are minted the way a client's would be and the order is real.
+        for (kind, reference) in [("invoice", "P1"), ("invoice", "P2"), ("statement", "1")] {
+            self.enqueue(
+                name,
+                "JOBS",
+                Record::from_display_string(&format!("{}^{}", kind, reference)),
+            )?;
         }
         self.save()?;
         if !original_account.is_empty() {

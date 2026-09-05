@@ -41,6 +41,18 @@ pub struct Request {
     /// server, so one request cannot ask it to sort and send every distinct
     /// value an index holds.
     pub limit: Option<usize>,
+    /// `CREATE.FILE`: create the file as a queue. `SET.FILE`: make an existing
+    /// file a queue, or return one to an ordinary file. Absent on `SET.FILE`
+    /// leaves the flag as it is, so a request that only changes durability does
+    /// not quietly demote a queue.
+    pub queue: Option<bool>,
+    /// Seconds a claim on a queue is held before it lapses. On `CREATE.FILE`
+    /// and `SET.FILE` it sets the queue's own timeout; on `DEQUEUE` it
+    /// overrides that timeout for the one claim being taken.
+    pub visibility_timeout: Option<u64>,
+    /// `CREATE.FILE` and `SET.FILE`: deliveries a record of this queue gets
+    /// before it is moved to the dead-letter file.
+    pub max_deliveries: Option<u32>,
 }
 
 /// The machine-readable classification of an error response.
@@ -262,4 +274,14 @@ pub struct Response {
     /// for an ordinary, unexploded one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub positions: Option<Vec<Option<ValuePosition>>>,
+    /// What a queue command did: the record's key, how many times it has been
+    /// delivered, when it was enqueued, and - for `DEQUEUE` - who holds the
+    /// claim and when it lapses.
+    ///
+    /// Its own field rather than more keys in `record`, because `record` is the
+    /// client's own data: folding the engine's bookkeeping into it would mean a
+    /// payload with a field called `key` could not be put on a queue and read
+    /// back unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim: Option<serde_json::Value>,
 }
