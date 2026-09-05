@@ -31,12 +31,31 @@ SETUP_COMMANDS = [
 # kill was written because the queue is durable and not because a timer fired.
 NO_AUTO_FLUSH = "flush_interval_ms = 3600000\nflush_max_pending = 1000000\n"
 
-# Short enough that a lapsed claim is observable inside a test run.
-SHORT_VISIBILITY = 1
+# The queue's own timeout, long enough that a claim outlives the several round
+# trips the checks below make while holding it. It was one second, and the suite
+# then raced its own timeout: on a slow or loaded machine a claim lapsed between
+# being taken and being asked about, and a `PEEK` that expected to see the holder
+# saw an unclaimed record instead. Nothing here is waiting for it to pass.
+VISIBILITY = 30
+# The one claim that is meant to lapse takes this as a per-claim override, at the
+# point the redelivery is being tested and nowhere else.
+LAPSE_SECONDS = 1
+# Deliveries a record gets. Three, so the redelivery below has room to happen
+# before the dead-lettering that follows it.
+MAX_DELIVERIES = 3
+
+
+def claim_of(resp):
+    """The claim a queue command reports, or an empty one.
+
+    Never indexed into directly: a key that is absent because a claim lapsed
+    would raise, and the suite would report `'owner'` rather than what it saw.
+    """
+    return resp.get("claim") or {}
 
 
 def claim_key(resp):
-    return (resp.get("claim") or {}).get("key")
+    return claim_of(resp).get("key")
 
 
 def queue_stats(conn, file=QUEUE):
@@ -82,16 +101,16 @@ def main():
                 file=QUEUE,
                 account=ACCOUNT,
                 queue=True,
-                visibility_timeout=SHORT_VISIBILITY,
-                max_deliveries=2,
+                visibility_timeout=VISIBILITY,
+                max_deliveries=MAX_DELIVERIES,
             )
             suite.check_eq("CREATE.FILE ... QUEUE", resp.get("status"), "OK")
             suite.check(
                 "A queue is durable and carries its policy",
                 resp["record"]["queue"] is True
                 and resp["record"]["durable"] is True
-                and resp["record"]["visibility_timeout_seconds"] == SHORT_VISIBILITY
-                and resp["record"]["max_deliveries"] == 2,
+                and resp["record"]["visibility_timeout_seconds"] == VISIBILITY
+                and resp["record"]["max_deliveries"] == MAX_DELIVERIES,
                 str(resp.get("record")),
             )
 
@@ -134,8 +153,8 @@ def main():
             )
             suite.check(
                 "A claim names the certificate's authorised client",
-                first["claim"]["owner"] == "alice" and second["claim"]["owner"] == "bob",
-                f"{first['claim']['owner']} and {second['claim']['owner']}",
+                claim_of(first).get("owner") == "alice" and claim_of(second).get("owner") == "bob",
+                f"{claim_of(first).get('owner')} and {claim_of(second).get('owner')}",
             )
             suite.check(
                 "The payload comes back beside the claim, through the dictionary",
@@ -175,7 +194,7 @@ def main():
             peeked = bob.request(command="PEEK", file=QUEUE, account=ACCOUNT, key=keys[0])
             suite.check(
                 "PEEK shows who is holding a record and claims nothing",
-                peeked["claim"]["owner"] == "alice" and peeked["claim"]["deliveries"] == 1,
+                claim_of(peeked).get("owner") == "alice" and claim_of(peeked).get("deliveries") == 1,
                 str(peeked.get("claim")),
             )
 
@@ -190,12 +209,34 @@ def main():
             )
 
             # --- Redelivery on a lapsed claim ---------------------------------
-            time.sleep(SHORT_VISIBILITY + 0.6)
+            # Both claims go back first, so what follows is the only thing in
+            # flight and the only thing timing matters to.
+            alice.request(command="NACK", file=QUEUE, account=ACCOUNT, key=keys[0])
+            bob.request(command="NACK", file=QUEUE, account=ACCOUNT, key=keys[1])
+
+            # This one claim is short lived, rather than the whole queue running
+            # on a one-second timeout: only the sleep below waits for it, so
+            # there is no other check racing the clock.
+            brief = alice.request(
+                command="DEQUEUE",
+                file=QUEUE,
+                account=ACCOUNT,
+                visibility_timeout=LAPSE_SECONDS,
+            )
+            suite.check(
+                "A per-claim visibility overrides the queue's own",
+                claim_key(brief) == keys[0]
+                and claim_of(brief).get("expires", 0) - claim_of(brief).get("enqueued", 0)
+                < VISIBILITY * 1000,
+                str(claim_of(brief)),
+            )
+
+            time.sleep(LAPSE_SECONDS + 1.5)
             back = bob.request(command="DEQUEUE", file=QUEUE, account=ACCOUNT)
             suite.check(
                 "A claim that lapses is redelivered with its count raised",
-                claim_key(back) == keys[0] and back["claim"]["deliveries"] == 2,
-                f"{claim_key(back)} on delivery {back['claim']['deliveries']}",
+                claim_key(back) == keys[0] and claim_of(back).get("deliveries") == 3,
+                f"{claim_key(back)} on delivery {claim_of(back).get('deliveries')}",
             )
             others = [
                 claim_key(alice.request(command="DEQUEUE", file=QUEUE, account=ACCOUNT))
@@ -208,13 +249,14 @@ def main():
             )
 
             # --- Dead letters --------------------------------------------------
-            # keys[0] has now had its two deliveries, so giving it back kills it.
+            # keys[0] has now had all the deliveries it gets, so giving it back
+            # kills it rather than returning it to the queue.
             resp = bob.request(command="NACK", file=QUEUE, account=ACCOUNT, key=keys[0])
             suite.check_eq("NACK a record out of retries", resp.get("status"), "OK")
             dead = admin.request(command="PEEK", file=DEAD, account=ACCOUNT, key=keys[0])
             suite.check(
                 "It lands in the dead-letter file with its failure count intact",
-                dead.get("status") == "OK" and dead["claim"]["deliveries"] == 2,
+                dead.get("status") == "OK" and claim_of(dead).get("deliveries") == MAX_DELIVERIES,
                 str(dead.get("claim") or dead.get("message")),
             )
             suite.check_eq(
@@ -228,7 +270,7 @@ def main():
             replay = admin.request(command="DEQUEUE", file=DEAD, account=ACCOUNT)
             suite.check(
                 "The dead-letter file is drained with the same commands",
-                claim_key(replay) == keys[0] and replay["claim"]["deliveries"] == 3,
+                claim_key(replay) == keys[0] and claim_of(replay).get("deliveries") == MAX_DELIVERIES + 1,
                 str(replay.get("claim") or replay.get("message")),
             )
             admin.request(command="NACK", file=DEAD, account=ACCOUNT, key=keys[0])
@@ -255,7 +297,7 @@ def main():
             still_held = alice.request(command="PEEK", file=QUEUE, account=ACCOUNT, key=in_flight)
             suite.check(
                 "A record is claimed and unacknowledged when the server dies",
-                still_held["claim"].get("owner") == "alice",
+                claim_of(still_held).get("owner") == "alice",
                 str(still_held.get("claim")),
             )
             expected_left = sorted(others[1:])
@@ -280,7 +322,7 @@ def main():
                 resp = admin.request(command="DEQUEUE", file=QUEUE, account=ACCOUNT)
                 if resp.get("status") == "EMPTY":
                     break
-                drained.append((claim_key(resp), resp["claim"]["deliveries"]))
+                drained.append((claim_key(resp), claim_of(resp).get("deliveries")))
                 admin.request(command="ACK", file=QUEUE, account=ACCOUNT, key=drained[-1][0])
             suite.check(
                 "Every surviving record comes back, in order",
