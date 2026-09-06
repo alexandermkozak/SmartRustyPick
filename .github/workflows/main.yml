@@ -1,4 +1,4 @@
-name: Build and Test
+name: Build, Test and Publish
 
 on:
   push:
@@ -322,3 +322,198 @@ jobs:
             echo "Run 'make ui-build' and commit $DIST_DIR."
             exit 1
           fi
+
+  # Publishes the runtime image to GitHub Packages (ghcr.io).
+  #
+  # It lives in this workflow rather than one of its own so that `needs:` can do
+  # the gating. `main` is not branch protected, so a merge can land without this
+  # workflow ever having passed on it - and `latest` naming a commit whose tests
+  # failed is exactly what a published image must never be. A separate workflow
+  # would have to be started by `workflow_run` and re-derive from the event what
+  # it is allowed to publish; this cannot get that wrong.
+  #
+  # A pull request builds and smoke-tests the image without pushing anything.
+  # The Containerfile is otherwise exercised for the first time after a merge,
+  # which is the wrong moment to find out that the build no longer works.
+  publish-container:
+    needs: [lint, test, dashboard-bundle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      # Writing the package, and attesting to what produced it.
+      packages: write
+      id-token: write
+      attestations: write
+
+    env:
+      REGISTRY: ghcr.io
+      # Port the smoke test publishes the dashboard on. Not 8080: the runner is
+      # shared with whatever else a job has started.
+      SMOKE_WEB_PORT: 18080
+      SMOKE_TOKEN: smoke-test-token
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # `github.repository` carries the repository's own capitalisation and a
+      # registry path may not, so the name is lowered once here rather than in
+      # each of the three places that need it.
+      - name: Name the image
+        id: image
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Skipped on a pull request, which pushes nothing - and whose token from a
+      # fork could not log in anyway.
+      - name: Log in to the registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Two tags, and they answer different questions. `latest` is "what is on
+      # main now"; `sha-<commit>` is immutable, so a deployment can name exactly
+      # what it is running and a rollback has something to name. There is no
+      # version tag because the crates carry a version nobody bumps - one would
+      # be a lie that moves.
+      - name: Work out the tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+          labels: |
+            org.opencontainers.image.title=SmartRustyPick
+            org.opencontainers.image.description=A PICK-like MultiValue database server, with a web management dashboard.
+
+      # Built into the local daemon first so the smoke test below runs against
+      # the very image that is about to be pushed, rather than against a second
+      # build of the same source. `load` is what makes that possible, and is why
+      # this is one architecture: a multi-platform build cannot be loaded, and
+      # arm64 under emulation would put a Rust release build on QEMU.
+      - name: Build the image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Containerfile
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The image has to start, not merely build. This asks it the one question
+      # that covers the whole stack at once: the dashboard is an ordinary remote
+      # client, so an authorized `/api/accounts` answering `SYSTEM` proves the
+      # entrypoint seeded /data, openssl generated the CA and server
+      # certificates, the TLS listener came up, the dashboard's own certificate
+      # was authorized, and the engine opened the database and answered a
+      # command over the protocol.
+      - name: Smoke-test the image
+        env:
+          IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+        run: |
+          set -euo pipefail
+
+          docker run -d --name srp-smoke \
+            -e SRP_WEB_TOKEN="$SMOKE_TOKEN" \
+            -p "$SMOKE_WEB_PORT:8080" \
+            "$IMAGE"
+
+          # First start generates a CA and two certificates, so this is not
+          # instant. Polled rather than slept through: the point is to fail with
+          # the container's log, not to guess how long a runner takes.
+          dashboard="http://127.0.0.1:$SMOKE_WEB_PORT/api/accounts"
+          for _ in $(seq 1 60); do
+            # `-fs` rather than `-fsS`: every attempt before the server is up
+            # fails by design, and printing each one buries the real failure.
+            code=$(curl -fs -o "$RUNNER_TEMP/accounts.json" -w '%{http_code}' \
+                     -H "Authorization: Bearer $SMOKE_TOKEN" "$dashboard" || true)
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+
+          if [ "${code:-}" != "200" ]; then
+            echo "::error::The image did not answer on the dashboard within two minutes."
+            exit 1
+          fi
+
+          # SYSTEM holds the account registry and the authorized clients, so a
+          # database that answers without it is one that did not really open.
+          if ! grep -q '"SYSTEM"' "$RUNNER_TEMP/accounts.json"; then
+            echo "::error::The dashboard answered without the SYSTEM account:"
+            cat "$RUNNER_TEMP/accounts.json"
+            exit 1
+          fi
+
+          # And the token is load-bearing rather than decorative.
+          unauthorized=$(curl -s -o /dev/null -w '%{http_code}' "$dashboard")
+          if [ "$unauthorized" != "401" ]; then
+            echo "::error::The dashboard answered $unauthorized without a token, expected 401."
+            exit 1
+          fi
+
+          # The CLI ships beside the server and `make container-cli` runs it.
+          # Tested for rather than run: starting it attaches a second database
+          # service to the same data directory.
+          docker exec srp-smoke sh -c 'test -x /usr/local/bin/smart-rusty-pick-cli'
+
+          echo "The image starts, serves the protocol and opens its database."
+
+      - name: Show the container log
+        if: failure()
+        run: docker logs srp-smoke || true
+
+      - name: Stop the smoke-test container
+        if: always()
+        run: docker rm -f srp-smoke || true
+
+      # A second call rather than a rebuild: every layer is already in this
+      # job's builder, so this resolves from cache and pushes. It also hands
+      # back the digest, which is what the attestation has to name - a tag can
+      # move, a digest cannot.
+      - name: Push the image
+        id: push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Containerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+
+      # Signed provenance: which workflow, from which commit, built this exact
+      # digest. `docs/security.md` states what this deployment trusts, and "the
+      # image came from this repository" is worth being able to check rather
+      # than assume.
+      - name: Attest the image's provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Say what was published
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "Digest: \`${{ steps.push.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

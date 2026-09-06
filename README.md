@@ -64,7 +64,8 @@ For more information, see the following documentation:
 - [Remote Protocol](docs/protocol.md) - Details on the TCP/SSL remote protocol.
 - [Web Dashboard](docs/web_dashboard.md) - The browser-based management interface.
 - [Security](docs/security.md) - The threat model: what is protected today, what is not, and the decisions the encryption work is designed against.
-- [Container Deployment](docs/deployment.md) - Running the server with podman or docker compose.
+- [Container Deployment](docs/deployment.md) - Running the server with podman or docker compose, and the image
+  published to GitHub Packages on every merge to `main`.
 - [Testing](docs/testing.md) - The unit, integration and performance suites and how to run them.
 - [AI Agents](agents.md) - Documentation on the role and contributions of AI agents in this project.
 

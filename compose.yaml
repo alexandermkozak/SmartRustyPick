@@ -5,6 +5,9 @@
 #
 services:
   smart-rusty-pick:
+    # Built from this working copy. To run the image every merge to `main`
+    # publishes instead, put its name here and delete the `build:` block:
+    #   image: ghcr.io/alexandermkozak/smartrustypick:latest
     image: localhost/smart-rusty-pick:latest
     build:
       context: .

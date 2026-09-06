@@ -1,7 +1,7 @@
 # Testing
 
 The project has five layers of tests, all runnable from the `Makefile` and all executed by the
-`Build and Test` GitHub workflow on every push to `main` and every pull request.
+`Build, Test and Publish` GitHub workflow on every push to `main` and every pull request.
 
 | Layer       | Command                 | What it covers                                                                                                                                  |
 |-------------|-------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -14,6 +14,13 @@ The project has five layers of tests, all runnable from the `Makefile` and all e
 `make test-all` runs the first three; `make ui-test` covers the dashboard's front end and needs node. Everything below
 the unit layer requires `cargo build` first; the Make targets
 take care of it.
+
+A sixth check is CI-only, because it needs a container engine: the `publish-container` job builds the image from the
+`Containerfile`, starts it, and asks the dashboard for its account list. That single request covers the whole stack —
+the entrypoint seeding `/data`, openssl generating the CA and server certificates, the TLS listener coming up, the
+dashboard authorizing its own certificate, and the engine opening the database and answering a protocol command. It
+runs on every pull request without pushing anything, and on `main` it gates the publish: see
+[Container Deployment](deployment.md#published-images).
 
 ## Static analysis
 
@@ -75,7 +82,7 @@ for the same isolation the Python suites get from `harness.py`:
 - **Config.** `test_support::isolated_config()` returns a `Config` passed explicitly to `Database::new(..., Some(...))`,
   so no test depends on the repository's `config.toml` or behaves differently depending on where `cargo test` is
   invoked from.
-- **Enforced in CI.** The `Build and Test` workflow runs `git status --porcelain` after `make test-unit` and fails the
+- **Enforced in CI.** The `Build, Test and Publish` workflow runs `git status --porcelain` after `make test-unit` and fails the
   build if it is non-empty, so a test that regresses to a CWD-relative fixture directory is caught immediately.
 
 ## Performance testing
