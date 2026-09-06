@@ -75,6 +75,23 @@ AI agents have been responsible for several critical improvements and fixes in t
   whose values is sub-valued, `PRODUCTS` carries an association group whose members are deliberately ragged, and a
   `JOBS` queue file arrives with three records already enqueued, so the fixture reaches every level of the hierarchy,
   both tiers of an association, and the ordering primitive as well as the record ones.
+- **Transactions:** `TRANSACT` applies a set of writes and deletes across any number of files of one account so that
+  either all of it is visible or none of it is. Nothing used to span records: a caller with two records that had to
+  change together wrote one, then the other, and hoped. The set is written to an **intent** - tmp-then-rename, CRC32C
+  trailer, fsynced - *before* anything is applied, and the intent is removed only once every file it names is fsynced;
+  `Database::new` replays whatever it finds. Recovery is forward rather than backward, which works because every change
+  is idempotent by construction, and it is the only shape available when several file renames cannot be made one atomic
+  act. A set outside the scope - a queue file, more than a thousand changes - is refused with its own
+  `TRANSACTION_SCOPE` code and writes nothing, because **a caller can handle a refusal and cannot handle a guarantee
+  that quietly does not hold**. The property is asserted the only way it can be: a test re-executes the test binary and
+  has the child SIGKILL itself between the two halves of a set, then checks that one file has its record, the other does
+  not, and that opening the database makes it whole.
+- **The one place two file locks are held:** a transaction takes every file its set touches, in file-name order, and
+  keeps them across the write-out. It is the single exception to *at most one file lock at a time*, and the ordering is
+  the whole deadlock argument - nothing else in the engine holds two, so nothing else can be the second party to a
+  cycle. Releasing the locks before flushing looked simpler and was wrong: a ticker flush slipping into the gap would
+  write one of the files under that *file's* sync policy, and the intent would then be retired over bytes that were only
+  in the page cache. That is why `flush_locked` exists beside `flush_handle`.
 - **Certificate Management:** Implemented `GENERATE.CERT` in the `SYSTEM` account, allowing users to create signed
   client certificates and PKCS#12 (.pfx) files directly from the database CLI for simplified secure remote access setup.
 - **Typed errors:** The engine reports a `DbError` variant - `FileNotFound`, `AccountExists`, `IndexNotFound`, `Io` and

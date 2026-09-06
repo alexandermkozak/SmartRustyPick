@@ -61,6 +61,7 @@ matched case-insensitively.
 | `queue`           | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Make the file a [queue file](#queue-files): ordered records, claimed one at a time. Optional; on `SET.FILE` an absent flag leaves the file as it is, and `false` returns a queue to an ordinary file without touching its records. |
 | `visibility_timeout` | number        | `CREATE.FILE`, `SET.FILE`, `DEQUEUE`                                                                               | Seconds a claim is held before it lapses. On the file commands it sets the queue's own timeout (default 60, maximum 86400); on `DEQUEUE` it overrides that timeout for the one claim being taken. Out of range is refused with `INVALID_DATA`. |
 | `max_deliveries`  | number           | `CREATE.FILE`, `SET.FILE`                                                                                          | Deliveries a record of this queue gets before it moves to the dead-letter file. Default 5, maximum 1000. Out of range is refused with `INVALID_DATA`. |
+| `changes`         | array of objects | `TRANSACT`                                                                                                         | The writes and deletes to apply as one. Each carries its own `op`, `file`, `key`, `data`/`structured_data` and `is_dict`, so one set may span several files of the account. See [TRANSACT](#transact). |
 | `field`           | string           | `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`                                | The dictionary field the index is on. Required by all of them. See [Storage Engine](storage.md#secondary-indexes).                                                                                                                                                                         |
 | `values`          | array of strings | `CREATE.INDEX`, `SET.INDEX.EXCLUDE`                                                                                | Values the index is to skip. Optional on `CREATE.INDEX`. On `SET.INDEX.EXCLUDE` it replaces the set, and an absent or empty list clears it.                                                                                                                                                |
 | `limit`           | number           | `INDEX.STATS`                                                                                                      | How many of the commonest values to return. Defaults to 10 and is clamped to 200, so one request cannot ask the server to sort and send every distinct value an index holds.                                                                                                               |
@@ -233,6 +234,7 @@ a code is added to the server and not written up here.
 | `INDEX_EXISTS`          | The file already carries an index on that field.                                                  |
 | `INVALID_FIELD`         | The field cannot carry an index. The message says why.                                            |
 | `INVALID_REQUEST`       | Understood and refused: the database will not do this. The message says why.                      |
+| `TRANSACTION_SCOPE`     | A `TRANSACT` set reaches past what the server applies in one piece - a queue file, or too many changes. **Nothing in the set was applied.** |
 | `CORRUPT_DATA`          | What is on disk does not decode. The file needs repair; retrying will not help.                   |
 | `PERMISSION_DENIED`     | The server may not touch a file or directory it needs. An operator problem, not the client's.     |
 | `IO_ERROR`              | Any other I/O failure - a full disk, a short write. Worth retrying, unlike the two above.         |
@@ -251,6 +253,7 @@ three are not repeated in the per-command lists below.
 | `READ`                  |       |   yes   | `file`, `key`                                        | `record`                                |
 | `WRITE`                 |       |   yes   | `file`, `key`, and one of `data` / `structured_data` | `status: "OK"`                          |
 | `DELETE`                |       |   yes   | `file`, `key`                                        | `status: "OK"`                          |
+| `TRANSACT`              |       |   yes   | `changes`                                            | `count`                                 |
 | `QUERY`                 |       |   yes   | `file`                                               | `results`                               |
 | `SELECT`                |       |   yes   | `file`                                               | `count`                                 |
 | `GET.NEXT`              |       |  yes¹   | `list_name` (defaults to `"DEFAULT"`)                | `results` + `count`, or `status: "EOF"` |
@@ -345,6 +348,93 @@ Remove one record. Succeeds whether or not the key existed.
 ```json
 {"status": "OK"}
 ```
+
+### TRANSACT
+
+Apply a set of writes and deletes so that **either all of them are visible or none of
+them are**, across any number of files within one account.
+
+This is the command for two records that must change together: an order and the basket it
+empties, a posting and the balance it moves. Without it a caller writes one, then the
+other, and a crash in between leaves a state no single operation created and no single
+operation can detect.
+
+- Required: `changes`, holding at least one change. Optional: `account`.
+- Each entry of `changes` is one operation on one record:
+
+| Field             | Type             | Notes                                                                                               |
+|-------------------|------------------|-----------------------------------------------------------------------------------------------------|
+| `"op"`            | string           | `"WRITE"` or `"DELETE"`, case-insensitive. Required.                                                 |
+| `"file"`          | string           | File within the request's account. Required. Different changes may name different files.             |
+| `"key"`           | string           | Record key. Required.                                                                                |
+| `"data"`          | string \| object | For a write: exactly what `WRITE` takes - a display-format string, or an object with ICONV applied.  |
+| `"structured_data"` | object         | The object form, spelled as `WRITE` spells it. Use this or `"data"`, not both.                       |
+| `"is_dict"`       | bool             | Operate on the file's dictionary section. Default `false`, exactly as on `WRITE` and `DELETE`.       |
+
+A change never names an account. A transaction is applied inside the one account the
+request names, and a field that could name another would be offering a scope the server
+does not implement.
+
+- Response: `count`, the number of changes applied.
+- Errors: `MISSING_FIELD` (no `changes`, or a change with no `file` or `key`),
+  `INVALID_DATA` (an `op` that is neither, or data that is not a record),
+  `INVALID_REQUEST` (the same file and key changed twice in one set - nothing says which
+  change would win), `TRANSACTION_SCOPE` (see below), `ACCOUNT_NOT_SPECIFIED`,
+  `ACCESS_DENIED`, `FILE_NOT_FOUND`.
+
+**Every one of those refusals applies to the whole set, and nothing in it is written.**
+That is the point of the command: a caller can handle a refusal, and cannot handle a
+guarantee that quietly does not hold.
+
+```json
+{"command": "TRANSACT", "account": "SALES", "changes": [
+  {"op": "WRITE", "file": "ORDERS", "key": "O-1041",
+   "data": {"customer": "C-7", "total": "129.50"}},
+  {"op": "WRITE", "file": "CUSTOMERS", "key": "C-7",
+   "data": {"name": "Alice", "lastOrder": "O-1041"}},
+  {"op": "DELETE", "file": "BASKETS", "key": "B-88"}
+]}
+```
+
+```json
+{"status": "OK", "count": 3}
+```
+
+#### What is refused, and why
+
+`TRANSACTION_SCOPE` means the set asks for something the server will not apply in one
+piece. It is a distinct code rather than `INVALID_REQUEST` so a client can tell "this
+database will not do that at all" from "this database will not do that atomically", and
+fall back to one write at a time if partial application is acceptable to it.
+
+- **A queue file.** Its records are minted by `ENQUEUE` and handed out by `DEQUEUE`
+  against a claim book, and a raw write would leave the order naming a record that is not
+  there. Use the queue commands.
+- **More than 1000 changes.** The whole set is held in memory, every file it names is
+  locked at once and the intent is one write. A set larger than that is a bulk load, which
+  is a different operation with different guarantees.
+
+The scope that is *supported* is any number of files within one account. Several accounts
+in one set cannot be asked for, because a change names no account.
+
+#### Batched is not atomic
+
+A future batched `WRITE` - several records in one request, each with its own status - is a
+throughput feature and is **not** this. Per-record status means partial success is a
+normal outcome: some records land, others do not, and the reply says which. `TRANSACT` has
+no per-change status because there is nothing to report per change; the set applied or it
+did not. Reading "batched" as "atomic" is the mistake this paragraph exists to prevent.
+
+#### Durability
+
+A `TRANSACT` reply is not sent until the whole set is on disk and fsynced, whatever the
+files' own `DURABLE` flags say. There is no buffering window for a transaction, which is
+why it is slower per record than `WRITE` and why it should be used for the records that
+need it rather than for every write.
+
+If the server dies partway through applying an accepted set, the set is completed the next
+time the database opens - so a client that gets no reply should re-read rather than assume
+the set was lost. See [Storage Engine](storage.md#transactions).
 
 ### QUERY
 

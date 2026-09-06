@@ -44,6 +44,7 @@ const REQUEST_FIELDS: &[&str] = &[
     "queue",
     "visibility_timeout",
     "max_deliveries",
+    "changes",
 ];
 
 /// Every JSON key a `Response` can carry.
@@ -64,6 +65,7 @@ const COMMANDS: &[&str] = &[
     "READ",
     "WRITE",
     "DELETE",
+    "TRANSACT",
     "QUERY",
     "SELECT",
     "GET.NEXT",
@@ -314,6 +316,20 @@ fn documented_commands_match_the_handler_dispatch() {
         "the commands handler.rs dispatches are no longer the documented ones. \
          Update docs/protocol.md and COMMANDS (an empty left side means the arms \
          of the dispatch match moved and commands_in_handler can no longer read them)."
+    );
+}
+
+/// The `changes` array of `TRANSACT` is a request object of its own, and the
+/// only one there is. Its keys are as much of the interface as the top-level
+/// fields, so they are pinned the same way rather than left to a reader of the
+/// documentation to notice.
+#[test]
+fn the_transact_change_object_is_documented() {
+    let value = serde_json::to_value(crate::server::models::ChangeSpec::default()).unwrap();
+    assert_documented_shape(
+        "TRANSACT change",
+        value_keys(&value),
+        &["op", "file", "key", "data", "structured_data", "is_dict"],
     );
 }
 

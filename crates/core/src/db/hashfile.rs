@@ -140,7 +140,7 @@ pub fn crc32c(data: &[u8]) -> u32 {
 ///
 /// Not every filesystem allows it; a refusal is not a reason to fail a write
 /// that otherwise succeeded, so those errors are swallowed.
-fn sync_dir(dir: &Path) -> io::Result<()> {
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
     match File::open(dir) {
         Ok(handle) => match handle.sync_all() {
             Ok(()) => Ok(()),
