@@ -10,7 +10,7 @@ on:
 # Three pushes to a pull request used to start three reviews and let the first
 # two run to completion - paid API calls for output nobody reads, since only the
 # review of the final commit is interesting. Same group and policy as
-# `Build and Test`.
+# `Build, Test and Publish`.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
