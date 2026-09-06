@@ -76,6 +76,13 @@ impl Database {
             for entry in entries.flatten() {
                 if entry.path().is_dir()
                     && let Some(name) = entry.file_name().to_str()
+                    // A hidden directory is the engine's own, not one of the
+                    // account's files: an account registered against the
+                    // database's own storage directory shares it with the
+                    // transaction log, and a file called `.txn` appearing in
+                    // LIST.FILES would be the least of what follows. No file
+                    // name a caller can create starts with a dot.
+                    && !name.starts_with('.')
                 {
                     tables.insert(name.to_string());
                 }

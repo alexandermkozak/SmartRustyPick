@@ -53,6 +53,30 @@ pub struct Request {
     /// `CREATE.FILE` and `SET.FILE`: deliveries a record of this queue gets
     /// before it is moved to the dead-letter file.
     pub max_deliveries: Option<u32>,
+    /// `TRANSACT`: the writes and deletes to apply as one, all of them or none.
+    /// Each carries its own file and key, so one set may span several files of
+    /// the account - see [`ChangeSpec`].
+    pub changes: Option<Vec<ChangeSpec>>,
+}
+
+/// One write or delete inside a `TRANSACT` set.
+///
+/// It is `WRITE` and `DELETE` in miniature and deliberately so: the same
+/// `file`, `key`, `data`, `structured_data` and `is_dict` mean the same things
+/// they do on those commands, so a caller assembling a set is not learning a
+/// second way to describe a record. What it does not carry is an account: a
+/// transaction is applied within the one account the request names, and a
+/// change that could name another would be a scope the server does not
+/// implement, offered on the wire.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct ChangeSpec {
+    /// `"WRITE"` or `"DELETE"`, case-insensitive.
+    pub op: Option<String>,
+    pub file: Option<String>,
+    pub key: Option<String>,
+    pub data: Option<serde_json::Value>,
+    pub structured_data: Option<serde_json::Value>,
+    pub is_dict: Option<bool>,
 }
 
 /// The machine-readable classification of an error response.
@@ -102,6 +126,10 @@ pub enum ErrorCode {
     InvalidField,
     /// Understood and refused: the database will not do this.
     InvalidRequest,
+    /// A `TRANSACT` set that reaches past what the server applies atomically.
+    /// Nothing in it was applied: a refusal a client can act on is worth far
+    /// more than a guarantee that quietly does not hold.
+    TransactionScope,
     /// What is on disk does not decode. The file needs repair, not a retry.
     CorruptData,
     /// The server may not touch a file or directory it needs.
@@ -137,6 +165,7 @@ impl ErrorCode {
         ErrorCode::IndexExists,
         ErrorCode::InvalidField,
         ErrorCode::InvalidRequest,
+        ErrorCode::TransactionScope,
         ErrorCode::CorruptData,
         ErrorCode::PermissionDenied,
         ErrorCode::IoError,
@@ -167,6 +196,7 @@ impl ErrorCode {
             ErrorCode::IndexExists => "INDEX_EXISTS",
             ErrorCode::InvalidField => "INVALID_FIELD",
             ErrorCode::InvalidRequest => "INVALID_REQUEST",
+            ErrorCode::TransactionScope => "TRANSACTION_SCOPE",
             ErrorCode::CorruptData => "CORRUPT_DATA",
             ErrorCode::PermissionDenied => "PERMISSION_DENIED",
             ErrorCode::IoError => "IO_ERROR",
@@ -238,6 +268,7 @@ impl From<&DbError> for ErrorCode {
             DbError::IndexNotFound { .. } => ErrorCode::IndexNotFound,
             DbError::InvalidField { .. } => ErrorCode::InvalidField,
             DbError::InvalidRequest(_) => ErrorCode::InvalidRequest,
+            DbError::TransactionScope(_) => ErrorCode::TransactionScope,
             DbError::Io(inner) => ErrorCode::from(inner),
         }
     }

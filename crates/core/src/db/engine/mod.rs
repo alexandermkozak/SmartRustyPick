@@ -3,6 +3,7 @@ mod cache;
 mod cache_tests;
 pub mod dictionary;
 pub mod queue;
+pub mod transaction;
 
 use crate::db::error::{DbError, DbResult};
 use crate::db::hashfile::{self, FsyncPolicy, SectionMeta};
@@ -234,11 +235,19 @@ struct ClientRegistry {
 /// 6. a single table, through its [`TableHandle`];
 /// 7. `file_attributes`, `clients`, `pending_writes`, `last_flush`.
 ///
-/// A thread holds **at most one table lock at a time**. Nothing in the engine
-/// needs two, and a command that ever does must take them in `(account, name)`
-/// order. In particular [`Database::save`] must never be called while a table
-/// guard is held: it locks each dirty table in turn and would deadlock on the
-/// one already held.
+/// A thread holds **at most one table lock at a time**, with one exception:
+/// [`Database::apply_transaction`] holds every file its change set touches,
+/// taken in file-name order, until the whole set is applied and written. That
+/// ordering is what keeps two transactions from deadlocking on each other, and
+/// nothing else here holds two locks, so nothing else can be the second party
+/// to a cycle. Any other command that ever needs two must take them in
+/// `(account, name)` order for the same reason.
+///
+/// In particular [`Database::save`] must never be called while a table guard is
+/// held: it locks each dirty table in turn and would deadlock on the one
+/// already held. A transaction writes its files out through
+/// [`Database::flush_locked`], which takes no lock of its own, against the
+/// guards it is already holding.
 ///
 /// That last rule is checked rather than merely written down. A debug build
 /// counts the table guards each thread holds and panics where a flush starts if
@@ -454,6 +463,11 @@ impl Database {
             db.load_clients_from_table()?;
             Ok(())
         })?;
+
+        // Last, and before anything can read a file: a transaction the previous
+        // run committed but did not finish writing is applied here, in the one
+        // moment when nothing else is looking at the files it touches.
+        db.replay_transaction_log()?;
 
         Ok(db)
     }
@@ -1021,17 +1035,22 @@ impl Database {
     /// locked - the eviction path needs exactly that - and so a flush of one
     /// file never blocks work on another.
     fn flush_handle(&self, key: &TableKey, handle: &TableHandle) -> io::Result<()> {
-        let (account, name) = (&key.0, &key.1);
-        let storage = self.account_storage_dir(account);
-        let per_group = self.records_per_group;
-        let data_path = format!("{}/{}/data", storage, name);
-        let dict_path = format!("{}/{}/dict", storage, name);
+        // Both looked up before the guard is taken: neither needs it, and the
+        // account registry is a lock the table's own sits under.
+        let storage = self.account_storage_dir(&key.0);
+        let fsync = self.flush_policy(key);
+        let mut table = handle.write();
+        self.flush_locked(key, &mut table, &storage, fsync)
+    }
 
-        // A file the caller marked durable is worth a real fsync: "flushed
-        // before the write is acknowledged" has to mean on disk, not merely in
-        // the page cache. Read from the cache rather than the DIR file so the
-        // flush path stays free of I/O.
-        let fsync = if self.durable_writes
+    /// How hard this file's flush pushes.
+    ///
+    /// A file the caller marked durable is worth a real fsync: "flushed before
+    /// the write is acknowledged" has to mean on disk, not merely in the page
+    /// cache. Read from the cache rather than the `DIR` file so the flush path
+    /// stays free of I/O.
+    pub(super) fn flush_policy(&self, key: &TableKey) -> FsyncPolicy {
+        if self.durable_writes
             || rlock(&self.file_attributes)
                 .get(key)
                 .map(|attributes| attributes.durable)
@@ -1040,13 +1059,33 @@ impl Database {
             self.durable_fsync
         } else {
             self.fsync
-        };
+        }
+    }
 
-        let mut table = handle.write();
+    /// The flush itself, against a table the caller has already locked.
+    ///
+    /// A transaction holds every file it touches for the whole of its apply,
+    /// and has to write them out without letting go - so it cannot go through
+    /// [`flush_handle`](Self::flush_handle), which takes the guard itself. This
+    /// takes no lock of its own, so calling it under a table guard is safe in a
+    /// way that calling [`Database::save`] there is not; `storage` and `fsync`
+    /// are passed in for exactly that reason, since looking either of them up
+    /// would need one.
+    pub(super) fn flush_locked(
+        &self,
+        key: &TableKey,
+        table: &mut Table,
+        storage: &str,
+        fsync: FsyncPolicy,
+    ) -> io::Result<()> {
+        let name = &key.1;
+        let per_group = self.records_per_group;
+        let data_path = format!("{}/{}/data", storage, name);
+        let dict_path = format!("{}/{}/dict", storage, name);
+
         if !table.is_dirty() {
             return Ok(());
         }
-        let table = &mut *table;
         // An index that has fallen behind is reconciled before anything is
         // written, so what lands on disk is an index that matches the records
         // beside it rather than one that has to be caught up on the next load.
@@ -1105,7 +1144,7 @@ impl Database {
         // cache and read back from disk - which for records is merely wasted
         // work, but for a queue file throws away every claim held in memory and
         // fails the next ACK.
-        table.stamp = Some(self.stamp_after_flush(account, name, table));
+        table.stamp = Some(self.stamp_after_flush(&key.0, name, table));
         Ok(())
     }
 

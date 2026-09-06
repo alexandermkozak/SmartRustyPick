@@ -2500,3 +2500,227 @@ fn selecting_into_a_list_again_resets_its_cursor() {
     // And it is BETA's list now, not ALPHA's.
     assert_eq!(response.results.unwrap()[0].0, "9");
 }
+
+/// The protocol side of a transaction: one client, one account, the fixture's
+/// two ordinary files and its queue.
+fn transact_fixture() -> (TempDir, Arc<RwLock<Database>>, ClientInfo) {
+    let dir = TempDir::new("handler_transact");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_test_account("TXN_TEST").unwrap();
+    let client = ClientInfo {
+        name: "txn_client".to_string(),
+        thumbprint: "txn_tp".to_string(),
+        allowed_accounts: vec!["TXN_TEST".to_string()],
+        is_admin: false,
+    };
+    (dir, Arc::new(RwLock::new(db)), client)
+}
+
+fn change(op: &str, file: &str, key: &str, data: Option<serde_json::Value>) -> crate::server::models::ChangeSpec {
+    crate::server::models::ChangeSpec {
+        op: Some(op.to_string()),
+        file: Some(file.to_string()),
+        key: Some(key.to_string()),
+        data,
+        ..Default::default()
+    }
+}
+
+fn transact(
+    db: &Arc<RwLock<Database>>,
+    client: &ClientInfo,
+    changes: Vec<crate::server::models::ChangeSpec>,
+) -> crate::server::models::Response {
+    handle_request(
+        Request {
+            command: "TRANSACT".to_string(),
+            account: Some("TXN_TEST".to_string()),
+            changes: Some(changes),
+            ..Default::default()
+        },
+        db,
+        client,
+    )
+}
+
+fn read_key(db: &Arc<RwLock<Database>>, client: &ClientInfo, file: &str, key: &str) -> crate::server::models::Response {
+    handle_request(
+        Request {
+            command: "READ".to_string(),
+            account: Some("TXN_TEST".to_string()),
+            file: Some(file.to_string()),
+            key: Some(key.to_string()),
+            ..Default::default()
+        },
+        db,
+        client,
+    )
+}
+
+#[test]
+fn a_transaction_writes_across_two_files_at_once() {
+    let (_dir, db_arc, client) = transact_fixture();
+
+    let response = transact(
+        &db_arc,
+        &client,
+        vec![
+            change(
+                "WRITE",
+                "USERS",
+                "99",
+                Some(serde_json::json!({"name": "Alice", "email": "alice@example.com"})),
+            ),
+            change(
+                "write",
+                "PRODUCTS",
+                "P-99",
+                Some(serde_json::Value::String("Widget".to_string())),
+            ),
+        ],
+    );
+
+    assert_eq!(response.status, "OK");
+    assert_eq!(response.count, Some(2));
+    assert_eq!(read_key(&db_arc, &client, "USERS", "99").status, "OK");
+    assert_eq!(read_key(&db_arc, &client, "PRODUCTS", "P-99").status, "OK");
+}
+
+#[test]
+fn a_transaction_naming_a_file_that_is_not_there_writes_nothing_at_all() {
+    let (_dir, db_arc, client) = transact_fixture();
+
+    let response = transact(
+        &db_arc,
+        &client,
+        vec![
+            change(
+                "WRITE",
+                "USERS",
+                "99",
+                Some(serde_json::Value::String("Alice".to_string())),
+            ),
+            change(
+                "WRITE",
+                "NOWHERE",
+                "1",
+                Some(serde_json::Value::String("X".to_string())),
+            ),
+        ],
+    );
+
+    assert_eq!(response.code, Some(ErrorCode::FileNotFound));
+    // The whole point: the change to the file that does exist was not applied
+    // on the way to finding out about the one that does not.
+    assert_eq!(
+        read_key(&db_arc, &client, "USERS", "99").code,
+        Some(ErrorCode::RecordNotFound)
+    );
+}
+
+#[test]
+fn a_transaction_over_a_queue_file_is_refused_with_the_scope_code() {
+    let (_dir, db_arc, client) = transact_fixture();
+
+    let response = transact(
+        &db_arc,
+        &client,
+        vec![
+            change(
+                "WRITE",
+                "USERS",
+                "99",
+                Some(serde_json::Value::String("Alice".to_string())),
+            ),
+            change(
+                "WRITE",
+                "JOBS",
+                "anything",
+                Some(serde_json::Value::String("X".to_string())),
+            ),
+        ],
+    );
+
+    // A distinct code, so a client can tell this from "the database will not do
+    // that at all" and fall back to writing one record at a time if it can.
+    assert_eq!(response.code, Some(ErrorCode::TransactionScope));
+    assert_eq!(
+        read_key(&db_arc, &client, "USERS", "99").code,
+        Some(ErrorCode::RecordNotFound)
+    );
+}
+
+#[test]
+fn a_transaction_says_which_change_it_could_not_read() {
+    let (_dir, db_arc, client) = transact_fixture();
+
+    let unknown_op = transact(
+        &db_arc,
+        &client,
+        vec![
+            change(
+                "WRITE",
+                "USERS",
+                "99",
+                Some(serde_json::Value::String("Alice".to_string())),
+            ),
+            change(
+                "UPSERT",
+                "USERS",
+                "98",
+                Some(serde_json::Value::String("Bob".to_string())),
+            ),
+        ],
+    );
+    assert_eq!(unknown_op.code, Some(ErrorCode::InvalidData));
+    // A set is refused whole, so the message has to say which of its changes is
+    // at fault - "not an operation" alone would leave a caller counting.
+    assert!(
+        unknown_op
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("Change 2:"),
+        "the refusal did not name the change: {:?}",
+        unknown_op.message
+    );
+
+    let no_key = transact(
+        &db_arc,
+        &client,
+        vec![crate::server::models::ChangeSpec {
+            op: Some("DELETE".to_string()),
+            file: Some("USERS".to_string()),
+            ..Default::default()
+        }],
+    );
+    assert_eq!(no_key.code, Some(ErrorCode::MissingField));
+
+    let nothing = transact(&db_arc, &client, Vec::new());
+    assert_eq!(nothing.code, Some(ErrorCode::MissingField));
+}
+
+#[test]
+fn one_key_changed_twice_in_a_transaction_is_refused() {
+    let (_dir, db_arc, client) = transact_fixture();
+
+    let response = transact(
+        &db_arc,
+        &client,
+        vec![
+            change(
+                "WRITE",
+                "USERS",
+                "99",
+                Some(serde_json::Value::String("Alice".to_string())),
+            ),
+            change("DELETE", "USERS", "99", None),
+        ],
+    );
+
+    assert_eq!(response.code, Some(ErrorCode::InvalidRequest));
+    assert_eq!(
+        read_key(&db_arc, &client, "USERS", "99").code,
+        Some(ErrorCode::RecordNotFound)
+    );
+}

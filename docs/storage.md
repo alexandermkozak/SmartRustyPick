@@ -432,6 +432,103 @@ A file marked `DURABLE` (and a database running with `durable_writes = true`) us
 write is acknowledged" has to mean on disk and not merely in the page cache. Setting `fsync` explicitly overrides that
 too, for an operator who knowingly trades the guarantee for throughput.
 
+## Transactions
+
+A single write is safe on its own — a group frame is checksummed, written tmp-then-rename and flushed under the file's
+sync policy — but nothing used to span records. A caller with two records that must change together wrote one, then the
+other, and hoped. A transaction is the answer: **a set of writes and deletes that is either wholly visible or not
+visible at all.**
+
+Over the wire it is the [`TRANSACT`](protocol.md#transact) command. In the engine it is `Database::apply_transaction`,
+and the format is `db/transaction.rs`.
+
+### The guarantee callers actually have
+
+- **Any number of files, within one account.** A change names a file, never an account, so a set that spans two accounts
+  cannot be asked for.
+- **Applied whole, or not at all.** Every refusal — a missing file, a queue file, too many changes, one key changed
+  twice — happens before anything is written. A set that is refused wrote nothing.
+- **Durable when it is acknowledged.** The reply is not sent until every file the set touched has been fsynced,
+  whatever those files' own `DURABLE` flags say. There is no buffering window for a transaction.
+- **Isolated from readers while it lands.** Every file the set touches is locked for the whole apply, so no reader sees
+  half a set.
+- **Completed after a crash, not rolled back.** A set the process died partway through is applied in full the next time
+  the database opens.
+
+What it is *not*: a transaction is not a session, there is no `BEGIN`/`COMMIT`, and reads take no part in it. A set is
+one request, decided in one place.
+
+### The intent log
+
+Several file renames cannot be made one atomic act, so the recovery is forward rather than backward. Before anything is
+applied, the whole set is written to an **intent** in `<storage_dir>/.txn/`, using the same discipline a group file
+uses — tmp-then-rename, a CRC32C trailer, fsync of the bytes and then of the directory:
+
+```text
+[magic "SRPTXN01"][account_len u64][account][change_count u64]
+  per change: [op u8][flags u8][file_len u64][file][key_len u64][key]
+              and, for a write, [data_len u64][record bytes]
+[crc32c u32]
+```
+
+The log directory sits beside `accounts.reg` rather than inside an account, because two accounts may be registered
+against the same directory. It is hidden, and the account listing skips names beginning with a dot, so it is never
+mistaken for one of an account's files.
+
+Then, and only then, the set is applied and every file it touched is written out. The intent is removed last, once all
+of them are fsynced. That order is what makes the two rules hold:
+
+- the intent is on disk **before** the first file is written, so a crash finds either a complete intent or no intent and
+  nothing applied;
+- the intent is removed **after** every file is durable, so it can never survive to replay stale bytes over a newer
+  write of the same key.
+
+### Replay, on open
+
+`Database::new` finishes what a previous run did not, in the order the intents were committed, before anything can read
+a file — the same moment as the `remove_stale_tmp` sweep, and for the same reason: nothing else is looking at the files
+yet.
+
+Every change is idempotent by construction — a write stores given bytes at a given key, a delete removes a key — so
+applying a set twice leaves exactly what applying it once does. The files that were already written are unaffected and
+the ones that were not catch up.
+
+| Where the crash landed                        | What the next open does                          |
+|-----------------------------------------------|--------------------------------------------------|
+| Before the intent was on disk                 | Nothing. The set was never committed.            |
+| After the intent, before or between the files | Applies the whole set again.                     |
+| After every file, before the intent went      | Applies the whole set again, changing nothing.   |
+
+An intent that does not decode was never renamed into place, so it names a transaction that was never committed: it is
+discarded, not repaired. One that *does* decode and then fails to apply is not swallowed — the database refuses to
+open, because starting quietly without a change that was acknowledged is the silent data loss this whole format exists
+to rule out. The two cases a replay steps over rather than failing on are a file, or an account, that has since been
+dropped: there is nothing left to apply the change to, and refusing to open over a file somebody deleted on purpose
+would be worse than the alternative.
+
+### What is refused
+
+A set outside the supported scope is refused with a distinct error code — `TRANSACTION_SCOPE` on the wire,
+`DbError::TransactionScope` in the engine — rather than accepted and applied non-atomically. A caller can handle a
+refusal; a caller cannot handle a guarantee that quietly does not hold.
+
+- **A queue file.** Its records are minted by `ENQUEUE` and handed out by `DEQUEUE` against a claim book a raw write
+  knows nothing about, so writing one directly would leave the order naming a record that is not there.
+- **More than 1000 changes.** The whole set is held in memory, every file it names is locked at once, and the intent is
+  one write. Larger than that is a bulk load, which is a different operation with different guarantees.
+
+### What it costs
+
+Two fsyncs of the log directory and one full fsync of every file the set touches, per transaction, on top of the work
+the same writes would have done buffered. That is the price of the guarantee and it is not small: use a transaction for
+the records that need one, and `WRITE` for the rest.
+
+### Where the guarantee stops
+
+Two processes opening the same database at once are not co-ordinated here. One process's replay at open can retire an
+intent another process is still applying, and nothing takes a cross-process lock on the log. The engine's freshness
+stamps have the same shape of limitation, and closing it properly is a lock manager rather than a file format.
+
 ## Queue Files
 
 A hash file has no order to walk: a record's key decides its group, so "the oldest record" is not a question the layout
@@ -589,9 +686,17 @@ Locks are acquired in this order, and never the other way round:
 6. a single file;
 7. the durability, client and flush-accounting caches.
 
-A thread holds **at most one file lock at a time**. Nothing in the engine needs two, and a command that ever does must
-take them in `(account, file)` order. In particular, a full flush must not be started while a file is locked: it locks
-each dirty file in turn, and would deadlock on the one already held. The same rule is why a report renders from the file
+A thread holds **at most one file lock at a time**, with one exception: a [transaction](#transactions) holds every file
+its set touches, taken in file-name order and held until the whole set is applied and written. That ordering is what
+keeps two transactions from deadlocking on each other, and nothing else in the engine holds two locks, so nothing else
+can be the second party to a cycle — a flush takes each dirty file in turn and releases it before reaching for the next.
+Any other command that ever needs two must take them in `(account, file)` order for the same reason.
+
+In particular, a full flush must not be started while a file is locked: it locks each dirty file in turn, and would
+deadlock on the one already held. A transaction writes its files out through a flush that takes no lock of its own,
+against the guards it is already holding, which is what lets it keep them across the write — and it must, because a
+ticker flush slipping into the gap would write one of the files with that *file's* sync policy, and the intent would
+then be retired over bytes that are only in the page cache. The one-lock rule is also why a report renders from the file
 its caller has already locked rather than looking the dictionary up again per column.
 
 That last rule is checked, not merely written down. A debug build counts the file locks each thread holds and panics

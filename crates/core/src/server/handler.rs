@@ -1,6 +1,9 @@
 use crate::db::engine::dictionary::DEFAULT_FIELD_WIDTH;
-use crate::db::{Database, DbError, ExplodeSpec, IndexStats, QueryNode, Record, SortSpec, Table};
-use crate::server::models::{ErrorCode, Request, Response};
+use crate::db::{
+    Change, ChangeOp, Database, DbError, ExplodeSpec, IndexStats, QueryNode, Record, SortSpec, Table, TableHandle,
+};
+use crate::server::models::{ChangeSpec, ErrorCode, Request, Response};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// The database handle shared by every connection.
@@ -277,7 +280,11 @@ fn is_record_command(command: &str) -> bool {
         // that has one, and taking the database exclusively to claim from it
         // would serialise every consumer against every other connection in the
         // server rather than against the other consumers of that one queue.
-        "READ" | "WRITE" | "DELETE" | "QUERY" | "ENQUEUE" | "DEQUEUE" | "ACK" | "NACK" | "PEEK"
+        // TRANSACT belongs here too: it takes the files it names, in name
+        // order, and nothing else. Sending it down the exclusive path would
+        // make every transaction stop the whole server rather than the files it
+        // touches, which is the opposite of what per-file locking bought.
+        "READ" | "WRITE" | "DELETE" | "QUERY" | "TRANSACT" | "ENQUEUE" | "DEQUEUE" | "ACK" | "NACK" | "PEEK"
     )
 }
 
@@ -310,6 +317,7 @@ fn record_command(command: &str, req: Request, db: &Database, acc: &str, owner: 
         "READ" => read_record(db, acc, &req),
         "WRITE" => write_record(db, acc, req),
         "DELETE" => delete_record(db, acc, req),
+        "TRANSACT" => transact(db, acc, req),
         "ENQUEUE" => enqueue_record(db, acc, req),
         "DEQUEUE" => dequeue_record(db, acc, &req, owner),
         "ACK" => settle_claim(db, acc, &req, owner, Settle::Ack),
@@ -499,7 +507,7 @@ fn peek_record(db: &Database, acc: &str, req: &Request) -> Response {
 // its own value. Boxing it to shrink the `Result` would only add an allocation on
 // the error path and an unboxing at each call site.
 #[allow(clippy::result_large_err)]
-fn resolve_file(db: &Database, acc: &str, name: &str) -> Result<crate::db::TableHandle, Response> {
+fn resolve_file(db: &Database, acc: &str, name: &str) -> Result<TableHandle, Response> {
     db.get_table_mut_for_account(acc, name).map_err(db_error)
 }
 
@@ -637,27 +645,9 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
     };
     let is_dict = req.is_dict.unwrap_or(false);
 
-    let record = if let Some(structured) = req.structured_data {
-        match db.deserialize_record_in(&handle.read(), &structured) {
-            Some(r) => r,
-            None => return error(ErrorCode::InvalidData, "Invalid structured data"),
-        }
-    } else if let Some(data_val) = req.data {
-        match data_val {
-            serde_json::Value::String(s) => Record::from_display_string(&s),
-            serde_json::Value::Object(_) => match db.deserialize_record_in(&handle.read(), &data_val) {
-                Some(r) => r,
-                None => return error(ErrorCode::InvalidData, "Invalid structured data in data field"),
-            },
-            _ => {
-                return error(
-                    ErrorCode::InvalidData,
-                    "Invalid data type in data field: expected string or object",
-                );
-            }
-        }
-    } else {
-        return error(ErrorCode::MissingField, "Data not specified");
+    let record = match record_from(db, &handle, req.data, req.structured_data) {
+        Ok(record) => record,
+        Err(resp) => return resp,
     };
 
     // The file's lock is dropped before the flush below: `note_write_for` may
@@ -677,6 +667,132 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
             ..Default::default()
         },
         Err(e) => db_error_in("Save error", e),
+    }
+}
+
+/// The record a `WRITE`-shaped request describes, in the file's own terms.
+///
+/// Shared by `WRITE` and by each write of a `TRANSACT` set, so the two accept
+/// exactly the same shapes: a display string, an object of field names, or the
+/// `structured_data` spelling of the second. It takes the handle the caller has
+/// already resolved rather than the file's name, because resolving it a second
+/// time would take the lock of the very file several connections are writing to
+/// at once - and it takes the handle rather than a locked table because a
+/// display string needs no dictionary and so should cost no lock at all.
+#[allow(clippy::result_large_err)]
+fn record_from(
+    db: &Database,
+    handle: &TableHandle,
+    data: Option<serde_json::Value>,
+    structured_data: Option<serde_json::Value>,
+) -> Result<Record, Response> {
+    if let Some(structured) = structured_data {
+        return db
+            .deserialize_record_in(&handle.read(), &structured)
+            .ok_or_else(|| error(ErrorCode::InvalidData, "Invalid structured data"));
+    }
+    match data {
+        Some(serde_json::Value::String(text)) => Ok(Record::from_display_string(&text)),
+        Some(object @ serde_json::Value::Object(_)) => db
+            .deserialize_record_in(&handle.read(), &object)
+            .ok_or_else(|| error(ErrorCode::InvalidData, "Invalid structured data in data field")),
+        Some(_) => Err(error(
+            ErrorCode::InvalidData,
+            "Invalid data type in data field: expected string or object",
+        )),
+        None => Err(error(ErrorCode::MissingField, "Data not specified")),
+    }
+}
+
+/// Turns the `changes` array into the engine's own change set.
+///
+/// Nothing is applied here: this only fails, and it fails on the whole set. A
+/// change that cannot be read is a set that is refused entire, which is the
+/// same promise the apply itself makes and the reason the two halves are
+/// written this way round.
+#[allow(clippy::result_large_err)]
+fn transaction_changes(db: &Database, acc: &str, specs: Vec<ChangeSpec>) -> Result<Vec<Change>, Response> {
+    // One handle per file however many changes name it: resolving is what loads
+    // the file, and a set of fifty changes to one file should load it once.
+    let mut handles: HashMap<String, TableHandle> = HashMap::new();
+    let mut changes = Vec::with_capacity(specs.len());
+
+    for (position, spec) in specs.into_iter().enumerate() {
+        // The position, because a set is refused as a whole and "file not
+        // specified" says nothing about which of thirty changes is at fault.
+        let at = |what: &str| format!("Change {}: {}", position + 1, what);
+        let file = spec
+            .file
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| error(ErrorCode::MissingField, at("file not specified")))?;
+        let key = spec
+            .key
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| error(ErrorCode::MissingField, at("key not specified")))?;
+        let is_dict = spec.is_dict.unwrap_or(false);
+
+        let op = match spec.op.as_deref().unwrap_or_default().to_uppercase().as_str() {
+            "DELETE" => ChangeOp::Delete,
+            "WRITE" => {
+                let handle = match handles.get(&file) {
+                    Some(handle) => handle.clone(),
+                    None => {
+                        let handle = resolve_file(db, acc, &file)?;
+                        handles.insert(file.clone(), handle.clone());
+                        handle
+                    }
+                };
+                let record = record_from(db, &handle, spec.data, spec.structured_data).map_err(|resp| {
+                    error(
+                        resp.code.unwrap_or(ErrorCode::InvalidData),
+                        at(&resp.message.unwrap_or_default()),
+                    )
+                })?;
+                ChangeOp::Write(record)
+            }
+            other => {
+                return Err(error(
+                    ErrorCode::InvalidData,
+                    at(&format!("'{}' is not an operation; use WRITE or DELETE", other)),
+                ));
+            }
+        };
+        changes.push(Change { file, key, is_dict, op });
+    }
+    Ok(changes)
+}
+
+/// `TRANSACT`: a set of writes and deletes across the files of one account,
+/// applied whole or not at all. See `docs/protocol.md` and
+/// [`crate::db::engine::transaction`].
+fn transact(db: &Database, acc: &str, req: Request) -> Response {
+    let specs = match req.changes {
+        Some(specs) if !specs.is_empty() => specs,
+        _ => return error(ErrorCode::MissingField, "Changes not specified"),
+    };
+    // Checked before the files are resolved: a set the server will not apply is
+    // not worth loading thirty files for.
+    if specs.len() > crate::db::MAX_CHANGES {
+        return error(
+            ErrorCode::TransactionScope,
+            format!(
+                "A transaction may carry at most {} changes, and this one carries {}",
+                crate::db::MAX_CHANGES,
+                specs.len()
+            ),
+        );
+    }
+    let changes = match transaction_changes(db, acc, specs) {
+        Ok(changes) => changes,
+        Err(resp) => return resp,
+    };
+    match db.apply_transaction(acc, changes) {
+        Ok(applied) => Response {
+            status: "OK".to_string(),
+            count: Some(applied),
+            ..Default::default()
+        },
+        Err(e) => db_error_in("Transaction error", e),
     }
 }
 
@@ -944,6 +1060,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
             query_records(db, acc, &req)
+        }
+        "TRANSACT" => {
+            if target_account.is_none() {
+                return error(ErrorCode::AccountNotSpecified, "Account not specified");
+            }
+            transact(db, acc, req)
         }
         // The queue commands, for the same callers as the record arms above:
         // the shared path in [`handle_request`] serves them whenever it can

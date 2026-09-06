@@ -50,6 +50,13 @@ pub enum DbError {
     /// The request was understood and refused: it asks for something the
     /// database will not do, such as setting the `DIR` file's durability.
     InvalidRequest(String),
+    /// A set of changes that reaches past what is applied atomically - a queue
+    /// file, or more changes than one transaction may carry. Its own variant
+    /// rather than an [`InvalidRequest`](DbError::InvalidRequest) so a caller
+    /// can tell "this database will not do that at all" from "this database
+    /// will not do that in one piece", and retry the second one record at a
+    /// time if partial application is acceptable to it.
+    TransactionScope(String),
     /// A real I/O failure, with the `io::Error` it came from.
     Io(io::Error),
 }
@@ -59,9 +66,10 @@ impl DbError {
     /// still speak `io::Result` - `main` and the async server plumbing.
     fn io_kind(&self) -> io::ErrorKind {
         match self {
-            DbError::NoAccount | DbError::InvalidField { .. } | DbError::InvalidRequest(_) => {
-                io::ErrorKind::InvalidInput
-            }
+            DbError::NoAccount
+            | DbError::InvalidField { .. }
+            | DbError::InvalidRequest(_)
+            | DbError::TransactionScope(_) => io::ErrorKind::InvalidInput,
             DbError::AccountNotFound(_) | DbError::FileNotFound { .. } | DbError::IndexNotFound { .. } => {
                 io::ErrorKind::NotFound
             }
@@ -95,6 +103,7 @@ impl fmt::Display for DbError {
             }
             DbError::InvalidField { field, reason } => write!(f, "'{}' cannot be indexed: {}", field, reason),
             DbError::InvalidRequest(detail) => write!(f, "{}", detail),
+            DbError::TransactionScope(detail) => write!(f, "{}", detail),
             DbError::Io(e) => write!(f, "{}", e),
         }
     }

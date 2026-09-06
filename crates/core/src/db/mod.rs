@@ -30,6 +30,9 @@ mod queue_tests;
 pub mod report;
 #[cfg(test)]
 mod report_tests;
+pub mod transaction;
+#[cfg(test)]
+mod transaction_tests;
 
 pub use engine::queue::QueueDelivery;
 pub use engine::{Database, TableHandle, TableKey};
@@ -38,3 +41,4 @@ pub use health::{Health, HealthSummary, Measure, Verdict};
 pub use index::{FileIndex, IndexReport, IndexStats, IndexUsageStats, IndexValue};
 pub use models::*;
 pub use queue::{QueuePolicy, QueueState};
+pub use transaction::{Change, ChangeOp, MAX_CHANGES};
