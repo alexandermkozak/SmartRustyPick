@@ -102,6 +102,29 @@ AI agents have been responsible for several critical improvements and fixes in t
   so attributes 2 to 5 read as empty on one whatever a hand-edited entry says. `SET.FILE` will not convert in either
   direction: an ordinary file's records are inside a hashed section and a directory file's are host files, so flipping
   the flag alone would leave a file whose entry says one thing and whose records are somewhere else.
+- **Raw byte transfers:** `PUT.BYTES` and `GET.BYTES`, the one place the protocol is not a line of JSON. A directory
+  file holds 64 MiB, and the ordinary path could carry 768 KiB of it: base64 inflates by 4/3 inside a 1 MiB request
+  line. So a length is announced on the line and the record's bytes follow it raw. The body is *announced* rather than
+  delimited because a record contains newlines like any other byte - which is also what lets an oversized transfer be
+  refused before a byte of it is read.
+- **The bug this was written to avoid.** By the time the request line has been parsed, the first bytes of the body are
+  already inside the connection's `BufReader` - they arrived in the same segment. Reading the body from the underlying
+  stream would drop exactly those, on exactly the transfers whose body straddles the buffer, and the record would be
+  stored looking almost right. Every read goes through the caller's reader, and the test asserts its own precondition
+  (the buffer is non-empty when the body is asked for) so it cannot quietly stop testing anything.
+- **A body is always accounted for, or the connection closes.** The rule the line reader already had for an over-long
+  request - *"unread bytes may still be sitting on the socket, so the only safe response is to close"* - becomes
+  routine once a body exists, so it is a return type rather than a comment: `Outcome` says whether the socket is still
+  at a request boundary. A refusal within the record limit drains the body and keeps the connection; one over the limit
+  closes, because draining ten gigabytes to report that ten gigabytes is too many is the denial of service the limit
+  exists to prevent.
+- **A short body is refused, not stored.** Fewer bytes than announced means a truncated record under a key the caller
+  would then trust, which is the corruption directory files exist to rule out. The staging is removed and the transfer
+  fails.
+- **A stalled transfer needed a bound of its own.** `idle_timeout_ms` watches a connection with nothing in flight; a
+  client that announces 64 MiB and sends a byte a second is neither idle nor finished. `transfer_stall_timeout_ms`
+  bounds *no progress* rather than total duration, so a slow link moving a large record is untouched, and it is on by
+  default because once a body is announced there is no line-reader bound left to fall back on.
 - **Transactions:** `TRANSACT` applies a set of writes and deletes across any number of files of one account so that
   either all of it is visible or none of it is. Nothing used to span records: a caller with two records that had to
   change together wrote one, then the other, and hoped. The set is written to an **intent** - tmp-then-rename, CRC32C

@@ -63,6 +63,11 @@ pub struct Request {
     /// directory, which is where they belong unless an operator is
     /// deliberately pointing the file at a tree that already exists.
     pub path: Option<String>,
+    /// `PUT.BYTES`: how many bytes of body follow this request line on the
+    /// connection. Announced rather than delimited, because a record is raw
+    /// bytes and has no terminator that cannot also occur inside it - see
+    /// [`crate::server::transfer`].
+    pub length: Option<u64>,
     /// `TRANSACT`: the writes and deletes to apply as one, all of them or none.
     /// Each carries its own file and key, so one set may span several files of
     /// the account - see [`ChangeSpec`].
@@ -325,4 +330,12 @@ pub struct Response {
     /// back unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claim: Option<serde_json::Value>,
+    /// `GET.BYTES`: how many bytes of body follow this response line on the
+    /// connection, and `PUT.BYTES`: how many were stored.
+    ///
+    /// Its own field rather than `count`, which counts records: a client that
+    /// has to read exactly this many bytes off the socket next should not be
+    /// reading it out of a field that means something else everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<u64>,
 }

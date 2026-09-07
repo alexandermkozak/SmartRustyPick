@@ -324,6 +324,60 @@ class Client:
         line, self._buffer = self._buffer.split(b"\n", 1)
         return json.loads(line.decode())
 
+    def _read_exactly(self, length):
+        """Read exactly `length` bytes of body, buffer first.
+
+        The buffer is the whole point. The first bytes of a body almost always
+        arrive in the same TCP segment as the response line that announced it,
+        so they are already in `self._buffer` by the time this is called.
+        Reading from the socket instead would drop exactly those bytes and
+        desynchronise the session for every request after it - which is the
+        mistake this method exists to make impossible for the suites.
+        """
+        while len(self._buffer) < length:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError(f"Server closed the connection {length - len(self._buffer)} bytes short")
+            self._buffer += chunk
+        body, self._buffer = self._buffer[:length], self._buffer[length:]
+        return body
+
+    def put_bytes(self, *, file, key, payload, account=None, length=None):
+        """`PUT.BYTES`: one request line, then the body, then one reply.
+
+        `length` defaults to the payload's own size; passing a different one is
+        how a suite tests what the server does with a body that does not match
+        what was announced.
+        """
+        header = {"command": "PUT.BYTES", "file": file, "key": key}
+        header["length"] = len(payload) if length is None else length
+        if account is not None:
+            header["account"] = account
+        # One `sendall`, because that is what a client does and it is what puts
+        # the body in the server's read buffer alongside the request line.
+        self.sock.sendall(json.dumps(header).encode() + b"\n" + payload)
+        while b"\n" not in self._buffer:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("Server closed the connection before responding")
+            self._buffer += chunk
+        line, self._buffer = self._buffer.split(b"\n", 1)
+        return json.loads(line.decode())
+
+    def get_bytes(self, *, file, key, account=None):
+        """`GET.BYTES`: the reply, then exactly `length` bytes of body.
+
+        Returns `(response, body)`; `body` is None when the reply carried no
+        length, which is every refusal.
+        """
+        request = {"command": "GET.BYTES", "file": file, "key": key}
+        if account is not None:
+            request["account"] = account
+        response = self.request(**request)
+        if response.get("length") is None:
+            return response, None
+        return response, self._read_exactly(response["length"])
+
     def close(self):
         try:
             self.sock.shutdown(socket.SHUT_RDWR)

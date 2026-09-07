@@ -9,8 +9,10 @@ refusals a client can branch on rather than as empty results.
 """
 
 import base64
+import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
 
@@ -34,6 +36,12 @@ HOSTILE = bytes([0xFE, 0x61, 0xFD, 0x62, 0xFC, 0x00, 0xFF, 0xC3, 0x7A, 0x0A])
 # request even base64-free. STORE streams it instead.
 BIG_BYTES = 3 * 1024 * 1024
 
+# Short enough that the suite can wait out a stalled transfer, long enough that
+# it is never tripped by a body that is merely arriving slowly - it bounds a gap
+# with no bytes at all, not the total duration.
+STALL_MS = 1500
+STALL_CONFIG = f"transfer_stall_timeout_ms = {STALL_MS}\n"
+
 
 def main():
     suite = harness.Suite("Directory", "integration_results.md")
@@ -46,7 +54,7 @@ def main():
 
         server = None
         try:
-            harness.write_config(port, certs=None)
+            harness.write_config(port, certs=None, extra=STALL_CONFIG)
             harness.run_cli(
                 [
                     f"AUTHORIZE.CONN {admin_tp} admin ADMIN",
@@ -56,7 +64,7 @@ def main():
                 args=["--account", "SYSTEM"],
             )
 
-            harness.write_config(port, certs)
+            harness.write_config(port, certs, extra=STALL_CONFIG)
             server = harness.start_server()
             admin = harness.wait_for_client(port, admin_crt, admin_key, certs.ca_crt, process=server)
 
@@ -75,6 +83,10 @@ def main():
                 os.path.isdir(records_dir),
                 records_dir,
             )
+
+            # An ordinary file, so the refusals have something to be refused
+            # against rather than only a missing one.
+            admin.request(command="CREATE.FILE", file="USERS_ORDINARY", account=ACCOUNT)
 
             listed = admin.request(command="LIST.FILES", account=ACCOUNT)
             flags = dict(listed["results"])
@@ -190,6 +202,125 @@ def main():
                 "And judges the file as the directory file it is",
                 [m["id"] for m in stats["health"]["measures"]] == ["format", "largest_record"],
                 str(stats.get("health")),
+            )
+
+            # --- PUT.BYTES and GET.BYTES ----------------------------------------
+            # The point of the whole transfer path: a record far larger than a
+            # request line, moved by a client with no filesystem access to the
+            # server. 3 MiB against a 1 MiB line, and it holds newlines, NULs
+            # and every mark byte - so anything that framed it, split it on a
+            # terminator or ran it through base64 would come back different.
+            big = (HOSTILE + b"\n\r\n" + bytes(range(256))) * 16384
+            resp = admin.put_bytes(file=FILE, key="huge.bin", payload=big, account=ACCOUNT)
+            suite.check(
+                "PUT.BYTES stores a record far larger than one request line",
+                resp.get("status") == "OK" and resp.get("length") == len(big),
+                str(resp),
+            )
+            suite.check(
+                "And the record on disk is those bytes exactly",
+                open(os.path.join(records_dir, "huge.bin"), "rb").read() == big,
+            )
+
+            resp, body = admin.get_bytes(file=FILE, key="huge.bin", account=ACCOUNT)
+            suite.check(
+                "GET.BYTES announces the length and sends exactly that many",
+                resp.get("length") == len(big) and body == big,
+                f"announced {resp.get('length')}, got {len(body) if body is not None else 'nothing'}",
+            )
+
+            # The session is still usable afterwards. This is the assertion that
+            # would fail if either side lost track of the body - one byte either
+            # way and the next line read is the middle of a PDF.
+            resp = admin.request(command="READ", file=FILE, account=ACCOUNT, key="note.txt")
+            suite.check_eq("The connection is still in sync after a transfer", resp.get("record"), "plain text")
+
+            # A refusal within the limit drains the body and keeps going.
+            resp = admin.put_bytes(file=FILE, key="../escape", payload=b"x" * 4096, account=ACCOUNT)
+            suite.check_eq("PUT.BYTES refuses a key that is not a file name", resp.get("code"), "INVALID_REQUEST")
+            resp = admin.request(command="READ", file=FILE, account=ACCOUNT, key="note.txt")
+            suite.check_eq(
+                "And drains the body, so the next request is still read", resp.get("record"), "plain text"
+            )
+
+            resp = admin.put_bytes(file="USERS_ORDINARY", key="k", payload=b"x" * 16, account=ACCOUNT)
+            suite.check_eq(
+                "PUT.BYTES refuses an ordinary file", resp.get("code"), "INVALID_REQUEST"
+            )
+
+            resp, body = admin.get_bytes(file=FILE, key="absent.bin", account=ACCOUNT)
+            suite.check(
+                "GET.BYTES on a missing record is an ordinary refusal",
+                resp.get("code") == "RECORD_NOT_FOUND" and body is None,
+                str(resp),
+            )
+
+            # A body that runs short is refused rather than stored truncated,
+            # and the connection closes because the socket is mid-body. A fresh
+            # one shows the record was never written.
+            short = harness.Client(port, admin_crt, admin_key, certs.ca_crt)
+            try:
+                resp = short.put_bytes(
+                    file=FILE, key="truncated.bin", payload=b"x" * 40, length=4096, account=ACCOUNT
+                )
+                truncated_refused = resp.get("status") == "ERROR"
+            except ConnectionError:
+                # Equally correct: the server closed on a socket it could not
+                # trust rather than answering.
+                truncated_refused = True
+            finally:
+                short.close()
+            suite.check("A body that runs short is refused", truncated_refused)
+            resp = admin.request(command="READ", file=FILE, account=ACCOUNT, key="truncated.bin")
+            suite.check_eq(
+                "And nothing truncated was stored under its key", resp.get("code"), "RECORD_NOT_FOUND"
+            )
+
+            resp = admin.request(command="FILE.STATS", file=FILE, account=ACCOUNT)
+            held = (resp.get("record") or {}).get("directory") or {}
+            suite.check_eq(
+                "An abandoned transfer leaves no record behind",
+                held.get("record_count"),
+                3,
+            )
+
+            # A client that announces a body and then stops sending is neither
+            # idle - a request is in flight - nor finished, which is the case
+            # `idle_timeout_ms` cannot see. Its own bound catches it.
+            stalled = harness.Client(port, admin_crt, admin_key, certs.ca_crt)
+            stalled.sock.settimeout(STALL_MS / 1000 * 8)
+            started = time.time()
+            try:
+                header = {
+                    "command": "PUT.BYTES",
+                    "file": FILE,
+                    "key": "stalled.bin",
+                    "account": ACCOUNT,
+                    "length": 1 << 20,
+                }
+                stalled.sock.sendall(json.dumps(header).encode() + b"\n" + b"x" * 64)
+                # Nothing more is sent. The server gives up on its own, says so,
+                # and then closes - the error line first, because a client that
+                # is told why can act on it, and the close after, because the
+                # socket is sitting in the middle of a body nobody will finish.
+                first = stalled.sock.recv(65536)
+                said_why = first != b"" and b"ERROR" in first
+                after = stalled.sock.recv(65536)
+                ended = said_why and after == b""
+            except (ConnectionError, OSError):
+                # Equally acceptable: the server dropped it without a word.
+                ended = True
+            finally:
+                elapsed = time.time() - started
+                stalled.close()
+            suite.check(
+                "A stalled transfer is ended rather than held open",
+                ended and elapsed < STALL_MS / 1000 * 6,
+                f"ended={ended} after {elapsed:.1f}s",
+            )
+            resp = admin.request(command="READ", file=FILE, account=ACCOUNT, key="stalled.bin")
+            suite.check_eq(
+                "And it stored nothing", resp.get("code"), "RECORD_NOT_FOUND"
             )
 
             # --- STORE and EXTRACT, past what a request line can carry -----------

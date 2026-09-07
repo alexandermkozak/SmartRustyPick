@@ -46,6 +46,7 @@ const REQUEST_FIELDS: &[&str] = &[
     "max_deliveries",
     "directory",
     "path",
+    "length",
     "changes",
 ];
 
@@ -60,6 +61,7 @@ const RESPONSE_FIELDS: &[&str] = &[
     "count",
     "positions",
     "claim",
+    "length",
 ];
 
 /// Every command string accepted by `handle_request_locked`.
@@ -76,6 +78,8 @@ const COMMANDS: &[&str] = &[
     "ACK",
     "NACK",
     "PEEK",
+    "PUT.BYTES",
+    "GET.BYTES",
     "CREATE.ACCOUNT",
     "CREATE.TEST.ACCOUNT",
     "DELETE.ACCOUNT",
@@ -138,6 +142,7 @@ fn response_struct_serializes_to_exactly_the_documented_fields() {
         count: Some(0),
         positions: Some(Vec::new()),
         claim: Some(serde_json::Value::Null),
+        length: Some(0),
     };
     let mut actual = json_keys(&populated);
     actual.sort();
