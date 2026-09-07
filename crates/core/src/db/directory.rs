@@ -277,6 +277,101 @@ pub fn extract(root: &Path, key: &str, destination: &Path) -> DbResult<Option<u6
     }
 }
 
+/// Reserves a place to stream a record into, before a byte of it has arrived.
+///
+/// The two halves of a streamed write are split so the bytes can be moved by
+/// somebody who is not the engine: the remote protocol reads them off a socket
+/// on an async task, and the engine is synchronous. This half does everything
+/// that can be decided in advance - the key is a usable name, the announced
+/// length is within the limit, the directory exists - and hands back the
+/// temporary file the caller is to fill. [`commit_staged`] is the other half.
+///
+/// The temporary lives in the file's own root, under the [`TMP_PREFIX`] no key
+/// can collide with, so a transfer abandoned half way is swept by the read path
+/// exactly as the debris of an interrupted local write is. That is the whole
+/// reason it is not put in the system temporary directory: a crash there leaves
+/// a file nothing in this database will ever look at again.
+pub fn stage(root: &Path, key: &str, length: u64, max_bytes: u64) -> DbResult<PathBuf> {
+    validate_key(key)?;
+    if length > max_bytes {
+        return Err(oversize(key, length, max_bytes, "written"));
+    }
+    ensure_root(root)?;
+    Ok(tmp_path(root))
+}
+
+/// Puts a staged record in place, or throws the staging away.
+///
+/// `arrived` is what was actually written to the temporary, checked against
+/// what [`stage`] was told to expect. A body that ran short is a truncated
+/// record, and storing it would be exactly the silent corruption this file type
+/// exists to rule out - so it is refused, and the staging removed, rather than
+/// renamed into place under a key a caller would then trust.
+pub fn commit_staged(
+    root: &Path,
+    key: &str,
+    staged: &Path,
+    arrived: u64,
+    expected: u64,
+    fsync: FsyncPolicy,
+) -> DbResult<()> {
+    let path = match record_path(root, key) {
+        Ok(path) => path,
+        Err(e) => {
+            sweep_one(staged);
+            return Err(e);
+        }
+    };
+    if arrived != expected {
+        sweep_one(staged);
+        return Err(DbError::InvalidRequest(format!(
+            "Record '{}' announced {} bytes and {} arrived: a short body is a truncated record, not a shorter one",
+            key, expected, arrived
+        )));
+    }
+    let result = (|| -> io::Result<()> {
+        // Reopened to be synced: the bytes were written by whoever filled the
+        // staging, and a `rename` over a file whose blocks are only in the page
+        // cache is a name that can outlive its content.
+        if fsync == FsyncPolicy::Always {
+            File::open(staged)?.sync_all()?;
+        }
+        fs::rename(staged, &path)
+    })();
+    finish(root, staged, result, fsync)
+}
+
+/// Throws away a staging whose transfer was abandoned.
+///
+/// Called where the failure is known, so the space goes back now rather than
+/// waiting for the next read of the file to sweep it.
+pub fn discard_staged(staged: &Path) {
+    sweep_one(staged);
+}
+
+/// Opens one record for streaming, with the length that open handle carries.
+///
+/// The file is opened here rather than being named and opened again later, so
+/// the length reported to a client and the bytes it then receives come from the
+/// same handle: a record replaced between the two would otherwise be announced
+/// at one size and sent at another.
+pub fn open(root: &Path, key: &str, max_bytes: u64) -> DbResult<Option<(File, u64)>> {
+    let path = record_path(root, key)?;
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(DbError::Io(e)),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(not_a_record(key, "is a directory, not a record"));
+    }
+    if meta.len() > max_bytes {
+        return Err(oversize(key, meta.len(), max_bytes, "read"));
+    }
+    Ok(Some((file, meta.len())))
+}
+
 /// Removes one record. `false` when there was none to remove.
 pub fn remove(root: &Path, key: &str) -> DbResult<bool> {
     let path = record_path(root, key)?;

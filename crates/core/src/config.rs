@@ -52,6 +52,13 @@ pub struct Config {
     /// bytes without a newline is cut off once it crosses this, instead of
     /// growing the read buffer without bound.
     pub max_request_bytes: Option<usize>,
+    /// How long a raw byte transfer (`PUT.BYTES`, `GET.BYTES`) may make no
+    /// progress before the connection is closed. This catches a *stalled*
+    /// transfer rather than capping the total duration, because a slow link
+    /// moving a large record is not a stalled one. `0` disables it, which
+    /// leaves a client that announces a body and never sends it holding a
+    /// connection indefinitely.
+    pub transfer_stall_timeout_ms: Option<u64>,
     /// Maximum time allowed to complete the TLS handshake before the connection
     /// is dropped.
     pub handshake_timeout_ms: Option<u64>,
@@ -69,6 +76,11 @@ pub struct Config {
 /// the README's configuration table for what each one guards against.
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+/// A transfer that has made no progress for this long is a stuck client, not a
+/// slow one. Unlike the idle timeout it is on by default: a body was announced,
+/// so the connection is committed to reading it and cannot fall back on the
+/// line reader's own bound.
+pub const DEFAULT_TRANSFER_STALL_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 0; // disabled
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
@@ -99,6 +111,17 @@ impl Config {
 
     pub fn max_request_bytes(&self) -> usize {
         self.max_request_bytes.unwrap_or(DEFAULT_MAX_REQUEST_BYTES)
+    }
+
+    /// How long a byte transfer may make no progress. `None` means disabled.
+    pub fn transfer_stall_timeout(&self) -> Option<std::time::Duration> {
+        match self
+            .transfer_stall_timeout_ms
+            .unwrap_or(DEFAULT_TRANSFER_STALL_TIMEOUT_MS)
+        {
+            0 => None,
+            ms => Some(std::time::Duration::from_millis(ms)),
+        }
     }
 
     pub fn handshake_timeout_ms(&self) -> u64 {
@@ -148,6 +171,7 @@ impl Default for Config {
             web_port: None,
             web_token: None,
             max_request_bytes: None,
+            transfer_stall_timeout_ms: None,
             handshake_timeout_ms: None,
             idle_timeout_ms: None,
             max_connections: None,
@@ -219,6 +243,20 @@ mod tests {
         assert_eq!(config.handshake_timeout_ms(), 10_000);
         assert_eq!(config.idle_timeout(), None, "disabled unless configured");
         assert_eq!(config.max_connections(), 1024);
+    }
+
+    #[test]
+    fn a_transfer_stall_timeout_is_on_by_default_and_can_be_switched_off() {
+        let mut config = empty();
+        // On by default, unlike the idle timeout: once a body has been
+        // announced the connection is committed to reading it, so there is no
+        // line-reader bound left to fall back on.
+        assert_eq!(
+            config.transfer_stall_timeout(),
+            Some(std::time::Duration::from_millis(30_000))
+        );
+        config.transfer_stall_timeout_ms = Some(0);
+        assert_eq!(config.transfer_stall_timeout(), None);
     }
 
     #[test]

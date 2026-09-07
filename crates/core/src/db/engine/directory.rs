@@ -34,6 +34,7 @@ use super::Database;
 use crate::db::directory::{self, DirectoryStats};
 use crate::db::error::{DbError, DbResult};
 use crate::db::models::*;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 /// One record of a directory file, as an enumeration reports it: the key and
@@ -130,6 +131,54 @@ impl Database {
     ) -> DbResult<Option<u64>> {
         let root = self.directory_root(account, name)?;
         directory::extract(&root, key, destination)
+    }
+
+    /// Reserves a place to stream a record into, before a byte of it has
+    /// arrived: the first half of a write whose bytes somebody else is moving.
+    ///
+    /// Everything that can be refused in advance is refused here — the file is
+    /// a directory file, the key is a usable name, the announced length is
+    /// within the limit — so a transfer the server will not accept costs no
+    /// bytes on the wire. See [`crate::db::directory::stage`].
+    pub fn stage_directory_record(&self, account: &str, name: &str, key: &str, length: u64) -> DbResult<PathBuf> {
+        let root = self.directory_root(account, name)?;
+        directory::stage(&root, key, length, self.max_directory_record_bytes)
+    }
+
+    /// Puts a staged record in place, or throws the staging away and says why.
+    ///
+    /// `arrived` is what was actually written; a body that ran short is refused
+    /// rather than stored, because a truncated record under a key a caller
+    /// trusts is the silent corruption this file type exists to rule out.
+    pub fn commit_directory_record(
+        &self,
+        account: &str,
+        name: &str,
+        key: &str,
+        staged: &Path,
+        arrived: u64,
+        expected: u64,
+    ) -> DbResult<()> {
+        let root = self.directory_root(account, name)?;
+        directory::commit_staged(
+            &root,
+            key,
+            staged,
+            arrived,
+            expected,
+            self.directory_fsync(account, name),
+        )
+    }
+
+    /// Opens one record for streaming, with the length the open handle carries.
+    ///
+    /// `None` when the file holds no such record. The handle rather than the
+    /// path, so the length announced to a client and the bytes it then receives
+    /// come from the same file — one replaced in between would otherwise be
+    /// announced at one size and sent at another.
+    pub fn open_directory_record(&self, account: &str, name: &str, key: &str) -> DbResult<Option<(File, u64)>> {
+        let root = self.directory_root(account, name)?;
+        directory::open(&root, key, self.max_directory_record_bytes)
     }
 
     /// Removes one record. `false` when there was none to remove.

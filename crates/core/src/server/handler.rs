@@ -756,6 +756,160 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
     }
 }
 
+/// A write that has been authorised and reserved, waiting for its bytes.
+///
+/// Handed to [`crate::server::transfer`], which moves the body off the socket
+/// and hands it back to [`commit_bytes`]. It carries the resolved account
+/// rather than the request, because by the time the body has arrived the
+/// authorisation is a decision already made and must not be made again against
+/// a client whose permissions changed mid-transfer.
+pub struct StagedWrite {
+    pub account: String,
+    pub file: String,
+    pub key: String,
+    /// Bytes the client said it would send. The body is read to exactly this.
+    pub length: u64,
+    /// The temporary the body is written into, inside the file's own directory
+    /// so an abandoned transfer is swept by the ordinary read path.
+    pub staged: std::path::PathBuf,
+}
+
+/// A record opened for streaming out, with the length that same handle carries.
+pub struct OpenedRecord {
+    pub file: std::fs::File,
+    pub length: u64,
+}
+
+/// The account a transfer runs in, or the refusal to send back.
+///
+/// The same rules the ordinary commands use, through the same helper, so a
+/// transfer cannot become a way to reach an account a `READ` could not.
+#[allow(clippy::result_large_err)]
+fn transfer_account<'a>(req: &'a Request, client_info: &'a crate::db::ClientInfo) -> Result<&'a str, Response> {
+    match allowed_account(req, client_info) {
+        Some(account) => Ok(account),
+        None => match req.account.as_deref() {
+            Some(account) => Err(error(
+                ErrorCode::AccessDenied,
+                format!("Access denied for account {}: Not in allowed list", account),
+            )),
+            None => Err(error(ErrorCode::AccountNotSpecified, "Account not specified")),
+        },
+    }
+}
+
+/// Everything a `PUT.BYTES` can be refused for before a byte of it is read.
+///
+/// The point of doing it all here is that a transfer the server will not accept
+/// costs nothing on the wire: the account, the file's type, the key and the
+/// announced length are all decided from the request line alone.
+#[allow(clippy::result_large_err)]
+pub fn stage_bytes(req: &Request, db: &SharedDb, client_info: &crate::db::ClientInfo) -> Result<StagedWrite, Response> {
+    let account = transfer_account(req, client_info)?.to_string();
+    let file = requested_file(req)?.to_string();
+    let key = match req.key.as_deref().filter(|key| !key.is_empty()) {
+        Some(key) => key.to_string(),
+        None => return Err(error(ErrorCode::MissingField, "Key not specified")),
+    };
+    let length = match req.length {
+        Some(length) => length,
+        None => {
+            return Err(error(
+                ErrorCode::MissingField,
+                "length not specified: PUT.BYTES announces how many bytes of body follow it",
+            ));
+        }
+    };
+    let db = read_lock(db);
+    if !db.is_table_directory_for_account(&account, &file) {
+        return Err(error(
+            ErrorCode::InvalidRequest,
+            format!(
+                "'{}' is not a directory file: PUT.BYTES stores a record that is its bytes, and an ordinary \
+                 file's records are fields inside a hashed section",
+                file
+            ),
+        ));
+    }
+    match db.stage_directory_record(&account, &file, &key, length) {
+        Ok(staged) => Ok(StagedWrite {
+            account,
+            file,
+            key,
+            length,
+            staged,
+        }),
+        Err(e) => Err(db_error(e)),
+    }
+}
+
+/// Puts a staged body in place once it has all arrived.
+pub fn commit_bytes(staged: &StagedWrite, arrived: u64, db: &SharedDb) -> Response {
+    let result = read_lock(db).commit_directory_record(
+        &staged.account,
+        &staged.file,
+        &staged.key,
+        &staged.staged,
+        arrived,
+        staged.length,
+    );
+    match result {
+        Ok(()) => Response {
+            status: "OK".to_string(),
+            length: Some(arrived),
+            ..Default::default()
+        },
+        Err(e) => db_error(e),
+    }
+}
+
+/// Opens the record a `GET.BYTES` names, having checked everything a `READ` of
+/// it would be checked for.
+#[allow(clippy::result_large_err)]
+pub fn open_bytes(req: &Request, db: &SharedDb, client_info: &crate::db::ClientInfo) -> Result<OpenedRecord, Response> {
+    let account = transfer_account(req, client_info)?;
+    let file = requested_file(req)?;
+    let key = match req.key.as_deref().filter(|key| !key.is_empty()) {
+        Some(key) => key,
+        None => return Err(error(ErrorCode::MissingField, "Key not specified")),
+    };
+    let db = read_lock(db);
+    if !db.is_table_directory_for_account(account, file) {
+        return Err(error(
+            ErrorCode::InvalidRequest,
+            format!(
+                "'{}' is not a directory file: GET.BYTES sends a record that is its bytes, and an ordinary \
+                 file's records are fields inside a hashed section",
+                file
+            ),
+        ));
+    }
+    match db.open_directory_record(account, file, key) {
+        Ok(Some((file, length))) => Ok(OpenedRecord { file, length }),
+        Ok(None) => Err(error(ErrorCode::RecordNotFound, "Record not found")),
+        Err(e) => Err(db_error(e)),
+    }
+}
+
+/// What a byte-transfer command answers when it arrives anywhere but on a
+/// connection that can carry its body.
+///
+/// `PUT.BYTES` and `GET.BYTES` are intercepted by the connection loop, which is
+/// the only place with the socket in hand. Reaching the ordinary dispatch means
+/// an in-process caller or a client library that sent the line and nothing
+/// else, and saying so beats `UNKNOWN_COMMAND` - the command exists, and this
+/// is not where it works.
+fn transfer_command_elsewhere(command: &str) -> Response {
+    error(
+        ErrorCode::InvalidRequest,
+        format!(
+            "{} carries raw bytes on the connection itself, so it is only available over the remote protocol \
+             and only to a client that reads or writes the body it announces",
+            command
+        ),
+    )
+}
+
 /// `READ` against a directory file: the record's bytes, exactly as they are on
 /// disk.
 ///
@@ -1311,6 +1465,10 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
             transact(db, acc, req)
         }
+        // Listed here so the command exists everywhere the protocol says it
+        // does, and is documented like any other; the connection loop takes it
+        // before this is reached, because only it has the socket.
+        "PUT.BYTES" | "GET.BYTES" => transfer_command_elsewhere(&command),
         // The queue commands, for the same callers as the record arms above:
         // the shared path in [`handle_request`] serves them whenever it can
         // resolve the account on its own.

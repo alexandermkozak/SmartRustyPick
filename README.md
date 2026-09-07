@@ -49,7 +49,8 @@ field formatting, and complex select operations.
   files in it - the key is the file name, the record is the file's bytes. Nothing frames them, so a PNG, a PDF or a
   `.wasm` module survives byte for byte where the marks of an ordinary record would split it; nothing caches them, so
   reading one costs that read rather than making the whole file resident. `STORE` and `EXTRACT` stream a host file in
-  and out.
+  and out locally, and `PUT.BYTES` / `GET.BYTES` do the same over the network - a length announced on the request line
+  and the record's bytes carried raw on the connection, so a remote client needs no filesystem access to the server.
 - **Remote Access**: TCP SSL server with certificate authentication and CRUD protocol.
 - **Web Dashboard**: Browser-based management of connections, certificates, accounts, files, their dictionaries and live
   server activity, started automatically with the server.
@@ -104,6 +105,9 @@ Currently supported settings:
   dashboard's URL.
 - `max_request_bytes`: Maximum size, in bytes, of a single request line before the connection is closed with an error
   (default: 1048576, i.e. 1 MiB).
+- `transfer_stall_timeout_ms`: How long a raw byte transfer (`PUT.BYTES`, `GET.BYTES`) may make no progress before the
+  connection is closed (default: 30000). It catches a stalled transfer rather than capping the total duration, so a
+  slow link moving a large record is unaffected; `0` disables it.
 - `handshake_timeout_ms`: Maximum time allowed to complete the TLS handshake before the connection is dropped
   (default: 10000).
 - `idle_timeout_ms`: Maximum time a connection may sit idle, with no request in flight, before it is closed

@@ -6,6 +6,9 @@ pub mod models;
 #[cfg(test)]
 mod protocol_doc_tests;
 pub mod stats;
+pub mod transfer;
+#[cfg(test)]
+mod transfer_tests;
 
 use crate::config::Config;
 pub use certs::{ensure_certificates, load_certs, load_key};
@@ -203,6 +206,19 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
 
             let max_request_bytes = config.max_request_bytes() as u64;
             let idle_timeout = config.idle_timeout();
+            // A stalled transfer needs a bound the line reader cannot give it:
+            // once a body is announced this connection is committed to reading
+            // that many bytes, however slowly they arrive. Disabled means no
+            // bound at all, which is why it defaults to on.
+            let stall_timeout = config
+                .transfer_stall_timeout()
+                .unwrap_or(std::time::Duration::from_secs(86_400));
+            let max_record_bytes = {
+                let db = db.clone();
+                tokio::task::spawn_blocking(move || read_lock(&db).max_directory_record_bytes())
+                    .await
+                    .unwrap_or(crate::db::directory::DEFAULT_MAX_RECORD_BYTES)
+            };
 
             loop {
                 line.clear();
@@ -264,6 +280,40 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                             }
                         };
 
+                        let command = req.command.to_uppercase();
+
+                        // A byte transfer is taken before the ordinary
+                        // dispatch, because its body is on this socket and the
+                        // handler has no socket. Everything after the request
+                        // line is read here or the connection is closed - the
+                        // line reader must never be handed a socket sitting in
+                        // the middle of somebody's PDF.
+                        if transfer::is_transfer_command(&command) {
+                            let outcome = if command == "PUT.BYTES" {
+                                transfer::put_bytes(
+                                    &mut reader,
+                                    &mut writer,
+                                    &req,
+                                    &db,
+                                    &client,
+                                    max_record_bytes,
+                                    stall_timeout,
+                                )
+                                .await
+                            } else {
+                                transfer::get_bytes(&mut writer, &req, &db, &client).await
+                            };
+                            stats::note_request(connection_id, &command, outcome.failed);
+                            if outcome.close {
+                                eprintln!(
+                                    "Transfer from {} left the connection at an unknown offset; closing",
+                                    peer_addr
+                                );
+                                break;
+                            }
+                            continue;
+                        }
+
                         // The engine is synchronous and file backed: running it on
                         // the async worker would stall every other task on that
                         // thread, handshakes of unrelated connections included. The
@@ -272,7 +322,6 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                         // this thread entirely.
                         let db_for_task = db.clone();
                         let tp = thumbprint.clone();
-                        let command = req.command.to_uppercase();
                         let handled = tokio::task::spawn_blocking(move || {
                             let info = read_lock(&db_for_task).client_for_thumbprint(&tp);
                             info.map(|info| handle_request(req, &db_for_task, &info))

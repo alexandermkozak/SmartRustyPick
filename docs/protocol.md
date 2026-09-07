@@ -31,6 +31,12 @@ server replies with exactly one line of JSON terminated by `\n`. The connection 
 for further requests until either side closes it. Buffered writes made during the
 connection are flushed to disk when it closes.
 
+**With one exception.** `PUT.BYTES` and `GET.BYTES` carry a *body* of raw bytes immediately
+after their JSON line, because a [directory file](#directory-files)'s record is arbitrary
+bytes and cannot be delimited by a newline it may itself contain. The length is announced on
+the line, and exactly that many bytes follow it — see
+[Raw byte transfers](#raw-byte-transfers). Every other command is a line and nothing else.
+
 ## Request object
 
 All fields other than `command` are optional at the JSON level; whether a given command
@@ -61,6 +67,7 @@ matched case-insensitively.
 | `queue`           | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Make the file a [queue file](#queue-files): ordered records, claimed one at a time. Optional; on `SET.FILE` an absent flag leaves the file as it is, and `false` returns a queue to an ordinary file without touching its records. |
 | `visibility_timeout` | number        | `CREATE.FILE`, `SET.FILE`, `DEQUEUE`                                                                               | Seconds a claim is held before it lapses. On the file commands it sets the queue's own timeout (default 60, maximum 86400); on `DEQUEUE` it overrides that timeout for the one claim being taken. Out of range is refused with `INVALID_DATA`. |
 | `max_deliveries`  | number           | `CREATE.FILE`, `SET.FILE`                                                                                          | Deliveries a record of this queue gets before it moves to the dead-letter file. Default 5, maximum 1000. Out of range is refused with `INVALID_DATA`. |
+| `length`          | number           | `PUT.BYTES`                                                                                                        | Bytes of body that follow this request line on the connection. Required: a body is announced rather than delimited, because a record may contain any byte including a newline. Checked against `max_directory_record_bytes` *before* a byte of body is read. |
 | `directory`       | bool             | `CREATE.FILE`                                                                                                      | Make the file a [directory file](#directory-files): its records are the files of a real directory on the host. A file's type is fixed when it is created, so `SET.FILE` refuses to change it with `INVALID_REQUEST`. |
 | `path`            | string           | `CREATE.FILE`                                                                                                      | The host directory a directory file's records are the files of. Absent means the default place inside the file's own directory. Implies `directory: true`; given for an ordinary file it is refused with `INVALID_REQUEST`. |
 | `changes`         | array of objects | `TRANSACT`                                                                                                         | The writes and deletes to apply as one. Each carries its own `op`, `file`, `key`, `data`/`structured_data` and `is_dict`, so one set may span several files of the account. See [TRANSACT](#transact). |
@@ -84,6 +91,7 @@ older server sent in its place.
 | `keys`      | array of strings          | `LIST.FILES`, `LIST.DICT`                                                                            | Plain list of names: the files in the account, or the file's dictionary entries. Both commands fill `results` as well, with what is known about each name.                                                       |
 | `count`     | integer                   | `SELECT`, `GET.NEXT`, `DEQUEUE`, `PEEK`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES`, `LIST.DICT`    | `SELECT`: number of keys selected into the list. `GET.NEXT`: number of records in the batch just returned. `DEQUEUE` and `PEEK`: `0`, beside an `"EMPTY"` status. The list commands: number of entries returned. |
 | `positions` | array of objects or nulls | `QUERY`, `GET.NEXT`                                                                                  | Present only for an exploded result. Index-aligned with `results`: the position within the exploded field that put each row there. See [Exploded results](#exploded-results).                                    |
+| `length`    | number                    | `PUT.BYTES`, `GET.BYTES`                                                                             | On `GET.BYTES`, bytes of body that follow this response line — a client reads exactly that many next. On `PUT.BYTES`, bytes stored. Its own field rather than `count`, which counts records everywhere else. See [Raw byte transfers](#raw-byte-transfers). |
 | `claim`     | object                    | `ENQUEUE`, `DEQUEUE`, `PEEK`                                                                         | What the queue knows about the record: its `key`, its `deliveries` count, when it was `enqueued`, and — for `DEQUEUE` — who holds it and when the claim `expires`. Its own field rather than more keys in `record`, so a payload with a field called `key` can be queued and read back unchanged. See [Queue files](#queue-files). |
 
 There is no `NOT_FOUND` status. A missing record, table or list yields
@@ -264,6 +272,8 @@ three are not repeated in the per-command lists below.
 | `ACK`                   |       |   yes   | `file`, `key`                                        | `status: "OK"`                          |
 | `NACK`                  |       |   yes   | `file`, `key`                                        | `status: "OK"`                          |
 | `PEEK`                  |       |   yes   | `file`                                               | `record` + `claim`, or `status: "EMPTY"` |
+| `PUT.BYTES`             |       |   yes   | `file`, `key`, `length` (+ a body)                   | `length`                                |
+| `GET.BYTES`             |       |   yes   | `file`, `key`                                        | `length` + a body                       |
 | `CREATE.ACCOUNT`        |  yes  |    —    | `target_account`                                     | `status: "OK"`                          |
 | `CREATE.TEST.ACCOUNT`   |  yes  |    —    | `target_account`                                     | `record`                                |
 | `DELETE.ACCOUNT`        |  yes  |    —    | `target_account`                                     | `status: "OK"`                          |
@@ -701,7 +711,7 @@ A record of an ordinary file is made of fields, and the marks that separate them
 of those bytes is indistinguishable from the separator it is and splits on the way back, so a
 PNG, a PDF or a `.wasm` module cannot be stored in one. The request line is capped at
 `max_request_bytes` (1 MiB by default) as well, and base64 inflates by 4/3, so even content
-that avoided the marks would top out around 700 KiB.
+that avoided the marks would top out just under 768 KiB.
 
 A file created with `directory: true` ([`CREATE.FILE`](#createfile--admin)) is the other
 thing. **Its records are ordinary files in a real directory on the host**: the key is the
@@ -776,11 +786,109 @@ the limit out of band is a refusal rather than an allocation the server cannot m
 `FILE.STATS` reports the largest record against that limit, with a `watch` verdict before it
 is reached.
 
-**The remote protocol is still line-delimited.** A `WRITE` or a `READ` of a directory record
-travels in one request, so `max_request_bytes` bounds what can cross the wire in one piece —
-about 700 KiB after base64. The file itself has no such limit: the CLI's `STORE` and
-`EXTRACT` stream a host file in and out without it passing through a request at all. See
-[General Commands](general_commands.md#directory-files).
+**A record larger than the request line has its own commands.** A `WRITE` or a `READ` of a
+directory record travels inside one request line, so `max_request_bytes` bounds those at just
+under 768 KiB after base64. Past that, [`PUT.BYTES` and `GET.BYTES`](#raw-byte-transfers)
+carry the record as raw bytes on the connection itself, up to
+`max_directory_record_bytes`; the CLI's `STORE` and `EXTRACT` do the same locally, without a
+request at all. See [General Commands](general_commands.md#directory-files).
+
+## Raw byte transfers
+
+A [directory file](#directory-files) will hold a record up to `max_directory_record_bytes`
+(64 MiB by default). The ordinary protocol cannot carry one: a record travels inside the
+request line base64-encoded, base64 inflates by 4/3, and `max_request_bytes` caps the line at
+1 MiB — so a `WRITE` tops out just under 768 KiB. `PUT.BYTES` and `GET.BYTES` are how the
+other 63 MiB get across, and they are the only place the protocol is not one line of JSON.
+
+```text
+→ {"command":"PUT.BYTES","account":"SALES","file":"SCANS","key":"scan.pdf","length":3145728}\n
+→ <3145728 raw bytes, no framing, no encoding>
+← {"status":"OK","length":3145728}\n
+```
+
+```text
+→ {"command":"GET.BYTES","account":"SALES","file":"SCANS","key":"scan.pdf"}\n
+← {"status":"OK","length":3145728}\n
+← <3145728 raw bytes>
+```
+
+The connection is already authenticated by the client certificate, so a transfer needs
+nothing new to authorise it and is an ordinary record command in every other respect: the
+same account rules, the same refusal for a file that is not a directory file, the same key
+validation, the same size limit. It is a bounded interlude in a session that carries on
+afterwards.
+
+**The body is announced, not delimited.** Every other request ends at a newline; a record is
+arbitrary bytes and holds newlines like any other byte, so there is nothing to look for. That
+is also what lets an oversized transfer be refused before a byte of it is read.
+
+### What a client has to get right
+
+**Send the body immediately after the line.** The server does not acknowledge the header
+first — it reads the body as soon as it has read the line, and a client that waits for a
+reply before sending will be closed on the stall timeout.
+
+**Read exactly `length` bytes, and no more.** On `GET.BYTES` the bytes begin the moment the
+response line's `\n` ends. A client that reads by lines, or that over-reads into its own
+buffer and discards the excess, desynchronises itself for the rest of the session. If your
+client library buffers — most do — the body must be taken from that buffer first, not from
+the socket underneath it: the first bytes of the body almost always arrive in the same
+packet as the response line and are already inside it.
+
+**A refusal may or may not keep the connection.** The reply says what went wrong either way;
+whether the connection survives depends on whether the server could safely account for the
+body:
+
+| Situation | What the server does |
+|---|---|
+| `PUT.BYTES` refused, announced `length` within the limit | Sends the error, reads and discards the body, keeps the connection |
+| `PUT.BYTES` refused, `length` over the limit or absent | Sends the error and **closes** — draining ten gigabytes to report that ten gigabytes is too many is the denial of service the limit exists to prevent |
+| `PUT.BYTES` body ends early, or the socket fails mid-body | Sends the error and **closes**: the connection is at an unknown offset |
+| `PUT.BYTES` stored but the disk failed | Sends the error, keeps the connection — the body was still consumed |
+| `GET.BYTES` refused | Sends the error and keeps the connection: nothing was on the socket to resynchronise against |
+
+A short body is **refused, not stored**. If fewer bytes arrive than were announced, the
+record is not written and the staging is removed: a truncated record under a key a caller
+would then trust is exactly the corruption directory files exist to rule out.
+
+### What bounds a transfer
+
+- `max_directory_record_bytes` bounds the record, checked against the announced length before
+  a byte is read and again against what actually arrived. `max_request_bytes` does **not**
+  apply to a body — it bounds JSON, and the two limits are deliberately separate.
+- `transfer_stall_timeout_ms` (30 s by default) bounds a transfer that stops making progress.
+  It is not a cap on total duration: a slow link moving a large record is not a stalled one,
+  and only a gap with no bytes at all trips it. `idle_timeout_ms` cannot see this case, since
+  a half-sent body is neither idle nor finished.
+- Nothing is buffered in memory at either end of the server: a body is streamed to a
+  temporary file inside the directory file's own root and renamed into place when it is
+  complete, so an abandoned transfer leaves no partial record and is swept by the ordinary
+  read path.
+
+### PUT.BYTES
+
+Store one record of a directory file from a body that follows the request line.
+
+- Required: `file`, `key`, `length`, and exactly `length` bytes of body. Optional: `account`.
+- Response: `length`, the bytes stored.
+- Errors: `MISSING_FIELD` (no `file`, `key` or `length`), `ACCOUNT_NOT_SPECIFIED`,
+  `ACCESS_DENIED`, `FILE_NOT_FOUND`, `INVALID_REQUEST` (not a directory file, an unusable
+  key, a length over the limit, or a body that ran short), `PERMISSION_DENIED`, `IO_ERROR`.
+
+### GET.BYTES
+
+Send one record of a directory file as a body following the response line.
+
+- Required: `file`, `key`. Optional: `account`.
+- Response: `length`, then exactly that many bytes.
+- Errors: `MISSING_FIELD` (no `file` or `key`), `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`,
+  `FILE_NOT_FOUND`, `RECORD_NOT_FOUND`, `INVALID_REQUEST` (not a directory file, or an
+  unusable key), `PERMISSION_DENIED`, `IO_ERROR`.
+
+Both are refused with `INVALID_REQUEST` on any path that cannot carry a body — an in-process
+caller, or a client that sent the line and nothing else. The command exists; that is not
+where it works.
 
 ## Management commands
 

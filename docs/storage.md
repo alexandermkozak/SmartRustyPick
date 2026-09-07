@@ -603,10 +603,15 @@ it is applied. A caller can handle a refusal; it cannot handle a guarantee that 
 ### Getting bytes in and out
 
 `STORE <file> <key> <path>` and `EXTRACT <file> <key> <path>` stream a host file in and out through a fixed-size
-buffer, so the size of a record is bounded by `max_directory_record_bytes` and by nothing else. The remote protocol's
-`READ` and `WRITE` still travel in one line-delimited request, so `max_request_bytes` (1 MiB by default) bounds what
-can cross the wire in one piece — about 700 KiB after base64. That is the one limit a directory file does not remove,
-and it is a limit on the *transport* rather than on the file.
+buffer, so the size of a record is bounded by `max_directory_record_bytes` and by nothing else. Those are local: the
+CLI works on an in-process database.
+
+Over the wire, `READ` and `WRITE` travel in one line-delimited request, so `max_request_bytes` (1 MiB by default)
+bounds them at just under 768 KiB after base64. Past that a remote client uses
+[`PUT.BYTES` and `GET.BYTES`](protocol.md#raw-byte-transfers), which announce a length on the request line and then
+carry the record as raw bytes on the connection itself — the same fixed-size streaming, with the same limit, reached
+from a machine that has no filesystem access to the server. `transfer_stall_timeout_ms` bounds a transfer that stops
+making progress; a body that ends early is refused rather than stored truncated.
 
 ## Queue Files
 
@@ -811,6 +816,10 @@ The following optional keys in `config.toml` control the storage engine:
   `always` unless this is set explicitly.
 - `flush_interval_ms` (default 250): Maximum time a change stays in memory before being flushed.
 - `flush_max_pending` (default 256): Maximum number of pending writes before a flush is triggered.
+- `transfer_stall_timeout_ms` (default 30000): How long a [raw byte transfer](protocol.md#raw-byte-transfers) may make
+  no progress before the connection is closed. It bounds a *stalled* transfer rather than the total duration, because a
+  slow link moving a large record is not a stalled one, and `idle_timeout_ms` cannot see the case at all - a half-sent
+  body is neither idle nor finished.
 
 ## Performance Measurements
 
