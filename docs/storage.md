@@ -529,6 +529,85 @@ Two processes opening the same database at once are not co-ordinated here. One p
 intent another process is still applying, and nothing takes a cross-process lock on the log. The engine's freshness
 stamps have the same shape of limitation, and closing it properly is a lock manager rather than a file format.
 
+## Directory Files
+
+A hash file's records are framed inside group files it owns: `[key_len][key][data_len][record]`, with the record's own
+`FM`, `VM` and `SVM` marks separating its fields. That framing is the reason a hash file cannot hold a scanned invoice.
+The marks **are** the structure, so the first `0xFE` inside a PNG is indistinguishable from the field separator it is
+and splits the value in two on the way back. The cache is the second reason: `hashfile::load` reads every group of a
+section into the table's map the first time the file is touched, so one read of one photograph makes every photograph
+resident.
+
+A **directory file** is the shape PICK already had for this. It is a pointer to a real directory on the host, and its
+records are the files in it — the key is the file name, the record is the file's bytes.
+
+```text
+db_storage/<account>/<file>/records/<key>       # created without a path of its own
+/srv/scans/<key>                                # created PATH /srv/scans
+```
+
+A file is made a directory file by its `DIR` entry, exactly as it is made a queue: **attribute 1 (`TYPE`) is `D`**
+rather than `F`, and attribute 6 (`PATH`) is the host directory, empty for the default place. The type is what decides
+the shape of the rest of the entry: a directory file has no buffered writes to make durable and no order to claim from,
+so attributes 2 to 5 are read as empty on one whatever a hand-edited entry says. `TYPE` is the half of a contradictory
+entry that survives, because it is the half that says where the records are.
+
+A file's type is fixed when it is created. `SET.FILE` will not change it in either direction: an ordinary file's
+records are inside a hashed section and a directory file's are host files, so converting one is a rewrite of every
+record rather than a flag, and flipping the flag alone would leave a file whose entry says one thing and whose records
+are somewhere else entirely.
+
+### What a directory file costs, and does not
+
+A read is one `open` and one `read_to_end` of one host file. No table is loaded, no table lock is taken, and nothing is
+cached — which is exactly the property a blob store has to have: reading a forty megabyte record must not block every
+writer to that file for the length of the read, and it cannot, because there is no lock to hold. A debug build asserts
+this rather than describing it: `the_hot_paths_lock_a_file_a_fixed_number_of_times` gives every directory-file command a
+budget of **zero** table locks.
+
+A write goes to a temporary file (`.tmp.<pid>.<n>`, a name no key can collide with because a key may not begin with a
+dot), is flushed, is `fsync`ed if the [sync policy](#sync-policy) says so, and is then renamed over its key. The
+directory itself is synced under `meta` as well as `always`, for the reason a section's `meta` is: a name that survives
+pointing at bytes that do not is the one ordering that cannot be recovered from. Debris from a crash between the create
+and the rename is swept on the *read* path, the same way `remove_stale_tmp` sweeps a section's, so a write never pays
+for a directory scan.
+
+There is no flush and no dirty state. `rename` is the commit, so a directory record is on the disk when the write
+returns and there is nothing for the ticker, the connection-close flush or the eviction path to write out later.
+
+### What is bounded
+
+`max_directory_record_bytes` (64 MiB by default) is checked on the way in **and** on the way out, so a file that grew
+past the limit out of band is a refusal rather than an allocation the server cannot meet. `FILE.STATS` reports the
+largest record against the limit and gives it a `watch` verdict at three quarters of it — the refusal arrives on a
+write, and the dashboard is where an operator would rather hear about it first.
+
+A key is checked rather than repaired: not empty, at most 255 bytes, no `/` or `\`, no leading dot, no control bytes.
+Every one of those is about a name reaching a filesystem, and a name quietly repaired is a write that succeeds and
+reads back under a key nobody asked for — with `..` it is that plus somebody else's directory.
+
+### What a directory file has not got
+
+No dictionary, no index, no queue, no place in a transaction.
+
+The first three are the same answer: a record has no fields. An index maps a dictionary field's values to the keys
+carrying them, and building one here would read every record to index nothing; a `WITH` clause has nothing to test. All
+of them are refused rather than answered emptily, because a query that quietly matches nothing is a wrong answer
+delivered with `status: "OK"`, which is the failure this engine keeps saying it will not have.
+
+The fourth is different. A transaction takes every file its set names, holds them all, and writes them out before
+releasing one lock — that is what makes the set atomic. A directory record commits on its own `rename`, which reaches
+one file and cannot be held back, so a set naming a directory file is refused with `TRANSACTION_SCOPE` and nothing in
+it is applied. A caller can handle a refusal; it cannot handle a guarantee that quietly does not hold.
+
+### Getting bytes in and out
+
+`STORE <file> <key> <path>` and `EXTRACT <file> <key> <path>` stream a host file in and out through a fixed-size
+buffer, so the size of a record is bounded by `max_directory_record_bytes` and by nothing else. The remote protocol's
+`READ` and `WRITE` still travel in one line-delimited request, so `max_request_bytes` (1 MiB by default) bounds what
+can cross the wire in one piece — about 700 KiB after base64. That is the one limit a directory file does not remove,
+and it is a limit on the *transport* rather than on the file.
+
 ## Queue Files
 
 A hash file has no order to walk: a record's key decides its group, so "the oldest record" is not a question the layout
@@ -720,6 +799,10 @@ The following optional keys in `config.toml` control the storage engine:
 
 - `records_per_group` (default 16): Target number of records per group. Lower values result in smaller group files and
   faster rewrites but more files.
+- `max_directory_record_bytes` (default 67108864, 64 MiB): Largest record a [directory file](#directory-files) will
+  read or write. A directory file's records are host files, so their size is decided by what is on the disk rather than
+  by what a client sent; this is what turns a mistake there into a refusal instead of an allocation the machine cannot
+  meet.
 - `max_loaded_tables` (default 64): How many files may be held in memory at once. A file is only as large in memory as
   the records that have been read into it, and eviction is what makes two connections working on different files
   interfere with each other, so this is worth raising rather than lowering on a database with many active files.

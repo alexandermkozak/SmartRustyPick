@@ -61,6 +61,8 @@ matched case-insensitively.
 | `queue`           | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Make the file a [queue file](#queue-files): ordered records, claimed one at a time. Optional; on `SET.FILE` an absent flag leaves the file as it is, and `false` returns a queue to an ordinary file without touching its records. |
 | `visibility_timeout` | number        | `CREATE.FILE`, `SET.FILE`, `DEQUEUE`                                                                               | Seconds a claim is held before it lapses. On the file commands it sets the queue's own timeout (default 60, maximum 86400); on `DEQUEUE` it overrides that timeout for the one claim being taken. Out of range is refused with `INVALID_DATA`. |
 | `max_deliveries`  | number           | `CREATE.FILE`, `SET.FILE`                                                                                          | Deliveries a record of this queue gets before it moves to the dead-letter file. Default 5, maximum 1000. Out of range is refused with `INVALID_DATA`. |
+| `directory`       | bool             | `CREATE.FILE`                                                                                                      | Make the file a [directory file](#directory-files): its records are the files of a real directory on the host. A file's type is fixed when it is created, so `SET.FILE` refuses to change it with `INVALID_REQUEST`. |
+| `path`            | string           | `CREATE.FILE`                                                                                                      | The host directory a directory file's records are the files of. Absent means the default place inside the file's own directory. Implies `directory: true`; given for an ordinary file it is refused with `INVALID_REQUEST`. |
 | `changes`         | array of objects | `TRANSACT`                                                                                                         | The writes and deletes to apply as one. Each carries its own `op`, `file`, `key`, `data`/`structured_data` and `is_dict`, so one set may span several files of the account. See [TRANSACT](#transact). |
 | `field`           | string           | `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`                                | The dictionary field the index is on. Required by all of them. See [Storage Engine](storage.md#secondary-indexes).                                                                                                                                                                         |
 | `values`          | array of strings | `CREATE.INDEX`, `SET.INDEX.EXCLUDE`                                                                                | Values the index is to skip. Optional on `CREATE.INDEX`. On `SET.INDEX.EXCLUDE` it replaces the set, and an absent or empty list clears it.                                                                                                                                                |
@@ -692,6 +694,94 @@ Read a record without claiming it.
            "enqueued": 1764950412345, "owner": "worker-2"}}
 ```
 
+## Directory files
+
+A record of an ordinary file is made of fields, and the marks that separate them — `FM`
+(`0xFE`), `VM` (`0xFD`) and `SVM` (`0xFC`) — **are** its structure. A sub-value carrying one
+of those bytes is indistinguishable from the separator it is and splits on the way back, so a
+PNG, a PDF or a `.wasm` module cannot be stored in one. The request line is capped at
+`max_request_bytes` (1 MiB by default) as well, and base64 inflates by 4/3, so even content
+that avoided the marks would top out around 700 KiB.
+
+A file created with `directory: true` ([`CREATE.FILE`](#createfile--admin)) is the other
+thing. **Its records are ordinary files in a real directory on the host**: the key is the
+file name and the record is the file's bytes, exactly as they were written. Nothing frames
+them, so nothing in them can be read as structure; nothing caches them, so reading one costs
+that one read rather than making the whole file resident.
+
+```json
+{"command": "CREATE.FILE", "account": "SALES", "file": "SCANS", "directory": true}
+```
+
+**A record is its bytes, not fields.** `READ` answers with `record` holding the *value*
+rather than an object of field names, because there are no field names to key it by. It is a
+JSON string when the bytes are valid UTF-8 and a [`{"$base64": "..."}`
+envelope](#values-that-are-not-text) when they are not — the same two shapes a sub-value
+already travels in. `WRITE` takes the same two in `data`; `structured_data` is refused with
+`INVALID_DATA`, because it describes fields.
+
+```json
+{"command": "WRITE", "account": "SALES", "file": "SCANS", "key": "invoice-4471.pdf",
+ "data": {"$base64": "JVBERi0xLjcK"}}
+```
+
+```json
+{"command": "READ", "account": "SALES", "file": "SCANS", "key": "invoice-4471.pdf"}
+```
+
+```json
+{"status": "OK", "record": {"$base64": "JVBERi0xLjcK"}}
+```
+
+**A key has to be a host file name**, and is checked rather than repaired. It may not be
+empty, longer than 255 bytes, hold `/` or `\`, begin with a dot, or hold a control byte;
+anything else is refused with `INVALID_REQUEST`. Repairing a key would mean a write that
+succeeds and reads back under a name the caller never asked for, and a key holding `..` would
+be that plus somebody else's directory. Keys are compared as the host filesystem compares
+them, so on a case-insensitive one `Invoice` and `INVOICE` are the same record — that is the
+host's answer rather than this database's, and it is the price of pointing at a real tree.
+
+**Listing shows sizes, never content.** `QUERY` and `GET.NEXT` answer with one row per record
+holding `{"size": <bytes>}`, and `SELECT` builds a list of the keys. Returning the bytes
+would make listing a file of scans cost the scans, which is the burden this file type exists
+to remove. A `query_string`, `query_node`, `sort_specs` or `explode` against a directory file
+is refused with `INVALID_REQUEST` rather than ignored: all four are read against a dictionary
+field, there are none, and a `WITH` clause that quietly matched everything would be a wrong
+answer sent as a right one. The keys come back in name order.
+
+```json
+{"command": "QUERY", "account": "SALES", "file": "SCANS"}
+```
+
+```json
+{"status": "OK", "results": [["invoice-4471.pdf", {"size": 284193}],
+                             ["invoice-4472.pdf", {"size": 91044}]]}
+```
+
+**What a directory file is not.** It has no dictionary (`is_dict` is refused), no
+[index](#createindex--rebuildindex--admin), and it cannot be a [queue](#queue-files) or take
+part in a [`TRANSACT`](#transact) set — the `rename` that commits one of its records commits
+it on its own, and cannot be held back until the rest of a set is ready. It carries no
+`durable` flag either: a record is on the disk when the write returns, so there is nothing
+buffered to make durable.
+
+**A write is atomic.** The bytes go to a temporary file, are `fsync`ed as far as the server's
+[`fsync` policy](storage.md) asks, and are then renamed over the key — so a reader sees the
+old record or the new one and never a half-written file. Debris from a crash between the two
+is swept on the read path, and is never reported as a record.
+
+**Size is bounded.** A record larger than `max_directory_record_bytes` (64 MiB by default) is
+refused with `INVALID_REQUEST` on the way in *and* on the way out, so a file that grew past
+the limit out of band is a refusal rather than an allocation the server cannot meet.
+`FILE.STATS` reports the largest record against that limit, with a `watch` verdict before it
+is reached.
+
+**The remote protocol is still line-delimited.** A `WRITE` or a `READ` of a directory record
+travels in one request, so `max_request_bytes` bounds what can cross the wire in one piece —
+about 700 KiB after base64. The file itself has no such limit: the CLI's `STORE` and
+`EXTRACT` stream a host file in and out without it passing through a request at all. See
+[General Commands](general_commands.md#directory-files).
+
 ## Management commands
 
 ### CREATE.ACCOUNT / DELETE.ACCOUNT — admin
@@ -752,7 +842,7 @@ Create an account already populated with the demo fixture — the same one the C
 Create a table (data and dictionary sections) in `account`.
 
 - Required: `account`, `file`. Optional: `durable`, `queue`, `visibility_timeout`,
-  `max_deliveries`. Admin only.
+  `max_deliveries`, `directory`, `path`. Admin only.
 - The file is added to the account's `DIR` listing, which is created first if the account
   has not got one.
 - With `durable: true` the file is marked mission critical in the account's `DIR` entry, so
@@ -763,8 +853,17 @@ Create a table (data and dictionary sections) in `account`.
   otherwise, because acknowledging a claim that a crash then loses is the failure a queue
   exists to prevent. `visibility_timeout` and `max_deliveries` set that queue's own claim
   policy; naming either implies `queue: true`.
+- With `directory: true` the file is a [directory file](#directory-files): its records are
+  the files of a real directory on the host, which is where content that is not fields
+  belongs. `path` points it at a directory that already exists, and naming it implies
+  `directory: true`; without one the records live in `<file>/records` inside the file's own
+  directory, and are removed with it by `DELETE.FILE`. The directory is created before the
+  entry naming it is written, so a path the server cannot reach is refused here rather than
+  on the first record. A directory file cannot also be a queue or be durable, and asking for
+  either alongside it is refused with `INVALID_REQUEST`.
 - Errors: `ADMIN_REQUIRED`, `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`),
-  `INVALID_DATA` (a timeout or delivery limit out of range), `FILE_EXISTS`.
+  `INVALID_DATA` (a timeout or delivery limit out of range), `INVALID_REQUEST` (`directory`
+  asked for alongside `queue` or `durable`, or `path` without `directory`), `FILE_EXISTS`.
 
 ```json
 {"command": "CREATE.FILE", "account": "SALES", "file": "JOBS", "queue": true,
@@ -774,8 +873,13 @@ Create a table (data and dictionary sections) in `account`.
 ```json
 {"status": "OK", "record": {"account": "SALES", "name": "JOBS", "durable": true,
                             "queue": true, "visibility_timeout_seconds": 300,
-                            "max_deliveries": 3}}
+                            "max_deliveries": 3, "directory": false, "path": null}}
 ```
+
+`path` is where a directory file's records actually are, resolved rather than as the `DIR`
+entry spells it — an entry that says nothing means "the default place", and an operator
+asking where the records went wants the answer and not the rule. It is `null` for every
+other file.
 
 ### SET.FILE — admin
 
@@ -799,6 +903,12 @@ policy retuned, all while keeping the records it holds.
   durable with it unless `durable: false` says otherwise, for the reason a queue is created
   durable. A file that is already a queue keeps the durability it has, so retuning its
   timeout cannot undo a deliberate demotion.
+- **A file's type cannot be set.** A [directory file](#directory-files)'s records are host
+  files and an ordinary file's are framed inside a hashed section, so turning one into the
+  other is a conversion of every record rather than a flag — and flipping the flag alone
+  would leave a file whose entry says one thing and whose records are somewhere else.
+  `directory` or `path` on `SET.FILE` is refused with `INVALID_REQUEST`; create a file of the
+  type you want and move the records.
 - The attributes are stored in the account's `DIR` entry for the file; an account without a
   `DIR` file gets one.
 - `DIR` itself cannot be set: it carries the other files' attributes rather than any of its
@@ -814,7 +924,7 @@ policy retuned, all while keeping the records it holds.
 ```json
 {"status": "OK", "record": {"account": "SALES", "name": "LEDGER", "durable": true,
                             "queue": false, "visibility_timeout_seconds": null,
-                            "max_deliveries": null}}
+                            "max_deliveries": null, "directory": false, "path": null}}
 ```
 
 ### DELETE.FILE — admin
@@ -966,8 +1076,9 @@ The files in one account, sorted.
 
 - Required: `account` (or a client with exactly one allowed account).
 - `keys` is the plain list of names. `results` pairs each name with what is known about the
-  file beside its name: `durable` and `queue`, so a client can see which files flush every
-  write and which are [queues](#queue-files) without reading the account's `DIR` file, and a
+  file beside its name: `durable`, `queue` and `directory`, so a client can see which files
+  flush every write, which are [queues](#queue-files) and which are
+  [directory files](#directory-files) without reading the account's `DIR` file, and a
   [health](#health-verdicts-and-measures) verdict, so a problem file can be found without
   opening every file in turn. A database running with `durable_writes = true` reports every
   file as durable, because every write then is.
@@ -986,11 +1097,12 @@ The files in one account, sorted.
 ```
 
 ```json
-{"status": "OK", "count": 4, "keys": ["DIR", "JOBS", "LEDGER", "USERS"], "results": [
-  ["DIR", {"durable": false, "queue": false, "health": "good", "health_reasons": []}],
-  ["JOBS", {"durable": true, "queue": true, "health": "good", "health_reasons": []}],
-  ["LEDGER", {"durable": true, "queue": false, "health": "good", "health_reasons": []}],
-  ["USERS", {"durable": false, "queue": false, "health": "act",
+{"status": "OK", "count": 5, "keys": ["DIR", "JOBS", "LEDGER", "SCANS", "USERS"], "results": [
+  ["DIR", {"durable": false, "queue": false, "directory": false, "health": "good", "health_reasons": []}],
+  ["JOBS", {"durable": true, "queue": true, "directory": false, "health": "good", "health_reasons": []}],
+  ["LEDGER", {"durable": true, "queue": false, "directory": false, "health": "good", "health_reasons": []}],
+  ["SCANS", {"durable": false, "queue": false, "directory": true, "health": "good", "health_reasons": []}],
+  ["USERS", {"durable": false, "queue": false, "directory": false, "health": "act",
              "health_reasons": ["1 of 2 indexes stale"]}]
 ]}
 ```
@@ -1058,7 +1170,8 @@ memory, so asking for them loads the file.
   "group_count": 128, "smallest_group_bytes": 96, "largest_group_bytes": 512,
   "disk_bytes": 262144, "group_bytes": 212992, "index_bytes": 20480,
   "checksums": true, "legacy": false,
-  "durable": false, "loaded": true, "modified_seconds_ago": 12, "queue": null,
+  "durable": false, "loaded": true, "modified_seconds_ago": 12,
+  "queue": null, "directory": null,
   "records_per_group_target": 16, "load_factor": 0.625,
   "records_until_growth": 769, "records_until_shrink": 768,
   "largest_group_share": 0.021, "skew": 2.7,
@@ -1123,6 +1236,26 @@ the in-flight set, which is the number of consumers rather than the depth.
 This matters more than it looks: the sweep runs under the queue's own lock, the one every
 consumer of it is waiting on, so a cost that grew with the backlog would mean a dashboard
 polling a deep queue slowed down the workers draining it.
+
+**Directory files.** `directory` is `null` for every ordinary file. For a
+[directory file](#directory-files) it is what the host directory holds, counted from its
+entries rather than by reading a record:
+
+```json
+{"directory": {
+  "path": "/var/lib/srp/SALES/SCANS/records",
+  "record_count": 412, "bytes": 91750400, "largest_bytes": 4194304,
+  "max_record_bytes": 67108864
+}}
+```
+
+`path` is where the records are, resolved rather than as the `DIR` entry spells it.
+`largest_bytes` against `max_record_bytes` is the one number here that turns into a refusal,
+so it carries its own verdict — `watch` at three quarters of the limit, `act` at it. The
+hashed-section figures beside it (`modulus`, `group_count`, `skew` and the rest) are all zero
+for a directory file, because it has no such section; `record_count` is the records it really
+holds, and the `health` measures are about a directory file rather than about a hash it has
+not got.
 
 **Bytes.** `disk_bytes` is the whole file directory. `group_bytes` is the record groups alone
 and `index_bytes` the index sections, so the remainder is the dictionary and the small

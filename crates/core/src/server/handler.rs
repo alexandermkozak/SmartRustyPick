@@ -519,16 +519,64 @@ fn resolve_file(db: &Database, acc: &str, name: &str) -> Result<TableHandle, Res
 /// The two policy numbers are validated here rather than clamped in the engine:
 /// a queue given a timeout of zero would hand every record to two consumers at
 /// once, and finding that out from the behaviour is far worse than being told.
+///
+/// A file's *type* is the one thing this will not change. A directory file's
+/// records are host files and an ordinary file's are framed inside a hashed
+/// section, so turning one into the other is a conversion of every record and
+/// not a flag - and a `SET.FILE` that flipped the flag alone would leave a file
+/// whose entry says one thing and whose records are somewhere else entirely.
 #[allow(clippy::result_large_err)]
 fn file_attributes(req: &Request, current: crate::db::FileAttributes) -> Result<crate::db::FileAttributes, Response> {
     use crate::db::queue::{MAX_DELIVERY_LIMIT, MAX_VISIBILITY_SECONDS, QueuePolicy};
+
+    let wants_directory = req.directory.unwrap_or(current.is_directory() || req.path.is_some());
+    if wants_directory != current.is_directory() && !current_is_new(&current) {
+        return Err(error(
+            ErrorCode::InvalidRequest,
+            "A file's type is fixed when it is created: create a new file of the type you want and move the records",
+        ));
+    }
+    if wants_directory {
+        if req.queue == Some(true) || req.visibility_timeout.is_some() || req.max_deliveries.is_some() {
+            return Err(error(
+                ErrorCode::InvalidRequest,
+                "A directory file cannot be a queue: its records are host files, with no order to claim from",
+            ));
+        }
+        if req.durable == Some(false) {
+            return Err(error(
+                ErrorCode::InvalidRequest,
+                "A directory file has no buffered writes to make durable: a record is on disk when the write returns",
+            ));
+        }
+        let path = req
+            .path
+            .clone()
+            .or_else(|| current.directory.as_ref().map(|policy| policy.path.clone()))
+            .unwrap_or_default();
+        return Ok(crate::db::FileAttributes {
+            durable: false,
+            queue: None,
+            directory: Some(crate::db::DirectoryPolicy { path }),
+        });
+    }
+    if req.path.is_some() {
+        return Err(error(
+            ErrorCode::InvalidRequest,
+            "path names where a directory file's records live; give directory as well, or leave both out",
+        ));
+    }
 
     let durable = req.durable.unwrap_or(current.durable);
     let wants_queue = req
         .queue
         .unwrap_or(current.queue.is_some() || req.visibility_timeout.is_some() || req.max_deliveries.is_some());
     if !wants_queue {
-        return Ok(crate::db::FileAttributes { durable, queue: None });
+        return Ok(crate::db::FileAttributes {
+            durable,
+            queue: None,
+            directory: None,
+        });
     }
 
     let existing = current.queue.unwrap_or_default();
@@ -569,11 +617,28 @@ fn file_attributes(req: &Request, current: crate::db::FileAttributes) -> Result<
             visibility,
             max_deliveries,
         }),
+        directory: None,
     })
 }
 
+/// Whether `current` is the placeholder a `CREATE.FILE` passes in rather than a
+/// file that already exists. A create may settle on any type; a set may not
+/// change the one a file has.
+fn current_is_new(current: &crate::db::FileAttributes) -> bool {
+    *current == crate::db::FileAttributes::default()
+}
+
 /// What `CREATE.FILE` and `SET.FILE` report back about the file they settled.
-fn file_attributes_json(account: &str, name: &str, attributes: crate::db::FileAttributes) -> serde_json::Value {
+///
+/// `path` is the host directory a directory file's records are the files of.
+/// It is reported resolved rather than as the entry spells it, because an
+/// entry that says nothing means "the default place", and an operator asking
+/// where the records went wants the answer and not the rule.
+fn file_attributes_json(db: &Database, account: &str, name: &str) -> serde_json::Value {
+    // Read back rather than echoed: this reports what the file now carries,
+    // which is the only answer that stays right when the engine settles an
+    // attribute the request did not name.
+    let attributes = db.file_attributes_for_account(account, name);
     serde_json::json!({
         "account": account,
         "name": name,
@@ -581,6 +646,11 @@ fn file_attributes_json(account: &str, name: &str, attributes: crate::db::FileAt
         "queue": attributes.queue.is_some(),
         "visibility_timeout_seconds": attributes.queue.map(|policy| policy.visibility_seconds()),
         "max_deliveries": attributes.queue.map(|policy| policy.max_deliveries),
+        "directory": attributes.is_directory(),
+        "path": db
+            .directory_root(account, name)
+            .ok()
+            .map(|root| root.to_string_lossy().into_owned()),
     })
 }
 
@@ -597,6 +667,9 @@ fn read_record(db: &Database, acc: &str, req: &Request) -> Response {
         Ok(name) => name,
         Err(resp) => return resp,
     };
+    if db.is_table_directory_for_account(acc, table_name) {
+        return directory_read(db, acc, table_name, req);
+    }
     // An already loaded, still current file needs no freshness check of its own.
     let handle = match db.table_ready_for_read(acc, table_name) {
         Some(handle) => handle,
@@ -614,6 +687,16 @@ fn query_records(db: &Database, acc: &str, req: &Request) -> Response {
         Ok(name) => name,
         Err(resp) => return resp,
     };
+    if db.is_table_directory_for_account(acc, table_name) {
+        return match directory_listing(db, acc, table_name, req) {
+            Ok(records) => Response {
+                status: "OK".to_string(),
+                results: Some(records.into_iter().map(directory_row).collect()),
+                ..Default::default()
+            },
+            Err(resp) => resp,
+        };
+    }
     let handle = match db.table_ready_for_read(acc, table_name) {
         Some(handle) => handle,
         None => match resolve_file(db, acc, table_name) {
@@ -630,6 +713,9 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
         Ok(name) => name.to_string(),
         Err(resp) => return resp,
     };
+    if db.is_table_directory_for_account(acc, &table_name) {
+        return directory_write(db, acc, &table_name, req);
+    }
     // Resolved once, and held: deserialization needs the dictionary and the
     // write needs the records. Resolving a second time would take this file's
     // lock again - and on a file several connections are writing at once, that
@@ -668,6 +754,151 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
         },
         Err(e) => db_error_in("Save error", e),
     }
+}
+
+/// `READ` against a directory file: the record's bytes, exactly as they are on
+/// disk.
+///
+/// The reply's `record` is the *value* rather than an object of field names,
+/// because a directory file has no field names to key it by - the whole record
+/// is its bytes. It is a JSON string when those bytes are text and the
+/// `{"$base64": "..."}` envelope when they are not, which is the same pair of
+/// shapes a sub-value already travels in, so a client that learned the envelope
+/// for step 1 needs nothing new for this.
+fn directory_read(db: &Database, acc: &str, name: &str, req: &Request) -> Response {
+    if let Err(resp) = directory_has_no_dictionary(name, req.is_dict.unwrap_or(false)) {
+        return resp;
+    }
+    let key = match req.key.as_deref() {
+        Some(key) => key,
+        None => return error(ErrorCode::MissingField, "Key not specified"),
+    };
+    match db.read_directory_record(acc, name, key) {
+        Ok(Some(bytes)) => Response {
+            status: "OK".to_string(),
+            record: Some(Database::bytes_to_json(&bytes)),
+            ..Default::default()
+        },
+        Ok(None) => error(ErrorCode::RecordNotFound, "Record not found"),
+        Err(e) => db_error(e),
+    }
+}
+
+/// `WRITE` against a directory file: exactly these bytes become the file.
+///
+/// `structured_data` is refused rather than flattened. It describes a record in
+/// fields, and a directory file has none; writing the flattened form would
+/// store marks the caller never asked for and read back as something else.
+fn directory_write(db: &Database, acc: &str, name: &str, req: Request) -> Response {
+    if let Err(resp) = directory_has_no_dictionary(name, req.is_dict.unwrap_or(false)) {
+        return resp;
+    }
+    let key = match req.key.as_deref() {
+        Some(key) => key,
+        None => return error(ErrorCode::MissingField, "Key not specified"),
+    };
+    if req.structured_data.is_some() {
+        return error(
+            ErrorCode::InvalidData,
+            "A directory file's record is its bytes, not fields: send them in data, as a string or a \
+             {\"$base64\": \"...\"} envelope",
+        );
+    }
+    let bytes: Vec<u8> = match req.data.as_ref() {
+        None => return error(ErrorCode::MissingField, "Data not specified"),
+        Some(value) => match Database::bytes_from_json(value) {
+            Some(bytes) => bytes,
+            None => {
+                return error(
+                    ErrorCode::InvalidData,
+                    "A directory file's record is its bytes: send a string, or a {\"$base64\": \"...\"} \
+                     envelope holding valid base64",
+                );
+            }
+        },
+    };
+    match db.write_directory_record(acc, name, key, &bytes) {
+        Ok(()) => Response {
+            status: "OK".to_string(),
+            ..Default::default()
+        },
+        Err(e) => db_error(e),
+    }
+}
+
+/// The keys of a directory file, for the commands that enumerate rather than
+/// fetch.
+///
+/// A criterion, a sort and an explode are each refused rather than ignored. All
+/// three are read against a dictionary field, a directory file has none, and a
+/// `WITH` clause that quietly matched everything would be a wrong answer
+/// delivered with `status: "OK"`.
+#[allow(clippy::result_large_err)]
+fn directory_listing(
+    db: &Database,
+    acc: &str,
+    name: &str,
+    req: &Request,
+) -> Result<Vec<crate::db::DirectoryRecord>, Response> {
+    directory_has_no_dictionary(name, req.is_dict.unwrap_or(false))?;
+    let named = [
+        req.query_node.is_some().then_some("query_node"),
+        req.query_string
+            .as_deref()
+            .filter(|q| !q.trim().is_empty())
+            .map(|_| "query_string"),
+        req.sort_specs
+            .as_ref()
+            .filter(|specs| !specs.is_empty())
+            .map(|_| "sort_specs"),
+        req.explode
+            .as_ref()
+            .filter(|fields| !fields.is_empty())
+            .map(|_| "explode"),
+    ];
+    if let Some(clause) = named.into_iter().flatten().next() {
+        return Err(error(
+            ErrorCode::InvalidRequest,
+            format!(
+                "'{}' is a directory file: its records are host files with no fields, so {} has nothing to \
+                 read - the keys come back in name order",
+                name, clause
+            ),
+        ));
+    }
+    db.directory_records(acc, name).map_err(db_error)
+}
+
+/// One enumerated record as a result row: the key and how large it is, never
+/// its bytes.
+///
+/// Listing a file of scans must not cost the scans, which it would if a row
+/// carried the content. `READ` fetches one record and `EXTRACT` streams one to
+/// a file; those are the two ways bytes leave a directory file, and both name
+/// the record they are about.
+fn directory_row(record: crate::db::DirectoryRecord) -> (String, serde_json::Value) {
+    (record.key, serde_json::json!({ "size": record.bytes }))
+}
+
+/// Refuses `is_dict` against a directory file.
+///
+/// A dictionary describes fields, and a directory file's records have none, so
+/// `is_dict` there names a section that exists on disk and governs nothing. A
+/// caller acting on what it read back would be acting on a promise that is not
+/// kept.
+#[allow(clippy::result_large_err)]
+fn directory_has_no_dictionary(name: &str, is_dict: bool) -> Result<(), Response> {
+    if !is_dict {
+        return Ok(());
+    }
+    Err(error(
+        ErrorCode::InvalidRequest,
+        format!(
+            "'{}' is a directory file: its records are host files with no fields, so it has no dictionary \
+             to read or write",
+            name
+        ),
+    ))
 }
 
 /// The record a `WRITE`-shaped request describes, in the file's own terms.
@@ -806,6 +1037,19 @@ fn delete_record(db: &Database, acc: &str, req: Request) -> Response {
         None => return error(ErrorCode::MissingField, "Key not specified"),
     };
     let is_dict = req.is_dict.unwrap_or(false);
+    if db.is_table_directory_for_account(acc, &table_name) {
+        if let Err(resp) = directory_has_no_dictionary(&table_name, is_dict) {
+            return resp;
+        }
+        return match db.delete_directory_record(acc, &table_name, &key) {
+            Ok(true) => Response {
+                status: "OK".to_string(),
+                ..Default::default()
+            },
+            Ok(false) => error(ErrorCode::RecordNotFound, "Record not found"),
+            Err(e) => db_error(e),
+        };
+    }
 
     {
         let handle = match resolve_file(db, acc, &table_name) {
@@ -1091,6 +1335,31 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             let is_dict = req.is_dict.unwrap_or(false);
             let list_name = req.list_name.clone().unwrap_or_else(|| "DEFAULT".to_string());
 
+            // A directory file's keys come from the host directory rather than
+            // from a table, and the list holds nothing else: `GET.NEXT` reads
+            // each record's size back off the disk when it pages them, so a
+            // list taken now does not pin bytes that may be rewritten before it
+            // is read.
+            if db.is_table_directory_for_account(acc, &table_name) {
+                let records = match directory_listing(db, acc, &table_name, &req) {
+                    Ok(records) => records,
+                    Err(resp) => return resp,
+                };
+                let list = crate::db::SelectList::from_keys(
+                    table_name,
+                    false,
+                    records.into_iter().map(|record| record.key).collect(),
+                );
+                let count = list.len();
+                db.remote_select_lists
+                    .insert(list_name, crate::db::RemoteSelectList::new(acc.to_string(), list));
+                return Response {
+                    status: "OK".to_string(),
+                    count: Some(count),
+                    ..Default::default()
+                };
+            }
+
             let (query_node, sort_specs, explode_specs) = match resolve_clause(db, &table_name, &req) {
                 Ok(clause) => clause,
                 Err(response) => return response,
@@ -1201,6 +1470,33 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             };
 
             let acc = list_account.as_str();
+            // The same rule the listing commands follow: a row says how large a
+            // record is and never what is in it, so paging a file of scans
+            // costs a `stat` per row rather than the scans.
+            if db.is_table_directory_for_account(acc, &table_name) {
+                let mut results_processed = Vec::with_capacity(entries_batch.len());
+                for entry in &entries_batch {
+                    let size = match db.read_directory_size(acc, &table_name, &entry.key) {
+                        Ok(Some(size)) => size,
+                        // Deleted since the list was taken. Skipped rather than
+                        // reported as zero bytes, which would read as an empty
+                        // record that is still there.
+                        Ok(None) => continue,
+                        Err(e) => return db_error(e),
+                    };
+                    results_processed.push(directory_row(crate::db::DirectoryRecord {
+                        key: entry.key.clone(),
+                        bytes: size,
+                    }));
+                }
+                let results_len = results_processed.len();
+                return Response {
+                    status: "OK".to_string(),
+                    results: Some(results_processed),
+                    count: Some(results_len),
+                    ..Default::default()
+                };
+            }
             if let Err(e) = db.get_table_mut_for_account(acc, &table_name) {
                 return db_error(e);
             }
@@ -1319,7 +1615,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             match db.create_table_with(acc, &name, attributes) {
                 Ok(_) => Response {
                     status: "OK".to_string(),
-                    record: Some(file_attributes_json(acc, &name, attributes)),
+                    record: Some(file_attributes_json(db, acc, &name)),
                     ..Default::default()
                 },
                 Err(e) => db_error(e),
@@ -1348,6 +1644,8 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 && req.queue.is_none()
                 && req.visibility_timeout.is_none()
                 && req.max_deliveries.is_none()
+                && req.directory.is_none()
+                && req.path.is_none()
             {
                 return error(
                     ErrorCode::MissingField,
@@ -1362,7 +1660,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             match db.set_file_attributes_for_account(acc, &name, attributes, "attributes") {
                 Ok(_) => Response {
                     status: "OK".to_string(),
-                    record: Some(file_attributes_json(acc, &name, attributes)),
+                    record: Some(file_attributes_json(db, acc, &name)),
                     ..Default::default()
                 },
                 Err(e) => db_error(e),
@@ -1667,6 +1965,10 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     let value = serde_json::json!({
                         "durable": attributes.durable,
                         "queue": attributes.queue.is_some(),
+                        // The type, so a client knows which commands the file
+                        // answers before it tries one. Free here: it is read
+                        // off the same DIR entry the other two flags are.
+                        "directory": attributes.is_directory(),
                         "health": health.verdict.as_str(),
                         "health_reasons": health.reasons,
                     });

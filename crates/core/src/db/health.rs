@@ -85,6 +85,12 @@ pub mod thresholds {
     /// few enough that a file with a modulus of 65,536 still sends a small reply.
     pub const DISTRIBUTION_BUCKETS: usize = 16;
 
+    /// A directory file's largest record against the configured maximum, past
+    /// which a write of one is refused. Watched before it is reached, because
+    /// the refusal arrives on the write and the operator would rather hear
+    /// about it on the dashboard.
+    pub const DIRECTORY_SIZE_WATCH: f64 = 0.75;
+
     /// Values an index histogram returns by default.
     pub const HISTOGRAM_DEFAULT: usize = 10;
     /// Most an `INDEX.STATS` caller may ask for, so one request cannot ask the
@@ -198,6 +204,67 @@ impl Health {
     }
 }
 
+/// The verdicts on a directory file.
+///
+/// Two things are worth saying about one, and neither is about a hash. The
+/// records are host files, which is what it is *for* and therefore `Good` and
+/// not a caveat; and the largest of them against the configured limit is the
+/// one number that turns into a refusal, so it is the one worth watching before
+/// it does.
+fn directory_health(stats: &crate::db::models::DirectoryFileStats) -> Health {
+    let mut measures = Vec::new();
+    measures.push(Measure::new(
+        "format",
+        "Storage format",
+        "directory file",
+        Verdict::Good,
+        "not applicable: a directory file has no hashed section",
+        format!(
+            "Records are the files of {}, written whole and never framed, so no byte of one can be \
+             read as structure and none of them is held in the table cache.",
+            stats.path
+        ),
+    ));
+
+    let share = if stats.max_record_bytes == 0 {
+        0.0
+    } else {
+        stats.largest_bytes as f64 / stats.max_record_bytes as f64
+    };
+    let (verdict, advice) = if share >= 1.0 {
+        (
+            Verdict::Act,
+            "A record at or past the limit cannot be read back over the protocol. Raise \
+             max_directory_record_bytes, or take it out with EXTRACT and store it split.",
+        )
+    } else if share >= thresholds::DIRECTORY_SIZE_WATCH {
+        (
+            Verdict::Watch,
+            "The largest record is approaching the configured limit, past which a write of one is \
+             refused. Raise max_directory_record_bytes before it is.",
+        )
+    } else {
+        (
+            Verdict::Good,
+            "The largest record is well inside the configured limit, so no write is near being \
+             refused for its size.",
+        )
+    };
+    measures.push(Measure::new(
+        "largest_record",
+        "Largest record",
+        format!("{} of {}", bytes(stats.largest_bytes), bytes(stats.max_record_bytes)),
+        verdict,
+        &format!(
+            "{:.0}% of max_directory_record_bytes",
+            thresholds::DIRECTORY_SIZE_WATCH * 100.0
+        ),
+        advice,
+    ));
+
+    Health::of(measures)
+}
+
 /// A verdict without the measures behind it.
 ///
 /// What a *listing* carries. `LIST.FILES` and `LIST.ACCOUNTS` answer "which of
@@ -276,6 +343,13 @@ pub fn bytes(value: u64) -> String {
 /// [`FileStats`]: crate::db::models::FileStats
 pub fn file_health(stats: &crate::db::models::FileStats) -> Health {
     use thresholds as t;
+    // A directory file has no hashed section, so every measure below is about
+    // something it has not got: reporting "legacy flat file" and a skew of zero
+    // would be three wrong verdicts on a file that is working perfectly. It
+    // gets the two measures that are true of it instead.
+    if let Some(held) = stats.directory.as_ref() {
+        return directory_health(held);
+    }
     let mut measures = Vec::new();
     let groups = &stats.group_records;
 

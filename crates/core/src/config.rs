@@ -15,6 +15,12 @@ pub struct Config {
     /// Target number of records per hashfile group. Lower means smaller, faster
     /// group rewrites but more files; higher means the opposite.
     pub records_per_group: Option<usize>,
+    /// Largest record a directory file will read or write, in bytes. A
+    /// directory file's records are host files, so their size is decided by
+    /// what is on the disk rather than by what a client sent - this is what
+    /// turns a mistake there into a refusal instead of an allocation the
+    /// machine cannot meet. Defaults to 64 MiB.
+    pub max_directory_record_bytes: Option<u64>,
     /// How many files may be held in memory at once. Each is locked
     /// individually, so a larger cache is what lets writers to different files
     /// run in parallel instead of taking turns being loaded and evicted.
@@ -131,6 +137,7 @@ impl Default for Config {
             log_detail: Some("normal".to_string()),
             max_log_records: Some(100),
             records_per_group: None,
+            max_directory_record_bytes: None,
             max_loaded_tables: None,
             durable_writes: None,
             fsync: None,

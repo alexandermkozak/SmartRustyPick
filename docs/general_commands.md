@@ -14,8 +14,10 @@ Switch the current context to a different account.
 
 #### LIST.FILES
 
-List all files in the current account, with the durability of each: `Durable` is `yes` when every write to that file is
-flushed before it is acknowledged, which `SET.FILE` changes. This command reads from the `DIR` file.
+List all files in the current account with what the `DIR` file says about each: its `Type` — `F` for an ordinary file
+or `D` for a [directory file](#directory-files) — whether it is `Durable`, meaning every write to it is flushed before
+it is acknowledged, and whether it is a `Queue`. A directory file shows `-` for the last two: its records are host
+files, on the disk the moment a write returns, and there is no order to claim from.
 
 - **Usage**: `LIST.FILES`
 - **Example**: `LIST.FILES`
@@ -26,6 +28,8 @@ Store a record in the database.
 
 - **Usage**: `SET [DICT] <table> <key> <data>`
 - **Example**: `SET USERS 1 Ted^Smith]123-4567`
+- On a [directory file](#directory-files) the text as typed becomes the record's bytes, with no marks and no fields.
+  A record that is not typeable — a scan, a PDF — goes in with [`STORE`](#store) instead.
 
 #### GET
 
@@ -33,6 +37,8 @@ Retrieve a record by its key or via an active SELECT list.
 
 - **Usage**: `GET [DICT] <table> [<key>]`
 - **Example**: `GET USERS 1`
+- On a [directory file](#directory-files) this prints the record's bytes as text, replacing anything that is not valid
+  UTF-8 — a terminal has no other way to show a PNG. [`EXTRACT`](#extract) is how one leaves the database intact.
 
 #### DELETE
 
@@ -223,6 +229,51 @@ Retrieve a previously saved SELECT list.
 - **Usage**: `GET-LIST <name>`
 - **Example**: `GET-LIST TED_LIST`
 
+#### Directory files
+
+An ordinary record is made of fields, and the marks that separate them (`^`, `]`, `\` as you type them; `0xFE`,
+`0xFD`, `0xFC` on disk) **are** its structure — so a PNG, a PDF or a `.wasm` module cannot be one. The first mark byte
+inside it is indistinguishable from the separator it is, and reading the record back splits the value in two.
+
+A **directory file** is the file type for that content, and PICK has had it all along: it is a pointer to a real
+directory on the host, and its records are the files in it. The key is the file name; the record is the file's bytes.
+Nothing frames them, so nothing in them can be read as structure, and nothing caches them, so reading a forty megabyte
+record costs that one read rather than making the whole file resident.
+
+```text
+CREATE.FILE SCANS DIRECTORY
+STORE SCANS invoice-4471.pdf /home/alex/scans/4471.pdf
+LIST SCANS
+EXTRACT SCANS invoice-4471.pdf /tmp/out.pdf
+```
+
+`LIST` and `SELECT` on one give keys and sizes, never content — listing a file of scans must not cost the scans. `GET`
+and `SET` work on a record's bytes as text; `STORE` and `EXTRACT` move a host file in and out without it passing
+through the command line at all, which is what makes a gigabyte storable.
+
+A directory file has no dictionary, no index, and cannot be a queue or take part in a transaction: there are no fields
+to describe, index or test, and the `rename` that commits one of its records commits it on its own. Each of those is
+refused with a message saying so rather than answered with nothing. See
+[Data Structures](data_structures.md#directory-files) and [Storage Engine](storage.md#directory-files).
+
+#### STORE
+
+Copy a host file into a [directory file](#directory-files) as one record. The bytes are streamed rather than read into
+memory, so the size of the file is bounded by `max_directory_record_bytes` (64 MiB by default) and by nothing else.
+
+- **Usage**: `STORE <file> <key> <path>`
+- **Example**: `STORE SCANS invoice-4471.pdf /home/alex/scans/4471.pdf`
+
+#### EXTRACT
+
+Copy one record of a directory file back out to a host file, byte for byte. With no key and an active `SELECT` list,
+every selected record is written into the directory you name, each under its own key.
+
+- **Usage**: `EXTRACT <file> <key> <path>`
+- **Usage**: `EXTRACT <file> <directory>` — with an active `SELECT` list
+- **Example**: `EXTRACT SCANS invoice-4471.pdf /tmp/4471.pdf`
+- **Example**: `SELECT SCANS` then `EXTRACT SCANS /tmp/all-scans`
+
 #### CREATE.FILE
 
 Create a new table (both data and dictionary sections).
@@ -237,11 +288,19 @@ queue is `DURABLE` unless `BUFFERED` says otherwise. `TIMEOUT` sets how long a c
 (default 60), and `RETRIES` how many times a record is delivered before it moves to the dead-letter file (default 5);
 naming either implies `QUEUE`.
 
-- **Usage**: `CREATE.FILE <name> [DURABLE] [QUEUE [TIMEOUT <seconds>] [RETRIES <n>]]`
+`DIRECTORY` makes it a [directory file](#directory-files): its records are the files of a real directory on the host,
+which is where content that is not fields belongs. `PATH` points it at a directory that already exists, and naming it
+implies `DIRECTORY`; without one the records live in `<file>/records` inside the file's own directory and are removed
+with it by `DELETE.FILE`. A directory file cannot also be `DURABLE` or a `QUEUE`, and asking for either alongside it is
+refused rather than settled one way.
+
+- **Usage**: `CREATE.FILE <name> [DURABLE] [QUEUE [TIMEOUT <seconds>] [RETRIES <n>]] [DIRECTORY [PATH <dir>]]`
 - **Example**: `CREATE.FILE ORDERS`
 - **Example**: `CREATE.FILE LEDGER DURABLE`
 - **Example**: `CREATE.FILE JOBS QUEUE`
 - **Example**: `CREATE.FILE JOBS QUEUE TIMEOUT 300 RETRIES 3`
+- **Example**: `CREATE.FILE SCANS DIRECTORY`
+- **Example**: `CREATE.FILE SPOOL DIRECTORY PATH /srv/incoming`
 
 #### SET.FILE
 
@@ -251,7 +310,9 @@ claim policy.
 Only the flags you name change, so a `SET.FILE JOBS DURABLE` cannot quietly stop `JOBS` being a queue. Promoting a
 file flushes what it still had buffered as part of the change, so the flag never gets ahead of the data it protects.
 `BUFFERED` returns the file to the database's ordinary flush policy, and `NOQUEUE` returns a queue to an ordinary
-file without touching a record, dropping the order and the delivery counts with it. The one exception to "only what you name": a file becoming a queue becomes `DURABLE`
+file without touching a record, dropping the order and the delivery counts with it. What `SET.FILE` will not change is
+a file's *type*: an ordinary file's records are inside a hashed section and a
+[directory file](#directory-files)'s are host files, so converting one is a rewrite of every record rather than a flag. The one exception to "only what you name": a file becoming a queue becomes `DURABLE`
 with it unless `BUFFERED` says otherwise, for the reason a queue is created durable. `DIR` carries the attributes for the other files and cannot be set itself. See
 [Storage Engine](storage.md).
 

@@ -11,7 +11,7 @@
  */
 import {reactive} from 'vue'
 import HealthPill from '@shared/components/HealthPill.vue'
-import type {FileEntry, QueueDraft} from '../types'
+import type {DirectoryDraft, FileEntry, QueueDraft} from '../types'
 
 const props = defineProps<{
   account: string | null
@@ -22,11 +22,36 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{
   select: [file: string]
-  create: [name: string, durable: boolean, queue: QueueDraft | null]
+  create: [
+    name: string,
+    durable: boolean,
+    queue: QueueDraft | null,
+    directory: DirectoryDraft | null,
+  ]
   drop: [name: string]
 }>()
 
-const draft = reactive({name: '', durable: false, queue: false, timeout: '', retries: ''})
+const draft = reactive({
+  name: '',
+  durable: false,
+  queue: false,
+  directory: false,
+  timeout: '',
+  retries: '',
+  path: '',
+})
+
+/**
+ * A directory file, or nothing when the form is not asking for one.
+ *
+ * A blank path is left out rather than sent as an empty string: the database
+ * has a default place for the records, and this page is not where it is decided.
+ */
+function directoryDraft(): DirectoryDraft | null {
+  if (!draft.directory) return null
+  const path = draft.path.trim()
+  return path ? {path} : {}
+}
 
 /**
  * The claim policy the form asks for, or nothing when it is not a queue.
@@ -48,8 +73,29 @@ function queueDraft(): QueueDraft | null {
 function create(): void {
   const name = draft.name.trim()
   if (!name) return
-  emit('create', name, draft.durable, queueDraft())
-  Object.assign(draft, {name: '', durable: false, queue: false, timeout: '', retries: ''})
+  emit('create', name, draft.durable, queueDraft(), directoryDraft())
+  Object.assign(draft, {
+    name: '',
+    durable: false,
+    queue: false,
+    directory: false,
+    timeout: '',
+    retries: '',
+    path: '',
+  })
+}
+
+/**
+ * The three types are exclusive, so choosing one clears the others rather than
+ * letting a request be assembled that the database will refuse. A directory
+ * file has no buffered writes to make durable and no order to claim from.
+ */
+function chooseDirectory(): void {
+  if (draft.directory) Object.assign(draft, {durable: false, queue: false})
+}
+
+function chooseQueue(): void {
+  if (draft.queue) draft.directory = false
 }
 
 /**
@@ -91,6 +137,13 @@ function drop(name: string): void {
               queue
             </span>
             <span
+              v-if="file.directory"
+              class="tag directory"
+              title="Records are the files of a real directory on the host"
+            >
+              directory
+            </span>
+            <span
               v-if="file.durable"
               class="tag durable"
               title="Every write is flushed before it is acknowledged"
@@ -124,10 +177,33 @@ function drop(name: string): void {
       Durable
     </label>
     <label class="check">
-      <input v-model="draft.queue" type="checkbox" />
+      <input v-model="draft.queue" type="checkbox" @change="chooseQueue" />
       Queue
     </label>
+    <label class="check">
+      <input v-model="draft.directory" type="checkbox" @change="chooseDirectory" />
+      Directory
+    </label>
     <button :disabled="busy || !draft.name.trim()" class="small" type="submit">Create file</button>
+  </form>
+  <!-- Only once the file is to be a directory file. A path is optional: without
+       one the records live inside the file's own directory and are removed with
+       it, which is what most of them should do. -->
+  <form
+    v-if="account && draft.directory"
+    class="inline-form spaced new-file"
+    @submit.prevent="create"
+  >
+    <input
+      v-model="draft.path"
+      aria-label="Host directory the records are the files of"
+      autocomplete="off"
+      placeholder="/srv/scans (optional)"
+    />
+    <span class="note">
+      Records are host files: no fields, no dictionary, no index. Left blank, they live inside the
+      file's own directory.
+    </span>
   </form>
   <!-- Only once the file is to be a queue: the two numbers mean nothing on an
        ordinary file, and a form that always showed them would suggest they do. -->

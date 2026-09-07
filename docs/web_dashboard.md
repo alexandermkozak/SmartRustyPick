@@ -63,7 +63,7 @@ by default), so they follow `ca_path` rather than littering the working director
 | Overview       | Uptime, listener, connection and request totals, pending writes, tables in memory, every connection open right now, and a storage roll-up naming the accounts that need attention. |
 | Authorizations | Every authorized client: name, thumbprint, allowed accounts, admin flag. Authorize a thumbprint, add or remove accounts, revoke. |
 | Certificates   | Issue a certificate signed by the server's CA, authorized in the same step, with its key downloadable once.                      |
-| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Accounts and files can be created and dropped, durable and queue files are tagged in the listing and either flag can be turned on or off, a queue's depth and in-flight count are reported, and the selected file's dictionary and indexes are listed and managed below. |
+| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Accounts and files can be created and dropped, durable, queue and directory files are tagged in the listing, durability and the queue flag can be turned on or off, a queue's depth and in-flight count are reported, and the selected file's dictionary and indexes are listed and managed below. |
 
 File statistics cover the record and dictionary counts, the indexes the file carries, the hash modulus and group
 distribution, bytes on disk, the durability flag and whether the file is currently held in the server's cache. Record
@@ -123,6 +123,13 @@ queue; with three claims a few seconds old it is a working one. The claim policy
 claim is held and how many deliveries a record gets — is listed with them. Reading the panel sweeps the claims that
 have lapsed, so an in-flight count never includes one that expired ten minutes ago.
 
+**Directory files.** A [directory file](storage.md#directory-files) is tagged in the listing and described in place of
+the layout, because every row the layout carries — the modulus, the group files, the records per group, the skew — is
+about a hashed section it has not got, and a modulus of zero reads as a fault rather than as "not applicable". What it
+shows instead is where the records are, what they weigh, the largest of them and the limit a write past which is
+refused. Neither of the two buttons below appears on one: its type is fixed when it was created, and it has no buffered
+writes to make durable.
+
 **What the dashboard changes rather than reports.** Two things, both beside the statistics. **Make durable** promotes
 the file so every write to it is flushed before being acknowledged, and **Buffer writes** returns it to the database's
 flush policy; promoting flushes what the file still had buffered, so no data is at risk while the flag lands. **Make a
@@ -141,13 +148,16 @@ asked for. See [Storage Engine](storage.md).
 Under the account list is a field that creates one. **Create account** makes an empty one (`CREATE.ACCOUNT`) and
 **Create demo** makes the populated fixture (`CREATE.TEST.ACCOUNT`) — the same one the CLI creates, with `USERS` and
 `PRODUCTS` files, their dictionaries, a multivalued field whose values go one level deeper still, a price carrying
-an `MD2` conversion, an [association group](data_structures.md#association-groups) over the `PRODUCTS` suppliers, and a
-`JOBS` [queue](storage.md#queue-files) with three records already on it. It is the quickest way to have something real to point the file statistics and the dictionary
-editor at. Each row carries a **Drop** (`DELETE.ACCOUNT`). The same pair sits under the file list: a name with **Durable** and
-**Queue** ticks creates a file (`CREATE.FILE`, with whichever it is given from its first write), and each file has its
-own **Drop** (`DELETE.FILE`). Ticking **Queue** reveals two more fields — how long a claim is held and how many
-deliveries a record gets — which travel with the create rather than following it, so a queue is never briefly running on
-a timeout nobody asked for; left blank, the database's own defaults apply. All four are admin commands, so a dashboard
+an `MD2` conversion, an [association group](data_structures.md#association-groups) over the `PRODUCTS` suppliers, a
+`JOBS` [queue](storage.md#queue-files) with three records already on it, and an `ATTACHMENTS`
+[directory file](storage.md#directory-files) holding a record whose bytes an ordinary record could not carry. It is the quickest way to have something real to point the file statistics and the dictionary
+editor at. Each row carries a **Drop** (`DELETE.ACCOUNT`). The same pair sits under the file list: a name with **Durable**,
+**Queue** and **Directory** ticks creates a file (`CREATE.FILE`, with whichever it is given from its first write), and
+each file has its own **Drop** (`DELETE.FILE`). Ticking **Queue** reveals two more fields — how long a claim is held and
+how many deliveries a record gets — which travel with the create rather than following it, so a queue is never briefly
+running on a timeout nobody asked for; left blank, the database's own defaults apply. Ticking **Directory** reveals an
+optional host path and clears the other two, because a directory file is neither: its records are host files, on disk
+the moment a write returns, with no order to claim from. All four are admin commands, so a dashboard
 whose certificate is not an admin one is refused by the database and says so.
 
 Both drops confirm first, naming what goes with them — an account drop names the number of files it takes. Two things

@@ -2,6 +2,7 @@ mod cache;
 #[cfg(test)]
 mod cache_tests;
 pub mod dictionary;
+pub mod directory;
 pub mod queue;
 pub mod transaction;
 
@@ -276,6 +277,11 @@ pub struct Database {
     pub max_log_records: usize,
     /// Records each group aims to hold; drives the dynamic modulus.
     pub records_per_group: usize,
+    /// Largest record a directory file will read or write. Bounds the one path
+    /// in the engine whose size is chosen by whatever is on the host's disk
+    /// rather than by what a caller sent, so a mistake is a refusal instead of
+    /// an allocation the machine cannot meet.
+    max_directory_record_bytes: u64,
     /// When true every write is flushed immediately, trading throughput for
     /// the guarantee that an acknowledged write survives a crash.
     pub durable_writes: bool,
@@ -434,6 +440,10 @@ impl Database {
                 .records_per_group
                 .filter(|n| *n > 0)
                 .unwrap_or(hashfile::DEFAULT_RECORDS_PER_GROUP),
+            max_directory_record_bytes: config
+                .max_directory_record_bytes
+                .filter(|n| *n > 0)
+                .unwrap_or(crate::db::directory::DEFAULT_MAX_RECORD_BYTES),
             durable_writes: config.durable_writes.unwrap_or(false),
             fsync: FsyncPolicy::from_config(config.fsync.as_deref()),
             durable_fsync: match config.fsync.as_deref() {
@@ -1570,6 +1580,22 @@ impl Database {
             .then(|| self.queue_statistics(account, name).ok())
             .flatten();
 
+        // A directory file's records are not in the section above, so every
+        // figure derived from it is zero and saying so is the honest answer.
+        // What it holds is counted from the directory entries instead - a
+        // `stat` per record and not a read.
+        let directory_stats = self.file_attributes_for_account(account, name).directory.map(|policy| {
+            let root = self.directory_root_from(account, name, &policy);
+            let held = crate::db::directory::stats(&root).unwrap_or_default();
+            DirectoryFileStats {
+                path: root.to_string_lossy().into_owned(),
+                record_count: held.record_count,
+                bytes: held.bytes,
+                largest_bytes: held.largest_bytes,
+                max_record_bytes: self.max_directory_record_bytes,
+            }
+        });
+
         let loaded_table = self.get_table_read_only_for_account(account, name);
         let loaded = loaded_table.is_some();
         let record_count = match &loaded_table {
@@ -1595,6 +1621,7 @@ impl Database {
         let mut stats = FileStats {
             indexes,
             queue,
+            directory: directory_stats,
             account: account.to_string(),
             name: name.to_string(),
             record_count,
@@ -1635,6 +1662,14 @@ impl Database {
             group_records: distribution,
             health: crate::db::health::Health::default(),
         };
+        // A directory file's records live outside the file's own directory when
+        // it points at one, so the tree walk above did not see them.
+        if let Some(held) = stats.directory.as_ref() {
+            stats.record_count = held.record_count;
+            if !Path::new(&held.path).starts_with(&file_dir) {
+                stats.disk_bytes += held.bytes;
+            }
+        }
         // Judged last, from the numbers above, so the verdicts and the values
         // they are about cannot be built apart and get out of step.
         stats.health = crate::db::health::file_health(&stats);
@@ -1651,6 +1686,14 @@ impl Database {
     /// an index has fallen behind the records. The full measures arrive with
     /// `FILE.STATS`.
     pub fn file_health_summary(&self, account: &str, name: &str) -> HealthSummary {
+        // A directory file's hashed section is empty by construction, and the
+        // measures below are all about one. There is nothing a listing can
+        // cheaply say against it, and "good" is the true answer rather than a
+        // shrug: a directory file is either readable or it is a missing path,
+        // and finding that out costs a `stat` that a listing does not spend.
+        if self.is_table_directory_for_account(account, name) {
+            return HealthSummary::good();
+        }
         let file_dir = self.file_dir(account, name);
         let meta = hashfile::read_meta(&format!("{}/data", file_dir));
         let mut summary = HealthSummary::good();
@@ -1685,6 +1728,22 @@ impl Database {
             .collect()
     }
 
+    /// Refuses an index on a directory file.
+    ///
+    /// An index maps a dictionary field's values to the keys carrying them, and
+    /// a directory file has no fields: the whole record is its bytes. Building
+    /// one would mean reading every record to index nothing.
+    fn refuse_index_on_directory(&self, account: &str, file: &str) -> DbResult<()> {
+        if self.is_table_directory_for_account(account, file) {
+            return Err(self.directory_file_refusal(
+                file,
+                "its records are host files with no fields to index",
+                "use SELECT to list its keys and READ or EXTRACT to fetch one",
+            ));
+        }
+        Ok(())
+    }
+
     /// Creates an index on a dictionary field of one file and writes it out.
     ///
     /// Building it is a single pass over the records, which is the one O(file)
@@ -1702,6 +1761,7 @@ impl Database {
         field: &str,
         exclude: &[String],
     ) -> DbResult<IndexStats> {
+        self.refuse_index_on_directory(account, file)?;
         let handle = self.get_table_mut_for_account(account, file)?;
         {
             let mut table = handle.write();
@@ -1721,6 +1781,7 @@ impl Database {
 
     /// Drops an index and removes its section from disk.
     pub fn drop_index_for_account(&self, account: &str, file: &str, field: &str) -> DbResult<()> {
+        self.refuse_index_on_directory(account, file)?;
         let field = field.trim();
         let handle = self.get_table_mut_for_account(account, file)?;
         let dropped = handle.write().drop_index(field);
@@ -1743,6 +1804,7 @@ impl Database {
     /// The repair for an index that is stale, and the way to bring one back
     /// after its section has been damaged or removed underneath the server.
     pub fn rebuild_index_for_account(&self, account: &str, file: &str, field: &str) -> DbResult<IndexStats> {
+        self.refuse_index_on_directory(account, file)?;
         let field = field.trim();
         let handle = self.get_table_mut_for_account(account, file)?;
         {
@@ -1965,7 +2027,15 @@ impl Database {
     }
 
     pub fn create_table_for_account_durable(&self, account: &str, name: &str, durable: bool) -> DbResult<()> {
-        self.create_table_with(account, name, FileAttributes { durable, queue: None })
+        self.create_table_with(
+            account,
+            name,
+            FileAttributes {
+                durable,
+                queue: None,
+                directory: None,
+            },
+        )
     }
 
     /// Creates a file with the `DIR` attributes it is to carry.
@@ -1977,6 +2047,16 @@ impl Database {
     /// `sync_dir_file_for_account` already makes.
     pub fn create_table_with(&self, account: &str, name: &str, attributes: FileAttributes) -> DbResult<()> {
         self.create_table_for_account(account, name)?;
+        // The directory a directory file's records are the files of is made
+        // here, before the entry naming it is written, so a `CREATE.FILE` that
+        // cannot reach the path an operator gave fails with that path in the
+        // message rather than succeeding and failing on the first record.
+        if let Some(policy) = attributes.directory.as_ref()
+            && let Err(e) = crate::db::directory::ensure_root(&self.directory_root_from(account, name, policy))
+        {
+            let _ = self.delete_table_for_account(account, name);
+            return Err(e);
+        }
         if attributes != FileAttributes::default() {
             self.set_file_attributes_for_account(account, name, attributes, "attributes")?;
         }
@@ -2090,7 +2170,7 @@ impl Database {
         dir_table.records.clear();
         for t in tables {
             if t != "DIR" {
-                let carried = attributes.get(&t).copied().unwrap_or_default();
+                let carried = attributes.get(&t).cloned().unwrap_or_default();
                 dir_table.records.insert(t, carried.to_record());
             }
         }
@@ -2102,12 +2182,13 @@ impl Database {
     fn ensure_dir_dictionary(dir_table: &mut Table) {
         // Attribute number, heading, justification and width, in the order
         // `DIR`'s attributes are defined in `models.rs`.
-        const ENTRIES: [(&str, &str); 5] = [
+        const ENTRIES: [(&str, &str); 6] = [
             ("TYPE", "1^TYPE^L^1"),
             ("DURABLE", "2^DURABLE^L^7"),
             ("QUEUE", "3^QUEUE^L^5"),
             ("QUEUE.TIMEOUT", "4^TIMEOUT^R^7"),
             ("QUEUE.RETRIES", "5^RETRIES^R^7"),
+            ("PATH", "6^PATH^L^40"),
         ];
         for (name, definition) in ENTRIES {
             if !dir_table.dictionary.contains_key(name) {
@@ -2193,10 +2274,11 @@ impl Database {
             dir_table.insert_record(name, attributes.to_record());
             Self::ensure_dir_dictionary(&mut dir_table);
         }
+        let is_queue = attributes.queue.is_some();
         wlock(&self.file_attributes).insert((account.to_string(), name.to_string()), attributes);
         // A file that has just become - or stopped being - a queue has to pick
         // up or drop its in-memory ordering before the next command reaches it.
-        self.reattach_queue(account, name, attributes.queue.is_some())?;
+        self.reattach_queue(account, name, is_queue)?;
         self.save()
     }
 
@@ -2219,7 +2301,7 @@ impl Database {
     pub fn file_attributes_for_account(&self, account: &str, name: &str) -> FileAttributes {
         let key = (account.to_string(), name.to_string());
         if let Some(attributes) = rlock(&self.file_attributes).get(&key) {
-            return *attributes;
+            return attributes.clone();
         }
         let has_dir = name != "DIR" && self.account_has_table(account, "DIR");
         let attributes = if has_dir {
@@ -2230,7 +2312,7 @@ impl Database {
         } else {
             FileAttributes::default()
         };
-        wlock(&self.file_attributes).insert(key, attributes);
+        wlock(&self.file_attributes).insert(key, attributes.clone());
         attributes
     }
 
@@ -2380,6 +2462,35 @@ impl Database {
         match conversion {
             Some(code) => Self::apply_iconv(&text, code),
             None => text,
+        }
+    }
+
+    /// A whole record's bytes as JSON, for the files whose records have no
+    /// fields to key an object by.
+    ///
+    /// The same two shapes a sub-value travels in - a string when the bytes are
+    /// valid UTF-8 and the `{"$base64": "..."}` envelope when they are not - so
+    /// a client that already handles binary sub-values handles these with no
+    /// new code. See [`crate::db::directory`].
+    pub fn bytes_to_json(bytes: &[u8]) -> serde_json::Value {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => serde_json::Value::String(text.to_string()),
+            Err(_) => Self::binary_json(bytes),
+        }
+    }
+
+    /// The mirror of [`bytes_to_json`](Self::bytes_to_json): a string, or the
+    /// envelope.
+    ///
+    /// `None` for anything else, including a number and a bare object. A record
+    /// that is a file's whole content is worth being explicit about: coercing
+    /// `42` into `"42"` here would mean a client's type error became bytes on
+    /// somebody's disk.
+    pub fn bytes_from_json(value: &serde_json::Value) -> Option<Vec<u8>> {
+        match value {
+            serde_json::Value::String(text) => Some(text.clone().into_bytes()),
+            object if Self::is_binary_json(object) => Self::binary_from_json(object),
+            _ => None,
         }
     }
 
@@ -2795,6 +2906,7 @@ impl Database {
                     visibility: Duration::from_secs(90),
                     max_deliveries: 3,
                 }),
+                directory: None,
             },
         )?;
         {
@@ -2817,6 +2929,32 @@ impl Database {
                 Record::from_display_string(&format!("{}^{}", kind, reference)),
             )?;
         }
+        // A directory file, so the fixture reaches the third file type as well.
+        // Its records carry the bytes an ordinary record cannot: `MARKS` holds
+        // all three mark bytes and an embedded NUL, which is exactly what a
+        // hashed section would split and lose, so anything that round-trips it
+        // has demonstrated the property this file type exists for.
+        self.create_table_with(
+            name,
+            "ATTACHMENTS",
+            FileAttributes {
+                durable: false,
+                queue: None,
+                directory: Some(DirectoryPolicy::default_path()),
+            },
+        )?;
+        self.write_directory_record(
+            name,
+            "ATTACHMENTS",
+            "README.txt",
+            b"A directory file's record is its bytes.\n",
+        )?;
+        self.write_directory_record(
+            name,
+            "ATTACHMENTS",
+            "MARKS.bin",
+            &[0xFE, 0xFD, 0xFC, 0x00, 0xFF, b'o', b'k'],
+        )?;
         self.save()?;
         if !original_account.is_empty() {
             let _ = self.logto(&original_account);
