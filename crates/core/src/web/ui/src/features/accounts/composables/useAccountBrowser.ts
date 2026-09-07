@@ -14,7 +14,7 @@ import {ref, watch} from 'vue'
 import {usePolling} from '@shared/composables/usePolling'
 import {useAlerts} from '@shared/composables/useAlerts'
 import {accountsApi} from '../api'
-import type {AccountStats, FileEntry, FileStats, QueueDraft} from '../types'
+import type {AccountStats, DirectoryDraft, FileEntry, FileStats, QueueDraft} from '../types'
 
 /**
  * What one `SET.FILE` changes. Every field is optional and only the ones
@@ -152,10 +152,14 @@ export function useAccountBrowser() {
         name: string,
         durable: boolean,
         queue?: QueueDraft | null,
+        directory?: DirectoryDraft | null,
     ): Promise<boolean> {
         const account = selectedAccount.value
         if (!account) return false
-        return maintain(() => accountsApi.createFile(account, name, durable, queue), true)
+        return maintain(
+            () => accountsApi.createFile(account, name, durable, queue, directory),
+            true,
+        )
     }
 
     async function deleteFile(name: string): Promise<boolean> {

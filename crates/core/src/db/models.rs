@@ -17,10 +17,11 @@ pub const SYS_LOGS_MESSAGE_IDX: usize = 0;
 pub const SYS_LOGS_DETAIL_IDX: usize = 1;
 // DIR entries describe the files of an account: field 1 is the entry type,
 // field 2 the per-file durability flag ("Y" = flush every write immediately),
-// field 3 the queue flag, and fields 4 and 5 that queue's claim policy. A file
-// carries its own policy because a queue of thirty-second jobs and a queue of
-// hour-long ones need different answers, and DIR is where a per-file answer
-// already survives a rebuild of the listing.
+// field 3 the queue flag, fields 4 and 5 that queue's claim policy, and field 6
+// the host directory a directory file points at. A file carries its own policy
+// because a queue of thirty-second jobs and a queue of hour-long ones need
+// different answers, and DIR is where a per-file answer already survives a
+// rebuild of the listing.
 pub const DIR_TYPE_IDX: usize = 0;
 pub const DIR_DURABLE_IDX: usize = 1;
 pub const DIR_QUEUE_IDX: usize = 2;
@@ -30,6 +31,17 @@ pub const DIR_QUEUE_TIMEOUT_IDX: usize = 3;
 /// Attribute 5: deliveries this queue gives a record before dead lettering it.
 /// Empty means [`crate::db::queue::DEFAULT_MAX_DELIVERIES`].
 pub const DIR_QUEUE_RETRIES_IDX: usize = 4;
+/// Attribute 6: the host directory a directory file's records are the files of.
+/// Only read when attribute 1 is [`DIR_TYPE_DIRECTORY`]; empty there means the
+/// default place inside the file's own directory.
+pub const DIR_PATH_IDX: usize = 5;
+
+/// Attribute 1 of an ordinary file - one whose records live in its own hashed
+/// section.
+pub const DIR_TYPE_FILE: &str = "F";
+/// Attribute 1 of a directory file, whose records are the files of a real
+/// directory on the host. `D` is what PICK calls the same thing.
+pub const DIR_TYPE_DIRECTORY: &str = "D";
 
 /// One `DIR` entry, read as what it says about the file rather than as five
 /// attributes to be picked apart at each call site.
@@ -38,12 +50,52 @@ pub const DIR_QUEUE_RETRIES_IDX: usize = 4;
 /// rebuilding the listing - and the rebuild is the one that matters: it
 /// reconstructs every entry from the filesystem, which knows none of this, so
 /// each attribute has to be carried across in one piece or be lost.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileAttributes {
     /// Every write to this file is flushed before it is acknowledged.
     pub durable: bool,
     /// The claim policy, for a file that is a queue. `None` for an ordinary one.
     pub queue: Option<crate::db::queue::QueuePolicy>,
+    /// Where the records are, for a file that is a directory file. `None` for
+    /// every other file, which is what keeps the type off the path they take.
+    ///
+    /// This is the one attribute that is not `Copy`, and deliberately not
+    /// squeezed into something that would be: a host path is what a directory
+    /// file *is*, and carrying it anywhere but beside the flag that says the
+    /// file has one is how the two get out of step.
+    pub directory: Option<DirectoryPolicy>,
+}
+
+/// Where a directory file keeps its records.
+///
+/// `path` empty means the default, `<file>/records` inside the file's own
+/// directory - which is where they belong unless an operator deliberately
+/// pointed the file at a tree that already exists. Held as the text the `DIR`
+/// entry carries rather than as a resolved `PathBuf`, because the entry is what
+/// survives a rebuild of the listing and the resolution needs the account's
+/// storage directory, which this does not know.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectoryPolicy {
+    /// The host directory, or empty for the default place.
+    pub path: String,
+}
+
+impl DirectoryPolicy {
+    /// A directory file that keeps its records where the engine puts them.
+    pub fn default_path() -> Self {
+        DirectoryPolicy { path: String::new() }
+    }
+
+    /// A directory file pointing at a host directory of its own.
+    pub fn at(path: impl Into<String>) -> Self {
+        DirectoryPolicy { path: path.into() }
+    }
+
+    /// The host path, or `None` for the default place.
+    pub fn explicit_path(&self) -> Option<&str> {
+        let path = self.path.trim();
+        (!path.is_empty()).then_some(path)
+    }
 }
 
 impl FileAttributes {
@@ -58,6 +110,21 @@ impl FileAttributes {
                 "Y" | "YES" | "1" | "TRUE" | "DURABLE" | "QUEUE"
             )
         };
+        // The type decides the shape of the rest: a directory file has no
+        // section to buffer writes to and no order to claim from, so reading a
+        // durability or queue flag off one would describe something it has not
+        // got. An entry that says both is a hand-edited entry, and the type is
+        // the half that says where the records are.
+        let directory = attribute(DIR_TYPE_IDX).trim().to_uppercase() == DIR_TYPE_DIRECTORY;
+        if directory {
+            return FileAttributes {
+                durable: false,
+                queue: None,
+                directory: Some(DirectoryPolicy {
+                    path: attribute(DIR_PATH_IDX).trim().to_string(),
+                }),
+            };
+        }
         FileAttributes {
             durable: flag(DIR_DURABLE_IDX),
             queue: flag(DIR_QUEUE_IDX).then(|| {
@@ -66,6 +133,7 @@ impl FileAttributes {
                     &attribute(DIR_QUEUE_RETRIES_IDX),
                 )
             }),
+            directory: None,
         }
     }
 
@@ -75,16 +143,25 @@ impl FileAttributes {
     /// defaults: the entry is what an administrator reads to find out what a
     /// queue will do, and "blank, which means sixty" is a worse answer than
     /// "60".
-    pub fn to_record(self) -> Record {
+    pub fn to_record(&self) -> Record {
         let mut rec = Record::new();
-        while rec.fields.len() <= DIR_QUEUE_RETRIES_IDX {
+        while rec.fields.len() <= DIR_PATH_IDX {
             rec.fields.push(Field::default());
         }
         let mut set = |idx: usize, text: String| rec.fields[idx].values = vec![Value::text(text)];
-        set(DIR_TYPE_IDX, "F".to_string());
+        let directory = self.directory.as_ref();
+        set(
+            DIR_TYPE_IDX,
+            if directory.is_some() {
+                DIR_TYPE_DIRECTORY
+            } else {
+                DIR_TYPE_FILE
+            }
+            .to_string(),
+        );
         set(DIR_DURABLE_IDX, if self.durable { "Y" } else { "" }.to_string());
         set(DIR_QUEUE_IDX, if self.queue.is_some() { "Y" } else { "" }.to_string());
-        let (timeout, retries) = match self.queue {
+        let (timeout, retries) = match &self.queue {
             Some(policy) => (
                 policy.visibility_seconds().to_string(),
                 policy.max_deliveries.to_string(),
@@ -93,7 +170,16 @@ impl FileAttributes {
         };
         set(DIR_QUEUE_TIMEOUT_IDX, timeout);
         set(DIR_QUEUE_RETRIES_IDX, retries);
+        set(
+            DIR_PATH_IDX,
+            directory.map(|policy| policy.path.clone()).unwrap_or_default(),
+        );
         rec
+    }
+
+    /// True when this file's records are the files of a host directory.
+    pub fn is_directory(&self) -> bool {
+        self.directory.is_some()
     }
 }
 
@@ -240,8 +326,8 @@ impl Record {
     /// structure, so a mark inside a sub-value is indistinguishable from the
     /// separator it is, and reading it back splits the value in two. That is
     /// the MultiValue data model, and it is why content that may contain
-    /// arbitrary bytes belongs in a blob section referenced by the record
-    /// rather than inlined into one (see #32).
+    /// arbitrary bytes belongs in a directory file, whose records are host
+    /// files and are never framed at all - see [`crate::db::directory`].
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut res = Vec::new();
         for (i, f) in self.fields.iter().enumerate() {
@@ -1052,6 +1138,25 @@ pub struct QueueStats {
     pub dead_letter: bool,
 }
 
+/// What a directory file holds, from the directory entries alone.
+///
+/// Reading none of it is the point: the count and the byte total come from the
+/// `stat` of each entry, so `FILE.STATS` on a file of scans costs a directory
+/// scan and not the scans.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct DirectoryFileStats {
+    /// The host directory the records are the files of.
+    pub path: String,
+    /// Files in it, not counting the debris of an interrupted write.
+    pub record_count: u64,
+    /// Their sizes, added up.
+    pub bytes: u64,
+    /// The largest of them: the read a client has to be ready for.
+    pub largest_bytes: u64,
+    /// Largest record this server will read or write, from the configuration.
+    pub max_record_bytes: u64,
+}
+
 /// Statistics for a single data file. Deliberately record free: the dashboard
 /// navigates files, it does not browse their contents.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -1092,6 +1197,12 @@ pub struct FileStats {
     /// reader can tell "not a queue" from "a build that does not know about
     /// queues".
     pub queue: Option<QueueStats>,
+    /// What this file holds as a directory file, or `None` when it is not one.
+    /// Its own object for the reason `queue` is: the numbers that describe a
+    /// tree of host files are not the numbers that describe a hashed section,
+    /// and the hashed ones above are all zero for a directory file because
+    /// there is no section for them to be about.
+    pub directory: Option<DirectoryFileStats>,
 
     // --- Derived measures. Everything below is computed from the section
     // metadata and the group trailers; none of it reads a record.

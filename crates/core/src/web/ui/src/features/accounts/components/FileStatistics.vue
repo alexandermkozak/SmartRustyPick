@@ -64,6 +64,23 @@ function headroom(file: FileStats): string {
 const rows = computed<Array<[string, string]>>(() => {
   const file = props.stats
   if (!file) return []
+  // A directory file has no hashed section, so every row below the first two
+  // would be about something it has not got: a modulus of zero, no groups, and
+  // a skew over nothing. It gets the rows that are true of it instead.
+  if (file.directory) {
+    return [
+      ['Records', count(file.directory.record_count)],
+      ['Records in', file.directory.path],
+      ['On disk', bytes(file.directory.bytes)],
+      ['Largest record', bytes(file.directory.largest_bytes)],
+      ['Limit per record', bytes(file.directory.max_record_bytes)],
+      ['In memory', 'no — a directory file is never cached'],
+      [
+        'Last modified',
+        file.modified_seconds_ago === null ? '—' : `${duration(file.modified_seconds_ago)} ago`,
+      ],
+    ]
+  }
   return [
     ['Records', count(file.record_count)],
     ['Dictionary entries', count(file.dict_count)],
@@ -87,8 +104,12 @@ const rows = computed<Array<[string, string]>>(() => {
 })
 
 // DIR holds the flags rather than carrying one, so it is the one file the
-// database refuses to set. Saying so beats offering a button that always fails.
-const settable = computed(() => props.stats !== null && props.stats.name !== 'DIR')
+// database refuses to set. A directory file is the other: it has no buffered
+// writes to make durable and no order to claim from, and its type is fixed when
+// it is created. Saying so beats offering two buttons that always fail.
+const settable = computed(
+  () => props.stats !== null && props.stats.name !== 'DIR' && !props.stats.directory,
+)
 
 function toggleDurable(): void {
   if (!props.stats) return
@@ -147,7 +168,7 @@ const queueRows = computed<Array<[string, string]>>(() => {
       <h4>Health — {{ verdictLabel(health.verdict) }}</h4>
       <HealthTable :health="health" />
 
-      <template v-if="stats.group_records && stats.group_records.groups">
+      <template v-if="!stats.directory && stats.group_records && stats.group_records.groups">
         <h4>Records per group</h4>
         <DistributionChart
           :buckets="stats.group_records.buckets"
@@ -176,8 +197,13 @@ const queueRows = computed<Array<[string, string]>>(() => {
         </p>
       </template>
 
-      <h4>Layout</h4>
+      <h4>{{ stats.directory ? 'Directory file' : 'Layout' }}</h4>
       <StatList :rows="rows" />
+      <p v-if="stats.directory" class="note">
+        Its records are the files of that directory, written whole and never framed — so content
+        that is not fields survives byte for byte, and none of it is held in memory. It has no
+        dictionary and no index, because a record has no fields to describe.
+      </p>
 
       <div v-if="settable" class="file-actions">
         <button :disabled="changing" class="small" type="button" @click="toggleDurable">
@@ -201,6 +227,10 @@ const queueRows = computed<Array<[string, string]>>(() => {
           }}
         </p>
       </div>
+      <p v-else-if="stats.directory" class="note">
+        A file’s type is fixed when it is created, and a directory file has nothing to buffer: a
+        record is on disk when the write returns.
+      </p>
       <p v-else class="note">
         DIR carries the other files’ attributes; its own writes are always flushed.
       </p>

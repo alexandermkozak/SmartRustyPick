@@ -291,6 +291,19 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                 "file": name,
                 "durable": flag(&body, "durable"),
             });
+            // A directory file, whose records are the files of a host
+            // directory. Sent instead of the durability flag rather than
+            // beside it: a directory file has no buffered writes to make
+            // durable, and the database refuses a request that asks for both.
+            if flag(&body, "directory") {
+                let object = request.as_object_mut().expect("built as an object");
+                object.remove("durable");
+                object.insert("directory".to_string(), json!(true));
+                if let Some(path) = field(&body, "path") {
+                    object.insert("path".to_string(), json!(path));
+                }
+                return run(client, request).await;
+            }
             // A queue is created with its claim policy, so the file is never
             // briefly a queue running on defaults nobody asked for.
             if flag(&body, "queue") {

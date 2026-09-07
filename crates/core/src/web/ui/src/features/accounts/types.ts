@@ -26,6 +26,10 @@ export interface FileEntry {
      *  it is in the same `DIR` entry the durability flag is - while a queue's
      *  depth and in-flight count cost a load and arrive with `FILE.STATS`. */
     queue: boolean
+    /** A directory file: its records are the files of a real directory on the
+     *  host, so it has no fields, no dictionary and no index. Read from the
+     *  same `DIR` entry the other two flags are. */
+    directory: boolean
     /**
      * The *cheap* verdict: section metadata and index `state` files only, no
      * group trailers and no records. Enough to say which file is worth
@@ -132,6 +136,10 @@ export interface FileStats {
     indexes?: IndexStats[]
     /** Null for a file that is not a queue. */
     queue?: QueueStats | null
+    /** Null for a file that is not a directory file. Everything the hashed
+     *  section describes above is zero on one, because it has no such
+     *  section. */
+    directory?: DirectoryFileStats | null
 
     // Derived measures. All of it comes from the section metadata and the group
     // trailers; none of it reads a record.
@@ -173,6 +181,22 @@ export interface QueueStats {
 }
 
 /**
+ * What a directory file holds, counted from the host directory's entries rather
+ * than by reading a record.
+ */
+export interface DirectoryFileStats {
+    /** Where the records are, resolved rather than as the `DIR` entry spells
+     *  it: an entry that says nothing means the default place. */
+    path: string
+    record_count: number
+    bytes: number
+    /** The largest record: the read a client has to be ready for. */
+    largest_bytes: number
+    /** Largest record this server will read or write, from its configuration. */
+    max_record_bytes: number
+}
+
+/**
  * The queue attributes a create or a change may carry. Both are optional, and
  * an omitted one leaves the database's own default - or, on a change, whatever
  * the file already has.
@@ -180,6 +204,16 @@ export interface QueueStats {
 export interface QueueDraft {
     visibility_timeout?: number
     max_deliveries?: number
+}
+
+/**
+ * What a directory file's create may carry: where its records go. An omitted
+ * path leaves them in the default place inside the file's own directory, which
+ * is where they belong unless an operator is deliberately pointing the file at a
+ * tree that already exists.
+ */
+export interface DirectoryDraft {
+    path?: string
 }
 
 /**

@@ -1,6 +1,9 @@
 pub mod base64;
 #[cfg(test)]
 mod db_tests;
+pub mod directory;
+#[cfg(test)]
+mod directory_tests;
 #[cfg(test)]
 mod durability_tests;
 pub mod engine;
@@ -34,6 +37,8 @@ pub mod transaction;
 #[cfg(test)]
 mod transaction_tests;
 
+pub use directory::DirectoryStats;
+pub use engine::directory::DirectoryRecord;
 pub use engine::queue::QueueDelivery;
 pub use engine::{Database, TableHandle, TableKey};
 pub use error::{DbError, DbResult};

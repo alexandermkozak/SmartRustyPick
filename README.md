@@ -45,6 +45,11 @@ field formatting, and complex select operations.
 - **Queue Files**: A file created `QUEUE` keeps its records in arrival order and hands them out one at a time, so
   several consumers can divide work between them: a claim is exclusive, an unacknowledged one comes back after a
   timeout, and a record that keeps failing lands in a dead-letter file rather than looping forever.
+- **Directory Files**: A file created `DIRECTORY` is a pointer to a real directory on the host, and its records are the
+  files in it - the key is the file name, the record is the file's bytes. Nothing frames them, so a PNG, a PDF or a
+  `.wasm` module survives byte for byte where the marks of an ordinary record would split it; nothing caches them, so
+  reading one costs that read rather than making the whole file resident. `STORE` and `EXTRACT` stream a host file in
+  and out.
 - **Remote Access**: TCP SSL server with certificate authentication and CRUD protocol.
 - **Web Dashboard**: Browser-based management of connections, certificates, accounts, files, their dictionaries and live
   server activity, started automatically with the server.
@@ -81,6 +86,10 @@ Currently supported settings:
 - `ca_path`: Path to the CA certificate for client authentication (default: `.local/certs/ca.crt`). The CA private key
   is kept next to it as `ca.key`, and `GENERATE.CERT` writes new client certificates into the same directory.
 - `records_per_group`: Target records per hashfile group (default: 16).
+- `max_directory_record_bytes`: Largest record a [directory file](docs/storage.md#directory-files) will read or write
+  (default: 67108864, i.e. 64 MiB). Its records are host files, so their size is decided by what is on the disk rather
+  than by what a client sent; this turns a mistake there into a refusal instead of an allocation the machine cannot
+  meet.
 - `max_loaded_tables`: How many files may be held in memory at once (default: 64). Each is locked individually, so a
   larger cache is what lets writers to different files run in parallel rather than take turns being loaded and evicted.
 - `durable_writes`: Flush every write before acknowledging it (default: false). Individual files can opt in without this

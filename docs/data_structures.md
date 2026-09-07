@@ -33,12 +33,51 @@ Every byte value survives storage and retrieval untouched, **except the three ma
 `FM` (`0xFE`), `VM` (`0xFD`) and `SVM` (`0xFC`) are the structure of a record, so a mark
 inside a sub-value is indistinguishable from the separator it is, and reading the record
 back splits the value in two. That is the MultiValue data model rather than a defect, and
-it is why content that may contain arbitrary bytes belongs in a blob referenced by the
-record rather than inlined into one.
+it is why content that may contain arbitrary bytes belongs in a
+[directory file](#directory-files), whose records are host files and are never framed at
+all, rather than inlined into a record.
 
 Over the remote protocol, a sub-value that is not valid UTF-8 travels as
 `{"$base64": "..."}` — see [Protocol](protocol.md#values-that-are-not-text). A sub-value
 that *is* valid UTF-8 travels as a plain JSON string, exactly as before.
+
+#### Directory files
+
+A third file type, beside the ordinary hash file and the [queue file](storage.md#queue-files),
+and PICK has had it all along: a **directory file** is a pointer to a real directory on the
+host, and its records are the files in it. The key is the file name; the record is the file's
+bytes, exactly as they were written.
+
+It exists because of the paragraph above. The marks are the structure of a record, so a PNG,
+a PDF or a `.wasm` module cannot be a record of a hash file — the first `0xFE` in it splits
+the value in two. A directory file frames nothing, so there is no byte in a record that can be
+read as a separator, and no encoding to get wrong.
+
+It has a second property that matters as much. A hash file reads every group of a section into
+memory the first time one record of it is touched, so one read of one photograph would make
+every photograph resident. A directory file has no table at all: a record is read from its
+host file when it is asked for and is not kept, so the cost of a read is that read.
+
+What follows from "the record is a file":
+
+- **A record has no fields.** There is nothing to index, nothing for a `WITH` clause to test
+  and nothing for a dictionary to describe, and every command that would need one is refused
+  rather than answered with nothing. `LIST` and `SELECT` enumerate keys and sizes; `GET` and
+  `EXTRACT` fetch one record.
+- **A key has to be a host file name.** It is checked, not repaired: no separators, no leading
+  dot, no control bytes, at most 255 bytes. A key quietly repaired would be a write that reads
+  back under a name nobody asked for.
+- **A write is one file, atomically.** Written to a temporary and renamed over the key, so a
+  reader sees the old record or the new one. There is nothing buffered, so there is nothing
+  to flush and no durability flag to set.
+- **It cannot be a queue or take part in a transaction.** The `rename` that commits a record
+  commits it on its own and cannot be held back until the rest of a set is ready.
+
+Created with `CREATE.FILE <name> DIRECTORY [PATH <dir>]`. Without a path the records live in
+`<file>/records` inside the file's own directory, and are removed with it; with one, the file
+points at a directory that already exists and the files already in it are already records.
+See [General Commands](general_commands.md#directory-files) and
+[Protocol](protocol.md#directory-files).
 
 #### Dictionary Items
 Dictionary items are special records stored in the `dict` section of a table. They define how data in the `data` section is interpreted.
@@ -135,6 +174,10 @@ The database is stored in the `db_storage` directory, organized by account:
     - `meta`: Metadata file (version, modulus, record count).
     - `g<hex>`: Group files containing hashed records.
 - `db_storage/<account>/<table>/dict`: A flat file containing dictionary records.
+- `db_storage/<account>/<table>/records/`: The records of a [directory file](#directory-files)
+  created without a path of its own — one host file per record, named by its key, holding its
+  bytes and nothing else. A directory file created `PATH <dir>` keeps them in `<dir>` instead,
+  and `data.hf/` stays empty for either.
 - `db_storage/<account>/<table>/index.<field>.hf/`: A [secondary index](storage.md#secondary-indexes) on a dictionary
   field, in the same hashed layout as the records. Its keys are the indexed values and each record holds the keys
   carrying that value; a `state` file names the field, the attribute it resolved to and the data version it matches.

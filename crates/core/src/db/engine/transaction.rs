@@ -173,15 +173,30 @@ impl Database {
 
         let mut files = Vec::with_capacity(names.len());
         for name in names {
-            if self.file_attributes_for_account(account, name).queue.is_some() {
+            let attributes = self.file_attributes_for_account(account, name);
+            let outside = if attributes.queue.is_some() {
+                Some(format!(
+                    "'{}' is a queue file: its records are minted by ENQUEUE and claimed by DEQUEUE, \
+                     so a transaction cannot write them",
+                    name
+                ))
+            } else if attributes.is_directory() {
+                // A directory file commits with `rename`, which is atomic for
+                // the one record and reaches nothing else. There is no way to
+                // hold that write back until the rest of the set is ready, so a
+                // set naming one is refused rather than applied in a way that
+                // could not be undone if a later change failed.
+                Some(format!(
+                    "'{}' is a directory file: each of its records is committed on its own by the write that \
+                     renames it, so a transaction cannot hold one back until the rest of the set is ready",
+                    name
+                ))
+            } else {
+                None
+            };
+            if let Some(why) = outside {
                 match unusable {
-                    Unusable::Refuse => {
-                        return Err(DbError::TransactionScope(format!(
-                            "'{}' is a queue file: its records are minted by ENQUEUE and claimed by DEQUEUE, \
-                             so a transaction cannot write them",
-                            name
-                        )));
-                    }
+                    Unusable::Refuse => return Err(DbError::TransactionScope(why)),
                     Unusable::Skip => continue,
                 }
             }

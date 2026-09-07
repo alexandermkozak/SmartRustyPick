@@ -74,7 +74,34 @@ AI agents have been responsible for several critical improvements and fixes in t
   structures or features are added to the system - the `USERS` file now carries a multivalued `ROLES` field, one of
   whose values is sub-valued, `PRODUCTS` carries an association group whose members are deliberately ragged, and a
   `JOBS` queue file arrives with three records already enqueued, so the fixture reaches every level of the hierarchy,
-  both tiers of an association, and the ordering primitive as well as the record ones.
+  both tiers of an association, and the ordering primitive as well as the record ones. An `ATTACHMENTS` directory file
+  arrives with two records, one of which holds all three mark bytes and an embedded NUL - content an ordinary record
+  cannot carry, so anything that round-trips it has demonstrated what the third file type is for.
+- **Directory Files:** A third file type, and the answer to "how does a record hold a scanned invoice". The marks
+  `FM`, `VM` and `SVM` *are* a record's structure, so a PNG or a `.wasm` module cannot be one - the first `0xFE` in it
+  is indistinguishable from the separator it is. A file created `DIRECTORY` is a pointer to a real directory on the
+  host, PICK's own answer: the key is a file name, the record is that file's bytes, and nothing frames them so nothing
+  in them can be read as structure. `STORE` and `EXTRACT` stream a host file in and out, so a gigabyte is bounded by
+  `max_directory_record_bytes` and not by the 1 MiB request line.
+- **The property that decided the shape:** a directory file has **no table**, and therefore no table lock. Reading a
+  forty megabyte record must not block every writer to that file for the length of the read, and it cannot when there
+  is nothing to lock - `the_hot_paths_lock_a_file_a_fixed_number_of_times` gives every directory-file command a budget
+  of **zero**, beside the two an ordinary `READ` takes. It also means nothing is cached: `hashfile::load` reads every
+  group of a section into the table's map on the first touch, so one read of one photograph would otherwise make every
+  photograph resident.
+- **Refusals over empty answers.** A directory file has no fields, so a dictionary, an index and a `WITH` clause each
+  have nothing to work on, and every one of them is refused with a message saying what to use instead. A query that
+  quietly matches nothing is a wrong answer sent with `status: "OK"` - the same failure `INVALID_QUERY` was introduced
+  for. A transaction naming one is refused for a different reason: its `rename` commits a record on its own and cannot
+  be held back until the rest of the set is ready, so the refusal is `TRANSACTION_SCOPE` and nothing is applied.
+- **A key is checked, never repaired.** No separators, no leading dot, no control bytes, at most 255 bytes. A name
+  quietly sanitised is a write that succeeds and reads back under a key nobody asked for, and with `..` it is that plus
+  somebody else's directory. Same rule as the error codes: the refusal is the interface.
+- **The type is fixed at creation, and the `DIR` entry says which.** Attribute 1 is `D` rather than `F`, and it decides
+  how the rest of the entry reads - a directory file has no buffered writes to make durable and no order to claim from,
+  so attributes 2 to 5 read as empty on one whatever a hand-edited entry says. `SET.FILE` will not convert in either
+  direction: an ordinary file's records are inside a hashed section and a directory file's are host files, so flipping
+  the flag alone would leave a file whose entry says one thing and whose records are somewhere else.
 - **Transactions:** `TRANSACT` applies a set of writes and deletes across any number of files of one account so that
   either all of it is visible or none of it is. Nothing used to span records: a caller with two records that had to
   change together wrote one, then the other, and hoped. The set is written to an **intent** - tmp-then-rename, CRC32C

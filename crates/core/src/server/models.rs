@@ -53,6 +53,16 @@ pub struct Request {
     /// `CREATE.FILE` and `SET.FILE`: deliveries a record of this queue gets
     /// before it is moved to the dead-letter file.
     pub max_deliveries: Option<u32>,
+    /// `CREATE.FILE`: create the file as a directory file, whose records are
+    /// the files of a real directory on the host. Not settable on an existing
+    /// file: a file's type is fixed when it is created, because changing it
+    /// would move every record rather than flip a flag.
+    pub directory: Option<bool>,
+    /// `CREATE.FILE`: the host directory a directory file's records are the
+    /// files of. Absent means the default place inside the file's own
+    /// directory, which is where they belong unless an operator is
+    /// deliberately pointing the file at a tree that already exists.
+    pub path: Option<String>,
     /// `TRANSACT`: the writes and deletes to apply as one, all of them or none.
     /// Each carries its own file and key, so one set may span several files of
     /// the account - see [`ChangeSpec`].

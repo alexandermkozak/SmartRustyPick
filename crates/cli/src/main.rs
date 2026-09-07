@@ -1,7 +1,7 @@
 use smart_rusty_pick_core::config::Config;
 use smart_rusty_pick_core::db::{
-    Database, ExplodeSpec, Field, FileAttributes, QueueDelivery, Record, SelectEntry, SelectList, ValuePosition, queue,
-    report,
+    Database, DirectoryPolicy, DirectoryRecord, ExplodeSpec, Field, FileAttributes, QueueDelivery, Record, SelectEntry,
+    SelectList, ValuePosition, queue, report,
 };
 use smart_rusty_pick_core::server;
 use std::io::{self, Write};
@@ -182,6 +182,12 @@ fn main() -> io::Result<()> {
             "CT" => {
                 handle_ct(&mut db.write().unwrap(), &parts);
             }
+            "STORE" => {
+                handle_store(&db.read().unwrap(), &parts);
+            }
+            "EXTRACT" => {
+                handle_extract(&mut db.write().unwrap(), &parts);
+            }
             "SAVE-LIST" => {
                 handle_save_list(&mut db.write().unwrap(), &parts);
             }
@@ -356,6 +362,21 @@ fn handle_set(db: &mut Database, parts: &[&str]) {
     let key = parts[offset + 1].to_string();
     let data = parts[offset + 2..].join(" ");
 
+    if directory_file(db, table_name) {
+        if is_dict {
+            println!("{}", NO_DICTIONARY);
+            return;
+        }
+        // The text as typed becomes the file's bytes. A record that is not
+        // typeable - a PNG, a PDF - goes in with STORE, which streams a host
+        // file in rather than routing it through a command line.
+        match db.write_directory_record(&db.current_account(), table_name, &key, data.as_bytes()) {
+            Ok(()) => println!("OK"),
+            Err(e) => println!("Error: {}", e),
+        }
+        return;
+    }
+
     let handle = match db.get_table_mut(table_name) {
         Ok(handle) => handle,
         Err(e) => {
@@ -397,7 +418,6 @@ fn handle_get(db: &mut Database, parts: &[&str]) {
     }
 
     let table_name = parts[offset];
-
     if parts.len() < offset + 2 {
         // Try to use active select list
         let mut keys_from_list = None;
@@ -408,6 +428,20 @@ fn handle_get(db: &mut Database, parts: &[&str]) {
             keys_from_list = Some(list.unique_keys());
         }
 
+        if let Some(keys) = keys_from_list.as_ref()
+            && directory_file(db, table_name)
+        {
+            let account = db.current_account();
+            for key in keys {
+                match db.read_directory_record(&account, table_name, key) {
+                    Ok(Some(bytes)) => println!("{}: {}", key, String::from_utf8_lossy(&bytes)),
+                    Ok(None) => {}
+                    Err(e) => println!("{}: Error: {}", key, e),
+                }
+            }
+            db.active_select_list = None;
+            return;
+        }
         if let Some(keys) = keys_from_list {
             if let Some(handle) = db.get_table(table_name) {
                 let table = handle.read();
@@ -428,6 +462,22 @@ fn handle_get(db: &mut Database, parts: &[&str]) {
 
     let key = parts[offset + 1];
 
+    if directory_file(db, table_name) {
+        if is_dict {
+            println!("{}", NO_DICTIONARY);
+            return;
+        }
+        match db.read_directory_record(&db.current_account(), table_name, key) {
+            // Lossy on purpose, and only here: this is a terminal, and a record
+            // that is not text has no printable form. EXTRACT is how those
+            // leave the database intact.
+            Ok(Some(bytes)) => println!("{}", String::from_utf8_lossy(&bytes)),
+            Ok(None) => println!("NOT FOUND"),
+            Err(e) => println!("Error: {}", e),
+        }
+        return;
+    }
+
     if let Some(handle) = db.get_table(table_name) {
         let table = handle.read();
         let map = if is_dict { &table.dictionary } else { &table.records };
@@ -440,6 +490,20 @@ fn handle_get(db: &mut Database, parts: &[&str]) {
         println!("TABLE NOT FOUND");
     }
 }
+
+/// True when the account's current file of this name is a directory file, whose
+/// records are host files rather than rows of a hashed section.
+fn directory_file(db: &Database, table_name: &str) -> bool {
+    db.is_table_directory_for_account(&db.current_account(), table_name)
+}
+
+/// What a `DICT` command is told when the file has no fields to describe.
+const NO_DICTIONARY: &str =
+    "That is a directory file: its records are host files with no fields, so it has no dictionary.";
+
+/// What the commands that work attribute by attribute are told about one.
+const NO_FIELDS_TO_SHOW: &str = "That is a directory file: a record is its bytes rather than a set of fields. \
+                                 Use GET to print one, or EXTRACT to take it out whole.";
 
 fn handle_delete(db: &mut Database, parts: &[&str]) {
     // DELETE [DICT] <table> [<key>]
@@ -457,6 +521,11 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
     }
 
     let table_name = parts[offset];
+    let directory = directory_file(db, table_name);
+    if directory && is_dict {
+        println!("{}", NO_DICTIONARY);
+        return;
+    }
 
     if parts.len() < offset + 2 {
         // Try to use active select list
@@ -470,6 +539,20 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
             used_list = true;
         }
 
+        if used_list && directory {
+            let account = db.current_account();
+            let mut count = 0;
+            for key in keys_to_delete {
+                match db.delete_directory_record(&account, table_name, &key) {
+                    Ok(true) => count += 1,
+                    Ok(false) => {}
+                    Err(e) => println!("Error: {}", e),
+                }
+            }
+            println!("[{}] records deleted", count);
+            db.active_select_list = None;
+            return;
+        }
         if used_list {
             let handle = match db.get_table_mut(table_name) {
                 Ok(handle) => handle,
@@ -508,6 +591,15 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
 
     let key = parts[offset + 1];
 
+    if directory {
+        match db.delete_directory_record(&db.current_account(), table_name, key) {
+            Ok(true) => println!("OK"),
+            Ok(false) => println!("NOT FOUND"),
+            Err(e) => println!("Error: {}", e),
+        }
+        return;
+    }
+
     let handle = match db.get_table_mut(table_name) {
         Ok(handle) => handle,
         Err(e) => {
@@ -539,6 +631,63 @@ fn handle_delete(db: &mut Database, parts: &[&str]) {
     }
 }
 
+/// `LIST` against a directory file: one row per record, with its size.
+///
+/// Never its content. A column list, a `WITH` clause and a `BY` clause all read
+/// a dictionary field, and a directory file has none - a clause that quietly
+/// matched every record would be a wrong answer printed as a right one, so it
+/// is refused instead.
+fn list_directory(db: &Database, table_name: &str, is_dict: bool, rest: &[&str]) {
+    let records = match directory_rows(db, table_name, is_dict, rest) {
+        Some(records) => records,
+        None => return,
+    };
+    println!("{:<40} {:>12}", "KEY", "BYTES");
+    for record in &records {
+        println!("{:<40} {:>12}", record.key, record.bytes);
+    }
+    println!("[{}] records listed", records.len());
+}
+
+/// `SELECT` against a directory file: its keys become the active list, so the
+/// commands that take one - `GET`, `DELETE`, `EXTRACT` - work on it as they do
+/// on any other file.
+fn select_directory(db: &mut Database, table_name: &str, is_dict: bool, rest: &[&str]) {
+    let Some(records) = directory_rows(db, table_name, is_dict, rest) else {
+        return;
+    };
+    let count = records.len();
+    db.active_select_list = Some(SelectList::from_keys(
+        table_name.to_string(),
+        false,
+        records.into_iter().map(|record| record.key).collect(),
+    ));
+    println!("[{}] records selected", count);
+}
+
+/// The keys of a directory file, or `None` having already said why not.
+fn directory_rows(db: &Database, table_name: &str, is_dict: bool, rest: &[&str]) -> Option<Vec<DirectoryRecord>> {
+    if is_dict {
+        println!("{}", NO_DICTIONARY);
+        return None;
+    }
+    if !rest.is_empty() {
+        println!(
+            "That is a directory file: its records are host files with no fields, so '{}' has nothing to read. \
+             The keys come back in name order.",
+            rest.join(" ")
+        );
+        return None;
+    }
+    match db.directory_records(&db.current_account(), table_name) {
+        Ok(records) => Some(records),
+        Err(e) => {
+            println!("Error: {}", e);
+            None
+        }
+    }
+}
+
 fn handle_list(db: &mut Database, parts: &[&str]) {
     // LIST [DICT] <table> [<fields>...] [WITH <field> <op> <value>]
     //                     [BY|BY.DSND <field> ...] [BY.EXP <field> [<op> <value>]]
@@ -562,6 +711,10 @@ fn handle_list(db: &mut Database, parts: &[&str]) {
     let table_name = parts[offset];
     if !db.list_tables().contains(&table_name.to_string()) {
         println!("TABLE NOT FOUND");
+        return;
+    }
+    if directory_file(db, table_name) {
+        list_directory(db, table_name, is_dict, &parts[offset + 1..]);
         return;
     }
 
@@ -685,6 +838,11 @@ fn handle_select(db: &mut Database, parts: &[&str]) {
 
     let table_name = parts[offset];
 
+    if directory_file(db, table_name) {
+        select_directory(db, table_name, is_dict, &parts[offset + 1..]);
+        return;
+    }
+
     // Check if we should refine the active select list
     let keys_to_filter = if let Some(list) = &db.active_select_list {
         if list.table_name == table_name && list.is_dict == is_dict {
@@ -782,6 +940,13 @@ fn handle_edit(db: &mut Database, parts: &[&str], config: &Config) {
 
     let table_name = parts[offset];
     let key = parts[offset + 1];
+    if directory_file(db, table_name) {
+        // The editor round trip is through `to_edit_string`, which is fields
+        // separated by newlines. A directory file's record is bytes, and
+        // putting a PNG through a text editor is how it stops being one.
+        println!("{}", NO_FIELDS_TO_SHOW);
+        return;
+    }
 
     // Get current record content or empty string
     let current_content = if let Some(handle) = db.get_table(table_name) {
@@ -879,6 +1044,13 @@ fn handle_ct(db: &mut Database, parts: &[&str]) {
     }
 
     let table_name = parts[offset];
+    if directory_file(db, table_name) {
+        // CT decomposes a record into its attributes, and a directory file's
+        // record has none: it is one byte string, which GET already prints and
+        // EXTRACT takes out whole.
+        println!("{}", NO_FIELDS_TO_SHOW);
+        return;
+    }
 
     if parts.len() < offset + 2 {
         // Try to use active select list
@@ -926,6 +1098,91 @@ fn handle_ct(db: &mut Database, parts: &[&str]) {
         println!("TABLE NOT FOUND");
     }
 }
+
+/// `STORE <file> <key> <path>`: a host file becomes one record of a directory
+/// file.
+///
+/// The bytes are streamed rather than read into memory, which is what makes a
+/// gigabyte scan storable at all: the remote protocol's request line bounds a
+/// `WRITE` at `max_request_bytes`, and nothing bounds this but the configured
+/// maximum record size.
+fn handle_store(db: &Database, parts: &[&str]) {
+    if parts.len() < 4 {
+        println!("Usage: STORE <file> <key> <path>");
+        return;
+    }
+    let (file, key, path) = (parts[1], parts[2], parts[3..].join(" "));
+    if !directory_file(db, file) {
+        println!("{}", NOT_A_DIRECTORY_FILE);
+        return;
+    }
+    match db.store_directory_record(&db.current_account(), file, key, std::path::Path::new(&path)) {
+        Ok(bytes) => println!("[{}] {} stored, {} bytes", file, key, bytes),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+/// `EXTRACT <file> <key> <path>`: one record of a directory file becomes a host
+/// file, byte for byte.
+///
+/// With no key and an active `SELECT` list, every selected record is written
+/// into the directory `<path>` under its own key - which is the shape that
+/// makes emptying a file of scans one command rather than one per scan.
+fn handle_extract(db: &mut Database, parts: &[&str]) {
+    if parts.len() < 3 {
+        println!("Usage: EXTRACT <file> <key> <path>   (or EXTRACT <file> <directory> with an active SELECT list)");
+        return;
+    }
+    let file = parts[1];
+    if !directory_file(db, file) {
+        println!("{}", NOT_A_DIRECTORY_FILE);
+        return;
+    }
+    let account = db.current_account();
+
+    if parts.len() == 3 {
+        let target = parts[2];
+        let keys = match db.active_select_list.as_ref().filter(|list| list.table_name == file) {
+            Some(list) => list.unique_keys(),
+            None => {
+                println!("Usage: EXTRACT <file> <key> <path>");
+                println!("(Or SELECT the file first, and give a directory to write every selected record into)");
+                return;
+            }
+        };
+        if let Err(e) = std::fs::create_dir_all(target) {
+            println!("Error: {}", e);
+            return;
+        }
+        let mut count = 0;
+        for key in keys {
+            let destination = std::path::Path::new(target).join(&key);
+            match db.extract_directory_record(&account, file, &key, &destination) {
+                Ok(Some(_)) => count += 1,
+                Ok(None) => println!("[{}] {} is no longer there", file, key),
+                Err(e) => println!("Error: {}", e),
+            }
+        }
+        println!("[{}] records extracted to {}", count, target);
+        db.active_select_list = None;
+        return;
+    }
+
+    let (key, path) = (parts[2], parts[3..].join(" "));
+    match db.extract_directory_record(&account, file, key, std::path::Path::new(&path)) {
+        Ok(Some(bytes)) => println!("[{}] {} extracted to {}, {} bytes", file, key, path, bytes),
+        Ok(None) => println!("NOT FOUND"),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+/// What `STORE` and `EXTRACT` say when the file is an ordinary one.
+///
+/// They move whole files, and an ordinary file's records are fields inside a
+/// hashed section - a mark byte in the bytes of one would split it on the way
+/// back, which is the corruption a directory file exists to rule out.
+const NOT_A_DIRECTORY_FILE: &str = "STORE and EXTRACT work on directory files, whose records are host files. \
+                                    Create one with CREATE.FILE <name> DIRECTORY.";
 
 fn print_record_fields(record: &Record) {
     for (i, field) in record.fields.iter().enumerate() {
@@ -982,11 +1239,14 @@ fn print_help(current_account: &str) {
     println!("  HELP                                  - Show this help.");
     println!("  SAVE-LIST <name>                      - Save active select list.");
     println!("  GET-LIST <name>                       - Restore a saved select list.");
-    println!("  CREATE.FILE <name> [DURABLE] [QUEUE [TIMEOUT <s>] [RETRIES <n>]]");
+    println!("  CREATE.FILE <name> [DURABLE] [QUEUE [TIMEOUT <s>] [RETRIES <n>]] [DIRECTORY [PATH <dir>]]");
     println!("                                        - Create a new file (data and dict) (SYSTEM only).");
     println!("                                          DURABLE flushes every write to that file immediately.");
     println!("                                          QUEUE keeps arrival order and hands records out one at a");
     println!("                                          time; it implies DURABLE unless BUFFERED is given.");
+    println!("                                          DIRECTORY makes the records files of a real host");
+    println!("                                          directory, for content that is not fields - a scan, a");
+    println!("                                          PDF, a .wasm module. PATH points it at one that exists.");
     println!("  SET.FILE <name> [DURABLE | BUFFERED] [QUEUE | NOQUEUE] [TIMEOUT <s>] [RETRIES <n>]");
     println!("                                        - Change an existing file's attributes, keeping its records.");
     println!("                                          Turning durability on flushes what the file had buffered.");
@@ -995,6 +1255,9 @@ fn print_help(current_account: &str) {
     println!("  ACK <queue> <key>                     - The work succeeded: remove the record for good.");
     println!("  NACK <queue> <key>                    - The work failed: give it back now rather than on timeout.");
     println!("  PEEK <queue> [<key>]                  - Read the head of the queue, or one record, claiming nothing.");
+    println!("  STORE <file> <key> <path>             - Copy a host file in as one record of a directory file.");
+    println!("  EXTRACT <file> <key> <path>           - Copy one record back out to a host file, byte for byte.");
+    println!("  EXTRACT <file> <dir>                  - With an active SELECT list, every selected record into <dir>.");
     println!("  DELETE.FILE <name>                    - Delete a file (data and dict) (SYSTEM only).");
     println!("  CREATE.INDEX <file> <field> [EXCLUDE <value>...] - Index a dictionary field, so WITH <field> = ...");
     println!("                                          stops scanning. EXCLUDE names values not worth indexing.");
@@ -1011,7 +1274,8 @@ fn print_help(current_account: &str) {
     }
     println!("  DELETE.ACCOUNT <name>                 - Delete an account and all its files (SYSTEM only).");
     println!("  LOGTO <name>                          - Switch to a different account.");
-    println!("  LIST.FILES                            - List all files in the current account, with their durability.");
+    println!("  LIST.FILES                            - List all files in the current account, with their type,");
+    println!("                                          durability and whether they are a queue.");
     if current_account == "SYSTEM" {
         println!("  AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts> - Authorize a client.");
         println!("  ADD.CLIENT.ACCOUNT <name> <accounts>  - Add allowed accounts to a client.");
@@ -1147,7 +1411,8 @@ fn handle_get_list(db: &mut Database, parts: &[&str]) {
     }
 }
 
-const CREATE_FILE_USAGE: &str = "Usage: CREATE.FILE <file_name> [DURABLE] [QUEUE [TIMEOUT <seconds>] [RETRIES <n>]]";
+const CREATE_FILE_USAGE: &str =
+    "Usage: CREATE.FILE <file_name> [DURABLE] [QUEUE [TIMEOUT <seconds>] [RETRIES <n>]] [DIRECTORY [PATH <dir>]]";
 const SET_FILE_USAGE: &str =
     "Usage: SET.FILE <file_name> [DURABLE | BUFFERED] [QUEUE | NOQUEUE] [TIMEOUT <seconds>] [RETRIES <n>]";
 
@@ -1166,6 +1431,12 @@ fn parse_file_flags(
 ) -> Result<(FileAttributes, bool), String> {
     let mut policy = attributes.queue.unwrap_or_default();
     let mut wants_queue = attributes.queue.is_some();
+    let mut wants_directory = attributes.is_directory();
+    let mut path = attributes
+        .directory
+        .as_ref()
+        .map(|policy| policy.path.clone())
+        .unwrap_or_default();
     let mut durability_named = false;
     let mut index = 2;
     while index < parts.len() {
@@ -1194,6 +1465,15 @@ fn parse_file_flags(
             }
             "QUEUE" | "-Q" => wants_queue = true,
             "NOQUEUE" => wants_queue = false,
+            "DIRECTORY" | "DIR" => wants_directory = true,
+            "PATH" => {
+                let value = parts
+                    .get(index + 1)
+                    .ok_or_else(|| format!("PATH needs a directory. {}", usage))?;
+                path = (*value).to_string();
+                wants_directory = true;
+                index += 1;
+            }
             "TIMEOUT" => {
                 policy.visibility = Duration::from_secs(number("TIMEOUT", queue::MAX_VISIBILITY_SECONDS)?);
                 wants_queue = true;
@@ -1206,18 +1486,51 @@ fn parse_file_flags(
         }
         index += 1;
     }
+    if wants_directory {
+        // Refused rather than settled either way: a directory file has no
+        // buffered writes to make durable and no order to claim from, so a
+        // command asking for both has asked for two different files and the
+        // operator is the one who knows which.
+        if wants_queue {
+            return Err(format!(
+                "A directory file cannot be a queue: its records are host files, with no order to claim from. {}",
+                usage
+            ));
+        }
+        if durability_named {
+            return Err(format!(
+                "A directory file has no buffered writes to make durable: a record is on disk when the write returns. {}",
+                usage
+            ));
+        }
+        attributes.durable = false;
+        attributes.queue = None;
+        attributes.directory = Some(DirectoryPolicy { path });
+        return Ok((attributes, durability_named));
+    }
+    attributes.directory = None;
     attributes.queue = wants_queue.then_some(policy);
     Ok((attributes, durability_named))
 }
 
 /// How a file's attributes read back to a person.
-fn describe_file(attributes: FileAttributes) -> String {
+///
+/// `root` is where a directory file's records actually are, which is what an
+/// operator wants to be told: the entry says nothing when the file uses the
+/// default place, and "the default place" is a rule rather than an answer.
+fn describe_file(attributes: &FileAttributes, root: Option<&std::path::Path>) -> String {
+    if attributes.is_directory() {
+        return match root {
+            Some(root) => format!("directory file, records in {}", root.display()),
+            None => "directory file".to_string(),
+        };
+    }
     let durability = if attributes.durable {
         "durable writes"
     } else {
         "buffered writes"
     };
-    match attributes.queue {
+    match &attributes.queue {
         Some(policy) => format!(
             "queue, {}, {}s visibility, {} deliveries before dead-lettering",
             durability,
@@ -1246,8 +1559,20 @@ fn handle_create_file(db: &mut Database, parts: &[&str]) {
     // loses is the failure a queue exists to prevent. An explicit BUFFERED is
     // still honoured - the operator has said so.
     attributes.durable |= attributes.queue.is_some() && !durability_named;
-    match db.create_table_with(&db.current_account(), file_name, attributes) {
-        Ok(_) => println!("[{}] created (data and dict, {})", file_name, describe_file(attributes)),
+    let account = db.current_account();
+    let directory = attributes.is_directory();
+    match db.create_table_with(&account, file_name, attributes) {
+        Ok(_) => {
+            let settled = db.file_attributes_for_account(&account, file_name);
+            let root = db.directory_root(&account, file_name).ok();
+            let what = if directory { "records" } else { "data and dict" };
+            println!(
+                "[{}] created ({}, {})",
+                file_name,
+                what,
+                describe_file(&settled, root.as_deref())
+            );
+        }
         Err(e) => println!("Error: {}", e),
     }
 }
@@ -1260,7 +1585,7 @@ fn handle_set_file(db: &mut Database, parts: &[&str]) {
     let file_name = parts[1];
     let account = db.current_account();
     let current = db.file_attributes_for_account(&account, file_name);
-    let (mut attributes, durability_named) = match parse_file_flags(parts, current, SET_FILE_USAGE) {
+    let (mut attributes, durability_named) = match parse_file_flags(parts, current.clone(), SET_FILE_USAGE) {
         Ok(parsed) => parsed,
         Err(message) => {
             println!("{}", message);
@@ -1271,8 +1596,18 @@ fn handle_set_file(db: &mut Database, parts: &[&str]) {
     // is created durable. One that was already a queue keeps the durability it
     // has, so retuning its timeout does not undo a deliberate BUFFERED.
     attributes.durable |= attributes.queue.is_some() && current.queue.is_none() && !durability_named;
+    if attributes.is_directory() != current.is_directory() {
+        println!(
+            "Error: a file's type is fixed when it is created. Create a new file of the type you want and move the records"
+        );
+        return;
+    }
     match db.set_file_attributes(&account, file_name, attributes) {
-        Ok(_) => println!("[{}] now {}", file_name, describe_file(attributes)),
+        Ok(_) => {
+            let settled = db.file_attributes_for_account(&account, file_name);
+            let root = db.directory_root(&account, file_name).ok();
+            println!("[{}] now {}", file_name, describe_file(&settled, root.as_deref()));
+        }
         Err(e) => println!("Error: {}", e),
     }
 }
@@ -1620,15 +1955,28 @@ fn handle_file_stats(db: &Database, parts: &[&str]) {
         stats.dict_count,
         smart_rusty_pick_core::db::health::bytes(stats.disk_bytes),
     );
-    println!(
-        "  modulus {} over {} groups; records per group min {} / median {} / mean {} / max {}",
-        stats.modulus,
-        stats.group_count,
-        groups.min,
-        groups.median,
-        smart_rusty_pick_core::db::health::ratio(groups.mean),
-        groups.max,
-    );
+    // The modulus line is about a hashed section, and a directory file has
+    // none: printing "modulus 8 over 0 groups" beside a hundred scans would be
+    // three numbers that are all true and all about nothing.
+    if let Some(held) = &stats.directory {
+        println!("  directory file, records in {}", held.path);
+        println!(
+            "  {} of records, largest {}, limit {} per record",
+            smart_rusty_pick_core::db::health::bytes(held.bytes),
+            smart_rusty_pick_core::db::health::bytes(held.largest_bytes),
+            smart_rusty_pick_core::db::health::bytes(held.max_record_bytes),
+        );
+    } else {
+        println!(
+            "  modulus {} over {} groups; records per group min {} / median {} / mean {} / max {}",
+            stats.modulus,
+            stats.group_count,
+            groups.min,
+            groups.median,
+            smart_rusty_pick_core::db::health::ratio(groups.mean),
+            groups.max,
+        );
+    }
     if let Some(queue) = &stats.queue {
         let age = match queue.oldest_unacknowledged_seconds {
             Some(seconds) => format!("{}s", seconds),
@@ -1799,23 +2147,13 @@ fn handle_list_files(db: &mut Database) {
 
     // Collected first: reading each file's durability needs the database again,
     // and the DIR table is borrowed from it here.
+    // Every entry, whatever its type. Filtering to `F` used to be harmless
+    // because `F` was the only type there was; a directory file is `D`, and a
+    // listing that hid one would hide a file the account really has.
     let listed: Vec<String> = match db.get_table("DIR") {
         Some(handle) => {
             let table = handle.read();
-            let mut files: Vec<_> = table
-                .records
-                .iter()
-                .filter(|(_, record)| {
-                    record
-                        .fields
-                        .first()
-                        .and_then(|f| f.values.first())
-                        .map(|v| v.first_bytes())
-                        .unwrap_or_default()
-                        == b"F"
-                })
-                .map(|(name, _)| name.clone())
-                .collect();
+            let mut files: Vec<_> = table.records.keys().cloned().collect();
             files.sort();
             files
         }
@@ -1825,15 +2163,26 @@ fn handle_list_files(db: &mut Database) {
         }
     };
 
-    println!("{:<20} {:<10} {:<10}", "File", "Type", "Durable");
-    println!("{:-<20} {:-<10} {:-<10}", "", "", "");
+    println!("{:<20} {:<10} {:<10} {:<10}", "File", "Type", "Durable", "Queue");
+    println!("{:-<20} {:-<10} {:-<10} {:-<10}", "", "", "", "");
 
     // Asked per file rather than read off the DIR record: a database running
     // with durable_writes makes every file durable, and a listing that said
     // otherwise would be describing the DIR entry rather than what a write does.
     for name in listed {
-        let durable = if db.is_table_durable(&name) { "yes" } else { "no" };
-        println!("{:<20} {:<10} {:<10}", name, "F", durable);
+        let attributes = db.file_attributes_for_account(&db.current_account(), &name);
+        let (kind, durable, queue) = if attributes.is_directory() {
+            // A directory file has neither: its records are host files, on disk
+            // the moment a write returns, and there is no order to claim from.
+            ("D", "-", "-")
+        } else {
+            (
+                "F",
+                if db.is_table_durable(&name) { "yes" } else { "no" },
+                if attributes.queue.is_some() { "yes" } else { "no" },
+            )
+        };
+        println!("{:<20} {:<10} {:<10} {:<10}", name, kind, durable, queue);
     }
 }
 

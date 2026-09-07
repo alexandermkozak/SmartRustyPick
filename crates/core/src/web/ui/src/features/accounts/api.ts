@@ -4,6 +4,7 @@ import type {
     AccountStats,
     DictionaryDraft,
     DictionaryEntry,
+    DirectoryDraft,
     FileEntry,
     FileStats,
     IndexReport,
@@ -42,6 +43,7 @@ export const accountsApi = {
         const results = await pairs<{
             durable: boolean
             queue?: boolean
+            directory?: boolean
             health?: string
             health_reasons?: string[]
         }>(`/api/accounts/${encode(account)}/files`)
@@ -49,6 +51,7 @@ export const accountsApi = {
             name,
             durable: info.durable === true,
             queue: info.queue === true,
+            directory: info.directory === true,
             health: summaryOf(info.health, info.health_reasons),
         }))
     },
@@ -94,17 +97,27 @@ export const accountsApi = {
      *
      * The policy travels with the create rather than following it, so a queue is
      * never briefly running on a timeout nobody asked for.
+     *
+     * `directory` makes a directory file instead, whose records are the files of
+     * a host directory. It is exclusive with the other two rather than combined
+     * with them: a directory file has no buffered writes to make durable and no
+     * order to claim from, and the database refuses a request asking for both.
      */
     createFile: (
         account: string,
         name: string,
         durable: boolean,
         queue?: QueueDraft | null,
-    ): Promise<unknown> =>
-        call(`/api/accounts/${encode(account)}/files`, {
+        directory?: DirectoryDraft | null,
+    ): Promise<unknown> => {
+        let body: Record<string, unknown> = {name, durable}
+        if (directory) body = {name, directory: true, ...directory}
+        else if (queue) body = {name, durable, queue: true, ...queue}
+        return call(`/api/accounts/${encode(account)}/files`, {
             method: 'POST',
-            body: JSON.stringify(queue ? {name, durable, queue: true, ...queue} : {name, durable}),
-        }),
+            body: JSON.stringify(body),
+        })
+    },
 
     /** `DELETE.FILE`: the file, its records and its dictionary. Admin only. */
     deleteFile: (account: string, file: string): Promise<unknown> =>

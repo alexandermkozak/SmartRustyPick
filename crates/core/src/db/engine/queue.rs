@@ -140,6 +140,16 @@ impl Database {
     /// worse still.
     fn queue_file(&self, account: &str, name: &str) -> DbResult<(TableHandle, QueuePolicy)> {
         let attributes = self.file_attributes_for_account(account, name);
+        if attributes.is_directory() {
+            // Named before the general refusal below, because "use SET.FILE to
+            // convert it" is advice that will not work here: a file's type is
+            // fixed when it is created.
+            return Err(self.directory_file_refusal(
+                name,
+                "its records are host files, with no order to claim from",
+                "create a separate queue file if the work needs claiming",
+            ));
+        }
         let Some(policy) = attributes.queue else {
             return Err(DbError::InvalidRequest(format!(
                 "{} is not a queue file. Create it with CREATE.FILE {} QUEUE, or use SET.FILE to convert it",
@@ -455,6 +465,7 @@ impl Database {
                 FileAttributes {
                     durable: true,
                     queue: Some(self.queue_policy_for_account(account, queue_name)),
+                    directory: None,
                 },
             ) {
                 Ok(()) => {}

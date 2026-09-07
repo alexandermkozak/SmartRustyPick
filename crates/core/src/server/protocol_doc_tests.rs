@@ -44,6 +44,8 @@ const REQUEST_FIELDS: &[&str] = &[
     "queue",
     "visibility_timeout",
     "max_deliveries",
+    "directory",
+    "path",
     "changes",
 ];
 
@@ -377,6 +379,7 @@ fn file_stats_record_is_documented() {
             "modified_seconds_ago",
             "indexes",
             "queue",
+            "directory",
             "group_bytes",
             "index_bytes",
             "group_records",
@@ -410,6 +413,11 @@ fn file_stats_derived_objects_are_documented() {
             "unreadable",
             "buckets",
         ],
+    );
+    assert_documented_shape(
+        "FILE.STATS directory",
+        value_keys(&serde_json::to_value(crate::db::DirectoryFileStats::default()).unwrap()),
+        &["path", "record_count", "bytes", "largest_bytes", "max_record_bytes"],
     );
     assert_documented_shape(
         "FILE.STATS queue",

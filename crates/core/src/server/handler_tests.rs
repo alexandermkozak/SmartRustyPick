@@ -1287,7 +1287,7 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
     assert_eq!(created["account"], "DEMO");
     assert_eq!(
         created["files"],
-        serde_json::json!(["DIR", "JOBS", "PRODUCTS", "USERS"])
+        serde_json::json!(["ATTACHMENTS", "DIR", "JOBS", "PRODUCTS", "USERS"])
     );
 
     // The fixture reaches the ordering primitive as well as the record ones, so
@@ -1394,6 +1394,258 @@ fn test_the_demo_account_is_admin_only_and_needs_a_name() {
     assert_eq!(resp.code, Some(ErrorCode::MissingField));
 }
 
+/// Directory files over the wire: the round trip, the shapes the reply uses,
+/// and every command that must refuse rather than answer emptily.
+#[test]
+fn a_directory_file_round_trips_arbitrary_bytes_over_the_protocol() {
+    let dir = TempDir::new("handler_directory");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.set_current_account("");
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "admin".to_string(),
+        thumbprint: "tp".to_string(),
+        allowed_accounts: vec![],
+        is_admin: true,
+    };
+    let request = |command: &str| Request {
+        command: command.to_string(),
+        account: Some("DIRS".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        handle_request(
+            Request {
+                target_account: Some("DIRS".to_string()),
+                ..request("CREATE.ACCOUNT")
+            },
+            &db_arc,
+            &admin
+        )
+        .status,
+        "OK"
+    );
+    let created = handle_request(
+        Request {
+            file: Some("SCANS".to_string()),
+            directory: Some(true),
+            ..request("CREATE.FILE")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(created.status, "OK", "{:?}", created.message);
+    let settled = created.record.unwrap();
+    assert_eq!(settled["directory"], serde_json::json!(true));
+    assert!(
+        settled["path"].as_str().unwrap().ends_with("SCANS/records"),
+        "the reply says where the records actually are: {}",
+        settled["path"]
+    );
+
+    // The marks and an embedded NUL: exactly what an ordinary record cannot
+    // hold, travelling in the envelope step 1 already defined.
+    let hostile = [0xFEu8, b'a', 0xFD, 0xFC, 0x00, 0xFF];
+    let encoded = crate::db::base64::encode(&hostile);
+    let written = handle_request(
+        Request {
+            file: Some("SCANS".to_string()),
+            key: Some("scan.bin".to_string()),
+            data: Some(serde_json::json!({ "$base64": encoded })),
+            ..request("WRITE")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(written.status, "OK", "{:?}", written.message);
+
+    let read = handle_request(
+        Request {
+            file: Some("SCANS".to_string()),
+            key: Some("scan.bin".to_string()),
+            ..request("READ")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(read.status, "OK");
+    // The record is the value, not an object of field names: a directory file
+    // has no field names to key one by.
+    assert_eq!(read.record.unwrap(), serde_json::json!({ "$base64": encoded }));
+
+    // Text goes as a plain string in both directions, so the common case needs
+    // no envelope at all.
+    handle_request(
+        Request {
+            file: Some("SCANS".to_string()),
+            key: Some("note.txt".to_string()),
+            data: Some(serde_json::Value::String("plain".to_string())),
+            ..request("WRITE")
+        },
+        &db_arc,
+        &admin,
+    );
+    let read = handle_request(
+        Request {
+            file: Some("SCANS".to_string()),
+            key: Some("note.txt".to_string()),
+            ..request("READ")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(read.record.unwrap(), serde_json::json!("plain"));
+
+    // Listing gives sizes and never content.
+    let queried = handle_request(
+        Request {
+            file: Some("SCANS".to_string()),
+            ..request("QUERY")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(
+        queried.results.unwrap(),
+        vec![
+            ("note.txt".to_string(), serde_json::json!({ "size": 5 })),
+            ("scan.bin".to_string(), serde_json::json!({ "size": 6 })),
+        ]
+    );
+
+    // SELECT then GET.NEXT pages the same rows.
+    let selected = handle_request(
+        Request {
+            file: Some("SCANS".to_string()),
+            ..request("SELECT")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(selected.count, Some(2));
+    let next = handle_request(
+        Request {
+            batch_size: Some(10),
+            ..request("GET.NEXT")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(next.status, "OK");
+    assert_eq!(next.results.unwrap().len(), 2);
+
+    // Every refusal, each with the code a client branches on.
+    let refusals: Vec<(&str, Request)> = vec![
+        (
+            "a criterion, which would read a field the file has not got",
+            Request {
+                file: Some("SCANS".to_string()),
+                query_string: Some("WITH NAME = \"x\"".to_string()),
+                ..request("QUERY")
+            },
+        ),
+        (
+            "the dictionary section, which governs nothing here",
+            Request {
+                file: Some("SCANS".to_string()),
+                key: Some("scan.bin".to_string()),
+                is_dict: Some(true),
+                ..request("READ")
+            },
+        ),
+        (
+            "changing the file's type after it was created",
+            Request {
+                file: Some("SCANS".to_string()),
+                directory: Some(false),
+                ..request("SET.FILE")
+            },
+        ),
+        (
+            "making a directory file a queue",
+            Request {
+                file: Some("SPOOL".to_string()),
+                directory: Some(true),
+                queue: Some(true),
+                ..request("CREATE.FILE")
+            },
+        ),
+        (
+            "a path on a file that is not a directory file",
+            Request {
+                file: Some("ORDINARY".to_string()),
+                path: Some("/tmp".to_string()),
+                directory: Some(false),
+                ..request("CREATE.FILE")
+            },
+        ),
+    ];
+    for (what, req) in refusals {
+        let response = handle_request(req, &db_arc, &admin);
+        assert_eq!(
+            response.code,
+            Some(ErrorCode::InvalidRequest),
+            "{what} should be refused with INVALID_REQUEST, got {:?}",
+            response
+        );
+    }
+
+    // Fields, sent to a file that has none.
+    let structured = handle_request(
+        Request {
+            file: Some("SCANS".to_string()),
+            key: Some("scan.bin".to_string()),
+            structured_data: Some(serde_json::json!({ "name": "Alice" })),
+            ..request("WRITE")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(structured.code, Some(ErrorCode::InvalidData));
+
+    // A key that is not a usable file name, refused rather than repaired.
+    let traversal = handle_request(
+        Request {
+            file: Some("SCANS".to_string()),
+            key: Some("../escape".to_string()),
+            data: Some(serde_json::Value::String("no".to_string())),
+            ..request("WRITE")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(traversal.code, Some(ErrorCode::InvalidRequest));
+
+    // And the record really is gone after a DELETE.
+    assert_eq!(
+        handle_request(
+            Request {
+                file: Some("SCANS".to_string()),
+                key: Some("note.txt".to_string()),
+                ..request("DELETE")
+            },
+            &db_arc,
+            &admin
+        )
+        .status,
+        "OK"
+    );
+    assert_eq!(
+        handle_request(
+            Request {
+                file: Some("SCANS".to_string()),
+                key: Some("note.txt".to_string()),
+                ..request("READ")
+            },
+            &db_arc,
+            &admin
+        )
+        .code,
+        Some(ErrorCode::RecordNotFound)
+    );
+}
+
 /// Each hot path takes a fixed, small number of file locks per request.
 ///
 /// This pins the shape of a regression nothing else here would catch. An extra
@@ -1453,6 +1705,21 @@ fn the_hot_paths_lock_a_file_a_fixed_number_of_times() {
         );
     }
 
+    // The fixture's directory file, warmed the same way: the first request
+    // against one reads its DIR entry, and the entry is cached from then on.
+    let attachment = |command: &str, key: &str| Request {
+        command: command.to_string(),
+        account: Some("HOT".to_string()),
+        file: Some("ATTACHMENTS".to_string()),
+        key: Some(key.to_string()),
+        ..Default::default()
+    };
+    let store = |key: &str| Request {
+        data: Some(serde_json::Value::String("x".repeat(4096))),
+        ..attachment("WRITE", key)
+    };
+    assert_eq!(handle_request(store("warm"), &db_arc, &client_info).status, "OK");
+
     let structured = Request {
         structured_data: Some(serde_json::json!({ "name": "Bob" })),
         ..request("WRITE", "structured")
@@ -1488,6 +1755,37 @@ fn the_hot_paths_lock_a_file_a_fixed_number_of_times() {
             request("DELETE", "warm1"),
             2,
             "the freshness check, then the removal",
+        ),
+        // The property a blob store has to have. Reading a forty megabyte
+        // record must not block every writer to that file for the length of
+        // the read - and it cannot, because a directory file has no table and
+        // so no lock to hold. Zero, not "few": there is nothing here to lock.
+        (
+            "WRITE to a directory file",
+            store("written"),
+            0,
+            "a directory file has no table; the write goes straight to the host file",
+        ),
+        (
+            "READ from a directory file",
+            attachment("READ", "warm"),
+            0,
+            "the record is read from the host file with no table involved",
+        ),
+        (
+            "QUERY over a directory file",
+            Request {
+                key: None,
+                ..attachment("QUERY", "")
+            },
+            0,
+            "the keys come from the host directory, not from a table",
+        ),
+        (
+            "DELETE from a directory file",
+            attachment("DELETE", "written"),
+            0,
+            "the removal is an unlink; nothing is locked for it",
         ),
     ];
 

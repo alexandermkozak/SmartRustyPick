@@ -113,15 +113,48 @@ function stubFetch(routes: Record<string, unknown>) {
     })
 }
 
-const fileList = (durable: boolean, usersHealth = 'good', reasons: string[] = [], queue = false) =>
+const fileList = (
+    durable: boolean,
+    usersHealth = 'good',
+    reasons: string[] = [],
+    queue = false,
+    directory = false,
+) =>
     envelope({
         keys: ['DIR', 'USERS'],
         results: [
-            ['DIR', {durable: false, queue: false, health: 'good', health_reasons: []}],
-            ['USERS', {durable, queue, health: usersHealth, health_reasons: reasons}],
+            [
+                'DIR',
+                {
+                    durable: false,
+                    queue: false,
+                    directory: false,
+                    health: 'good',
+                    health_reasons: [],
+                },
+            ],
+            ['USERS', {durable, queue, directory, health: usersHealth, health_reasons: reasons}],
         ],
         count: 2,
     })
+
+/** `FILE.STATS` for a directory file, whose hashed-section figures are all zero
+ *  because it has no such section. */
+const directoryStats = (over: Record<string, unknown> = {}) => ({
+    ...fileStats,
+    durable: false,
+    record_count: 2,
+    modulus: 0,
+    group_count: 0,
+    directory: {
+        path: '/var/lib/srp/SALES/USERS/records',
+        record_count: 2,
+        bytes: 3145728,
+        largest_bytes: 3145718,
+        max_record_bytes: 67108864,
+        ...over,
+    },
+})
 
 /** `FILE.STATS` for a queue file, with the four numbers the panel reports. */
 const queueStats = (over: Record<string, unknown> = {}) => ({
@@ -473,6 +506,33 @@ describe('the accounts view', () => {
         // The dead-letter file is named, because that is where the reader goes next.
         expect(text).toContain('USERS.DEAD')
         expect(wrapper.findAll('.file-actions button')[1].text()).toBe('Stop being a queue')
+    })
+
+    it('marks a directory file and describes it as one', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubFetch({
+                ...routes,
+                '/api/accounts/SALES/files': fileList(false, 'good', [], false, true),
+                '/api/accounts/SALES/files/USERS': envelope({record: directoryStats()}),
+            }),
+        )
+        const wrapper = await openUsers(View)
+
+        const entries = wrapper.findAll('.list')[1].findAll('li')
+        expect(entries[1].text()).toContain('directory')
+
+        const text = wrapper.text()
+        expect(text).toContain('Directory file')
+        expect(text).toContain('/var/lib/srp/SALES/USERS/records')
+        expect(text).toContain('Largest record')
+        expect(text).toContain('Limit per record')
+        // None of the hashed-section rows: every one of them is about something
+        // a directory file has not got, and a modulus of zero reads as a fault.
+        expect(text).not.toContain('Hash modulus')
+        expect(text).not.toContain('Records per group')
+        // And neither button, because both would be refused.
+        expect(wrapper.findAll('.file-actions button')).toHaveLength(0)
     })
 
     it('reports nothing about queues for an ordinary file', async () => {
