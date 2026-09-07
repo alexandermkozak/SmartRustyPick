@@ -605,7 +605,7 @@ it is applied. A caller can handle a refusal; it cannot handle a guarantee that 
 `STORE <file> <key> <path>` and `EXTRACT <file> <key> <path>` stream a host file in and out through a fixed-size
 buffer, so the size of a record is bounded by `max_directory_record_bytes` and by nothing else. The remote protocol's
 `READ` and `WRITE` still travel in one line-delimited request, so `max_request_bytes` (1 MiB by default) bounds what
-can cross the wire in one piece — about 700 KiB after base64. That is the one limit a directory file does not remove,
+can cross the wire in one piece — just under 768 KiB after base64. That is the one limit a directory file does not remove,
 and it is a limit on the *transport* rather than on the file.
 
 ## Queue Files

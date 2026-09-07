@@ -701,7 +701,7 @@ A record of an ordinary file is made of fields, and the marks that separate them
 of those bytes is indistinguishable from the separator it is and splits on the way back, so a
 PNG, a PDF or a `.wasm` module cannot be stored in one. The request line is capped at
 `max_request_bytes` (1 MiB by default) as well, and base64 inflates by 4/3, so even content
-that avoided the marks would top out around 700 KiB.
+that avoided the marks would top out just under 768 KiB.
 
 A file created with `directory: true` ([`CREATE.FILE`](#createfile--admin)) is the other
 thing. **Its records are ordinary files in a real directory on the host**: the key is the
@@ -778,7 +778,7 @@ is reached.
 
 **The remote protocol is still line-delimited.** A `WRITE` or a `READ` of a directory record
 travels in one request, so `max_request_bytes` bounds what can cross the wire in one piece —
-about 700 KiB after base64. The file itself has no such limit: the CLI's `STORE` and
+just under 768 KiB after base64. The file itself has no such limit: the CLI's `STORE` and
 `EXTRACT` stream a host file in and out without it passing through a request at all. See
 [General Commands](general_commands.md#directory-files).
 
