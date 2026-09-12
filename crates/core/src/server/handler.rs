@@ -2382,6 +2382,18 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     "authorized_clients".to_string(),
                     serde_json::json!(db.authorized_client_count()),
                 );
+                // What an operator needs before swapping the image over a
+                // mounted volume: what the directory is at, and what this build
+                // will open. Asking the running server beats reading a file
+                // inside a container or trusting a tag to mean a version.
+                object.insert(
+                    "storage_format".to_string(),
+                    serde_json::json!(crate::db::format::CURRENT),
+                );
+                object.insert(
+                    "storage_format_oldest_supported".to_string(),
+                    serde_json::json!(crate::db::format::OLDEST_SUPPORTED),
+                );
             }
             Response {
                 status: "OK".to_string(),

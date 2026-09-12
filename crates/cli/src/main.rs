@@ -30,8 +30,21 @@ fn main() -> io::Result<()> {
     let config = Config::load();
     let config_arc = Arc::new(config.clone());
 
-    // We use a directory "db_storage" to hold our tables
-    let db = Arc::new(RwLock::new(Database::new(&db_dir, Some(config.clone()))?));
+    // We use a directory "db_storage" to hold our tables. As in the headless
+    // binary, a storage format this build cannot open is reported as the
+    // decision it is rather than raised as an I/O error with the explanation
+    // flattened into it - see `crate::db::format`.
+    let db = match Database::new(&db_dir, Some(config.clone())) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+    if let Some(note) = db.storage_format_note() {
+        println!("{}", note);
+    }
+    let db = Arc::new(RwLock::new(db));
 
     // Check if server should be auto-started in background for CLI
     if config.cert_path.is_some() && config.key_path.is_some() && config.ca_path.is_some() {

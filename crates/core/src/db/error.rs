@@ -57,6 +57,13 @@ pub enum DbError {
     /// will not do that in one piece", and retry the second one record at a
     /// time if partial application is acceptable to it.
     TransactionScope(String),
+    /// The storage directory was written in a format this build does not
+    /// open, and `detail` says which way and what to do about it.
+    ///
+    /// It is only ever returned while opening the database, so it is a server
+    /// that does not start rather than a command that fails - which is the
+    /// point of it. See [`crate::db::format`].
+    IncompatibleStorage { storage_dir: String, detail: String },
     /// A conditional write or delete whose condition did not hold, and nothing
     /// was applied. `detail` says which condition and what was there instead.
     ///
@@ -77,7 +84,8 @@ impl DbError {
             DbError::NoAccount
             | DbError::InvalidField { .. }
             | DbError::InvalidRequest(_)
-            | DbError::TransactionScope(_) => io::ErrorKind::InvalidInput,
+            | DbError::TransactionScope(_)
+            | DbError::IncompatibleStorage { .. } => io::ErrorKind::InvalidInput,
             // The closest kind there is: the request was well formed and the
             // state it names is not what it requires. `AlreadyExists` would fit
             // `if_absent` and misdescribe `if_match`.
@@ -117,6 +125,9 @@ impl fmt::Display for DbError {
             DbError::InvalidRequest(detail) => write!(f, "{}", detail),
             DbError::TransactionScope(detail) => write!(f, "{}", detail),
             DbError::PreconditionFailed(detail) => write!(f, "{}", detail),
+            DbError::IncompatibleStorage { storage_dir, detail } => {
+                write!(f, "Cannot open the storage directory '{}': {}", storage_dir, detail)
+            }
             DbError::Io(e) => write!(f, "{}", e),
         }
     }

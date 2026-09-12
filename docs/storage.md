@@ -132,6 +132,10 @@ SmartRustyPick automatically migrates data from the old flat file format. If a t
 converted to the `data.hf/` layout during the first flush, and the old `data` file is deleted. No manual export/import
 is required.
 
+This is per *file* and predates the directory-wide [storage format version](#storage-format-versions), which is why it
+is not one of its migration steps: both layouts are readable by every build that has ever existed, so a directory
+holding either is format 1.
+
 ## Secondary Indexes
 
 A keyed read is O(1): the key is hashed and one group is read. Every other retrieval used to be a full scan of a fully
@@ -838,6 +842,87 @@ every other connection in the server.
 Delivery is therefore **at least once, not exactly once**. A consumer that finishes its work and dies before
 acknowledging leaves a claim that lapses and a record that is handed out again; the delivery count on every claim is
 what a consumer should be idempotent against.
+
+## Storage Format Versions
+
+The server is deployed as a container image with `db_storage/` on a mounted volume. The volume outlives the container by
+design — that is what mounting it is for — so replacing the image with a newer tag is the *normal* way to upgrade.
+Nothing used to record which build wrote the data and nothing checked, so every one of those upgrades was an untested
+assumption.
+
+The failure that costs is not a server that refuses to start. It is a newer binary opening an older directory,
+misreading a structure whose layout changed, and either serving wrong answers or writing something the older binary can
+no longer read — by which time the rollback is broken too. A database that will not start is a bad morning; one that
+starts and is subtly wrong is a bad quarter. The stamp exists to turn the second into the first.
+
+### The stamp
+
+`db_storage/.format` holds one line, checksummed the way the other small state files are:
+
+```text
+checksum=2fdf1377
+version=1
+```
+
+It is written when the directory is created and changed only by a migration. The leading dot is deliberate: the
+directory's other entries are account directories, and an account cannot be named `.format`.
+
+It describes the **storage root** — the directory that gets mounted and upgraded. An account pointed at a directory
+elsewhere (`CREATE.ACCOUNT` with a path) is outside it, and keeping that in step is the operator's, since nothing in
+the root records that it exists.
+
+### The policy
+
+A build declares two numbers, reported by [`SERVER.STATS`](protocol.md#serverstats--admin) so they can be asked of a
+running server rather than read off a file inside a container:
+
+| Number | Means |
+|--------|-------|
+| `storage_format` | The version this build writes. |
+| `storage_format_oldest_supported` | The oldest version it can open and bring forward. |
+
+Opening a directory then has four outcomes:
+
+- **At the current version** — nothing happens, and nothing is printed. The ordinary start.
+- **Between the oldest supported and the current version** — migrated in place, one version at a time, and restamped.
+  An upgrade is "pull the new tag and start it", not a runbook.
+- **Below the oldest supported, or above the current version** — **refused**, naming the version found and the range
+  this build has. The server does not start and writes nothing.
+- **No stamp at all** — adopted as the oldest supported version, recorded, and then migrated forward like any other old
+  directory.
+
+Today both numbers are `1`, so the only outcomes an existing deployment can meet are *current*, *adopted* and *refused*.
+
+### Why adopting an unstamped directory is sound
+
+Stamping did not always exist, so every directory written before it has none. There has only ever been one lineage of
+this format, so such a directory is version 1 — less a guess than the only thing it can be. It is the single assumption
+in the design, it is made once per directory, it is announced on the start that makes it, and it is recorded, so it is
+never made again.
+
+A **damaged** stamp is the opposite case and is refused. The version it carried cannot be recovered, and reading "I
+cannot tell what this says" as "this never said anything" is exactly how a directory would be adopted as version 1 by a
+build that should have refused it. The state-file reader distinguishes *missing* from *unreadable* for this one reason.
+
+### Downgrade
+
+Migrating restamps the directory, so **the previous image will refuse it**. That is the correct outcome rather than a
+limitation — the older build genuinely cannot read what the newer one wrote — but it has to be said in advance, because
+the operator reaching for the previous tag needs to know before they try. See
+[Container Deployment](deployment.md#upgrading-and-rolling-back).
+
+One transition is not covered and cannot be: a build from before any of this checks nothing, so it will open a directory
+of any version quite happily. The protection starts with the first build that has it.
+
+### Adding a version
+
+Raise `CURRENT` in `db::format`, and add the migration step that reaches it. A unit test fails if you do one without the
+other, so the ladder cannot quietly acquire a missing rung — and a build that somehow reached a version with no step
+refuses to open the directory rather than stamping one it never converted.
+
+Raise it only for a change an older build would **misread**. A new `DIR` attribute it ignores, or a new file beside the
+records it never opens, is not one: a version that rises without the format really changing makes every upgrade a
+migration and teaches operators that the number means nothing.
 
 ## Concurrency and Lock Ordering
 

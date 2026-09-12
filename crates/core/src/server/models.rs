@@ -314,6 +314,12 @@ impl From<&DbError> for ErrorCode {
             DbError::InvalidRequest(_) => ErrorCode::InvalidRequest,
             DbError::TransactionScope(_) => ErrorCode::TransactionScope,
             DbError::PreconditionFailed(_) => ErrorCode::PreconditionFailed,
+            // No client ever sees this one: it is returned while opening the
+            // database, so a server that hits it does not reach the point of
+            // accepting a connection. It is mapped rather than given a code of
+            // its own because a code nothing can receive is a code nothing can
+            // branch on.
+            DbError::IncompatibleStorage { .. } => ErrorCode::Unavailable,
             DbError::Io(inner) => ErrorCode::from(inner),
         }
     }
