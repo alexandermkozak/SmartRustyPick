@@ -329,7 +329,7 @@ fn test_set_file_promotes_and_demotes_an_existing_file() {
     assert_eq!(resp.code, Some(ErrorCode::MissingField));
     assert_eq!(
         resp.message.unwrap(),
-        "Nothing to set: name durable, queue, visibility_timeout or max_deliveries"
+        "Nothing to set: name durable, autokey, queue, visibility_timeout or max_deliveries"
     );
 
     // Storage decisions are administrative, like creating the file was.
@@ -1287,7 +1287,7 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
     assert_eq!(created["account"], "DEMO");
     assert_eq!(
         created["files"],
-        serde_json::json!(["ATTACHMENTS", "DIR", "JOBS", "PRODUCTS", "USERS"])
+        serde_json::json!(["ATTACHMENTS", "DIR", "EVENTS", "JOBS", "PRODUCTS", "USERS"])
     );
 
     // The fixture reaches the ordering primitive as well as the record ones, so
@@ -1312,6 +1312,29 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
         "the fixture's policy is not the default, so a reader can see it is read"
     );
     assert_eq!(stats["queue"]["max_deliveries"], serde_json::json!(3));
+
+    // And the other thing a key can be. The fixture's EVENTS records were
+    // appended with no key at all, so the keys in it are minted ones and a
+    // listing of them is in the order they were written.
+    let events = handle_request(
+        Request {
+            command: "QUERY".to_string(),
+            account: Some("DEMO".to_string()),
+            file: Some("EVENTS".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    let mut keys: Vec<String> = events.results.unwrap().into_iter().map(|(key, _)| key).collect();
+    keys.sort();
+    assert_eq!(keys.len(), 2);
+    assert!(
+        keys.iter()
+            .all(|key| key.len() == 20 && key.bytes().all(|b| b.is_ascii_digit())),
+        "a minted key is twenty digits: {:?}",
+        keys
+    );
 
     // Populated, not just created: a record read back carries the dictionary's
     // names, its multivalues and the MD2 conversion the fixture exists to show.
@@ -3020,5 +3043,364 @@ fn one_key_changed_twice_in_a_transaction_is_refused() {
     assert_eq!(
         read_key(&db_arc, &client, "USERS", "99").code,
         Some(ErrorCode::RecordNotFound)
+    );
+}
+
+// --------------------------------------------- conditional writes and autokeys
+
+/// Reads one record of the fixture account, whatever the read reports.
+fn read_cond(
+    db: &Arc<RwLock<Database>>,
+    client: &ClientInfo,
+    file: &str,
+    key: &str,
+) -> crate::server::models::Response {
+    handle_request(
+        Request {
+            command: "READ".to_string(),
+            account: Some("COND".to_string()),
+            file: Some(file.to_string()),
+            key: Some(key.to_string()),
+            ..Default::default()
+        },
+        db,
+        client,
+    )
+}
+
+/// An account with one ordinary file, and an admin client that can create more.
+fn conditional_fixture(label: &str) -> (TempDir, Arc<RwLock<Database>>, ClientInfo) {
+    let dir = TempDir::new(label);
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_test_account("COND").unwrap();
+    db.set_current_account("");
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "admin".to_string(),
+        thumbprint: "admin_tp".to_string(),
+        allowed_accounts: vec!["COND".to_string()],
+        is_admin: true,
+    };
+    (dir, db_arc, admin)
+}
+
+fn write_request(file: &str, key: Option<&str>, body: &str) -> Request {
+    Request {
+        command: "WRITE".to_string(),
+        account: Some("COND".to_string()),
+        file: Some(file.to_string()),
+        key: key.map(str::to_string),
+        data: Some(serde_json::Value::String(body.to_string())),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn if_absent_over_the_protocol_creates_once_and_then_reports_the_collision() {
+    let (_dir, db_arc, admin) = conditional_fixture("proto_if_absent");
+
+    let created = handle_request(
+        Request {
+            if_absent: Some(true),
+            ..write_request("USERS", Some("NEW"), "Alice")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(created.status, "OK", "unexpected: {:?}", created.message);
+    // A supplied key is not echoed back; a version always is, so the caller can
+    // make its next write conditional without reading first.
+    assert_eq!(created.key, None);
+    assert!(created.version.is_some());
+
+    let collided = handle_request(
+        Request {
+            if_absent: Some(true),
+            ..write_request("USERS", Some("NEW"), "Mallory")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(collided.status, "ERROR");
+    assert_eq!(
+        collided.code,
+        Some(ErrorCode::PreconditionFailed),
+        "a collision must be distinguishable from a failure: {:?}",
+        collided.message
+    );
+    // And it must not be *described* as a failure either: nothing was saved, so
+    // nothing failed to save.
+    assert!(
+        !collided.message.unwrap().starts_with("Save error"),
+        "a refused condition is not a save that went wrong"
+    );
+    assert_eq!(
+        read_cond(&db_arc, &admin, "USERS", "NEW").record.unwrap()["name"],
+        "Alice",
+        "the refused write must not have landed"
+    );
+}
+
+#[test]
+fn read_reports_a_version_that_if_match_accepts_and_a_stale_one_it_does_not() {
+    let (_dir, db_arc, admin) = conditional_fixture("proto_if_match");
+    handle_request(write_request("USERS", Some("RMW"), "Alice"), &db_arc, &admin);
+
+    let stale = read_cond(&db_arc, &admin, "USERS", "RMW").version.unwrap();
+
+    // Somebody else writes in between, so the version moves on.
+    handle_request(write_request("USERS", Some("RMW"), "Bob"), &db_arc, &admin);
+    let current = read_cond(&db_arc, &admin, "USERS", "RMW").version.unwrap();
+    assert_ne!(stale, current, "a changed record must have a changed version");
+
+    let refused = handle_request(
+        Request {
+            if_match: Some(stale),
+            ..write_request("USERS", Some("RMW"), "Carol")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(refused.code, Some(ErrorCode::PreconditionFailed));
+    assert_eq!(
+        read_cond(&db_arc, &admin, "USERS", "RMW").record.unwrap()["name"],
+        "Bob"
+    );
+
+    let applied = handle_request(
+        Request {
+            if_match: Some(current),
+            ..write_request("USERS", Some("RMW"), "Carol")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(applied.status, "OK", "unexpected: {:?}", applied.message);
+    assert_eq!(
+        read_cond(&db_arc, &admin, "USERS", "RMW").record.unwrap()["name"],
+        "Carol"
+    );
+
+    // And a DELETE takes the same condition, for the same reason.
+    let delete = |version: Option<String>| {
+        handle_request(
+            Request {
+                command: "DELETE".to_string(),
+                account: Some("COND".to_string()),
+                file: Some("USERS".to_string()),
+                key: Some("RMW".to_string()),
+                if_match: version,
+                ..Default::default()
+            },
+            &db_arc,
+            &admin,
+        )
+    };
+    assert_eq!(
+        delete(Some("deadbeefdeadbeef".to_string())).code,
+        Some(ErrorCode::PreconditionFailed)
+    );
+    let current = read_cond(&db_arc, &admin, "USERS", "RMW").version.unwrap();
+    assert_eq!(delete(Some(current)).status, "OK");
+    assert_eq!(
+        read_cond(&db_arc, &admin, "USERS", "RMW").code,
+        Some(ErrorCode::RecordNotFound)
+    );
+}
+
+#[test]
+fn two_conditions_at_once_are_refused_rather_than_one_of_them_being_picked() {
+    let (_dir, db_arc, admin) = conditional_fixture("proto_two_conditions");
+
+    let both = handle_request(
+        Request {
+            if_absent: Some(true),
+            if_match: Some("deadbeefdeadbeef".to_string()),
+            ..write_request("USERS", Some("X"), "Alice")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(both.code, Some(ErrorCode::InvalidRequest));
+
+    // `if_absent: false` is no condition, not "must exist": it writes.
+    let neither = handle_request(
+        Request {
+            if_absent: Some(false),
+            ..write_request("USERS", Some("X"), "Alice")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(neither.status, "OK", "unexpected: {:?}", neither.message);
+
+    // An empty `if_match` is a client bug rather than a condition that matches
+    // nothing, and is told so.
+    let empty = handle_request(
+        Request {
+            if_match: Some(String::new()),
+            ..write_request("USERS", Some("X"), "Bob")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(empty.code, Some(ErrorCode::InvalidData));
+}
+
+#[test]
+fn a_directory_file_refuses_a_condition_rather_than_promising_one() {
+    let (_dir, db_arc, admin) = conditional_fixture("proto_dir_condition");
+
+    let refused = handle_request(
+        Request {
+            if_absent: Some(true),
+            ..write_request("ATTACHMENTS", Some("NEW.txt"), "hello")
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(refused.code, Some(ErrorCode::InvalidRequest));
+    assert!(
+        refused.message.unwrap().contains("host files"),
+        "the refusal has to say why a version off a host file means nothing"
+    );
+}
+
+#[test]
+fn create_file_autokey_mints_a_key_for_a_write_that_names_none() {
+    let (_dir, db_arc, admin) = conditional_fixture("proto_autokey");
+
+    let created = handle_request(
+        Request {
+            command: "CREATE.FILE".to_string(),
+            account: Some("COND".to_string()),
+            file: Some("AUDIT".to_string()),
+            autokey: Some(true),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(created.status, "OK", "unexpected: {:?}", created.message);
+    assert_eq!(created.record.unwrap()["autokey"], serde_json::json!(true));
+
+    let mut minted = Vec::new();
+    for n in 0..3 {
+        let appended = handle_request(write_request("AUDIT", None, &format!("EVENT-{}", n)), &db_arc, &admin);
+        assert_eq!(appended.status, "OK", "unexpected: {:?}", appended.message);
+        let key = appended.key.expect("a minted key has to come back, or it is lost");
+        assert_eq!(key.len(), 20);
+        minted.push(key);
+    }
+    let mut sorted = minted.clone();
+    sorted.sort();
+    assert_eq!(sorted, minted, "minted keys must come back in arrival order");
+
+    // The record really is under the key that was reported.
+    let read = read_cond(&db_arc, &admin, "AUDIT", &minted[1]);
+    assert_eq!(read.status, "OK");
+
+    // A keyless write to an ordinary file names the flag that would allow it.
+    let refused = handle_request(write_request("USERS", None, "X"), &db_arc, &admin);
+    assert_eq!(refused.code, Some(ErrorCode::InvalidRequest));
+    assert!(refused.message.unwrap().contains("AUTOKEY"));
+
+    // An empty key is a missing key, not a request to mint one.
+    let empty = handle_request(write_request("AUDIT", Some(""), "X"), &db_arc, &admin);
+    assert_eq!(empty.code, Some(ErrorCode::MissingField));
+}
+
+#[test]
+fn a_file_cannot_be_both_a_queue_and_an_autokey_file() {
+    let (_dir, db_arc, admin) = conditional_fixture("proto_autokey_queue");
+
+    let both = handle_request(
+        Request {
+            command: "CREATE.FILE".to_string(),
+            account: Some("COND".to_string()),
+            file: Some("CONFUSED".to_string()),
+            queue: Some(true),
+            autokey: Some(true),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(both.code, Some(ErrorCode::InvalidRequest));
+    assert!(both.message.unwrap().contains("ENQUEUE"));
+
+    let directory = handle_request(
+        Request {
+            command: "CREATE.FILE".to_string(),
+            account: Some("COND".to_string()),
+            file: Some("SCANS".to_string()),
+            directory: Some(true),
+            autokey: Some(true),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(directory.code, Some(ErrorCode::InvalidRequest));
+}
+
+#[test]
+fn set_file_turns_minting_on_and_off_and_the_listing_says_which() {
+    let (_dir, db_arc, admin) = conditional_fixture("proto_set_autokey");
+    let set = |autokey: Option<bool>, durable: Option<bool>| {
+        handle_request(
+            Request {
+                command: "SET.FILE".to_string(),
+                account: Some("COND".to_string()),
+                file: Some("USERS".to_string()),
+                autokey,
+                durable,
+                ..Default::default()
+            },
+            &db_arc,
+            &admin,
+        )
+    };
+
+    let on = set(Some(true), None);
+    assert_eq!(on.status, "OK", "unexpected: {:?}", on.message);
+    assert_eq!(on.record.unwrap()["autokey"], serde_json::json!(true));
+    assert_eq!(
+        handle_request(write_request("USERS", None, "Appended"), &db_arc, &admin).status,
+        "OK"
+    );
+
+    // Only what is named changes: a request about durability leaves minting on.
+    assert_eq!(
+        set(None, Some(true)).record.unwrap()["autokey"],
+        serde_json::json!(true),
+        "a SET.FILE that did not mention autokey must not have turned it off"
+    );
+
+    let listed = handle_request(
+        Request {
+            command: "LIST.FILES".to_string(),
+            account: Some("COND".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    let users = listed
+        .results
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == "USERS")
+        .unwrap()
+        .1;
+    assert_eq!(users["autokey"], serde_json::json!(true));
+
+    assert_eq!(
+        set(Some(false), None).record.unwrap()["autokey"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        handle_request(write_request("USERS", None, "X"), &db_arc, &admin).code,
+        Some(ErrorCode::InvalidRequest)
     );
 }

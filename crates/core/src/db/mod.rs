@@ -33,17 +33,22 @@ mod queue_tests;
 pub mod report;
 #[cfg(test)]
 mod report_tests;
+pub mod sequence;
 pub mod transaction;
 #[cfg(test)]
 mod transaction_tests;
+#[cfg(test)]
+mod write_tests;
 
 pub use directory::DirectoryStats;
 pub use engine::directory::DirectoryRecord;
 pub use engine::queue::QueueDelivery;
+pub use engine::write::{Condition, Written};
 pub use engine::{Database, TableHandle, TableKey};
 pub use error::{DbError, DbResult};
 pub use health::{Health, HealthSummary, Measure, Verdict};
 pub use index::{FileIndex, IndexReport, IndexStats, IndexUsageStats, IndexValue};
 pub use models::*;
 pub use queue::{QueuePolicy, QueueState};
+pub use sequence::Sequence;
 pub use transaction::{Change, ChangeOp, MAX_CHANGES};

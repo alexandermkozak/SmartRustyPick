@@ -9,25 +9,16 @@
 //!
 //! # Sequence keys
 //!
-//! The engine mints the key of every enqueued record, as twenty decimal digits:
+//! The engine mints the key of every enqueued record, as twenty decimal digits
+//! carrying the millisecond it arrived - see [`crate::db::sequence`], which is
+//! also where the counter and its state file live, because an autokey file
+//! mints its keys the same way and for the same reasons.
 //!
-//! ```text
-//!  01764950412345 000001
-//!  ^ milliseconds ^ counter within that millisecond
-//! ```
-//!
-//! `milliseconds * 1_000_000 + counter`, zero padded, so the keys sort in
-//! arrival order both as text and as numbers. The clock is *in* the key, which
-//! is what lets the oldest unacknowledged age be read off the smallest live key
-//! rather than from a timestamp stored per record - and that is the difference
-//! between a queue whose persistent state is the size of its in-flight set and
-//! one whose state is the size of its depth.
-//!
-//! Two consequences are worth stating plainly. The sequence is forced upwards
-//! ([`QueueState::mint`]), so a clock that steps backwards still yields keys in
-//! arrival order, but the time those keys carry is behind the wall clock until
-//! it catches up. And a millisecond holds a million keys; enqueueing faster
-//! than that borrows from the next millisecond rather than colliding.
+//! The clock being *in* the key is what lets the oldest unacknowledged age be
+//! read off the smallest live key rather than from a timestamp stored per
+//! record - and that is the difference between a queue whose persistent state
+//! is the size of its in-flight set and one whose state is the size of its
+//! depth.
 //!
 //! # What is persisted, and what is not
 //!
@@ -47,20 +38,14 @@
 //! often is readable with `PEEK`, and a fixed consumer can drain it with the
 //! same commands it drains the live queue with.
 
-use crate::db::hashfile::{self, FsyncPolicy};
+use crate::db::hashfile::FsyncPolicy;
+use crate::db::sequence::{self, Sequence};
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-/// Digits in a sequence key. Twenty holds `u64::MAX`, so every key this mints
-/// is the same width and text order is numeric order.
-pub const KEY_DIGITS: usize = 20;
-
-/// Sequence numbers per millisecond. The low part of a key is a counter within
-/// its millisecond; the high part is the millisecond itself.
-pub const SUB_MILLISECOND: u64 = 1_000_000;
+pub use sequence::{KEY_DIGITS, SUB_MILLISECOND, format_key, key_sequence, now_millis};
 
 /// Appended to a queue's name to name the file its dead letters go to.
 pub const DEAD_LETTER_SUFFIX: &str = ".DEAD";
@@ -91,35 +76,12 @@ pub fn is_dead_letter_name(name: &str) -> bool {
     name.ends_with(DEAD_LETTER_SUFFIX)
 }
 
-/// A sequence number as the key it is stored under.
-pub fn format_key(sequence: u64) -> String {
-    format!("{:0width$}", sequence, width = KEY_DIGITS)
-}
-
-/// The sequence number a key carries, or `None` for a key this did not mint.
-///
-/// Written by hand into a queue file, a key that is not a sequence number is
-/// still a perfectly good record - it simply has no place in the order, which
-/// is what the callers use this to find out.
-pub fn key_sequence(key: &str) -> Option<u64> {
-    if key.len() != KEY_DIGITS || !key.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    key.parse::<u64>().ok()
-}
-
 /// When the record under `key` was enqueued, in milliseconds since the epoch.
+///
+/// Named for what a queue uses it for; the general form is
+/// [`sequence::key_millis`].
 pub fn key_enqueued_millis(key: &str) -> Option<u64> {
-    key_sequence(key).map(|sequence| sequence / SUB_MILLISECOND)
-}
-
-/// Milliseconds since the epoch, saturating rather than panicking on a clock
-/// set before it.
-pub fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
+    sequence::key_millis(key)
 }
 
 /// How long a claim on this queue lasts, and how many deliveries a record gets.
@@ -232,8 +194,8 @@ pub enum ClaimError {
 /// every load rather than trusted across one.
 #[derive(Debug, Default)]
 pub struct QueueState {
-    /// The next sequence number to mint. Never decreases.
-    next_sequence: u64,
+    /// The counter this queue's keys are minted from.
+    sequence: Sequence,
     /// Keys nobody is holding, in arrival order. The order is the whole point:
     /// claiming the oldest is `first()`, not a scan.
     available: BTreeSet<String>,
@@ -259,11 +221,9 @@ impl QueueState {
     /// with a record that is still there.
     pub fn attach<R>(records: &HashMap<String, R>, persisted: PersistedQueue) -> Self {
         let mut available = BTreeSet::new();
-        let mut highest = 0u64;
+        let mut sequence = Sequence::restored(persisted.next_sequence);
         for key in records.keys() {
-            if let Some(sequence) = key_sequence(key) {
-                highest = highest.max(sequence + 1);
-            }
+            sequence.raise_past(key);
             available.insert(key.clone());
         }
         let deliveries: HashMap<String, u32> = persisted
@@ -272,7 +232,7 @@ impl QueueState {
             .filter(|(key, _)| records.contains_key(key))
             .collect();
         QueueState {
-            next_sequence: persisted.next_sequence.max(highest),
+            sequence,
             available,
             claims: HashMap::new(),
             deliveries,
@@ -282,26 +242,23 @@ impl QueueState {
 
     /// Whether the `queue` file is behind what is held here.
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.dirty || self.sequence.is_dirty()
     }
 
     pub fn clear_dirty(&mut self) {
         self.dirty = false;
+        self.sequence.clear_dirty();
     }
 
-    /// The next sequence number, advanced to the current millisecond when the
-    /// clock has moved on and forced upwards when it has not.
+    /// The next sequence number - see [`Sequence::mint`].
     pub fn mint(&mut self, now_millis: u64) -> u64 {
-        let sequence = self.next_sequence.max(now_millis.saturating_mul(SUB_MILLISECOND));
-        self.next_sequence = sequence.saturating_add(1);
-        self.dirty = true;
-        sequence
+        self.sequence.mint(now_millis)
     }
 
     /// The sequence number this queue would mint next. Reported by
     /// `FILE.STATS`; the queue itself reads it through [`mint`](Self::mint).
     pub fn next_sequence(&self) -> u64 {
-        self.next_sequence
+        self.sequence.peek()
     }
 
     /// Puts a newly written record at the back of the queue.
@@ -453,9 +410,7 @@ impl QueueState {
             if !self.claims.contains_key(key) {
                 self.available.insert(key.clone());
             }
-            if let Some(sequence) = key_sequence(key) {
-                self.next_sequence = self.next_sequence.max(sequence + 1);
-            }
+            self.sequence.raise_past(key);
         }
         self.claims.retain(|key, _| records.contains_key(key));
         self.deliveries.retain(|key, _| records.contains_key(key));
@@ -510,7 +465,7 @@ impl QueueState {
     /// What the `queue` file has to say, for the flush.
     pub fn to_persisted(&self) -> PersistedQueue {
         PersistedQueue {
-            next_sequence: self.next_sequence,
+            next_sequence: self.sequence.peek(),
             deliveries: self
                 .deliveries
                 .iter()
@@ -540,12 +495,7 @@ pub fn state_path(file_dir: &str) -> PathBuf {
 /// a queue that redelivers a few records more than it had to - not a queue that
 /// refuses to open.
 pub fn read_state(file_dir: &str) -> Option<PersistedQueue> {
-    let content = fs::read_to_string(state_path(file_dir)).ok()?;
-    let (checksum_line, body) = content.split_once('\n')?;
-    let recorded = checksum_line.strip_prefix("checksum=")?;
-    if u32::from_str_radix(recorded.trim(), 16).ok()? != hashfile::crc32c(body.as_bytes()) {
-        return None;
-    }
+    let body = sequence::read_checked(&state_path(file_dir))?;
     let mut state = PersistedQueue::default();
     for line in body.lines() {
         if let Some(next) = line.strip_prefix("next=") {
@@ -560,17 +510,13 @@ pub fn read_state(file_dir: &str) -> Option<PersistedQueue> {
     Some(state)
 }
 
-/// Writes a queue's persisted state, checksum first and through a temporary
-/// file, so a crash mid-write leaves the previous state rather than half of
-/// this one.
+/// Writes a queue's persisted state.
 ///
 /// Written after the records, exactly as an index's `state` is: a delivery
 /// count that names a record the data section has not got is dropped on the
 /// next load, whereas a record with no delivery count is simply one that starts
 /// its retries again.
 pub fn write_state(file_dir: &str, state: &PersistedQueue, fsync: FsyncPolicy) -> io::Result<()> {
-    let dir = Path::new(file_dir);
-    fs::create_dir_all(dir)?;
     let mut body = format!("next={}\n", state.next_sequence);
     // Sorted, so the same state always produces the same bytes and the checksum
     // does not change without the state changing.
@@ -579,22 +525,10 @@ pub fn write_state(file_dir: &str, state: &PersistedQueue, fsync: FsyncPolicy) -
     for (key, count) in deliveries {
         body.push_str(&format!("deliveries={}:{}\n", key, count));
     }
-    let tmp = dir.join("queue.tmp");
-    {
-        let mut file = File::create(&tmp)?;
-        writeln!(file, "checksum={:08x}", hashfile::crc32c(body.as_bytes()))?;
-        file.write_all(body.as_bytes())?;
-        if fsync == FsyncPolicy::Always {
-            file.sync_all()?;
-        }
-    }
-    fs::rename(tmp, state_path(file_dir))
+    sequence::write_checked(&state_path(file_dir), &body, fsync)
 }
 
 /// Removes a queue's persisted state, for a file that is no longer a queue.
 pub fn remove_state(file_dir: &str) -> io::Result<()> {
-    match fs::remove_file(state_path(file_dir)) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        other => other,
-    }
+    sequence::remove_if_present(&state_path(file_dir))
 }

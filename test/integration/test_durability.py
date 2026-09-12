@@ -189,7 +189,7 @@ def main():
                 suite.check_eq(
                     "SET.FILE says what it could have been asked to change",
                     resp.get("message"),
-                    "Nothing to set: name durable, queue, visibility_timeout or max_deliveries",
+                    "Nothing to set: name durable, autokey, queue, visibility_timeout or max_deliveries",
                 )
 
                 resp = conn.request(

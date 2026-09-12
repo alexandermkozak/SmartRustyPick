@@ -17,8 +17,9 @@ pub const SYS_LOGS_MESSAGE_IDX: usize = 0;
 pub const SYS_LOGS_DETAIL_IDX: usize = 1;
 // DIR entries describe the files of an account: field 1 is the entry type,
 // field 2 the per-file durability flag ("Y" = flush every write immediately),
-// field 3 the queue flag, fields 4 and 5 that queue's claim policy, and field 6
-// the host directory a directory file points at. A file carries its own policy
+// field 3 the queue flag, fields 4 and 5 that queue's claim policy, field 6 the
+// host directory a directory file points at, and field 7 the autokey flag. A
+// file carries its own policy
 // because a queue of thirty-second jobs and a queue of hour-long ones need
 // different answers, and DIR is where a per-file answer already survives a
 // rebuild of the listing.
@@ -35,6 +36,9 @@ pub const DIR_QUEUE_RETRIES_IDX: usize = 4;
 /// Only read when attribute 1 is [`DIR_TYPE_DIRECTORY`]; empty there means the
 /// default place inside the file's own directory.
 pub const DIR_PATH_IDX: usize = 5;
+/// Attribute 7: set when this file mints the key of a keyless `WRITE`. Empty on
+/// every file that requires the caller to supply one.
+pub const DIR_AUTOKEY_IDX: usize = 6;
 
 /// Attribute 1 of an ordinary file - one whose records live in its own hashed
 /// section.
@@ -64,6 +68,10 @@ pub struct FileAttributes {
     /// file *is*, and carrying it anywhere but beside the flag that says the
     /// file has one is how the two get out of step.
     pub directory: Option<DirectoryPolicy>,
+    /// A `WRITE` that names no key mints one on this file - see
+    /// [`crate::db::sequence`]. `false` everywhere else, where a keyless write
+    /// is refused rather than given a key the caller did not ask for.
+    pub autokey: bool,
 }
 
 /// Where a directory file keeps its records.
@@ -120,6 +128,7 @@ impl FileAttributes {
             return FileAttributes {
                 durable: false,
                 queue: None,
+                autokey: false,
                 directory: Some(DirectoryPolicy {
                     path: attribute(DIR_PATH_IDX).trim().to_string(),
                 }),
@@ -133,6 +142,10 @@ impl FileAttributes {
                     &attribute(DIR_QUEUE_RETRIES_IDX),
                 )
             }),
+            // A queue already mints every key it stores, so an entry claiming
+            // both describes two counters on one file. The queue is the half
+            // that says where the records are handed out from, so it wins.
+            autokey: flag(DIR_AUTOKEY_IDX) && !flag(DIR_QUEUE_IDX),
             directory: None,
         }
     }
@@ -145,7 +158,7 @@ impl FileAttributes {
     /// "60".
     pub fn to_record(&self) -> Record {
         let mut rec = Record::new();
-        while rec.fields.len() <= DIR_PATH_IDX {
+        while rec.fields.len() <= DIR_AUTOKEY_IDX {
             rec.fields.push(Field::default());
         }
         let mut set = |idx: usize, text: String| rec.fields[idx].values = vec![Value::text(text)];
@@ -174,6 +187,7 @@ impl FileAttributes {
             DIR_PATH_IDX,
             directory.map(|policy| policy.path.clone()).unwrap_or_default(),
         );
+        set(DIR_AUTOKEY_IDX, if self.autokey { "Y" } else { "" }.to_string());
         rec
     }
 
@@ -328,6 +342,26 @@ impl Record {
     /// the MultiValue data model, and it is why content that may contain
     /// arbitrary bytes belongs in a directory file, whose records are host
     /// files and are never framed at all - see [`crate::db::directory`].
+    /// The token a conditional write compares against: a digest of the bytes
+    /// this record is stored as.
+    ///
+    /// A digest rather than a counter because a counter is a field that has to
+    /// go somewhere. The record section has no room for one, so adding it would
+    /// be a change to the on-disk format and a migration of every file, to hold
+    /// a number the bytes already determine. The bytes are in hand wherever the
+    /// decision is made, so this costs a hash of one record and nothing on disk.
+    ///
+    /// Sixteen hex digits of SHA-256 - 64 bits, which is far more than the
+    /// number of versions any one record will have. **It is opaque**: a client
+    /// gets it from `READ` and hands it back to `if_match`, and nothing about
+    /// its length or alphabet is promised beyond that it is text and that it
+    /// changes whenever the record does.
+    pub fn version(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(self.to_bytes());
+        hex::encode(&digest[..8])
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut res = Vec::new();
         for (i, f) in self.fields.iter().enumerate() {
@@ -521,6 +555,15 @@ pub struct Table {
     /// the path every other file takes. Attached when the table is loaded and
     /// rebuilt from the records each time - see [`crate::db::queue`].
     pub queue: Option<QueueState>,
+    /// The counter a keyless `WRITE` mints from, for a file whose `DIR` entry
+    /// marks it `AUTOKEY`.
+    ///
+    /// `None` for every file that requires the caller to supply a key, which is
+    /// what keeps the counter - and the small file it persists into - off the
+    /// path every other file takes. Attached on the first keyless write and
+    /// pulled past every key already in the file, so a state file that was lost
+    /// cannot mint a key that is already taken.
+    pub autokey: Option<crate::db::sequence::Sequence>,
 }
 
 impl Default for Table {
@@ -542,11 +585,17 @@ impl Table {
             dict_dirty: false,
             indexes: BTreeMap::new(),
             queue: None,
+            autokey: None,
         }
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty_all || self.dict_dirty || !self.dirty_keys.is_empty() || self.indexes_dirty() || self.queue_dirty()
+        self.dirty_all
+            || self.dict_dirty
+            || !self.dirty_keys.is_empty()
+            || self.indexes_dirty()
+            || self.queue_dirty()
+            || self.autokey_dirty()
     }
 
     /// Brings a queue's order back in line with its records - see
@@ -561,6 +610,15 @@ impl Table {
     /// file beside the records does not yet say. A dequeue changes no record,
     /// so without this a delivery count could be lost to a restart that the
     /// table did not otherwise think it had anything to write.
+    /// True when this file has minted a key the `autokey` file beside the
+    /// records does not yet say. Its own flag for the reason
+    /// [`queue_dirty`](Self::queue_dirty) is: a write that is refused after the
+    /// key was minted changes no record, and losing that counter to a restart
+    /// is a key handed out twice.
+    pub fn autokey_dirty(&self) -> bool {
+        self.autokey.as_ref().is_some_and(|counter| counter.is_dirty())
+    }
+
     pub fn queue_dirty(&self) -> bool {
         self.queue.as_ref().is_some_and(|queue| queue.is_dirty())
     }
@@ -1182,6 +1240,11 @@ pub struct FileStats {
     pub legacy: bool,
     /// Every write to this file is flushed before it is acknowledged.
     pub durable: bool,
+    /// A `WRITE` naming no key is given one on this file. A flag rather than
+    /// the counter's current value: the next key is minted from the clock as
+    /// much as from the counter, so a number reported here would be a guess
+    /// that a reader could mistake for a reservation.
+    pub autokey: bool,
     /// Currently held in the server's table cache.
     pub loaded: bool,
     /// Seconds since the data section was last modified, when the filesystem

@@ -1239,15 +1239,19 @@ fn print_help(current_account: &str) {
     println!("  HELP                                  - Show this help.");
     println!("  SAVE-LIST <name>                      - Save active select list.");
     println!("  GET-LIST <name>                       - Restore a saved select list.");
-    println!("  CREATE.FILE <name> [DURABLE] [QUEUE [TIMEOUT <s>] [RETRIES <n>]] [DIRECTORY [PATH <dir>]]");
+    println!("  CREATE.FILE <name> [DURABLE] [AUTOKEY] [QUEUE [TIMEOUT <s>] [RETRIES <n>]]");
+    println!("              [DIRECTORY [PATH <dir>]]");
     println!("                                        - Create a new file (data and dict) (SYSTEM only).");
     println!("                                          DURABLE flushes every write to that file immediately.");
+    println!("                                          AUTOKEY mints the key of a WRITE that names none, so an");
+    println!("                                          appending client cannot invent one somebody else is using.");
     println!("                                          QUEUE keeps arrival order and hands records out one at a");
     println!("                                          time; it implies DURABLE unless BUFFERED is given.");
     println!("                                          DIRECTORY makes the records files of a real host");
     println!("                                          directory, for content that is not fields - a scan, a");
     println!("                                          PDF, a .wasm module. PATH points it at one that exists.");
-    println!("  SET.FILE <name> [DURABLE | BUFFERED] [QUEUE | NOQUEUE] [TIMEOUT <s>] [RETRIES <n>]");
+    println!("  SET.FILE <name> [DURABLE | BUFFERED] [AUTOKEY | NOAUTOKEY] [QUEUE | NOQUEUE]");
+    println!("           [TIMEOUT <s>] [RETRIES <n>]");
     println!("                                        - Change an existing file's attributes, keeping its records.");
     println!("                                          Turning durability on flushes what the file had buffered.");
     println!("  ENQUEUE <queue> <data>                - Append a record; the engine mints its sequence key.");
@@ -1411,10 +1415,10 @@ fn handle_get_list(db: &mut Database, parts: &[&str]) {
     }
 }
 
-const CREATE_FILE_USAGE: &str =
-    "Usage: CREATE.FILE <file_name> [DURABLE] [QUEUE [TIMEOUT <seconds>] [RETRIES <n>]] [DIRECTORY [PATH <dir>]]";
-const SET_FILE_USAGE: &str =
-    "Usage: SET.FILE <file_name> [DURABLE | BUFFERED] [QUEUE | NOQUEUE] [TIMEOUT <seconds>] [RETRIES <n>]";
+const CREATE_FILE_USAGE: &str = "Usage: CREATE.FILE <file_name> [DURABLE] [AUTOKEY] \
+                                 [QUEUE [TIMEOUT <seconds>] [RETRIES <n>]] [DIRECTORY [PATH <dir>]]";
+const SET_FILE_USAGE: &str = "Usage: SET.FILE <file_name> [DURABLE | BUFFERED] [AUTOKEY | NOAUTOKEY] \
+                              [QUEUE | NOQUEUE] [TIMEOUT <seconds>] [RETRIES <n>]";
 
 /// Reads the flags `CREATE.FILE` and `SET.FILE` share, over the attributes the
 /// file carries now.
@@ -1431,6 +1435,7 @@ fn parse_file_flags(
 ) -> Result<(FileAttributes, bool), String> {
     let mut policy = attributes.queue.unwrap_or_default();
     let mut wants_queue = attributes.queue.is_some();
+    let mut wants_autokey = attributes.autokey;
     let mut wants_directory = attributes.is_directory();
     let mut path = attributes
         .directory
@@ -1465,6 +1470,8 @@ fn parse_file_flags(
             }
             "QUEUE" | "-Q" => wants_queue = true,
             "NOQUEUE" => wants_queue = false,
+            "AUTOKEY" | "-A" => wants_autokey = true,
+            "NOAUTOKEY" => wants_autokey = false,
             "DIRECTORY" | "DIR" => wants_directory = true,
             "PATH" => {
                 let value = parts
@@ -1503,13 +1510,32 @@ fn parse_file_flags(
                 usage
             ));
         }
+        if wants_autokey {
+            return Err(format!(
+                "A directory file cannot mint keys: its keys are the names of host files, which is what a caller \
+                 opens them by. {}",
+                usage
+            ));
+        }
         attributes.durable = false;
         attributes.queue = None;
+        attributes.autokey = false;
         attributes.directory = Some(DirectoryPolicy { path });
         return Ok((attributes, durability_named));
     }
+    if wants_queue && wants_autokey {
+        // Refused rather than settled: a queue already mints the key of every
+        // record it stores, so a file asked for both has been asked for two
+        // counters, and which one a write draws from is the operator's answer
+        // to give.
+        return Err(format!(
+            "A queue file already mints the key of every record it stores: ENQUEUE is what appends to one. {}",
+            usage
+        ));
+    }
     attributes.directory = None;
     attributes.queue = wants_queue.then_some(policy);
+    attributes.autokey = wants_autokey;
     Ok((attributes, durability_named))
 }
 
@@ -1537,6 +1563,7 @@ fn describe_file(attributes: &FileAttributes, root: Option<&std::path::Path>) ->
             policy.visibility_seconds(),
             policy.max_deliveries
         ),
+        None if attributes.autokey => format!("{}, mints its own keys", durability),
         None => durability.to_string(),
     }
 }

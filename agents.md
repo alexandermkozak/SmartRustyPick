@@ -74,7 +74,9 @@ AI agents have been responsible for several critical improvements and fixes in t
   structures or features are added to the system - the `USERS` file now carries a multivalued `ROLES` field, one of
   whose values is sub-valued, `PRODUCTS` carries an association group whose members are deliberately ragged, and a
   `JOBS` queue file arrives with three records already enqueued, so the fixture reaches every level of the hierarchy,
-  both tiers of an association, and the ordering primitive as well as the record ones. An `ATTACHMENTS` directory file
+  both tiers of an association, and the ordering primitive as well as the record ones. An `EVENTS` autokey file arrives
+  with two records appended with no key at all, so the keys in it are real minted ones and a range read over them is in
+  write order. An `ATTACHMENTS` directory file
   arrives with two records, one of which holds all three mark bytes and an embedded NUL - content an ordinary record
   cannot carry, so anything that round-trips it has demonstrated what the third file type is for.
 - **Directory Files:** A third file type, and the answer to "how does a record hold a scanned invoice". The marks
@@ -142,6 +144,46 @@ AI agents have been responsible for several critical improvements and fixes in t
   cycle. Releasing the locks before flushing looked simpler and was wrong: a ticker flush slipping into the gap would
   write one of the files under that *file's* sync policy, and the intent would then be retired over bytes that were only
   in the page cache. That is why `flush_locked` exists beside `flush_handle`.
+- **Conditional writes:** `WRITE` overwrote, always, which is two lost-record bugs in one line. Two clients that both
+  intend to *create* a record write the same key and the second silently wins; two that each read, change and write
+  back lose one of the changes. Both writes were valid, so nothing was reported. A write may now carry `if_absent` or
+  `if_match`, and `DELETE` takes `if_match` too - deleting a record somebody has since changed is the same bug wearing
+  a different hat. **No new synchronisation was needed**: a write already holds the file's own lock and the record it
+  is about to replace is in hand there, so the comparison and the write happen inside one guard with no release in
+  between. That is the whole concurrency argument.
+- **The refusal is the feature.** `PRECONDITION_FAILED` is its own code, because the entire value is in telling a
+  collision - read again and retry - apart from a failure, where retrying changes nothing. Reusing a generic write
+  error would have left a client exactly where it started. Same rule the error codes went in under: the code is the
+  interface, the message is for a person.
+- **The token is a digest, not a counter.** A counter is a field, and the record section has no room for one: adding it
+  would be a change to the frame encoding and a migration of every file, to hold a number the record's own bytes
+  already determine. `Record::version` hashes the bytes that are already in hand, costs nothing on disk, and is
+  documented as **opaque** - which is what leaves the choice reversible. Per record rather than per file, because per
+  file would turn every concurrent write to a busy file into a conflict, which is exactly where the feature is needed.
+- **Server-minted keys:** `WRITE` with no key on a file created `AUTOKEY` mints one and returns it, the way `ENQUEUE`
+  already did. The machinery existed - a queue mints under the file's lock and keeps arrival order - so an autokey file
+  uses the same counter, moved into `db::sequence` and shared, rather than growing a second answer to "what does a
+  minted key look like". Twenty zero-padded digits carrying the millisecond, so **a range read comes back in write
+  order by sorting the keys as text**; the width is part of the interface, because a width chosen too small is a
+  migration.
+- **Two sources for the counter, and both matter.** The `autokey` file beside the records is authoritative when it is
+  there, because a key it has handed out may since have been *deleted* and must not come round again. The keys already
+  in the file are the backstop for when it is not - lost, restored, or the flag turned on by hand. Between them a
+  minted key collides only if both are wrong at once, and because the clock is in the key even a counter starting from
+  nothing moves forward past everything minted before it. The restart property is asserted the only way it can be: a
+  test re-executes the test binary, has the child delete its highest key and SIGKILL itself, then checks that the key
+  does not come back.
+- **Opt-in, and exclusive.** A file that does not mint keys refuses a keyless write, naming the flag, rather than
+  inventing behaviour - and `AUTOKEY` is refused alongside `QUEUE` and `DIRECTORY`, because a queue already mints every
+  key it stores and a directory file's keys are the names of host files. Same principle as the directory-file refusals:
+  a command asking for two different files has asked a question only the operator can answer.
+- **The test that would have caught the original bug.** Eight threads racing to create one key: exactly one succeeds
+  and seven are told they collided. Eight more doing a read-modify-write with no retry: the count on disk equals the
+  number of writes that were *acknowledged*, which before the condition existed was eight acknowledgements over a count
+  of anything from one upwards. Writing those found a **pre-existing** race of its own - `hashfile::load` sweeps `.tmp`
+  files and cannot tell an abandoned temporary from one a concurrent flush of the same file is still writing, so the
+  flush fails with `NotFound`. It reproduces with a plain `WRITE` loop and has nothing to do with either feature, so it
+  is left for its own change; the tests note it and keep out of its way.
 - **Certificate Management:** Implemented `GENERATE.CERT` in the `SYSTEM` account, allowing users to create signed
   client certificates and PKCS#12 (.pfx) files directly from the database CLI for simplified secure remote access setup.
 - **Typed errors:** The engine reports a `DbError` variant - `FileNotFound`, `AccountExists`, `IndexNotFound`, `Io` and

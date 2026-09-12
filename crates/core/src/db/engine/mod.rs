@@ -5,6 +5,7 @@ pub mod dictionary;
 pub mod directory;
 pub mod queue;
 pub mod transaction;
+pub mod write;
 
 use crate::db::error::{DbError, DbResult};
 use crate::db::hashfile::{self, FsyncPolicy, SectionMeta};
@@ -1145,6 +1146,16 @@ impl Database {
         {
             queue::persist(&file_dir, state, fsync)?;
         }
+        // The autokey counter last of all, and for the opposite reason: it must
+        // never be *behind* the records, or a key already in the file would be
+        // minted a second time. Written after them, a crash in between leaves a
+        // counter ahead of the records, which costs a gap in the keys and
+        // nothing else.
+        if let Some(counter) = table.autokey.as_mut()
+            && counter.is_dirty()
+        {
+            write::persist(&file_dir, counter, fsync)?;
+        }
         table.clear_dirty();
         // Stamped here, under the guard that did the writing, rather than by
         // the caller afterwards. Two threads flushing the same file take this
@@ -1635,6 +1646,7 @@ impl Database {
             checksums: meta.map(|m| m.checksums).unwrap_or(false),
             legacy: meta.is_none(),
             durable,
+            autokey: self.is_table_autokey_for_account(account, name),
             loaded,
             modified_seconds_ago: modified
                 .and_then(|time| SystemTime::now().duration_since(time).ok())
@@ -2033,6 +2045,7 @@ impl Database {
             FileAttributes {
                 durable,
                 queue: None,
+                autokey: false,
                 directory: None,
             },
         )
@@ -2275,10 +2288,13 @@ impl Database {
             Self::ensure_dir_dictionary(&mut dir_table);
         }
         let is_queue = attributes.queue.is_some();
+        let mints_keys = attributes.autokey;
         wlock(&self.file_attributes).insert((account.to_string(), name.to_string()), attributes);
         // A file that has just become - or stopped being - a queue has to pick
-        // up or drop its in-memory ordering before the next command reaches it.
+        // up or drop its in-memory ordering before the next command reaches it,
+        // and one that has stopped minting keys has to drop its counter.
         self.reattach_queue(account, name, is_queue)?;
+        self.reattach_autokey(account, name, mints_keys)?;
         self.save()
     }
 
@@ -2906,6 +2922,7 @@ impl Database {
                     visibility: Duration::from_secs(90),
                     max_deliveries: 3,
                 }),
+                autokey: false,
                 directory: None,
             },
         )?;
@@ -2940,6 +2957,7 @@ impl Database {
             FileAttributes {
                 durable: false,
                 queue: None,
+                autokey: false,
                 directory: Some(DirectoryPolicy::default_path()),
             },
         )?;
@@ -2955,6 +2973,44 @@ impl Database {
             "MARKS.bin",
             &[0xFE, 0xFD, 0xFC, 0x00, 0xFF, b'o', b'k'],
         )?;
+        // A file that mints its own keys, so the fixture reaches the other
+        // thing a key can be: a record whose identifier means nothing beyond
+        // "later than the last one". Two records, appended the way a client
+        // would - with no key - so the keys in it are real minted ones and a
+        // range read over them comes back in the order they were written.
+        self.create_table_with(
+            name,
+            "EVENTS",
+            FileAttributes {
+                durable: false,
+                queue: None,
+                autokey: true,
+                directory: None,
+            },
+        )?;
+        {
+            let handle = self.get_table_mut("EVENTS")?;
+            let mut table = handle.write();
+            table
+                .dictionary
+                .insert("KIND".to_string(), Record::from_display_string("1^KIND^L^12"));
+            table
+                .dictionary
+                .insert("DETAIL".to_string(), Record::from_display_string("2^DETAIL^L^24"));
+            table.mark_dict_dirty();
+        }
+        for (kind, detail) in [("login", "alice"), ("order.placed", "P-7")] {
+            let handle = self.get_table_mut_for_account(name, "EVENTS")?;
+            self.write_record_in(
+                name,
+                "EVENTS",
+                &handle,
+                None,
+                Record::from_display_string(&format!("{}^{}", kind, detail)),
+                false,
+                &crate::db::engine::write::Condition::Always,
+            )?;
+        }
         self.save()?;
         if !original_account.is_empty() {
             let _ = self.logto(&original_account);

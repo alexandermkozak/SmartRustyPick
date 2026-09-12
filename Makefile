@@ -100,6 +100,7 @@ test-integration: build
 	$(PYTHON) test/integration/test_durability.py
 	$(PYTHON) test/integration/test_queue.py
 	$(PYTHON) test/integration/test_directory.py
+	$(PYTHON) test/integration/test_conditional.py
 	$(PYTHON) test/integration/test_transaction.py
 	$(PYTHON) test/integration/test_web.py
 

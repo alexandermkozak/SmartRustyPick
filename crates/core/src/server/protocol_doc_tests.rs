@@ -48,6 +48,9 @@ const REQUEST_FIELDS: &[&str] = &[
     "path",
     "length",
     "changes",
+    "autokey",
+    "if_absent",
+    "if_match",
 ];
 
 /// Every JSON key a `Response` can carry.
@@ -61,6 +64,8 @@ const RESPONSE_FIELDS: &[&str] = &[
     "count",
     "positions",
     "claim",
+    "key",
+    "version",
     "length",
 ];
 
@@ -142,6 +147,8 @@ fn response_struct_serializes_to_exactly_the_documented_fields() {
         count: Some(0),
         positions: Some(Vec::new()),
         claim: Some(serde_json::Value::Null),
+        key: Some(String::new()),
+        version: Some(String::new()),
         length: Some(0),
     };
     let mut actual = json_keys(&populated);
@@ -380,6 +387,7 @@ fn file_stats_record_is_documented() {
             "checksums",
             "legacy",
             "durable",
+            "autokey",
             "loaded",
             "modified_seconds_ago",
             "indexes",

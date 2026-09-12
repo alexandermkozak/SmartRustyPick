@@ -49,7 +49,7 @@ matched case-insensitively.
 | `account`         | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `LIST.FILES`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `LIST.INDEXES`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`, `ENQUEUE`, `DEQUEUE`, `ACK`, `NACK`, `PEEK` | Account context for the operation. If omitted and the client has exactly one allowed account, that account is used. `GET.NEXT` is the exception: it takes the account from the select list, and checks this against it rather than using it. An admin client with more than one possible account must send it. Access is denied if the account is not in the client's allowed list (admins may reach any account). |
 | `target_account`  | string           | `CREATE.ACCOUNT`, `CREATE.TEST.ACCOUNT`, `DELETE.ACCOUNT`                                                          | Name of the account to create or drop. (Distinct from `account`, which selects an existing context.)                                                                                                                                                                                      |
 | `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`, `ENQUEUE`, `DEQUEUE`, `ACK`, `NACK`, `PEEK` | Table (file) name. Optional on `LIST.INDEXES`, which lists the whole account without it. |                                                                                                                                                                                                                                                                        |
-| `key`             | string           | `READ`, `WRITE`, `DELETE`, `SET.DICT`, `ACK`, `NACK`, `PEEK`                                                                              | Record key; for `SET.DICT`, the name of the dictionary entry; for `ACK` and `NACK`, the claimed record. Optional on `PEEK`, which reads the head of the queue without it. Never sent on `ENQUEUE`, whose key the engine mints.                                                                                                                                                                                                                                                                               |
+| `key`             | string           | `READ`, `WRITE`, `DELETE`, `SET.DICT`, `ACK`, `NACK`, `PEEK`                                                                              | Record key; for `SET.DICT`, the name of the dictionary entry; for `ACK` and `NACK`, the claimed record. Optional on `PEEK`, which reads the head of the queue without it. Never sent on `ENQUEUE`, whose key the engine mints. Optional on `WRITE` to an [autokey file](#server-minted-keys), which mints one and returns it in `key`; an empty string is a *missing* key, not a request to mint one. |
 | `data`            | string \| object | `WRITE`, `ENQUEUE`                                                                                                            | Record contents. A string is parsed as a display-format record (`^` field mark, `]` value mark, `\` sub-value mark). An object maps field names — original dictionary names or their camelCase form — to values, applying the dictionary's input conversions (ICONV).                     |
 | `structured_data` | object           | `WRITE`, `SET.DICT`, `ENQUEUE`                                                                                                | `WRITE` and `ENQUEUE`: same object form as `data`, checked first when present — use either this or `data`, not both. `SET.DICT`: the dictionary attributes of one entry.                                                                                                                                 |
 | `is_dict`         | bool             | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`                                                                       | Operate on the file's dictionary section instead of its data section. Default `false`.                                                                                                                                                                                                    |
@@ -65,6 +65,9 @@ matched case-insensitively.
 | `is_admin`        | bool             | `AUTHORIZE.CONN`, `GENERATE.CERT`                                                                                  | Grant the client admin rights. Default `false`.                                                                                                                                                                                                                                           |
 | `durable`         | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Per-file durable writes. Optional for `CREATE.FILE`, default `false` - except on a queue, which defaults to `true`. On `SET.FILE` an absent flag leaves the file's durability alone. See [Storage Engine](storage.md). |
 | `queue`           | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Make the file a [queue file](#queue-files): ordered records, claimed one at a time. Optional; on `SET.FILE` an absent flag leaves the file as it is, and `false` returns a queue to an ordinary file without touching its records. |
+| `autokey`         | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Make the file mint the key of a `WRITE` that names none - see [Server-minted keys](#server-minted-keys). Optional; on `SET.FILE` an absent flag leaves it as it is. Refused with `INVALID_REQUEST` alongside `queue` or `directory`: a queue already mints every key it stores, and a directory file's keys are the names of host files. |
+| `if_absent`       | bool             | `WRITE`                                                                                                            | Apply the write only if the key holds no record. A key that is taken is refused with `PRECONDITION_FAILED` and nothing is written. `false` means the same as absent - no condition. See [Conditional writes](#conditional-writes). |
+| `if_match`        | string           | `WRITE`, `DELETE`                                                                                                  | Apply the write or delete only if the record under the key still has this `version`, as `READ` reported it. Anything else - changed, or no longer there - is refused with `PRECONDITION_FAILED` and nothing is written. Naming it alongside `if_absent` is refused with `INVALID_REQUEST`. See [Conditional writes](#conditional-writes). |
 | `visibility_timeout` | number        | `CREATE.FILE`, `SET.FILE`, `DEQUEUE`                                                                               | Seconds a claim is held before it lapses. On the file commands it sets the queue's own timeout (default 60, maximum 86400); on `DEQUEUE` it overrides that timeout for the one claim being taken. Out of range is refused with `INVALID_DATA`. |
 | `max_deliveries`  | number           | `CREATE.FILE`, `SET.FILE`                                                                                          | Deliveries a record of this queue gets before it moves to the dead-letter file. Default 5, maximum 1000. Out of range is refused with `INVALID_DATA`. |
 | `length`          | number           | `PUT.BYTES`                                                                                                        | Bytes of body that follow this request line on the connection. Required: a body is announced rather than delimited, because a record may contain any byte including a newline. Checked against `max_directory_record_bytes` *before* a byte of body is read. |
@@ -92,6 +95,8 @@ older server sent in its place.
 | `count`     | integer                   | `SELECT`, `GET.NEXT`, `DEQUEUE`, `PEEK`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES`, `LIST.DICT`    | `SELECT`: number of keys selected into the list. `GET.NEXT`: number of records in the batch just returned. `DEQUEUE` and `PEEK`: `0`, beside an `"EMPTY"` status. The list commands: number of entries returned. |
 | `positions` | array of objects or nulls | `QUERY`, `GET.NEXT`                                                                                  | Present only for an exploded result. Index-aligned with `results`: the position within the exploded field that put each row there. See [Exploded results](#exploded-results).                                    |
 | `length`    | number                    | `PUT.BYTES`, `GET.BYTES`                                                                             | On `GET.BYTES`, bytes of body that follow this response line — a client reads exactly that many next. On `PUT.BYTES`, bytes stored. Its own field rather than `count`, which counts records everywhere else. See [Raw byte transfers](#raw-byte-transfers). |
+| `key`       | string                    | `WRITE`                                                                                              | The key the server minted, set **only** when the request named none and the file is an [autokey file](#server-minted-keys). A key the client supplied is never echoed back. |
+| `version`   | string                    | `READ`, `WRITE`                                                                                      | The token for `if_match` on a later `WRITE` or `DELETE` of this record. **Opaque**: read it, keep it, hand it back unexamined - nothing about its length or alphabet is promised beyond that it is text and that it changes whenever the record does. See [Conditional writes](#conditional-writes). |
 | `claim`     | object                    | `ENQUEUE`, `DEQUEUE`, `PEEK`                                                                         | What the queue knows about the record: its `key`, its `deliveries` count, when it was `enqueued`, and — for `DEQUEUE` — who holds it and when the claim `expires`. Its own field rather than more keys in `record`, so a payload with a field called `key` can be queued and read back unchanged. See [Queue files](#queue-files). |
 
 There is no `NOT_FOUND` status. A missing record, table or list yields
@@ -244,6 +249,7 @@ a code is added to the server and not written up here.
 | `INDEX_EXISTS`          | The file already carries an index on that field.                                                  |
 | `INVALID_FIELD`         | The field cannot carry an index. The message says why.                                            |
 | `INVALID_REQUEST`       | Understood and refused: the database will not do this. The message says why.                      |
+| `PRECONDITION_FAILED`   | An `if_absent` or `if_match` condition did not hold. **Nothing was written.** Read the record again and retry; see [Conditional writes](#conditional-writes). |
 | `TRANSACTION_SCOPE`     | A `TRANSACT` set reaches past what the server applies in one piece - a queue file, or too many changes. **Nothing in the set was applied.** |
 | `CORRUPT_DATA`          | What is on disk does not decode. The file needs repair; retrying will not help.                   |
 | `PERMISSION_DENIED`     | The server may not touch a file or directory it needs. An operator problem, not the client's.     |
@@ -260,8 +266,8 @@ three are not repeated in the per-command lists below.
 
 | Command                 | Admin | Account | Required fields                                      | Response on success                     |
 |-------------------------|:-----:|:-------:|------------------------------------------------------|-----------------------------------------|
-| `READ`                  |       |   yes   | `file`, `key`                                        | `record`                                |
-| `WRITE`                 |       |   yes   | `file`, `key`, and one of `data` / `structured_data` | `status: "OK"`                          |
+| `READ`                  |       |   yes   | `file`, `key`                                        | `record` + `version`                    |
+| `WRITE`                 |       |   yes   | `file`, one of `data` / `structured_data`, and `key` unless the file mints one | `version`, and `key` if minted |
 | `DELETE`                |       |   yes   | `file`, `key`                                        | `status: "OK"`                          |
 | `TRANSACT`              |       |   yes   | `changes`                                            | `count`                                 |
 | `QUERY`                 |       |   yes   | `file`                                               | `results`                               |
@@ -308,6 +314,10 @@ neither on the request. The account is still checked against the client's own. S
 Retrieve one record.
 
 - Required: `file`, `key`. Optional: `account`, `is_dict`.
+- `version` comes back with every record. It is the token a later conditional `WRITE` or
+  `DELETE` hands to `if_match`, and it costs nothing to send, so it is not asked for —
+  a client that only found out it needed one afterwards would have to read twice. See
+  [Conditional writes](#conditional-writes).
 - Errors: `MISSING_FIELD` (no `file` or `key`), `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`,
   `FILE_NOT_FOUND`, `RECORD_NOT_FOUND`.
 
@@ -316,7 +326,8 @@ Retrieve one record.
 ```
 
 ```json
-{"status": "OK", "record": {"name": "Alice", "email": "alice@example.com"}}
+{"status": "OK", "record": {"name": "Alice", "email": "alice@example.com"},
+ "version": "6b1f9c0a4d2e8371"}
 ```
 
 ### WRITE
@@ -324,12 +335,18 @@ Retrieve one record.
 Create or replace one record. The table's dictionary is pre-loaded so object data maps
 correctly.
 
-- Required: `file`, `key`, and one of `data` or `structured_data`. Optional: `account`,
-  `is_dict`.
+- Required: `file`, and one of `data` or `structured_data`. `key` too, unless the file is
+  an [autokey file](#server-minted-keys), which mints one and returns it. Optional:
+  `account`, `is_dict`, `if_absent`, `if_match`.
 - `data` as a string is a raw display-format record; `data` as an object, or
   `structured_data`, is field-name → value with ICONV applied.
-- Errors: `MISSING_FIELD` (no `file`, `key` or data), `INVALID_DATA` (data that is not a
-  record), `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`, `FILE_NOT_FOUND`.
+- `version` comes back on every write: it is what the record now has, so a client can make
+  its *next* write conditional without reading in between.
+- Errors: `MISSING_FIELD` (no `file` or data; no `key` on a file that does not mint them),
+  `INVALID_DATA` (data that is not a record, or an empty `if_match`), `INVALID_REQUEST`
+  (`if_absent` and `if_match` together, a condition on a directory file, or a keyless write
+  to a file that does not mint keys), `PRECONDITION_FAILED`, `ACCOUNT_NOT_SPECIFIED`,
+  `ACCESS_DENIED`, `FILE_NOT_FOUND`.
 
 ```json
 {"command": "WRITE", "account": "SALES", "file": "USERS", "key": "3",
@@ -342,16 +359,44 @@ correctly.
 ```
 
 ```json
-{"status": "OK"}
+{"status": "OK", "version": "6b1f9c0a4d2e8371"}
+```
+
+Create only if nobody else got there first:
+
+```json
+{"command": "WRITE", "account": "SALES", "file": "USERS", "key": "3",
+ "data": "Alice^alice@example.com", "if_absent": true}
+```
+
+```json
+{"status": "ERROR", "code": "PRECONDITION_FAILED",
+ "message": "Record '3' in file 'USERS' already exists, and if_absent asked for it not to"}
+```
+
+Append without inventing a key, on a file created `AUTOKEY`:
+
+```json
+{"command": "WRITE", "account": "SALES", "file": "EVENTS", "data": "login^alice"}
+```
+
+```json
+{"status": "OK", "key": "01764950412345000001", "version": "c40aa1be77d90e52"}
 ```
 
 ### DELETE
 
 Remove one record. Succeeds whether or not the key existed.
 
-- Required: `file`, `key`. Optional: `account`, `is_dict`.
-- Errors: `MISSING_FIELD` (no `file` or `key`), `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`,
-  `FILE_NOT_FOUND`.
+- Required: `file`, `key`. Optional: `account`, `is_dict`, `if_match`.
+- `if_match` makes it conditional: deleting a record somebody else has changed since you
+  read it is the same lost-update bug a `WRITE` has, so it takes the same condition. With
+  one, a key that holds nothing is `PRECONDITION_FAILED` rather than `"OK"` — there was no
+  record whose version could match. Without one, it stays "succeeds whether or not the key
+  existed", which is the difference between *already done* and *not the record you read*.
+- Errors: `MISSING_FIELD` (no `file` or `key`), `INVALID_DATA` (an empty `if_match`),
+  `INVALID_REQUEST` (a condition on a directory file), `PRECONDITION_FAILED`,
+  `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`, `FILE_NOT_FOUND`.
 
 ```json
 {"command": "DELETE", "account": "SALES", "file": "USERS", "key": "3"}
@@ -360,6 +405,107 @@ Remove one record. Succeeds whether or not the key existed.
 ```json
 {"status": "OK"}
 ```
+
+```json
+{"command": "DELETE", "account": "SALES", "file": "USERS", "key": "3",
+ "if_match": "6b1f9c0a4d2e8371"}
+```
+
+### Conditional writes
+
+`WRITE` overwrites. That is the right default and it is also two lost-record bugs: two
+clients that both intend to *create* a record write the same key and the second silently
+wins, and two clients that each read a record, change it and write it back lose one of the
+two changes. Both writes were valid, so nothing is reported, and the record is simply gone.
+
+Two conditions cover almost every case:
+
+- **`if_absent`** — write only if the key holds no record. Create-if-not-exists, and what
+  makes any generated-key or append pattern safe.
+- **`if_match`** — write or delete only if the record there still has the `version` a
+  `READ` reported. This is the read-modify-write loop.
+
+Either way the condition is checked and the write applied **inside the file's own write
+lock**, with nothing in between, so a second writer arriving at any moment either has not
+got the lock yet or is looking at a file the first one has already changed. A refused
+condition writes nothing at all.
+
+The refusal is its own code, `PRECONDITION_FAILED`, and that is the whole point: a
+collision is something a client acts on — read again and retry — and a generic write error
+is not. Reusing one would have made the feature useless.
+
+The retry loop a client writes:
+
+```json
+{"command": "READ", "account": "SALES", "file": "COUNTERS", "key": "HITS"}
+{"status": "OK", "record": {"n": "41"}, "version": "6b1f9c0a4d2e8371"}
+
+{"command": "WRITE", "account": "SALES", "file": "COUNTERS", "key": "HITS",
+ "data": {"n": "42"}, "if_match": "6b1f9c0a4d2e8371"}
+{"status": "ERROR", "code": "PRECONDITION_FAILED",
+ "message": "Record 'HITS' in file 'COUNTERS' has version 9e30..., not the 6b1f... if_match named: it was changed since it was read"}
+```
+
+— at which point the client reads again, recomputes and writes again. Only a
+`PRECONDITION_FAILED` is worth retrying; every other code means retrying changes nothing.
+
+**The version is a digest of the record, and it is opaque.** It is sixteen hex characters
+today, derived from the record's stored bytes rather than from a counter kept beside them —
+a counter would be a field the record section has no room for, and so a change to the
+on-disk format to hold a number the bytes already determine. Nothing about the token's
+length, alphabet or derivation is part of this interface: read it, keep it, hand it back.
+What *is* promised is that it changes whenever the record's bytes change, and that a record
+written back unchanged keeps it.
+
+**Two conditions at once are refused.** `if_absent` says the key holds nothing and
+`if_match` says which record it holds, so a request carrying both has contradicted itself
+and gets `INVALID_REQUEST`. `if_absent: false` is not a third condition — it means the same
+as omitting it.
+
+**A directory file takes no condition.** Its records are files on the host that anything on
+the machine can change, so a version taken from one promises nothing, and asking for one is
+refused with `INVALID_REQUEST` rather than checked and hoped for.
+
+**`TRANSACT` carries no conditions.** A set is applied whole or not at all, which is a
+different guarantee: see [TRANSACT](#transact).
+
+### Server-minted keys
+
+For a record with a natural identifier, a caller-supplied key is right. For anything a
+caller is *accumulating* — a log, a journal, a stream of events — the key means nothing
+beyond "later than the last one", and making the client invent it creates the problem
+above: read the current maximum, add one, write, and lose a record to whoever did the same
+thing in between.
+
+A file created `AUTOKEY` mints the key itself. `WRITE` with no `key` stores the record and
+returns the key it chose:
+
+```json
+{"command": "CREATE.FILE", "account": "SALES", "file": "EVENTS", "autokey": true}
+{"command": "WRITE", "account": "SALES", "file": "EVENTS", "data": "login^alice"}
+{"status": "OK", "key": "01764950412345000001", "version": "c40aa1be77d90e52"}
+```
+
+- **The minting happens under the file's write lock**, so two clients appending at once
+  both succeed with distinct keys rather than one of them silently overwriting the other.
+- **The key is twenty decimal digits, zero padded, and increases in arrival order** — the
+  same shape a [queue file](#queue-files) mints, `milliseconds * 1000000 + counter`. The
+  fixed width is part of the interface: it means a range scan reads the records back in the
+  order they were written, sorting the keys **as text**, without the caller knowing how
+  wide the counter is or parsing it.
+- **The counter is per file and survives a restart without reuse.** It is persisted beside
+  the records, and because the clock is in the key it moves forward even when that file is
+  lost.
+- **A file without the flag refuses a keyless `WRITE`** with `INVALID_REQUEST`, naming
+  `AUTOKEY`, rather than inventing a key. A supplied key still works on a file that mints
+  them: the counter steps over it.
+- **`AUTOKEY` and `QUEUE` are mutually exclusive**, and so are `AUTOKEY` and `DIRECTORY`. A
+  queue already mints the key of every record it stores — `ENQUEUE` is what appends to one —
+  and a directory file's keys are the names of host files.
+
+This is complementary to conditional writes rather than a substitute. Minted keys remove the
+lost-record failure for appends; `if_match` is still what a read-modify-write on an existing
+record needs.
 
 ### TRANSACT
 
@@ -932,6 +1078,9 @@ Create an account already populated with the demo fixture — the same one the C
 - It also gets a `JOBS` [queue file](#queue-files) holding three enqueued records, on a
   ninety-second visibility timeout and three deliveries — deliberately not the defaults, so
   anywhere the policy is displayed it can be seen to be read rather than assumed.
+- And an `EVENTS` [autokey file](#server-minted-keys) holding two records appended with no
+  key at all, so the keys in it are real minted ones and a range read over them comes back
+  in the order they were written.
 - `record` names the account and the files it was given, read back after the fact rather than
   listed from a constant, so it describes whatever the fixture creates today.
 - The account must not already exist; nothing is written when it does.
@@ -942,15 +1091,16 @@ Create an account already populated with the demo fixture — the same one the C
 ```
 
 ```json
-{"status": "OK", "record": {"account": "DEMO", "files": ["DIR", "JOBS", "PRODUCTS", "USERS"]}}
+{"status": "OK", "record": {"account": "DEMO",
+                            "files": ["ATTACHMENTS", "DIR", "EVENTS", "JOBS", "PRODUCTS", "USERS"]}}
 ```
 
 ### CREATE.FILE — admin
 
 Create a table (data and dictionary sections) in `account`.
 
-- Required: `account`, `file`. Optional: `durable`, `queue`, `visibility_timeout`,
-  `max_deliveries`, `directory`, `path`. Admin only.
+- Required: `account`, `file`. Optional: `durable`, `autokey`, `queue`,
+  `visibility_timeout`, `max_deliveries`, `directory`, `path`. Admin only.
 - The file is added to the account's `DIR` listing, which is created first if the account
   has not got one.
 - With `durable: true` the file is marked mission critical in the account's `DIR` entry, so
@@ -961,6 +1111,10 @@ Create a table (data and dictionary sections) in `account`.
   otherwise, because acknowledging a claim that a crash then loses is the failure a queue
   exists to prevent. `visibility_timeout` and `max_deliveries` set that queue's own claim
   policy; naming either implies `queue: true`.
+- With `autokey: true` the file mints the key of a `WRITE` that names none — see
+  [Server-minted keys](#server-minted-keys). It cannot also be a queue or a directory file:
+  a queue already mints every key it stores and a directory file's keys are the names of
+  host files, so asking for either combination is refused with `INVALID_REQUEST`.
 - With `directory: true` the file is a [directory file](#directory-files): its records are
   the files of a real directory on the host, which is where content that is not fields
   belongs. `path` points it at a directory that already exists, and naming it implies
@@ -971,7 +1125,8 @@ Create a table (data and dictionary sections) in `account`.
   either alongside it is refused with `INVALID_REQUEST`.
 - Errors: `ADMIN_REQUIRED`, `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`),
   `INVALID_DATA` (a timeout or delivery limit out of range), `INVALID_REQUEST` (`directory`
-  asked for alongside `queue` or `durable`, or `path` without `directory`), `FILE_EXISTS`.
+  asked for alongside `queue` or `durable`, `autokey` alongside `queue` or `directory`, or
+  `path` without `directory`), `FILE_EXISTS`.
 
 ```json
 {"command": "CREATE.FILE", "account": "SALES", "file": "JOBS", "queue": true,
@@ -981,7 +1136,8 @@ Create a table (data and dictionary sections) in `account`.
 ```json
 {"status": "OK", "record": {"account": "SALES", "name": "JOBS", "durable": true,
                             "queue": true, "visibility_timeout_seconds": 300,
-                            "max_deliveries": 3, "directory": false, "path": null}}
+                            "max_deliveries": 3, "autokey": false, "directory": false,
+                            "path": null}}
 ```
 
 `path` is where a directory file's records actually are, resolved rather than as the `DIR`
@@ -995,8 +1151,8 @@ Change what a file already is, without recreating it — so a file can be promot
 critical or demoted back, made a queue or returned to an ordinary file, and a queue's claim
 policy retuned, all while keeping the records it holds.
 
-- Required: `account`, `file`, and at least one of `durable`, `queue`, `visibility_timeout`
-  or `max_deliveries`. Admin only.
+- Required: `account`, `file`, and at least one of `durable`, `autokey`, `queue`,
+  `visibility_timeout` or `max_deliveries`. Admin only.
 - **Only what is named changes.** An omitted field leaves that attribute alone, so a request
   about durability cannot quietly stop a file being a queue, and one about a queue's timeout
   cannot quietly demote it to buffered writes.
@@ -1007,6 +1163,10 @@ policy retuned, all while keeping the records it holds.
   `queue: false` detaches it and leaves every record where it is, removing the queue's
   bookkeeping with it — so a file promoted again later starts its delivery counts over rather
   than resurrecting counts from before it stopped being a queue.
+- `autokey: true` makes the file mint the key of a keyless `WRITE`, and `autokey: false`
+  returns it to requiring one, removing the counter's own file with it — so a file switched
+  on again later starts from the keys it actually holds rather than from a counter nothing
+  has been maintaining. The records are untouched either way.
 - The one exception to "only what is named changes": a file *becoming* a queue becomes
   durable with it unless `durable: false` says otherwise, for the reason a queue is created
   durable. A file that is already a queue keeps the durability it has, so retuning its
@@ -1032,7 +1192,8 @@ policy retuned, all while keeping the records it holds.
 ```json
 {"status": "OK", "record": {"account": "SALES", "name": "LEDGER", "durable": true,
                             "queue": false, "visibility_timeout_seconds": null,
-                            "max_deliveries": null, "directory": false, "path": null}}
+                            "max_deliveries": null, "autokey": false, "directory": false,
+                            "path": null}}
 ```
 
 ### DELETE.FILE — admin
@@ -1184,15 +1345,17 @@ The files in one account, sorted.
 
 - Required: `account` (or a client with exactly one allowed account).
 - `keys` is the plain list of names. `results` pairs each name with what is known about the
-  file beside its name: `durable`, `queue` and `directory`, so a client can see which files
-  flush every write, which are [queues](#queue-files) and which are
+  file beside its name: `durable`, `queue`, `autokey` and `directory`, so a client can see
+  which files flush every write, which are [queues](#queue-files), which
+  [mint their own keys](#server-minted-keys) and which are
   [directory files](#directory-files) without reading the account's `DIR` file, and a
   [health](#health-verdicts-and-measures) verdict, so a problem file can be found without
   opening every file in turn. A database running with `durable_writes = true` reports every
   file as durable, because every write then is.
-- The queue *flag* is here because it is free — it is read from the same `DIR` entry the
-  durability flag is. A queue's depth and in-flight count are not, so they arrive with
-  [`FILE.STATS`](#filestats) rather than making a listing open every file.
+- The queue and autokey *flags* are here because they are free — they are read from the same
+  `DIR` entry the durability flag is, and `autokey` is the one thing a client has to know
+  before trying a keyless `WRITE`. A queue's depth and in-flight count are not free, so they
+  arrive with [`FILE.STATS`](#filestats) rather than making a listing open every file.
 - `health` here is the *cheap* verdict — one of `good`, `watch` or `act`, derived from the
   section metadata and the index `state` files alone. It reads no group trailer and no
   record, because a listing must not cost what opening a file costs. `health_reasons` names
@@ -1205,13 +1368,19 @@ The files in one account, sorted.
 ```
 
 ```json
-{"status": "OK", "count": 5, "keys": ["DIR", "JOBS", "LEDGER", "SCANS", "USERS"], "results": [
-  ["DIR", {"durable": false, "queue": false, "directory": false, "health": "good", "health_reasons": []}],
-  ["JOBS", {"durable": true, "queue": true, "directory": false, "health": "good", "health_reasons": []}],
-  ["LEDGER", {"durable": true, "queue": false, "directory": false, "health": "good", "health_reasons": []}],
-  ["SCANS", {"durable": false, "queue": false, "directory": true, "health": "good", "health_reasons": []}],
-  ["USERS", {"durable": false, "queue": false, "directory": false, "health": "act",
-             "health_reasons": ["1 of 2 indexes stale"]}]
+{"status": "OK", "count": 6, "keys": ["DIR", "EVENTS", "JOBS", "LEDGER", "SCANS", "USERS"], "results": [
+  ["DIR", {"durable": false, "queue": false, "autokey": false, "directory": false,
+           "health": "good", "health_reasons": []}],
+  ["EVENTS", {"durable": false, "queue": false, "autokey": true, "directory": false,
+              "health": "good", "health_reasons": []}],
+  ["JOBS", {"durable": true, "queue": true, "autokey": false, "directory": false,
+            "health": "good", "health_reasons": []}],
+  ["LEDGER", {"durable": true, "queue": false, "autokey": false, "directory": false,
+              "health": "good", "health_reasons": []}],
+  ["SCANS", {"durable": false, "queue": false, "autokey": false, "directory": true,
+             "health": "good", "health_reasons": []}],
+  ["USERS", {"durable": false, "queue": false, "autokey": false, "directory": false,
+             "health": "act", "health_reasons": ["1 of 2 indexes stale"]}]
 ]}
 ```
 
@@ -1278,7 +1447,7 @@ memory, so asking for them loads the file.
   "group_count": 128, "smallest_group_bytes": 96, "largest_group_bytes": 512,
   "disk_bytes": 262144, "group_bytes": 212992, "index_bytes": 20480,
   "checksums": true, "legacy": false,
-  "durable": false, "loaded": true, "modified_seconds_ago": 12,
+  "durable": false, "autokey": false, "loaded": true, "modified_seconds_ago": 12,
   "queue": null, "directory": null,
   "records_per_group_target": 16, "load_factor": 0.625,
   "records_until_growth": 769, "records_until_shrink": 768,
@@ -1312,6 +1481,11 @@ memory, so asking for them loads the file.
 order, with the same objects `LIST.INDEXES` returns. It is `[]` for a file that has none. The
 worst index verdict is rolled into the file's own `health`, so a badly shaped index is
 visible from the file rather than only from the index table.
+
+`autokey` says whether a keyless `WRITE` works on this file — see
+[Server-minted keys](#server-minted-keys). A flag rather than the counter's next value: a
+minted key comes from the clock as much as from the counter, so a number here would be a
+guess a reader could mistake for a reservation.
 
 **Queues.** `queue` is `null` for an ordinary file. For a [queue file](#queue-files) it is
 the four numbers an administrator needs about one, plus the policy behind them:

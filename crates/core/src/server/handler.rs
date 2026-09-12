@@ -1,6 +1,7 @@
 use crate::db::engine::dictionary::DEFAULT_FIELD_WIDTH;
 use crate::db::{
-    Change, ChangeOp, Database, DbError, ExplodeSpec, IndexStats, QueryNode, Record, SortSpec, Table, TableHandle,
+    Change, ChangeOp, Condition, Database, DbError, ExplodeSpec, IndexStats, QueryNode, Record, SortSpec, Table,
+    TableHandle,
 };
 use crate::server::models::{ChangeSpec, ErrorCode, Request, Response};
 use std::collections::HashMap;
@@ -536,11 +537,19 @@ fn file_attributes(req: &Request, current: crate::db::FileAttributes) -> Result<
             "A file's type is fixed when it is created: create a new file of the type you want and move the records",
         ));
     }
+    let wants_autokey = req.autokey.unwrap_or(current.autokey);
     if wants_directory {
         if req.queue == Some(true) || req.visibility_timeout.is_some() || req.max_deliveries.is_some() {
             return Err(error(
                 ErrorCode::InvalidRequest,
                 "A directory file cannot be a queue: its records are host files, with no order to claim from",
+            ));
+        }
+        if wants_autokey {
+            return Err(error(
+                ErrorCode::InvalidRequest,
+                "A directory file cannot mint keys: its keys are the names of host files, which is what a caller \
+                 opens them by",
             ));
         }
         if req.durable == Some(false) {
@@ -557,6 +566,7 @@ fn file_attributes(req: &Request, current: crate::db::FileAttributes) -> Result<
         return Ok(crate::db::FileAttributes {
             durable: false,
             queue: None,
+            autokey: false,
             directory: Some(crate::db::DirectoryPolicy { path }),
         });
     }
@@ -575,8 +585,21 @@ fn file_attributes(req: &Request, current: crate::db::FileAttributes) -> Result<
         return Ok(crate::db::FileAttributes {
             durable,
             queue: None,
+            autokey: wants_autokey,
             directory: None,
         });
+    }
+    if wants_autokey {
+        // Refused rather than settled either way: a queue already mints the key
+        // of every record it stores, so a file asked for both has been asked
+        // for two counters, and which one a `WRITE` should draw from is a
+        // question only the caller can answer. `ENQUEUE` is what appends to a
+        // queue; `autokey` is what gives an ordinary file the same thing.
+        return Err(error(
+            ErrorCode::InvalidRequest,
+            "A queue file already mints the key of every record it stores: use ENQUEUE, or create a separate \
+             autokey file for records that are not claimed",
+        ));
     }
 
     let existing = current.queue.unwrap_or_default();
@@ -617,6 +640,7 @@ fn file_attributes(req: &Request, current: crate::db::FileAttributes) -> Result<
             visibility,
             max_deliveries,
         }),
+        autokey: false,
         directory: None,
     })
 }
@@ -646,6 +670,7 @@ fn file_attributes_json(db: &Database, account: &str, name: &str) -> serde_json:
         "queue": attributes.queue.is_some(),
         "visibility_timeout_seconds": attributes.queue.map(|policy| policy.visibility_seconds()),
         "max_deliveries": attributes.queue.map(|policy| policy.max_deliveries),
+        "autokey": attributes.autokey,
         "directory": attributes.is_directory(),
         "path": db
             .directory_root(account, name)
@@ -713,7 +738,14 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
         Ok(name) => name.to_string(),
         Err(resp) => return resp,
     };
+    let condition = match requested_condition(&req) {
+        Ok(condition) => condition,
+        Err(resp) => return resp,
+    };
     if db.is_table_directory_for_account(acc, &table_name) {
+        if let Err(resp) = directory_takes_no_condition(&table_name, &condition) {
+            return resp;
+        }
         return directory_write(db, acc, &table_name, req);
     }
     // Resolved once, and held: deserialization needs the dictionary and the
@@ -725,34 +757,38 @@ fn write_record(db: &Database, acc: &str, req: Request) -> Response {
         Err(resp) => return resp,
     };
 
-    let key = match req.key {
-        Some(k) => k,
-        None => return error(ErrorCode::MissingField, "Key not specified"),
-    };
     let is_dict = req.is_dict.unwrap_or(false);
+    // An empty key is a missing one rather than a request to mint: a client
+    // that meant to ask the server for a key omits the field, and one that
+    // built the key and got an empty string has a bug this should report.
+    if req.key.as_deref().is_some_and(str::is_empty) {
+        return error(ErrorCode::MissingField, "Key not specified");
+    }
 
     let record = match record_from(db, &handle, req.data, req.structured_data) {
         Ok(record) => record,
         Err(resp) => return resp,
     };
 
-    // The file's lock is dropped before the flush below: `note_write_for` may
-    // decide to save, and a save locks every dirty file in turn.
-    {
-        let mut table = handle.write();
-        if is_dict {
-            table.dictionary.insert(key, record);
-            table.mark_dict_dirty();
-        } else {
-            table.insert_record(&key, record);
-        }
-    }
-    match db.note_write_for(acc, &table_name) {
-        Ok(_) => Response {
+    match db.write_record_in(
+        acc,
+        &table_name,
+        &handle,
+        req.key.as_deref(),
+        record,
+        is_dict,
+        &condition,
+    ) {
+        // The key is reported only when the server chose it. Echoing one the
+        // client already sent would make every reply carry a field that means
+        // something on one write in a hundred.
+        Ok(written) => Response {
             status: "OK".to_string(),
+            key: written.minted.then_some(written.key),
+            version: Some(written.version),
             ..Default::default()
         },
-        Err(e) => db_error_in("Save error", e),
+        Err(e) => write_error(e),
     }
 }
 
@@ -1186,6 +1222,10 @@ fn delete_record(db: &Database, acc: &str, req: Request) -> Response {
         Ok(name) => name.to_string(),
         Err(resp) => return resp,
     };
+    let condition = match requested_condition(&req) {
+        Ok(condition) => condition,
+        Err(resp) => return resp,
+    };
     let key = match req.key {
         Some(k) => k,
         None => return error(ErrorCode::MissingField, "Key not specified"),
@@ -1193,6 +1233,9 @@ fn delete_record(db: &Database, acc: &str, req: Request) -> Response {
     let is_dict = req.is_dict.unwrap_or(false);
     if db.is_table_directory_for_account(acc, &table_name) {
         if let Err(resp) = directory_has_no_dictionary(&table_name, is_dict) {
+            return resp;
+        }
+        if let Err(resp) = directory_takes_no_condition(&table_name, &condition) {
             return resp;
         }
         return match db.delete_directory_record(acc, &table_name, &key) {
@@ -1205,25 +1248,21 @@ fn delete_record(db: &Database, acc: &str, req: Request) -> Response {
         };
     }
 
-    {
-        let handle = match resolve_file(db, acc, &table_name) {
-            Ok(handle) => handle,
-            Err(resp) => return resp,
-        };
-        let mut table = handle.write();
-        if is_dict {
-            table.dictionary.remove(&key);
-            table.mark_dict_dirty();
-        } else {
-            table.remove_record(&key);
-        }
-    }
-    match db.note_write_for(acc, &table_name) {
+    let handle = match resolve_file(db, acc, &table_name) {
+        Ok(handle) => handle,
+        Err(resp) => return resp,
+    };
+    match db.delete_record_in(acc, &table_name, &handle, &key, is_dict, &condition) {
+        // An unconditional delete of a key that is not there still answers OK,
+        // as it always has: the caller asked for the record to be gone and it
+        // is. A conditional one never reaches here on a missing record - the
+        // condition refused it first, which is the difference between "already
+        // done" and "not the record you read".
         Ok(_) => Response {
             status: "OK".to_string(),
             ..Default::default()
         },
-        Err(e) => db_error_in("Save error", e),
+        Err(e) => write_error(e),
     }
 }
 
@@ -1243,6 +1282,69 @@ fn allowed_account<'a>(req: &'a Request, client_info: &'a crate::db::ClientInfo)
     }
 }
 
+/// The condition a `WRITE` or `DELETE` request attaches to itself.
+///
+/// Naming both is refused rather than settled: `if_absent` says the key holds
+/// nothing and `if_match` says it holds one particular thing, so a request
+/// carrying both has contradicted itself, and guessing which half was meant is
+/// how a caller ends up trusting a check that never ran.
+///
+/// `if_absent: false` is the same as omitting it - the client asked for no
+/// condition. Reading it as "the record must exist" would invent a third
+/// condition nobody named.
+#[allow(clippy::result_large_err)]
+fn requested_condition(req: &Request) -> Result<Condition, Response> {
+    match (req.if_absent.unwrap_or(false), req.if_match.as_deref()) {
+        (true, Some(_)) => Err(error(
+            ErrorCode::InvalidRequest,
+            "if_absent and if_match contradict each other: one says the key holds nothing, the other says which \
+             record it holds",
+        )),
+        (true, None) => Ok(Condition::IfAbsent),
+        (false, Some("")) => Err(error(
+            ErrorCode::InvalidData,
+            "if_match needs the version a READ reported; an empty one matches nothing",
+        )),
+        (false, Some(version)) => Ok(Condition::IfMatch(version.to_string())),
+        (false, None) => Ok(Condition::Always),
+    }
+}
+
+/// The reply for an error out of the write path.
+///
+/// A write that was *refused* - a condition that did not hold, a keyless write
+/// to a file that does not mint keys - saved nothing and failed at nothing, so
+/// prefixing it with "Save error" would describe it to a person as the one
+/// thing it is not. Only a genuine failure to store the record gets that
+/// context; the code is right either way.
+fn write_error(e: DbError) -> Response {
+    match e {
+        refused @ (DbError::PreconditionFailed(_) | DbError::InvalidRequest(_)) => db_error(refused),
+        failed => db_error_in("Save error", failed),
+    }
+}
+
+/// Refuses a condition on a directory file, whose records are host files.
+///
+/// A directory record is a file on the host, changed by whatever else has that
+/// path open, so a version this server minted would be a promise about bytes it
+/// does not control. Said plainly rather than checked and hoped for: the point
+/// of a condition is that it holds.
+#[allow(clippy::result_large_err)]
+fn directory_takes_no_condition(name: &str, condition: &Condition) -> Result<(), Response> {
+    if condition.is_unconditional() {
+        return Ok(());
+    }
+    Err(error(
+        ErrorCode::InvalidRequest,
+        format!(
+            "'{}' is a directory file: its records are host files that anything on the machine can change, so a \
+             version taken from one promises nothing",
+            name
+        ),
+    ))
+}
+
 /// Reads a single record from `table`, which the caller has already resolved.
 fn read_command(db: &Database, table: &Table, req: &Request) -> Response {
     if req.file.is_none() {
@@ -1259,6 +1361,12 @@ fn read_command(db: &Database, table: &Table, req: &Request) -> Response {
         Some(record) => Response {
             status: "OK".to_string(),
             record: Some(db.serialize_record_in(table, record)),
+            // Sent on every read rather than on request: it is a hash of the
+            // bytes the read already had in hand and already serialized, so
+            // asking for it would be a second round trip to save nothing, and a
+            // client that only finds out it needed one after the fact would
+            // have to read twice.
+            version: Some(record.version()),
             ..Default::default()
         },
         None => error(ErrorCode::RecordNotFound, "Record not found"),
@@ -1800,6 +1908,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             // because the request was about durability.
             if req.durable.is_none()
                 && req.queue.is_none()
+                && req.autokey.is_none()
                 && req.visibility_timeout.is_none()
                 && req.max_deliveries.is_none()
                 && req.directory.is_none()
@@ -1807,7 +1916,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             {
                 return error(
                     ErrorCode::MissingField,
-                    "Nothing to set: name durable, queue, visibility_timeout or max_deliveries",
+                    "Nothing to set: name durable, autokey, queue, visibility_timeout or max_deliveries",
                 );
             }
             let current = db.file_attributes_for_account(acc, &name);
@@ -2123,9 +2232,13 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     let value = serde_json::json!({
                         "durable": attributes.durable,
                         "queue": attributes.queue.is_some(),
+                        // Whether a keyless WRITE works on it, which is the one
+                        // thing a client has to know before trying one - and
+                        // free here for the same reason the queue flag is.
+                        "autokey": attributes.autokey,
                         // The type, so a client knows which commands the file
                         // answers before it tries one. Free here: it is read
-                        // off the same DIR entry the other two flags are.
+                        // off the same DIR entry the other flags are.
                         "directory": attributes.is_directory(),
                         "health": health.verdict.as_str(),
                         "health_reasons": health.reasons,
