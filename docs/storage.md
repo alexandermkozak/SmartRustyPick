@@ -889,6 +889,26 @@ Two connections may load the same cold file at the same time. The second to fini
 in the map and discards its own copy. That costs a duplicate read of a file nobody had written to yet, and is what keeps
 the map's lock off the disk.
 
+### Staleness, and the same rule again
+
+A cached file whose data section was rewritten by another process is dropped so the next access reads it fresh. **That
+drop obeys the eviction rule above**: a file another thread still holds a handle to is left alone, however stale the
+cache believes it is. Removing the map entry does not remove the file from memory — it only lets the next caller load a
+second copy beside the one still in use, which is the two-copies hazard eviction has always avoided. The entry goes
+stale again the moment nobody is using it, and is dropped then.
+
+That was a real failure and not a precaution. A thread that dropped a held entry went on to read the section from disk
+while the holder was flushing it, and the load swept the `.tmp` files as it went — including the one that flush was
+between `create` and `rename` of. The flush then failed its rename, and a durable `WRITE` came back `IO_ERROR` under
+nothing worse than concurrency. Nothing was lost or corrupted, because a temporary is never part of the section, but a
+write failed for a reason no caller could act on.
+
+The sweep moved with the fix. Reclaiming crash debris needs to know that no flush of that section is in progress, which
+is the file lock's guarantee and not something a load can establish — a load is what runs *before* there is a file to
+lock. It now happens on a loaded file's **first flush**, under the lock that flush already holds, which keeps it to one
+directory scan per load rather than one per write. Leaving the debris until then costs only the space: nothing ever
+reads a `.tmp`.
+
 ## Configuration
 
 The following optional keys in `config.toml` control the storage engine:

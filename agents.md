@@ -36,8 +36,9 @@ AI agents have been responsible for several critical improvements and fixes in t
 
 - **Web Dashboard:** Built the browser-based management interface that starts with the database server, covering
   connection authorization, certificate issuing and download, live connection and usage monitoring, navigation of
-  accounts and their files, per-file durability, creating and dropping accounts and files, creating the populated demo
-  account, and maintaining a file's dictionary. It connects to the database as an ordinary remote client, with a certificate reissued and
+  accounts and their files, per-file durability, the queue and autokey flags with the numbers behind each - a queue's
+  depth and in-flight count, an autokey file's next key - creating and dropping accounts and files, creating the
+  populated demo account, and maintaining a file's dictionary. It connects to the database as an ordinary remote client, with a certificate reissued and
   re-authorized on every boot, so it can do nothing the documented protocol does not already allow.
 - **Protocol Extensions:** Added the management commands the dashboard needed - `LIST.CONNS`, `LIST.ACCOUNTS`,
   `LIST.FILES`, `FILE.STATS`, `SERVER.STATS`, `SET.FILE`, `GENERATE.CERT`, `LIST.DICT`, `SET.DICT` and
@@ -59,7 +60,7 @@ AI agents have been responsible for several critical improvements and fixes in t
 - **MultiValue Logic:** Implementation of hierarchical data structures (FM, VM, SVM), and the `BY.EXP` clause that
   gives each value of a multivalued field its own `LIST` row, carrying the matched position through select lists,
   `SAVE-LIST`/`GET-LIST` and the remote protocol. Fields that belong together explode together - see
-  [Association groups](#7-association-groups-correlated-multivalues-for-free) below.
+  [Association groups](#8-association-groups-correlated-multivalues-for-free) below.
 - **Dictionary Support:** Logic for field formatting and conversions (Dates, Numbers).
 - **Query Engine:** Implementation of `SELECT` and `QUERY` commands for data retrieval.
 - **Queue Files:** An ordering primitive beside the hashed one. A file created `QUEUE` mints a sequence key per
@@ -173,6 +174,12 @@ AI agents have been responsible for several critical improvements and fixes in t
   nothing moves forward past everything minted before it. The restart property is asserted the only way it can be: a
   test re-executes the test binary, has the child delete its highest key and SIGKILL itself, then checks that the key
   does not come back.
+- **What the dashboard shows, and what it will not.** A file's next key is on the page, because "where has the counter
+  got to" is the question an autokey file raises and none of the other numbers answers it. The counter *behind* the key
+  is not: it is a `u64` near 1.7e18, past the integer JavaScript holds exactly, so the browser has already rounded it
+  by the time the page sees it. The key is the string the server formatted and says the same thing without the lie.
+  Neither costs a load - the counter comes from memory when the file is open and from its own small file when it is
+  not - because describing a file must not be what pulls it into the cache.
 - **Opt-in, and exclusive.** A file that does not mint keys refuses a keyless write, naming the flag, rather than
   inventing behaviour - and `AUTOKEY` is refused alongside `QUEUE` and `DIRECTORY`, because a queue already mints every
   key it stores and a directory file's keys are the names of host files. Same principle as the directory-file refusals:
@@ -180,10 +187,7 @@ AI agents have been responsible for several critical improvements and fixes in t
 - **The test that would have caught the original bug.** Eight threads racing to create one key: exactly one succeeds
   and seven are told they collided. Eight more doing a read-modify-write with no retry: the count on disk equals the
   number of writes that were *acknowledged*, which before the condition existed was eight acknowledgements over a count
-  of anything from one upwards. Writing those found a **pre-existing** race of its own - `hashfile::load` sweeps `.tmp`
-  files and cannot tell an abandoned temporary from one a concurrent flush of the same file is still writing, so the
-  flush fails with `NotFound`. It reproduces with a plain `WRITE` loop and has nothing to do with either feature, so it
-  is left for its own change; the tests note it and keep out of its way.
+  of anything from one upwards. Writing those found a **pre-existing** race, since fixed - see below.
 - **Certificate Management:** Implemented `GENERATE.CERT` in the `SYSTEM` account, allowing users to create signed
   client certificates and PKCS#12 (.pfx) files directly from the database CLI for simplified secure remote access setup.
 - **Typed errors:** The engine reports a `DbError` variant - `FileNotFound`, `AccountExists`, `IndexNotFound`, `Io` and
@@ -249,7 +253,29 @@ AI agents have been responsible for several critical improvements and fixes in t
   one file no longer drags every other file through a flush with it. The connection-close, ticker and shutdown paths
   still flush everything, which is what bounds how long any change can stay in memory.
 
-### 7. Association groups: correlated multivalues for free
+### 7. The bug the concurrency tests found
+
+- **A durable `WRITE` could fail for no reason a caller could act on.** Not often - perhaps one run in six with eight
+  threads on one file - and never with a record lost, which is why it had gone unnoticed: it surfaced only once there
+  were tests that wrote to one file from several threads at once.
+- **Two copies of one file.** A thread that found a cached file stale dropped it from the map *even though another
+  thread was still holding a handle to it*. Dropping the entry does not drop the file - it only lets the next caller
+  load a second copy from disk beside the one still in use. The eviction path had always known this and skipped a held
+  file, saying so in its own comment; the invalidation path a few lines above did the same thing without the check.
+  One rule, written down once and implemented twice, is how that happens.
+- **The symptom was two directories away from the cause.** The second copy's load swept the section's `.tmp` files on
+  its way past, and one of them was not crash debris - it was the temporary the *first* copy's flush was between
+  `create` and `rename` of. The rename then failed with `NotFound` and the write came back `IO_ERROR`.
+- **The sweep moved to where the question can be answered.** "Is any flush of this section in progress" is the file
+  lock's guarantee, and a load is precisely the thing that runs before there is a file to lock, so it could never
+  answer it. It happens on a loaded file's first flush now, under the lock that flush already holds - still one
+  directory scan per load rather than per write. Leaving the debris until then costs only space: a `.tmp` is never
+  read, by anything.
+- **Both halves are pinned.** `concurrent_writers_to_one_durable_file_all_succeed` is the original failure, and
+  `a_table_somebody_is_holding_is_not_invalidated_out_from_under_them` is the rule that prevents it - the second fails
+  deterministically when the check is removed, which the first, at one run in six, could never be trusted to do.
+
+### 8. Association groups: correlated multivalues for free
 
 - **The gap.** `BY.EXP` accepted exactly one field, and refused two with *Only one BY.EXP field may be given*. That
   refusal was honest rather than lazy: three accounts beside three dates could mean three rows or nine, and nothing in

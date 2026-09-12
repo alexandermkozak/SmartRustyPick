@@ -386,10 +386,12 @@ button:disabled {
 
 /* What a file *is*, beside how its writes are flushed. Filled rather than
    outlined so the two tags on one row are told apart at a glance without
-   introducing a third colour. A directory file is the same shape: the two are
-   exclusive, so they are never on one row together. */
+   introducing a third colour. The three are mutually exclusive, so only ever
+   one of them is on a row - which is why they share a look rather than needing
+   one colour each. */
 .tag.queue,
-.tag.directory {
+.tag.directory,
+.tag.autokey {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--accent-ink);

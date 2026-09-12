@@ -20,7 +20,7 @@ import type {AccountStats, DirectoryDraft, FileEntry, FileStats, QueueDraft} fro
  * What one `SET.FILE` changes. Every field is optional and only the ones
  * present are sent, because the database leaves an omitted attribute alone.
  */
-export type FileChanges = {durable?: boolean; queue?: boolean} & QueueDraft
+export type FileChanges = {durable?: boolean; queue?: boolean; autokey?: boolean} & QueueDraft
 
 export function useAccountBrowser() {
     // Accounts and files change when someone creates or drops one, so a slow
@@ -78,7 +78,8 @@ export function useAccountBrowser() {
 
     /**
      * Changes what the selected file is - durable or buffered, a queue or an
-     * ordinary file, a queue's claim policy - then re-reads both views of it
+     * ordinary file, minting its own keys or not, a queue's claim policy - then
+     * re-reads both views of it
      * from the database rather than assuming the change took: the server is the
      * one that knows, and a global `durable_writes` makes every file durable
      * whatever this page just asked for.
@@ -153,11 +154,12 @@ export function useAccountBrowser() {
         durable: boolean,
         queue?: QueueDraft | null,
         directory?: DirectoryDraft | null,
+        autokey?: boolean,
     ): Promise<boolean> {
         const account = selectedAccount.value
         if (!account) return false
         return maintain(
-            () => accountsApi.createFile(account, name, durable, queue, directory),
+            () => accountsApi.createFile(account, name, durable, queue, directory, autokey),
             true,
         )
     }

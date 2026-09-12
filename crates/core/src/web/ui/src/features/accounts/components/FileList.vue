@@ -27,6 +27,7 @@ const emit = defineEmits<{
     durable: boolean,
     queue: QueueDraft | null,
     directory: DirectoryDraft | null,
+    autokey: boolean,
   ]
   drop: [name: string]
 }>()
@@ -36,6 +37,7 @@ const draft = reactive({
   durable: false,
   queue: false,
   directory: false,
+  autokey: false,
   timeout: '',
   retries: '',
   path: '',
@@ -73,12 +75,13 @@ function queueDraft(): QueueDraft | null {
 function create(): void {
   const name = draft.name.trim()
   if (!name) return
-  emit('create', name, draft.durable, queueDraft(), directoryDraft())
+  emit('create', name, draft.durable, queueDraft(), directoryDraft(), draft.autokey)
   Object.assign(draft, {
     name: '',
     durable: false,
     queue: false,
     directory: false,
+    autokey: false,
     timeout: '',
     retries: '',
     path: '',
@@ -86,16 +89,22 @@ function create(): void {
 }
 
 /**
- * The three types are exclusive, so choosing one clears the others rather than
+ * The kinds are exclusive, so choosing one clears the others rather than
  * letting a request be assembled that the database will refuse. A directory
- * file has no buffered writes to make durable and no order to claim from.
+ * file has no buffered writes to make durable and no order to claim from, and a
+ * queue already mints the key of every record it stores - which is the whole of
+ * what an autokey file does, so a file cannot sensibly be both.
  */
 function chooseDirectory(): void {
-  if (draft.directory) Object.assign(draft, {durable: false, queue: false})
+  if (draft.directory) Object.assign(draft, {durable: false, queue: false, autokey: false})
 }
 
 function chooseQueue(): void {
-  if (draft.queue) draft.directory = false
+  if (draft.queue) Object.assign(draft, {directory: false, autokey: false})
+}
+
+function chooseAutokey(): void {
+  if (draft.autokey) Object.assign(draft, {directory: false, queue: false})
 }
 
 /**
@@ -144,6 +153,13 @@ function drop(name: string): void {
               directory
             </span>
             <span
+              v-if="file.autokey"
+              class="tag autokey"
+              title="A write that names no key is given one, in arrival order"
+            >
+              autokey
+            </span>
+            <span
               v-if="file.durable"
               class="tag durable"
               title="Every write is flushed before it is acknowledged"
@@ -184,6 +200,10 @@ function drop(name: string): void {
       <input v-model="draft.directory" type="checkbox" @change="chooseDirectory" />
       Directory
     </label>
+    <label class="check">
+      <input v-model="draft.autokey" type="checkbox" @change="chooseAutokey" />
+      Autokey
+    </label>
     <button :disabled="busy || !draft.name.trim()" class="small" type="submit">Create file</button>
   </form>
   <!-- Only once the file is to be a directory file. A path is optional: without
@@ -205,6 +225,15 @@ function drop(name: string): void {
       file's own directory.
     </span>
   </form>
+  <!-- Only once the file is to mint its own keys. There is nothing to set, so
+       this says what the choice means rather than asking for anything: the key
+       is the server's to choose from here on, and a client appends by leaving
+       it out. -->
+  <p v-if="account && draft.autokey" class="note new-file">
+    A write that names no key is given one — twenty digits in arrival order, so a range of them
+    reads back in the order they were written. For a log or a journal, where the key means nothing
+    but “after the last one”.
+  </p>
   <!-- Only once the file is to be a queue: the two numbers mean nothing on an
        ordinary file, and a form that always showed them would suggest they do. -->
   <form v-if="account && draft.queue" class="inline-form spaced new-file" @submit.prevent="create">

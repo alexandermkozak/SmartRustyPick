@@ -153,7 +153,16 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Removes `.tmp` files left behind by a crash between `create` and `rename`.
-/// They are never part of the section, so dropping them is always safe.
+///
+/// They are never part of the section - nothing reads a `.tmp`, and the next
+/// write to that group creates it again - so this is reclaiming space rather
+/// than repairing anything.
+///
+/// **It must run under the section's write lock.** A temporary that is not
+/// debris is one a flush is between `create` and `rename` of, and deleting that
+/// makes the flush fail its rename with `NotFound`. The lock is what makes
+/// "no flush of this section is in progress" true; see [`sweep_tmp`], which is
+/// the only caller and says where it is called from.
 fn remove_stale_tmp(dir: &Path) -> io::Result<()> {
     for entry in fs::read_dir(dir)?.flatten() {
         let name = entry.file_name();
@@ -616,17 +625,35 @@ fn write_frames(path: &Path, entries: &mut [(&str, Cow<'_, Record>)], fsync: Fsy
 pub fn load(section_path: &str, map: &mut HashMap<String, Record>) -> io::Result<SectionMeta> {
     let dir = section_dir(section_path);
     let meta = read_meta_checked(section_path)?.unwrap_or_else(SectionMeta::empty);
-    // Sweep the debris of a crash between `create` and `rename` here rather
-    // than on the write path: this costs one directory scan when a table is
-    // opened, while doing it per flush would make a write scan every group and
-    // scale with the size of the table again.
-    if dir.is_dir() {
-        remove_stale_tmp(&dir)?;
-    }
+    // The sweep of crash debris used to be here, and could not be: a load takes
+    // no lock on the section - it is what runs *before* there is a table to
+    // lock - so it could delete a temporary that a flush on another thread was
+    // between `create` and `rename` of, and that flush then failed with
+    // `NotFound`. It is [`sweep_tmp`] now, called from the flush, which does
+    // hold the lock. Nothing here needs it: a `.tmp` is never read.
     for group in 0..meta.modulus {
         read_group(map, &group_path(&dir, group), meta.checksums)?;
     }
     Ok(meta)
+}
+
+/// Reclaims the `.tmp` files a crash left behind in one section.
+///
+/// Split out of the flush rather than done on every one of them: a directory
+/// scan per write would put a cost proportional to the group count back on the
+/// write path, which is the one thing this format exists to avoid. The engine
+/// calls it once per loaded table, on that table's first flush - see
+/// `Database::flush_locked`.
+///
+/// **The caller must hold the section's write lock.** What makes the sweep safe
+/// is that no flush of this section can be in progress, and that is the lock's
+/// guarantee rather than this function's.
+pub fn sweep_tmp(section_path: &str) -> io::Result<()> {
+    let dir = section_dir(section_path);
+    if dir.is_dir() {
+        remove_stale_tmp(&dir)?;
+    }
+    Ok(())
 }
 
 /// Persists a section.

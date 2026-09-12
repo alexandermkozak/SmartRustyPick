@@ -1102,6 +1102,15 @@ impl Database {
         // beside it rather than one that has to be caught up on the next load.
         table.rebuild_stale_indexes();
 
+        // Under this table's write guard, which is what makes it safe: a
+        // temporary that is not crash debris belongs to a flush of this same
+        // section, and no other flush of it can be running here. Once per
+        // loaded table, so it stays one directory scan per load rather than one
+        // per write.
+        if !table.tmp_swept {
+            hashfile::sweep_tmp(&data_path)?;
+            table.tmp_swept = true;
+        }
         if table.records_dirty() {
             let incremental = if table.dirty_all || table.legacy_data {
                 None
@@ -1591,6 +1600,10 @@ impl Database {
             .then(|| self.queue_statistics(account, name).ok())
             .flatten();
 
+        // Neither loads the file: the counter is read from the table when it
+        // is already open and from the small `autokey` file when it is not.
+        let autokey = self.autokey_statistics(account, name);
+
         // A directory file's records are not in the section above, so every
         // figure derived from it is zero and saying so is the honest answer.
         // What it holds is counted from the directory entries instead - a
@@ -1632,6 +1645,7 @@ impl Database {
         let mut stats = FileStats {
             indexes,
             queue,
+            autokey,
             directory: directory_stats,
             account: account.to_string(),
             name: name.to_string(),
@@ -1646,7 +1660,6 @@ impl Database {
             checksums: meta.map(|m| m.checksums).unwrap_or(false),
             legacy: meta.is_none(),
             durable,
-            autokey: self.is_table_autokey_for_account(account, name),
             loaded,
             modified_seconds_ago: modified
                 .and_then(|time| SystemTime::now().duration_since(time).ok())

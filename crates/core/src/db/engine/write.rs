@@ -121,6 +121,34 @@ impl Database {
         self.file_attributes_for_account(account, name).autokey
     }
 
+    /// Where an autokey file's counter has got to, or `None` for a file that
+    /// does not mint keys.
+    ///
+    /// **Loads nothing.** The counter is taken from the table when it is
+    /// already open - where it is exact - and from the `autokey` file beside
+    /// the records when it is not, which is one small read rather than every
+    /// group of the section. `FILE.STATS` is what asks, and a management view
+    /// must not be able to fill the cache by describing files.
+    pub fn autokey_statistics(&self, account: &str, name: &str) -> Option<AutoKeyStats> {
+        if !self.is_table_autokey_for_account(account, name) {
+            return None;
+        }
+        let in_memory = self
+            .get_table_read_only_for_account(account, name)
+            .and_then(|handle| handle.read().autokey.as_ref().map(Sequence::peek));
+        let next_sequence = in_memory
+            .or_else(|| sequence::read_autokey(&self.file_dir(account, name)))
+            .unwrap_or(0);
+        Some(AutoKeyStats {
+            // The same `max` the mint itself does, so this is the key a write
+            // arriving at this instant would actually be given rather than the
+            // counter dressed up as one.
+            next_key: sequence::format_key(next_sequence.max(sequence::now_millis() * sequence::SUB_MILLISECOND)),
+            next_sequence,
+            loaded: in_memory.is_some(),
+        })
+    }
+
     /// Writes one record, applying `condition` and minting the key when the
     /// caller supplied none.
     ///

@@ -9,6 +9,7 @@ record, and that both survive a restart of the server.
 """
 
 import concurrent.futures
+import json
 import os
 import sys
 
@@ -160,10 +161,18 @@ def main():
             clients.append(admin)
 
             resp = admin.request(command="FILE.STATS", file=EVENTS, account=ACCOUNT)
-            suite.check_eq(
+            counter = ((resp.get("record") or {}).get("autokey")) or {}
+            suite.check(
                 "The autokey flag survived the restart",
-                (resp.get("record") or {}).get("autokey"),
-                True,
+                bool(counter),
+                json.dumps(counter),
+            )
+            # The counter came back from the `autokey` file, so it is at least
+            # past every key the file already holds.
+            suite.check(
+                "and FILE.STATS says where the counter got to",
+                counter.get("next_key", "") > max(minted),
+                f"{counter.get('next_key')} against {max(minted)}",
             )
             resp = admin.request(command="WRITE", file=EVENTS, account=ACCOUNT, data="AFTER RESTART")
             after = resp.get("key")

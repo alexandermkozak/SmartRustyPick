@@ -17,33 +17,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn open_account(base: &str, account: &str) -> Database {
-    let db = Database::new(base, Some(quiet_config())).unwrap();
+    let db = Database::new(base, Some(isolated_config())).unwrap();
     db.create_account(account, Some(base)).unwrap();
     db.logto(account).unwrap();
     db
-}
-
-/// The isolated config with the *automatic* flushes turned off, so nothing
-/// writes this file out except a `save` a test asks for.
-///
-/// The racing tests below need this. What they assert - one winner, no lost
-/// update, distinct keys - is decided inside the file's write lock, and a flush
-/// landing in the middle of one proves nothing about it either way. It does
-/// currently break them, though: a reload of a file that another thread is
-/// flushing sweeps that flush's temporary out from under it (`hashfile::load`
-/// calls `remove_stale_tmp`, which cannot tell an abandoned temporary from an
-/// in-flight one), and the flush fails with `NotFound`. That is a pre-existing
-/// race in the flush path rather than anything these tests are about - a plain
-/// `WRITE` loop with no condition and no minting reproduces it - so it is not
-/// papered over here so much as kept out of the way of a test that is asking a
-/// different question. **If it is fixed, the right change here is to delete
-/// this and go back to `isolated_config`**, not to work around it further.
-fn quiet_config() -> crate::config::Config {
-    crate::config::Config {
-        flush_max_pending: Some(usize::MAX),
-        flush_interval_ms: Some(60 * 60 * 1000),
-        ..isolated_config()
-    }
 }
 
 fn file(db: &Database, account: &str, name: &str, autokey: bool) {
@@ -51,10 +28,11 @@ fn file(db: &Database, account: &str, name: &str, autokey: bool) {
         account,
         name,
         FileAttributes {
-            // Buffered, and flushed only where a test says so - see
-            // [`quiet_config`]. The tests that care about disk call `save`
-            // themselves, which is the same flush by a different door.
-            durable: false,
+            // Durable, so every write here flushes before it returns. That is
+            // the harder setting for the racing tests below - it puts a real
+            // flush inside the contention rather than after it - and it is what
+            // makes the hard-stop test's records be on disk when the child dies.
+            durable: true,
             queue: None,
             autokey,
             directory: None,
@@ -460,7 +438,7 @@ fn the_flag_survives_a_restart_and_can_be_turned_off_again() {
         write(&db, "A6", "EVENTS", None, "ONE", &Condition::Always).unwrap();
         db.save().unwrap();
     }
-    let db = Database::new(base, Some(quiet_config())).unwrap();
+    let db = Database::new(base, Some(isolated_config())).unwrap();
     db.logto("A6").unwrap();
     assert!(db.is_table_autokey_for_account("A6", "EVENTS"));
     write(&db, "A6", "EVENTS", None, "TWO", &Condition::Always).unwrap();
@@ -471,7 +449,7 @@ fn the_flag_survives_a_restart_and_can_be_turned_off_again() {
         "A6",
         "EVENTS",
         FileAttributes {
-            durable: false,
+            durable: true,
             queue: None,
             autokey: false,
             directory: None,
@@ -571,7 +549,7 @@ fn the_counter_survives_a_hard_stop_without_handing_a_key_out_twice() {
     );
 
     let base = guard.path();
-    let db = Database::new(base, Some(quiet_config())).unwrap();
+    let db = Database::new(base, Some(isolated_config())).unwrap();
     db.logto("A8").unwrap();
     let handle = db.get_table_mut_for_account("A8", "EVENTS").unwrap();
     let survived: HashSet<String> = handle.read().records.keys().cloned().collect();
@@ -596,4 +574,61 @@ fn the_counter_survives_a_hard_stop_without_handing_a_key_out_twice() {
             highest
         );
     }
+}
+
+#[test]
+fn file_stats_says_where_the_counter_got_to_without_loading_the_file() {
+    let guard = TempDir::new("auto_stats");
+    let base = guard.path();
+    let db = open_account(base, "A9");
+    file(&db, "A9", "EVENTS", true);
+    file(&db, "A9", "PLAIN", false);
+
+    assert!(
+        db.file_statistics("A9", "PLAIN").unwrap().autokey.is_none(),
+        "a file that does not mint keys has no counter to report"
+    );
+
+    let minted = write(&db, "A9", "EVENTS", None, "ONE", &Condition::Always).unwrap().key;
+    let stats = db
+        .file_statistics("A9", "EVENTS")
+        .unwrap()
+        .autokey
+        .expect("an autokey file");
+    assert!(stats.loaded, "the file is open, so the counter is the one in memory");
+    assert!(
+        stats.next_key > minted,
+        "the next key must come after the one just handed out: {} then {}",
+        minted,
+        stats.next_key
+    );
+    assert_eq!(stats.next_key.len(), sequence::KEY_DIGITS);
+
+    // Dropped from the cache, the counter still reads back - from the `autokey`
+    // file, and without pulling the records in behind it.
+    db.save().unwrap();
+    db.clear_loaded_tables();
+    let stats = db
+        .file_statistics("A9", "EVENTS")
+        .unwrap()
+        .autokey
+        .expect("an autokey file");
+    assert!(!stats.loaded, "nothing is in memory, so this came off the disk");
+    assert!(
+        stats.next_sequence > sequence::key_sequence(&minted).unwrap(),
+        "the persisted counter is behind the key it minted"
+    );
+    assert!(
+        !db.is_table_loaded("EVENTS"),
+        "describing a file must not be what loads it"
+    );
+
+    // And the key it promised is one the file will actually accept.
+    let next = write(&db, "A9", "EVENTS", None, "TWO", &Condition::Always).unwrap().key;
+    assert!(
+        next >= stats.next_key,
+        "{} was reported as the next key and {} was handed out",
+        stats.next_key,
+        next
+    );
 }

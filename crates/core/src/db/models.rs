@@ -555,6 +555,13 @@ pub struct Table {
     /// the path every other file takes. Attached when the table is loaded and
     /// rebuilt from the records each time - see [`crate::db::queue`].
     pub queue: Option<QueueState>,
+    /// Set once this table's section has been swept of the `.tmp` files a crash
+    /// left behind - see [`crate::db::hashfile::sweep_tmp`].
+    ///
+    /// The sweep needs the section's write lock, so it happens on the first
+    /// flush rather than on the load, and this is what keeps it to one
+    /// directory scan per loaded table instead of one per write.
+    pub tmp_swept: bool,
     /// The counter a keyless `WRITE` mints from, for a file whose `DIR` entry
     /// marks it `AUTOKEY`.
     ///
@@ -584,6 +591,7 @@ impl Table {
             dirty_all: false,
             dict_dirty: false,
             indexes: BTreeMap::new(),
+            tmp_swept: false,
             queue: None,
             autokey: None,
         }
@@ -1196,6 +1204,32 @@ pub struct QueueStats {
     pub dead_letter: bool,
 }
 
+/// Where an autokey file's counter has got to.
+///
+/// Read without loading the file: from the counter in memory when the file
+/// happens to be open, and from the small `autokey` file beside the records
+/// when it is not. Asking what the next key is must not be what pulls a large
+/// file into the cache.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutoKeyStats {
+    /// The key a keyless `WRITE` arriving **now** would be given.
+    ///
+    /// A lower bound rather than a reservation, and deliberately reported as
+    /// such: a minted key carries the millisecond it was minted in, so the next
+    /// one actually handed out is this or later, and is later as soon as the
+    /// clock moves. What it is good for is reading a range - it is the boundary
+    /// between the keys that exist and the keys that will.
+    pub next_key: String,
+    /// The counter behind it, as the `autokey` file records it. Below
+    /// `next_key` whenever the clock has moved on since the last write, which
+    /// is the ordinary case for a file that is not being written to right now.
+    pub next_sequence: u64,
+    /// True when `next_sequence` came from the counter held in memory rather
+    /// than from the file on disk - which is to say, when this file is open and
+    /// the number is exact rather than as of its last flush.
+    pub loaded: bool,
+}
+
 /// What a directory file holds, from the directory entries alone.
 ///
 /// Reading none of it is the point: the count and the byte total come from the
@@ -1240,11 +1274,6 @@ pub struct FileStats {
     pub legacy: bool,
     /// Every write to this file is flushed before it is acknowledged.
     pub durable: bool,
-    /// A `WRITE` naming no key is given one on this file. A flag rather than
-    /// the counter's current value: the next key is minted from the clock as
-    /// much as from the counter, so a number reported here would be a guess
-    /// that a reader could mistake for a reservation.
-    pub autokey: bool,
     /// Currently held in the server's table cache.
     pub loaded: bool,
     /// Seconds since the data section was last modified, when the filesystem
@@ -1266,6 +1295,11 @@ pub struct FileStats {
     /// and the hashed ones above are all zero for a directory file because
     /// there is no section for them to be about.
     pub directory: Option<DirectoryFileStats>,
+    /// Where this file's minted keys have got to, or `None` when it does not
+    /// mint them. Its own object for the reason `queue` is one: the counter and
+    /// the key it would hand out are not numbers that mean anything about any
+    /// other file.
+    pub autokey: Option<AutoKeyStats>,
 
     // --- Derived measures. Everything below is computed from the section
     // metadata and the group trailers; none of it reads a record.

@@ -304,6 +304,14 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                 }
                 return run(client, request).await;
             }
+            // A file that mints its own keys. Exclusive with `queue`, which
+            // already mints one per record, so the two are never sent
+            // together - the page offers them as one choice for that reason.
+            if flag(&body, "autokey") {
+                let object = request.as_object_mut().expect("built as an object");
+                object.insert("autokey".to_string(), json!(true));
+                return run(client, request).await;
+            }
             // A queue is created with its claim policy, so the file is never
             // briefly a queue running on defaults nobody asked for.
             if flag(&body, "queue") {
@@ -339,6 +347,9 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
             if let Some(queue) = optional_flag(&body, "queue") {
                 object.insert("queue".to_string(), json!(queue));
             }
+            if let Some(autokey) = optional_flag(&body, "autokey") {
+                object.insert("autokey".to_string(), json!(autokey));
+            }
             if let Some(seconds) = number(&body, "visibility_timeout") {
                 object.insert("visibility_timeout".to_string(), json!(seconds));
             }
@@ -348,7 +359,7 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
             if object.len() <= 3 {
                 return Response::error(
                     400,
-                    "Nothing to set: name durable, queue, visibility_timeout or max_deliveries",
+                    "Nothing to set: name durable, autokey, queue, visibility_timeout or max_deliveries",
                 );
             }
             run(client, request).await

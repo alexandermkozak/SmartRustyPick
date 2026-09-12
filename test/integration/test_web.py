@@ -287,6 +287,46 @@ def main():
                 "The new file joins the account's listing", (payload or {}).get("keys"), ["DIR", "LEDGER"]
             )
 
+            # A file that mints its own keys, created and then inspected the way
+            # the page does it: the listing flag is what tells a client a
+            # keyless write will work, and FILE.STATS is where the next key is.
+            status, _, _ = dashboard.call(
+                "/api/accounts/WEB_MADE/files",
+                method="POST",
+                payload={"name": "EVENTS", "autokey": True},
+            )
+            suite.check_eq("An autokey file can be created from the dashboard", status, 200)
+            _, payload, _ = dashboard.call("/api/accounts/WEB_MADE/files")
+            minting = {name: info.get("autokey") for name, info in (payload or {}).get("results") or []}
+            suite.check_eq("The listing marks it as minting its own keys", minting.get("EVENTS"), True)
+            suite.check_eq("and leaves the other files alone", minting.get("LEDGER"), False)
+
+            _, payload, _ = dashboard.call("/api/accounts/WEB_MADE/files/EVENTS")
+            counter = ((payload or {}).get("record") or {}).get("autokey") or {}
+            suite.check(
+                "FILE.STATS says what the next key would be",
+                len(counter.get("next_key", "")) == 20 and counter.get("next_key", "").isdigit(),
+                json.dumps(counter),
+            )
+
+            # And it can be turned off again, which is a SET.FILE carrying only
+            # the one attribute the page changed.
+            status, payload, _ = dashboard.call(
+                "/api/accounts/WEB_MADE/files/EVENTS", method="POST", payload={"autokey": False}
+            )
+            suite.check_eq(
+                "Minting can be switched off from the dashboard",
+                status == 200 and ((payload or {}).get("record") or {}).get("autokey"),
+                False,
+            )
+            _, payload, _ = dashboard.call("/api/accounts/WEB_MADE/files/EVENTS")
+            suite.check_eq(
+                "and FILE.STATS stops reporting a counter",
+                ((payload or {}).get("record") or {}).get("autokey"),
+                None,
+            )
+            dashboard.call("/api/accounts/WEB_MADE/files/EVENTS", method="DELETE")
+
             status, _, _ = dashboard.call("/api/accounts/WEB_MADE/files/LEDGER", method="DELETE")
             _, payload, _ = dashboard.call("/api/accounts/WEB_MADE/files")
             gone = "LEDGER" not in ((payload or {}).get("keys") or [])

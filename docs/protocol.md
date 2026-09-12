@@ -1447,8 +1447,8 @@ memory, so asking for them loads the file.
   "group_count": 128, "smallest_group_bytes": 96, "largest_group_bytes": 512,
   "disk_bytes": 262144, "group_bytes": 212992, "index_bytes": 20480,
   "checksums": true, "legacy": false,
-  "durable": false, "autokey": false, "loaded": true, "modified_seconds_ago": 12,
-  "queue": null, "directory": null,
+  "durable": false, "loaded": true, "modified_seconds_ago": 12,
+  "queue": null, "autokey": null, "directory": null,
   "records_per_group_target": 16, "load_factor": 0.625,
   "records_until_growth": 769, "records_until_shrink": 768,
   "largest_group_share": 0.021, "skew": 2.7,
@@ -1482,10 +1482,26 @@ order, with the same objects `LIST.INDEXES` returns. It is `[]` for a file that 
 worst index verdict is rolled into the file's own `health`, so a badly shaped index is
 visible from the file rather than only from the index table.
 
-`autokey` says whether a keyless `WRITE` works on this file — see
-[Server-minted keys](#server-minted-keys). A flag rather than the counter's next value: a
-minted key comes from the clock as much as from the counter, so a number here would be a
-guess a reader could mistake for a reservation.
+**Minted keys.** `autokey` is `null` for a file that requires the caller to supply a key.
+For an [autokey file](#server-minted-keys) it says where the counter has got to:
+
+```json
+{"autokey": {"next_key": "01764950412345000000", "next_sequence": 1764950412344000007,
+             "loaded": true}}
+```
+
+`next_key` is the key a keyless `WRITE` arriving **now** would be given, and `next_sequence`
+is the counter behind it. They differ whenever the clock has moved on since the last write,
+which is the ordinary case for a file nothing is writing to: a minted key carries the
+millisecond it was minted in, so the counter is the floor and the clock is usually what
+decides. Read `next_key` as **the boundary between the keys that exist and the keys that
+will** — a lower bound on the next one, not a reservation of it.
+
+`loaded` says where the number came from: `true` when the file is open and the counter was
+read from memory, so it is exact; `false` when it came from the `autokey` file beside the
+records, so it is that counter as of its last flush. Neither costs a load — describing a
+file must not be what pulls it into the cache — which is why the distinction is reported
+rather than hidden.
 
 **Queues.** `queue` is `null` for an ordinary file. For a [queue file](#queue-files) it is
 the four numbers an administrator needs about one, plus the policy behind them:

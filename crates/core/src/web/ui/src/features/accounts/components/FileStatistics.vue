@@ -24,7 +24,9 @@ import {NO_HEALTH, verdictLabel} from '@shared/health'
 import type {FileStats} from '../types'
 
 const props = defineProps<{stats: FileStats | null; changing: boolean}>()
-const emit = defineEmits<{setFile: [changes: {durable?: boolean; queue?: boolean}]}>()
+const emit = defineEmits<{
+  setFile: [changes: {durable?: boolean; queue?: boolean; autokey?: boolean}]
+}>()
 
 const health = computed(() => props.stats?.health ?? NO_HEALTH)
 
@@ -95,6 +97,7 @@ const rows = computed<Array<[string, string]>>(() => {
     ['Flush version', count(file.version)],
     ['Durable writes', file.durable ? 'yes' : 'no'],
     ['Queue', file.queue ? (file.queue.dead_letter ? 'yes (dead letters)' : 'yes') : 'no'],
+    ['Mints its own keys', file.autokey ? 'yes' : 'no'],
     ['In memory', file.loaded ? 'yes' : 'no'],
     [
       'Last modified',
@@ -116,6 +119,21 @@ function toggleDurable(): void {
   emit('setFile', {durable: !props.stats.durable})
 }
 
+function toggleAutokey(): void {
+  if (!props.stats) return
+  const becoming = !props.stats.autokey
+  if (
+    !becoming &&
+    !window.confirm(
+      `Stop ${props.stats.name} minting its own keys? Its records stay, but a write that ` +
+        'names no key will be refused from now on.',
+    )
+  ) {
+    return
+  }
+  emit('setFile', {autokey: becoming})
+}
+
 function toggleQueue(): void {
   if (!props.stats) return
   const becoming = !props.stats.queue
@@ -130,6 +148,25 @@ function toggleQueue(): void {
   }
   emit('setFile', {queue: becoming})
 }
+
+/**
+ * Where the counter has got to, for a file that mints its own keys.
+ *
+ * `next_key` and not `next_sequence`, though the reply carries both. The
+ * sequence is a `u64` around 1.7e18, which is past the integer `Number` holds
+ * exactly - `JSON.parse` has already rounded it by the time this sees it, so
+ * rendering it would put a subtly wrong number on the page. The key is the
+ * string the server formatted, it is what a caller actually uses, and it says
+ * the same thing.
+ */
+const autokeyRows = computed<Array<[string, string]>>(() => {
+  const counter = props.stats?.autokey
+  if (!counter) return []
+  return [
+    ['Next key', counter.next_key],
+    ['Read from', counter.loaded ? 'memory — exact' : 'disk — as of the last flush'],
+  ]
+})
 
 /**
  * The queue's own rows. Depth and in flight rather than a single record count,
@@ -197,6 +234,19 @@ const queueRows = computed<Array<[string, string]>>(() => {
         </p>
       </template>
 
+      <!-- Above the layout for the reason the queue block is: it is the thing
+           somebody opened this file to find out, and none of the numbers below
+           says it. -->
+      <template v-if="stats.autokey">
+        <h4>Minted keys</h4>
+        <StatList :rows="autokeyRows" />
+        <p class="note">
+          A write that names no key is given one. The next key is a lower bound rather than a
+          reservation — a minted key carries the millisecond it was minted in, so the clock moves it
+          forward on its own — and every key after it sorts after every key before it.
+        </p>
+      </template>
+
       <h4>{{ stats.directory ? 'Directory file' : 'Layout' }}</h4>
       <StatList :rows="rows" />
       <p v-if="stats.directory" class="note">
@@ -212,6 +262,15 @@ const queueRows = computed<Array<[string, string]>>(() => {
         <button :disabled="changing" class="small" type="button" @click="toggleQueue">
           {{ stats.queue ? 'Stop being a queue' : 'Make a queue' }}
         </button>
+        <button
+          v-if="!stats.queue"
+          :disabled="changing"
+          class="small"
+          type="button"
+          @click="toggleAutokey"
+        >
+          {{ stats.autokey ? 'Require a key' : 'Mint keys' }}
+        </button>
         <p class="note">
           {{
             stats.durable
@@ -224,6 +283,16 @@ const queueRows = computed<Array<[string, string]>>(() => {
             stats.queue
               ? 'The records stay where they are; only the order and the claims go.'
               : 'A queue keeps its records in arrival order and hands them out one at a time. Making one also makes the file durable.'
+          }}
+        </p>
+        <!-- Offered only when the file is not a queue, because a queue already
+             mints the key of every record it stores - ENQUEUE is what appends
+             to one - and the database refuses a file that claims both. -->
+        <p v-if="!stats.queue" class="note">
+          {{
+            stats.autokey
+              ? 'Requiring a key again leaves every record where it is; a write that names none will be refused from then on.'
+              : 'Minting gives a keyless write a key of its own, in arrival order — for a log or a journal, where the key means nothing but “after the last one”.'
           }}
         </p>
       </div>

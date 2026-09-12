@@ -44,6 +44,7 @@ export const accountsApi = {
             durable: boolean
             queue?: boolean
             directory?: boolean
+            autokey?: boolean
             health?: string
             health_reasons?: string[]
         }>(`/api/accounts/${encode(account)}/files`)
@@ -52,6 +53,7 @@ export const accountsApi = {
             durable: info.durable === true,
             queue: info.queue === true,
             directory: info.directory === true,
+            autokey: info.autokey === true,
             health: summaryOf(info.health, info.health_reasons),
         }))
     },
@@ -72,7 +74,7 @@ export const accountsApi = {
     setFile: (
         account: string,
         file: string,
-        changes: {durable?: boolean; queue?: boolean} & QueueDraft,
+        changes: {durable?: boolean; queue?: boolean; autokey?: boolean} & QueueDraft,
     ): Promise<unknown> =>
         call(`/api/accounts/${encode(account)}/files/${encode(file)}`, {
             method: 'POST',
@@ -98,6 +100,10 @@ export const accountsApi = {
      * The policy travels with the create rather than following it, so a queue is
      * never briefly running on a timeout nobody asked for.
      *
+     * `autokey` makes a file that mints the key of a keyless write instead. It
+     * is exclusive with `queue`, which already mints one per record, so only one
+     * of the three shapes is ever put in the body.
+     *
      * `directory` makes a directory file instead, whose records are the files of
      * a host directory. It is exclusive with the other two rather than combined
      * with them: a directory file has no buffered writes to make durable and no
@@ -109,10 +115,12 @@ export const accountsApi = {
         durable: boolean,
         queue?: QueueDraft | null,
         directory?: DirectoryDraft | null,
+        autokey?: boolean,
     ): Promise<unknown> => {
         let body: Record<string, unknown> = {name, durable}
         if (directory) body = {name, directory: true, ...directory}
         else if (queue) body = {name, durable, queue: true, ...queue}
+        else if (autokey) body = {name, durable, autokey: true}
         return call(`/api/accounts/${encode(account)}/files`, {
             method: 'POST',
             body: JSON.stringify(body),

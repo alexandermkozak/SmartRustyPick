@@ -183,6 +183,24 @@ impl Database {
     /// Drops a cached table whose backing files were modified by another process,
     /// forcing a fresh read on the next access. Locally modified (dirty) tables are
     /// kept untouched so that pending changes are never silently discarded.
+    ///
+    /// **A table another thread is still holding a handle to is left alone**,
+    /// exactly as [`evict_if_over_budget`](Self::evict_if_over_budget) leaves
+    /// one alone, and for the same reason: dropping it from the map does not
+    /// drop the table, it only lets the next caller load a *second* copy from
+    /// disk beside it, and then the two write over each other. The holder's
+    /// copy is the one with the handle, so it is the one that wins the
+    /// argument; the entry goes stale again the moment nobody is using it, and
+    /// is dropped then.
+    ///
+    /// This was a real failure rather than a precaution. A thread that had
+    /// dropped the entry here would go on to load the section from disk while
+    /// the holder was flushing it, and the load's sweep of `.tmp` files deleted
+    /// the temporary that flush was between `create` and `rename` of - so a
+    /// durable `WRITE` failed with `IO_ERROR` under nothing worse than
+    /// concurrency. The sweep moved under the section's lock as well (see
+    /// [`crate::db::hashfile::sweep_tmp`]); this is the half that stops the two
+    /// copies existing at all.
     fn invalidate_if_stale(&self, account: &str, name: &str) {
         let key = (account.to_string(), name.to_string());
         let handle = match rlock(&self.tables).get(&key) {
@@ -196,10 +214,14 @@ impl Database {
         if !stale {
             return;
         }
+        drop(handle);
         // Re-check under the map lock: another thread may have replaced the
-        // entry, or made it dirty, since the check above.
+        // entry, made it dirty, or taken a handle to it since the check above.
         let mut tables = wlock(&self.tables);
         let still_stale = match tables.get(&key) {
+            // The map's own handle and nothing else. Counted here rather than
+            // above because the clone taken for the check is itself a holder.
+            Some(current) if current.refs() > 1 => false,
             Some(current) => {
                 let table = current.read();
                 !table.is_dirty() && table.stamp != Some(self.disk_stamp(account, name))
