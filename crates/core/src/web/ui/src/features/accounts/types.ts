@@ -30,6 +30,11 @@ export interface FileEntry {
      *  host, so it has no fields, no dictionary and no index. Read from the
      *  same `DIR` entry the other two flags are. */
     directory: boolean
+    /** An autokey file: a `WRITE` that names no key is given one. The flag is
+     *  here because it is the one thing a client has to know before trying a
+     *  keyless write, and it is free - the same `DIR` entry as the others.
+     *  Absent from an older server's reply. */
+    autokey?: boolean
     /**
      * The *cheap* verdict: section metadata and index `state` files only, no
      * group trailers and no records. Enough to say which file is worth
@@ -136,6 +141,8 @@ export interface FileStats {
     indexes?: IndexStats[]
     /** Null for a file that is not a queue. */
     queue?: QueueStats | null
+    /** Null for a file that does not mint its own keys. */
+    autokey?: AutoKeyStats | null
     /** Null for a file that is not a directory file. Everything the hashed
      *  section describes above is zero on one, because it has no such
      *  section. */
@@ -178,6 +185,31 @@ export interface QueueStats {
     max_deliveries: number
     /** True when this file is itself another queue's dead-letter file. */
     dead_letter: boolean
+}
+
+/**
+ * Where an autokey file's counter has got to.
+ *
+ * Neither number costs a load: the counter comes from memory when the file is
+ * open and from the small `autokey` file beside the records when it is not,
+ * which is what `loaded` distinguishes.
+ */
+export interface AutoKeyStats {
+    /** The key a keyless write arriving now would be given. A lower bound on
+     *  the next one rather than a reservation of it - a minted key carries the
+     *  millisecond it was minted in, so the clock moves this forward on its
+     *  own. Read it as the boundary between the keys that exist and the keys
+     *  that will. */
+    next_key: string
+    /** The counter behind it, as of the last flush when `loaded` is false.
+     *
+     *  **Do not render this.** It is a `u64` around 1.7e18, past what `Number`
+     *  holds exactly, so `JSON.parse` has already rounded it. `next_key` is the
+     *  string the server formatted from it and says the same thing exactly. */
+    next_sequence: number
+    /** True when the number came from the counter in memory, and is therefore
+     *  exact rather than as of the file's last flush. */
+    loaded: boolean
 }
 
 /**

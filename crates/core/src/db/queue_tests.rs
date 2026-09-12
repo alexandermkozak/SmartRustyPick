@@ -27,6 +27,7 @@ fn queue_file(db: &Database, account: &str, name: &str, visibility: u64, deliver
                 visibility: Duration::from_secs(visibility),
                 max_deliveries: deliveries,
             }),
+            autokey: false,
             directory: None,
         },
     )
@@ -351,6 +352,7 @@ fn a_file_can_be_made_a_queue_and_returned_to_an_ordinary_one() {
         FileAttributes {
             durable: true,
             queue: Some(QueuePolicy::default()),
+            autokey: false,
             directory: None,
         },
     )
@@ -364,6 +366,7 @@ fn a_file_can_be_made_a_queue_and_returned_to_an_ordinary_one() {
         FileAttributes {
             durable: true,
             queue: None,
+            autokey: false,
             directory: None,
         },
     )
@@ -472,6 +475,7 @@ fn a_file_that_stops_being_a_queue_loses_its_bookkeeping_too() {
         FileAttributes {
             durable: true,
             queue: None,
+            autokey: false,
             directory: None,
         },
     )
@@ -489,6 +493,7 @@ fn a_file_that_stops_being_a_queue_loses_its_bookkeeping_too() {
         FileAttributes {
             durable: true,
             queue: Some(QueuePolicy::default()),
+            autokey: false,
             directory: None,
         },
     )

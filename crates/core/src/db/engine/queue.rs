@@ -465,6 +465,7 @@ impl Database {
                 FileAttributes {
                     durable: true,
                     queue: Some(self.queue_policy_for_account(account, queue_name)),
+                    autokey: false,
                     directory: None,
                 },
             ) {

@@ -63,7 +63,7 @@ by default), so they follow `ca_path` rather than littering the working director
 | Overview       | Uptime, listener, connection and request totals, pending writes, tables in memory, every connection open right now, and a storage roll-up naming the accounts that need attention. |
 | Authorizations | Every authorized client: name, thumbprint, allowed accounts, admin flag. Authorize a thumbprint, add or remove accounts, revoke. |
 | Certificates   | Issue a certificate signed by the server's CA, authorized in the same step, with its key downloadable once.                      |
-| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Accounts and files can be created and dropped, durable, queue and directory files are tagged in the listing, durability and the queue flag can be turned on or off, a queue's depth and in-flight count are reported, and the selected file's dictionary and indexes are listed and managed below. |
+| Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Accounts and files can be created and dropped, durable, queue, autokey and directory files are tagged in the listing, durability and the queue and autokey flags can be turned on or off, a queue's depth and in-flight count and an autokey file's next key are reported, and the selected file's dictionary and indexes are listed and managed below. |
 
 File statistics cover the record and dictionary counts, the indexes the file carries, the hash modulus and group
 distribution, bytes on disk, the durability flag and whether the file is currently held in the server's cache. Record
@@ -123,6 +123,19 @@ queue; with three claims a few seconds old it is a working one. The claim policy
 claim is held and how many deliveries a record gets — is listed with them. Reading the panel sweeps the claims that
 have lapsed, so an in-flight count never includes one that expired ten minutes ago.
 
+**Minted keys.** An [autokey file](storage.md#autokey-files) gets a panel of its own above the layout too, for the same
+reason the queue does: what somebody opened it to find out is not in any of the numbers underneath. It shows **the next
+key** — the key a write naming none would be given if one arrived now — and where that number was read from: the
+counter in memory, which is exact, or the small `autokey` file beside the records, which is the counter as of its last
+flush. Neither costs a load, because describing a file must not be the thing that pulls it into the cache.
+
+Read the next key as **the boundary between the keys that exist and the keys that will**, which is what somebody
+reading a range back actually needs — not as a reservation. A minted key carries the millisecond it was minted in, so
+the clock moves this forward on its own between one glance and the next; what is promised is that every key handed out
+from here sorts after every key already in the file. The counter behind it is deliberately *not* shown: it is a 64-bit
+number around 1.7e18, past the integer JavaScript holds exactly, so the browser has already rounded it by the time the
+page sees it. The key is the string the server formatted and says the same thing without the rounding.
+
 **Directory files.** A [directory file](storage.md#directory-files) is tagged in the listing and described in place of
 the layout, because every row the layout carries — the modulus, the group files, the records per group, the skew — is
 about a hashed section it has not got, and a modulus of zero reads as a fault rather than as "not applicable". What it
@@ -130,12 +143,18 @@ shows instead is where the records are, what they weigh, the largest of them and
 refused. Neither of the two buttons below appears on one: its type is fixed when it was created, and it has no buffered
 writes to make durable.
 
-**What the dashboard changes rather than reports.** Two things, both beside the statistics. **Make durable** promotes
+**What the dashboard changes rather than reports.** Three things, all beside the statistics. **Make durable** promotes
 the file so every write to it is flushed before being acknowledged, and **Buffer writes** returns it to the database's
 flush policy; promoting flushes what the file still had buffered, so no data is at risk while the flag lands. **Make a
 queue** attaches an arrival order to the records the file already holds, and **Stop being a queue** detaches it — the
 records stay put either way, which is why the second one confirms first: what it drops is the order and any claim a
-consumer is holding.
+consumer is holding. **Mint keys** makes a write that names no key be given one, and **Require a key** goes back to
+refusing one; again the records stay put, and again the second confirms first, because what changes is what a client
+writing to the file is allowed to leave out.
+
+**Mint keys** appears only on a file that is not a queue. A queue already mints the key of every record it stores —
+`ENQUEUE` is what appends to one — so the database refuses a file claiming both, and a button that always failed would
+be worse than no button.
 
 Both go out as the ordinary `SET.FILE` command, so they are refused unless the dashboard's own certificate is an admin
 one, and only the attribute the button names is sent — the database leaves an omitted one alone, so making a file a
@@ -149,15 +168,19 @@ Under the account list is a field that creates one. **Create account** makes an 
 **Create demo** makes the populated fixture (`CREATE.TEST.ACCOUNT`) — the same one the CLI creates, with `USERS` and
 `PRODUCTS` files, their dictionaries, a multivalued field whose values go one level deeper still, a price carrying
 an `MD2` conversion, an [association group](data_structures.md#association-groups) over the `PRODUCTS` suppliers, a
-`JOBS` [queue](storage.md#queue-files) with three records already on it, and an `ATTACHMENTS`
+`JOBS` [queue](storage.md#queue-files) with three records already on it, an `EVENTS`
+[autokey file](storage.md#autokey-files) whose two records were appended with no key at all, and an `ATTACHMENTS`
 [directory file](storage.md#directory-files) holding a record whose bytes an ordinary record could not carry. It is the quickest way to have something real to point the file statistics and the dictionary
 editor at. Each row carries a **Drop** (`DELETE.ACCOUNT`). The same pair sits under the file list: a name with **Durable**,
-**Queue** and **Directory** ticks creates a file (`CREATE.FILE`, with whichever it is given from its first write), and
-each file has its own **Drop** (`DELETE.FILE`). Ticking **Queue** reveals two more fields — how long a claim is held and
+**Queue**, **Directory** and **Autokey** ticks creates a file (`CREATE.FILE`, with whichever it is given from its first
+write), and
+each file has its own **Drop** (`DELETE.FILE`). Ticking **Autokey** clears the other two and says what the choice
+means rather than asking for anything further: from then on a client appends to the file by leaving the key out.
+Ticking **Queue** reveals two more fields — how long a claim is held and
 how many deliveries a record gets — which travel with the create rather than following it, so a queue is never briefly
 running on a timeout nobody asked for; left blank, the database's own defaults apply. Ticking **Directory** reveals an
-optional host path and clears the other two, because a directory file is neither: its records are host files, on disk
-the moment a write returns, with no order to claim from. All four are admin commands, so a dashboard
+optional host path and clears the others, because a directory file is none of them: its records are host files, on disk
+the moment a write returns, with no order to claim from and a name of their own for a key. All four are admin commands, so a dashboard
 whose certificate is not an admin one is refused by the database and says so.
 
 Both drops confirm first, naming what goes with them — an account drop names the number of files it takes. Two things

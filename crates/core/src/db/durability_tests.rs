@@ -366,3 +366,126 @@ fn test_the_listing_carries_each_files_durability() {
             .all(|(_, attributes)| attributes.durable)
     );
 }
+
+/// Several threads writing to one durable file, which is the plainest thing a
+/// busy server does and used to fail.
+///
+/// A durable write flushes before it returns, so this puts real flushes inside
+/// real contention. The failure it guards against had nothing to do with the
+/// records: a thread that found the cached table stale dropped it from the map
+/// even though another thread was still holding a handle to it, then loaded a
+/// second copy from disk - and the load's sweep of `.tmp` files deleted the
+/// temporary the holder's flush was between `create` and `rename` of. The write
+/// came back `IO_ERROR`, having lost nothing but having failed for no reason a
+/// caller could act on.
+///
+/// It reproduced perhaps one run in six under load, so a single pass proves
+/// little; what makes this worth having is running it in a suite that runs
+/// often, beside every other test competing for the same cores.
+#[test]
+fn concurrent_writers_to_one_durable_file_all_succeed() {
+    let guard = TempDir::new("durable_contention");
+    let base = guard.path();
+    let db = Database::new(base, Some(isolated_config())).unwrap();
+    db.create_account("HOT", Some(base)).unwrap();
+    db.logto("HOT").unwrap();
+    db.create_table_with(
+        "HOT",
+        "LEDGER",
+        FileAttributes {
+            durable: true,
+            queue: None,
+            autokey: false,
+            directory: None,
+        },
+    )
+    .unwrap();
+
+    let writers = 8;
+    let each = 10;
+    let db = std::sync::Arc::new(db);
+    std::thread::scope(|scope| {
+        for writer in 0..writers {
+            let db = std::sync::Arc::clone(&db);
+            scope.spawn(move || {
+                for n in 0..each {
+                    let key = format!("{}-{}", writer, n);
+                    let handle = db.get_table_mut_for_account("HOT", "LEDGER").unwrap();
+                    handle
+                        .write()
+                        .insert_record(&key, Record::from_display_string("POSTED"));
+                    db.note_write_for("HOT", "LEDGER")
+                        .unwrap_or_else(|e| panic!("a durable write failed under contention: {:?}", e));
+                }
+            });
+        }
+    });
+
+    // Every record is there, and every one of them is on disk: each write was
+    // acknowledged only after its own flush.
+    let handle = db.get_table_mut_for_account("HOT", "LEDGER").unwrap();
+    assert_eq!(handle.read().records.len(), writers * each);
+    drop(handle);
+
+    let reopened = Database::new(base, Some(isolated_config())).unwrap();
+    reopened.logto("HOT").unwrap();
+    let handle = reopened.get_table_mut_for_account("HOT", "LEDGER").unwrap();
+    assert_eq!(
+        handle.read().records.len(),
+        writers * each,
+        "a durable write that returned must have been on disk"
+    );
+}
+
+/// The rule that stops the two copies existing: a cached table another thread
+/// is still using is not dropped, however stale the cache believes it is.
+///
+/// Eviction has always worked this way and says why in its own comment -
+/// dropping the entry does not drop the table, it only lets the next caller
+/// load a second copy beside it. Invalidation did not, which is the bug above.
+#[test]
+fn a_table_somebody_is_holding_is_not_invalidated_out_from_under_them() {
+    let guard = TempDir::new("invalidate_held");
+    let base = guard.path();
+    let db = Database::new(base, Some(isolated_config())).unwrap();
+    db.create_account("HELD", Some(base)).unwrap();
+    db.logto("HELD").unwrap();
+    db.create_table_for_account("HELD", "BOOK").unwrap();
+
+    let held = db.get_table_mut_for_account("HELD", "BOOK").unwrap();
+    held.write().insert_record("K1", Record::from_display_string("MINE"));
+    db.save().unwrap();
+
+    // Another process appears to have rewritten the section: the flush counter
+    // on disk has moved past the one this table was stamped with, which is
+    // exactly what `invalidate_if_stale` exists to notice. The stamp is now
+    // wrong, and dropping the entry is still the wrong answer - this handle is
+    // the table, and a second copy read from disk beside it would be a second
+    // set of records, whichever flushed last winning.
+    let section = format!("{}/BOOK/data", db.account_storage_dir("HELD"));
+    let meta = hashfile::section_dir(&section).join("meta");
+    let before = fs::read_to_string(&meta).unwrap();
+    let bumped = before
+        .lines()
+        .map(|line| match line.strip_prefix("version=") {
+            Some(version) => format!("version={}", version.trim().parse::<u64>().unwrap() + 9),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&meta, format!("{}\n", bumped)).unwrap();
+    assert_ne!(
+        before,
+        fs::read_to_string(&meta).unwrap(),
+        "the section was not disturbed"
+    );
+
+    let again = db.get_table_mut_for_account("HELD", "BOOK").unwrap();
+    held.write()
+        .insert_record("K2", Record::from_display_string("ALSO MINE"));
+    assert_eq!(
+        again.read().records.len(),
+        2,
+        "the second lookup handed back a different copy of the table"
+    );
+}

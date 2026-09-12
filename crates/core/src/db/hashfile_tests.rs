@@ -359,7 +359,7 @@ fn test_truncated_meta_is_detected() {
 }
 
 #[test]
-fn test_stale_tmp_file_is_cleaned_up_and_never_read() {
+fn a_stale_tmp_file_is_never_read_and_is_swept_only_when_asked() {
     let guard = fresh_dir("hashfile_stale_tmp");
     let dir = guard.path();
     let section = format!("{}/data", dir);
@@ -371,25 +371,53 @@ fn test_stale_tmp_file_is_cleaned_up_and_never_read() {
     fs::write(section_dir.join("g00000000.tmp"), b"half a group").unwrap();
     fs::write(section_dir.join("meta.tmp"), b"half a meta").unwrap();
 
+    let leftovers = |what: &str| -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&section_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        names.sort();
+        assert!(!names.is_empty() || what.is_empty());
+        names
+    };
+
     let mut loaded = HashMap::new();
     hashfile::load(&section, &mut loaded).unwrap();
     assert_eq!(loaded.len(), 50, "a leftover temporary file is not part of the section");
 
+    // A load deliberately leaves them: it holds no lock on the section, so it
+    // cannot tell debris from a temporary another thread's flush is still
+    // writing. Nothing reads a `.tmp`, so leaving them costs only the space.
+    assert_eq!(
+        leftovers("after a load"),
+        vec!["g00000000.tmp".to_string(), "meta.tmp".to_string()],
+        "a load must not sweep: it cannot know whether a flush owns one of these"
+    );
+
     map.insert("K00001".to_string(), record("CHANGED"));
     let dirty: HashSet<String> = ["K00001".to_string()].into_iter().collect();
     hashfile::save(&section, &map, meta, Some(&dirty), 16).unwrap();
-
-    let leftovers: Vec<String> = fs::read_dir(&section_dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.ends_with(".tmp"))
-        .collect();
-    assert!(
-        leftovers.is_empty(),
-        "stale temporary files should be swept: {:?}",
-        leftovers
+    assert_eq!(
+        loaded.len(),
+        50,
+        "the leftover was still not read into the section by anything above"
     );
+
+    // The sweep is its own call, made by whoever holds the section's lock.
+    hashfile::sweep_tmp(&section).unwrap();
+    assert!(
+        leftovers("").is_empty(),
+        "sweep_tmp is what reclaims them: {:?}",
+        leftovers("")
+    );
+
+    // And it leaves a healthy section alone.
+    let mut reloaded = HashMap::new();
+    hashfile::load(&section, &mut reloaded).unwrap();
+    assert_eq!(reloaded.len(), 50);
+    assert_eq!(reloaded["K00001"], record("CHANGED"));
 }
 
 #[test]

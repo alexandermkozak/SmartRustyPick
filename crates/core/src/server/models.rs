@@ -72,6 +72,26 @@ pub struct Request {
     /// Each carries its own file and key, so one set may span several files of
     /// the account - see [`ChangeSpec`].
     pub changes: Option<Vec<ChangeSpec>>,
+    /// `CREATE.FILE`: create the file so that a `WRITE` naming no key is given
+    /// one. `SET.FILE`: turn that on or off for a file that already exists.
+    /// Absent on `SET.FILE` leaves the flag as it is, like `queue`.
+    pub autokey: Option<bool>,
+    /// `WRITE`: apply this only if the key holds no record. The refusal when it
+    /// does is `PRECONDITION_FAILED`, which is what tells a client that raced
+    /// somebody else apart from one that failed.
+    ///
+    /// `false` means the same as absent - no condition. A client that computed
+    /// its condition and got `false` asked for an unconditional write, and
+    /// reading that as "must exist" would invent a third condition nobody
+    /// named.
+    pub if_absent: Option<bool>,
+    /// `WRITE` and `DELETE`: apply this only if the record currently stored
+    /// under the key still has this `version`, as `READ` reported it. The
+    /// refusal when it does not is `PRECONDITION_FAILED`.
+    ///
+    /// The token is opaque. A client gets it from a `READ` and hands it back
+    /// unexamined; nothing about how it is built is part of the interface.
+    pub if_match: Option<String>,
 }
 
 /// One write or delete inside a `TRANSACT` set.
@@ -141,6 +161,13 @@ pub enum ErrorCode {
     InvalidField,
     /// Understood and refused: the database will not do this.
     InvalidRequest,
+    /// A conditional `WRITE` or `DELETE` whose condition did not hold: the key
+    /// already exists, or the record under it is no longer the one the client
+    /// read. Nothing was written. Its own code rather than a generic refusal
+    /// because the whole value of the condition is in telling a collision - the
+    /// caller should read again and retry - apart from a failure, where
+    /// retrying changes nothing.
+    PreconditionFailed,
     /// A `TRANSACT` set that reaches past what the server applies atomically.
     /// Nothing in it was applied: a refusal a client can act on is worth far
     /// more than a guarantee that quietly does not hold.
@@ -180,6 +207,7 @@ impl ErrorCode {
         ErrorCode::IndexExists,
         ErrorCode::InvalidField,
         ErrorCode::InvalidRequest,
+        ErrorCode::PreconditionFailed,
         ErrorCode::TransactionScope,
         ErrorCode::CorruptData,
         ErrorCode::PermissionDenied,
@@ -211,6 +239,7 @@ impl ErrorCode {
             ErrorCode::IndexExists => "INDEX_EXISTS",
             ErrorCode::InvalidField => "INVALID_FIELD",
             ErrorCode::InvalidRequest => "INVALID_REQUEST",
+            ErrorCode::PreconditionFailed => "PRECONDITION_FAILED",
             ErrorCode::TransactionScope => "TRANSACTION_SCOPE",
             ErrorCode::CorruptData => "CORRUPT_DATA",
             ErrorCode::PermissionDenied => "PERMISSION_DENIED",
@@ -284,6 +313,7 @@ impl From<&DbError> for ErrorCode {
             DbError::InvalidField { .. } => ErrorCode::InvalidField,
             DbError::InvalidRequest(_) => ErrorCode::InvalidRequest,
             DbError::TransactionScope(_) => ErrorCode::TransactionScope,
+            DbError::PreconditionFailed(_) => ErrorCode::PreconditionFailed,
             DbError::Io(inner) => ErrorCode::from(inner),
         }
     }
@@ -330,6 +360,24 @@ pub struct Response {
     /// back unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claim: Option<serde_json::Value>,
+    /// The key a `WRITE` stored the record under, set only when the server
+    /// minted it because the request named none - see `autokey`.
+    ///
+    /// Its own field rather than folded into `record`, for the reason `claim`
+    /// is: `record` is the client's own data, and a payload with a field called
+    /// `key` must still read back unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// `READ`: the token to hand back to `if_match` on a later `WRITE` or
+    /// `DELETE` of this record, and `WRITE`: the token the record just written
+    /// now has.
+    ///
+    /// Opaque, and changes whenever the record does. A client that reads,
+    /// modifies and writes back passes the version it read; if anybody else
+    /// wrote in between, the version no longer matches and the write is refused
+    /// with `PRECONDITION_FAILED` rather than overwriting them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// `GET.BYTES`: how many bytes of body follow this response line on the
     /// connection, and `PUT.BYTES`: how many were stored.
     ///

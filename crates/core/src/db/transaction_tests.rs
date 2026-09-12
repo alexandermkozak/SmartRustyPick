@@ -265,6 +265,7 @@ fn a_queue_file_is_refused_with_a_scope_error() {
         FileAttributes {
             durable: false,
             queue: Some(QueuePolicy::default()),
+            autokey: false,
             directory: None,
         },
     )

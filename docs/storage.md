@@ -613,13 +613,103 @@ carry the record as raw bytes on the connection itself — the same fixed-size s
 from a machine that has no filesystem access to the server. `transfer_stall_timeout_ms` bounds a transfer that stops
 making progress; a body that ends early is refused rather than stored truncated.
 
+## Conditional Writes
+
+`WRITE` overwrites, and that is two lost-record bugs wearing one hat. Two clients that both intend to *create* a record
+write the same key and the second silently wins. Two clients that each read a record, change it and write it back lose
+one of the two changes. Both writes were valid, so nothing is reported.
+
+A write may now carry a condition on what is under the key: `if_absent`, which requires nothing to be there, or
+`if_match`, which requires the record there to still be the one the caller read. `DELETE` takes `if_match` too, because
+deleting a record somebody has since changed is the same bug. A condition that does not hold is refused with
+`PRECONDITION_FAILED` and **nothing is written**.
+
+### Why no new synchronisation was needed
+
+A write already holds the file's own lock — see [Concurrency and Lock Ordering](#concurrency-and-lock-ordering) — and
+the record it is about to replace is in hand at that moment. So the comparison and the write happen inside one guard,
+with no release in between, and a second writer arriving at any point either has not got the lock yet or is looking at
+a file the first one has already changed. That is the whole of the concurrency argument, and it is why the check sits
+in the write path rather than beside it.
+
+### The token is a digest, not a counter
+
+`READ` reports a `version`, and `if_match` compares against it. It is a digest of the record's stored bytes — sixteen
+hex characters of SHA-256 — rather than a counter kept beside the record.
+
+A counter is a field, and the record section has no room for one. Adding it would be a change to the frame encoding and
+a migration of every file, to hold a number the record's own bytes already determine. The bytes are in hand exactly
+where the decision is made, so a digest costs a hash of one record and nothing at all on disk. A counter is cheaper to
+compare and easier to explain, and neither of those buys back a format change.
+
+**The token is per record, not per file.** Per file would be cheaper to maintain and would turn every concurrent write
+to a busy file into a conflict — which would make the feature unusable exactly where it is most needed.
+
+**It is opaque to clients.** Its length, alphabet and derivation are not part of the protocol; what is promised is that
+it changes whenever the record's bytes change. That is what leaves the engine free to make the choice above, and to
+revisit it.
+
+### What takes no condition
+
+A [directory file](#directory-files) does not. Its records are host files that anything on the machine can change, so a
+version this server took from one promises nothing, and the refusal says so rather than checking and hoping.
+`TRANSACT` does not either: a set is applied whole or not at all, which is a different guarantee, and mixing a
+per-record precondition into it would make "nothing was applied" mean two things.
+
+## Autokey Files
+
+`WRITE` requires a key, and for a record with a natural identifier that is right. For anything being *accumulated* the
+key carries no meaning beyond "later than the last one", and making the client invent it recreates the problem above:
+read the current maximum, add one, write, and lose a record to whoever did the same in between.
+
+A file is made an autokey file by its `DIR` entry, exactly as it is made durable or a queue: attribute 7 (`AUTOKEY`) is
+`Y`. A `WRITE` that names no key on such a file is given one; a `WRITE` that names no key anywhere else is refused,
+naming the flag, rather than being handed a key nobody asked for. The flag is opt-in per file for that reason — a file
+that mints keys says so, and every other file behaves as it always did.
+
+`AUTOKEY` is exclusive with `QUEUE`, and with `DIRECTORY`. A queue already mints the key of every record it stores, so
+a file carrying both has two counters and no answer to which one a write draws from; a directory file's keys are the
+names of host files. Both combinations are refused at creation, and a hand-edited entry claiming both reads as the
+queue it says it is.
+
+### The key, and the counter behind it
+
+The key is the same twenty-digit sequence key a [queue file](#queue-files) mints — `milliseconds * 1000000 + counter`,
+zero padded — and for the same reasons, so the two file types share one counter implementation in `db::sequence` and
+there is one answer in the system to "what does a minted key look like".
+
+The **fixed width is part of the interface** rather than an implementation detail. A caller reading a range back
+depends on the keys sorting into arrival order *as text*, and a width chosen per file, or one chosen too small, would
+make the first file that outgrew it a migration. Twenty digits holds `u64::MAX`.
+
+The counter is minted **inside the file's write lock**, so concurrency is the existing lock's problem rather than a new
+one, and two clients appending at once come away with distinct keys.
+
+### What survives a restart
+
+The counter persists into a small `autokey` file beside the records, written checksum-first through a temporary, the
+way a queue's `queue` file and an index's `state` are. It is written **after** the records, so a crash in between
+leaves a counter ahead of them — which costs a gap in the keys, where the reverse would mint a key twice.
+
+Two sources are consulted when a file's counter is attached, and both matter:
+
+- The `autokey` file, which is authoritative when it is there, because a key it has already handed out may since have
+  been **deleted** and must not come round again.
+- The keys already in the file, which the counter is pulled past. That is the backstop for an `autokey` file that was
+  lost or never written — the flag turned on by hand, a restored file — and it also covers a key written by hand into a
+  file that mints them.
+
+Between them a minted key collides with an existing record only if both are wrong at once. And because the clock is in
+the key, a counter that starts from nothing still moves forward past everything minted before it: time has passed.
+
 ## Queue Files
 
 A hash file has no order to walk: a record's key decides its group, so "the oldest record" is not a question the layout
 can answer. A queue file adds the two things that are missing from that for work several consumers divide between them
 — an order, and a claim only one of them can hold.
 
-A file is made a queue by its `DIR` entry, exactly as it is made durable: attribute 3 (`QUEUE`) is `Y`, attribute 4
+A file is made a queue by its `DIR` entry, exactly as it is made durable or made to mint its own keys: attribute 3
+(`QUEUE`) is `Y`, attribute 4
 (`QUEUE.TIMEOUT`) is how many seconds a claim is held, and attribute 5 (`QUEUE.RETRIES`) is how many times a record is
 delivered before it is dead-lettered. Both numbers are written out even when they are the defaults (60 and 5), because
 the entry is what an administrator reads to find out what the queue will do, and "blank, which means sixty" is a worse
@@ -639,7 +729,8 @@ The engine mints the key of every enqueued record, as twenty decimal digits:
 ```
 
 `milliseconds-since-the-epoch * 1000000 + counter`, zero padded, so the keys sort into arrival order both as text and as
-numbers. Claiming the oldest record is then the first entry of an ordered set, not a scan.
+numbers. Claiming the oldest record is then the first entry of an ordered set, not a scan. The counter itself is shared
+with [autokey files](#autokey-files), which mint the same keys for the same reasons — it lives in `db::sequence`.
 
 The clock is deliberately *in* the key. That is what lets the oldest unacknowledged age be read off the smallest live
 key rather than from a timestamp stored per record — and that is the difference between persistent queue state the size
@@ -797,6 +888,26 @@ can reload it between it leaving the cache and its changes reaching the disk.
 Two connections may load the same cold file at the same time. The second to finish finds the first one's entry already
 in the map and discards its own copy. That costs a duplicate read of a file nobody had written to yet, and is what keeps
 the map's lock off the disk.
+
+### Staleness, and the same rule again
+
+A cached file whose data section was rewritten by another process is dropped so the next access reads it fresh. **That
+drop obeys the eviction rule above**: a file another thread still holds a handle to is left alone, however stale the
+cache believes it is. Removing the map entry does not remove the file from memory — it only lets the next caller load a
+second copy beside the one still in use, which is the two-copies hazard eviction has always avoided. The entry goes
+stale again the moment nobody is using it, and is dropped then.
+
+That was a real failure and not a precaution. A thread that dropped a held entry went on to read the section from disk
+while the holder was flushing it, and the load swept the `.tmp` files as it went — including the one that flush was
+between `create` and `rename` of. The flush then failed its rename, and a durable `WRITE` came back `IO_ERROR` under
+nothing worse than concurrency. Nothing was lost or corrupted, because a temporary is never part of the section, but a
+write failed for a reason no caller could act on.
+
+The sweep moved with the fix. Reclaiming crash debris needs to know that no flush of that section is in progress, which
+is the file lock's guarantee and not something a load can establish — a load is what runs *before* there is a file to
+lock. It now happens on a loaded file's **first flush**, under the lock that flush already holds, which keeps it to one
+directory scan per load rather than one per write. Leaving the debris until then costs only the space: nothing ever
+reads a `.tmp`.
 
 ## Configuration
 

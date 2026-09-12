@@ -34,6 +34,7 @@ fn database() -> (TempDir, SharedDb) {
         FileAttributes {
             durable: false,
             queue: None,
+            autokey: false,
             directory: Some(DirectoryPolicy::default_path()),
         },
     )

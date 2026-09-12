@@ -288,15 +288,21 @@ queue is `DURABLE` unless `BUFFERED` says otherwise. `TIMEOUT` sets how long a c
 (default 60), and `RETRIES` how many times a record is delivered before it moves to the dead-letter file (default 5);
 naming either implies `QUEUE`.
 
+`AUTOKEY` makes it an [autokey file](#autokey-files): a `WRITE` over the
+[remote protocol](protocol.md#server-minted-keys) that names no key is given one, minted in arrival order. A file
+cannot be both `AUTOKEY` and `QUEUE` - a queue already mints the key of every record it stores - and a directory file
+cannot be `AUTOKEY` at all, since its keys are the names of host files.
+
 `DIRECTORY` makes it a [directory file](#directory-files): its records are the files of a real directory on the host,
 which is where content that is not fields belongs. `PATH` points it at a directory that already exists, and naming it
 implies `DIRECTORY`; without one the records live in `<file>/records` inside the file's own directory and are removed
 with it by `DELETE.FILE`. A directory file cannot also be `DURABLE` or a `QUEUE`, and asking for either alongside it is
 refused rather than settled one way.
 
-- **Usage**: `CREATE.FILE <name> [DURABLE] [QUEUE [TIMEOUT <seconds>] [RETRIES <n>]] [DIRECTORY [PATH <dir>]]`
+- **Usage**: `CREATE.FILE <name> [DURABLE] [AUTOKEY] [QUEUE [TIMEOUT <seconds>] [RETRIES <n>]] [DIRECTORY [PATH <dir>]]`
 - **Example**: `CREATE.FILE ORDERS`
 - **Example**: `CREATE.FILE LEDGER DURABLE`
+- **Example**: `CREATE.FILE EVENTS AUTOKEY`
 - **Example**: `CREATE.FILE JOBS QUEUE`
 - **Example**: `CREATE.FILE JOBS QUEUE TIMEOUT 300 RETRIES 3`
 - **Example**: `CREATE.FILE SCANS DIRECTORY`
@@ -310,18 +316,45 @@ claim policy.
 Only the flags you name change, so a `SET.FILE JOBS DURABLE` cannot quietly stop `JOBS` being a queue. Promoting a
 file flushes what it still had buffered as part of the change, so the flag never gets ahead of the data it protects.
 `BUFFERED` returns the file to the database's ordinary flush policy, and `NOQUEUE` returns a queue to an ordinary
-file without touching a record, dropping the order and the delivery counts with it. What `SET.FILE` will not change is
+file without touching a record, dropping the order and the delivery counts with it. `AUTOKEY` and `NOAUTOKEY` turn
+key minting on and off the same way: the records are untouched either way, and a file switched off loses the counter's
+own file with it, so one switched back on later starts from the keys it actually holds. What `SET.FILE` will not change is
 a file's *type*: an ordinary file's records are inside a hashed section and a
 [directory file](#directory-files)'s are host files, so converting one is a rewrite of every record rather than a flag. The one exception to "only what you name": a file becoming a queue becomes `DURABLE`
 with it unless `BUFFERED` says otherwise, for the reason a queue is created durable. `DIR` carries the attributes for the other files and cannot be set itself. See
 [Storage Engine](storage.md).
 
-- **Usage**: `SET.FILE <name> [DURABLE | BUFFERED] [QUEUE | NOQUEUE] [TIMEOUT <seconds>] [RETRIES <n>]`
+- **Usage**: `SET.FILE <name> [DURABLE | BUFFERED] [AUTOKEY | NOAUTOKEY] [QUEUE | NOQUEUE] [TIMEOUT <seconds>] [RETRIES <n>]`
 - **Example**: `SET.FILE LEDGER DURABLE`
+- **Example**: `SET.FILE EVENTS AUTOKEY`
 - **Example**: `SET.FILE LEDGER BUFFERED`
 - **Example**: `SET.FILE OUTBOX QUEUE TIMEOUT 120`
 - **Note**: Admin clients can do the same over the [remote protocol](protocol.md) with `SET.FILE`, and from the
   [web dashboard](web_dashboard.md).
+
+#### Autokey files
+
+`SET` needs a key, and for a record with a natural identifier that is right. For anything being *accumulated* - a log,
+a journal, a stream of events - the key means nothing beyond "later than the last one", and making the caller invent
+it is how two writers computing the same next key lose one of the two records.
+
+A file created `AUTOKEY` mints the key itself. Over the [remote protocol](protocol.md#server-minted-keys) a `WRITE`
+with no `key` stores the record and returns the key it chose; the key is twenty digits carrying the millisecond it
+arrived, zero padded, so a `SELECT` or a `LIST` over a range of them reads the records back in the order they were
+written without anything having to parse them. The minting happens inside the file's own write lock, so two clients
+appending at once both succeed with distinct keys.
+
+The counter is per file and survives a restart without handing a key out twice. A file without the flag refuses a
+keyless write, naming `AUTOKEY`, rather than inventing a key; a key supplied by hand still works on a file that mints
+them, and the counter steps over it.
+
+Everything else still works on the file: `SET`, `GET`, `LIST`, `SELECT` and the dictionary commands treat it as the
+ordinary file it also is. From the CLI, `SET` names the key as usual - minting is what a remote client asks for by
+leaving the key out.
+
+Conditional writes are the other half of the same problem, for a record that already exists: see
+[Conditional writes](protocol.md#conditional-writes), which are a property of a `WRITE` rather than of a file and so
+need no flag here.
 
 #### Queue files
 

@@ -28,6 +28,7 @@ fn directory_file(db: &Database, account: &str, name: &str) {
         FileAttributes {
             durable: false,
             queue: None,
+            autokey: false,
             directory: Some(DirectoryPolicy::default_path()),
         },
     )
@@ -264,6 +265,7 @@ fn a_file_created_with_a_path_keeps_its_records_there() {
         FileAttributes {
             durable: false,
             queue: None,
+            autokey: false,
             directory: Some(DirectoryPolicy::at(elsewhere.to_string_lossy().into_owned())),
         },
     )
@@ -289,6 +291,7 @@ fn the_dir_entry_survives_a_rebuild_of_the_listing() {
     let attributes = FileAttributes {
         durable: false,
         queue: None,
+        autokey: false,
         directory: Some(DirectoryPolicy::at(elsewhere.to_string_lossy().into_owned())),
     };
     db.create_table_with("DIRS", "SPOOL", attributes.clone()).unwrap();
@@ -314,6 +317,7 @@ fn the_type_decides_what_the_rest_of_the_entry_can_say() {
         FileAttributes {
             durable: false,
             queue: None,
+            autokey: false,
             directory: Some(DirectoryPolicy::at("/srv/scans")),
         }
     );

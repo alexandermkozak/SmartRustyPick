@@ -119,6 +119,7 @@ const fileList = (
     reasons: string[] = [],
     queue = false,
     directory = false,
+    autokey = false,
 ) =>
     envelope({
         keys: ['DIR', 'USERS'],
@@ -133,7 +134,10 @@ const fileList = (
                     health_reasons: [],
                 },
             ],
-            ['USERS', {durable, queue, directory, health: usersHealth, health_reasons: reasons}],
+            [
+                'USERS',
+                {durable, queue, directory, autokey, health: usersHealth, health_reasons: reasons},
+            ],
         ],
         count: 2,
     })
@@ -152,6 +156,17 @@ const directoryStats = (over: Record<string, unknown> = {}) => ({
         bytes: 3145728,
         largest_bytes: 3145718,
         max_record_bytes: 67108864,
+        ...over,
+    },
+})
+
+/** `FILE.STATS` for a file that mints its own keys. */
+const autokeyStats = (over: Record<string, unknown> = {}) => ({
+    ...fileStats,
+    autokey: {
+        next_key: '01764950412345000000',
+        next_sequence: 1764950412344000007,
+        loaded: true,
         ...over,
     },
 })
@@ -485,6 +500,78 @@ describe('the accounts view', () => {
         expect(entries[1].text()).toContain('queue')
     })
 
+    it('marks the files that mint their own keys', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubFetch({
+                ...routes,
+                '/api/accounts/SALES/files': fileList(false, 'good', [], false, false, true),
+            }),
+        )
+        const wrapper = mount(View)
+        await flushPromises()
+        await selectors(wrapper, 0)[0].trigger('click')
+        await flushPromises()
+
+        const entries = wrapper.findAll('.list')[1].findAll('li')
+        expect(entries[0].text()).not.toContain('autokey')
+        expect(entries[1].text()).toContain('autokey')
+    })
+
+    it('reports the next key an autokey file would hand out', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubFetch({
+                ...routes,
+                '/api/accounts/SALES/files/USERS': envelope({record: autokeyStats()}),
+            }),
+        )
+        const wrapper = await openUsers(View)
+
+        expect(wrapper.text()).toContain('Minted keys')
+        expect(wrapper.text()).toContain('01764950412345000000')
+        expect(wrapper.text()).toContain('memory — exact')
+        // The counter behind the key is past what a Number holds exactly, so it
+        // is deliberately not on the page: `JSON.parse` has already rounded it.
+        expect(wrapper.text()).not.toContain('1764950412344000007')
+        expect(wrapper.findAll('.file-actions button')[2].text()).toBe('Require a key')
+    })
+
+    it('says where the counter was read from when the file is not in memory', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubFetch({
+                ...routes,
+                '/api/accounts/SALES/files/USERS': envelope({
+                    record: autokeyStats({loaded: false}),
+                }),
+            }),
+        )
+        const wrapper = await openUsers(View)
+        expect(wrapper.text()).toContain('disk — as of the last flush')
+    })
+
+    it('offers minting on an ordinary file and reports nothing about it', async () => {
+        const wrapper = await openUsers(View)
+        expect(wrapper.text()).not.toContain('Minted keys')
+        expect(wrapper.text()).toContain('Mints its own keys')
+        expect(wrapper.findAll('.file-actions button')[2].text()).toBe('Mint keys')
+    })
+
+    it('does not offer minting on a queue, which already mints every key', async () => {
+        vi.stubGlobal(
+            'fetch',
+            stubFetch({
+                ...routes,
+                '/api/accounts/SALES/files/USERS': envelope({record: queueStats()}),
+            }),
+        )
+        const wrapper = await openUsers(View)
+        // Durable and the queue switch, and no third button: the database
+        // refuses a file that claims both, so the page does not offer it.
+        expect(wrapper.findAll('.file-actions button')).toHaveLength(2)
+    })
+
     it('reports a queue’s depth, in-flight count, age and dead letters', async () => {
         vi.stubGlobal(
             'fetch',
@@ -768,6 +855,41 @@ describe('account and file maintenance', () => {
                 method: 'POST',
                 path: '/api/accounts/SALES/files',
                 body: '{"name":"JOBS","durable":false,"queue":true,"visibility_timeout":300,"max_deliveries":3}',
+            },
+        ])
+    })
+
+    it('creates a file that mints its own keys', async () => {
+        const wrapper = mount(View)
+        await flushPromises()
+        await selectors(wrapper, 0)[0].trigger('click')
+        await flushPromises()
+
+        const checkboxes = wrapper.findAll('.new-file input[type="checkbox"]')
+        await checkboxes[3].setValue(true)
+        await wrapper.find('.new-file input:not([type="checkbox"])').setValue('EVENTS')
+        await wrapper.findAll('.new-file')[0].trigger('submit')
+        await flushPromises()
+
+        expect(sent).toEqual([
+            {
+                method: 'POST',
+                path: '/api/accounts/SALES/files',
+                body: '{"name":"EVENTS","durable":false,"autokey":true}',
+            },
+        ])
+    })
+
+    it('sends only the attribute the minting switch changes', async () => {
+        const wrapper = await openUsers(View)
+        await wrapper.findAll('.file-actions button')[2].trigger('click')
+        await flushPromises()
+
+        expect(sent).toEqual([
+            {
+                method: 'POST',
+                path: '/api/accounts/SALES/files/USERS',
+                body: '{"autokey":true}',
             },
         ])
     })

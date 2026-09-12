@@ -57,6 +57,14 @@ pub enum DbError {
     /// will not do that in one piece", and retry the second one record at a
     /// time if partial application is acceptable to it.
     TransactionScope(String),
+    /// A conditional write or delete whose condition did not hold, and nothing
+    /// was applied. `detail` says which condition and what was there instead.
+    ///
+    /// Its own variant rather than an [`InvalidRequest`](DbError::InvalidRequest)
+    /// because the caller's next move is different: a refused condition is a
+    /// collision to read again and retry, not a request the database will never
+    /// accept. Telling the two apart is the entire point of the feature.
+    PreconditionFailed(String),
     /// A real I/O failure, with the `io::Error` it came from.
     Io(io::Error),
 }
@@ -70,6 +78,10 @@ impl DbError {
             | DbError::InvalidField { .. }
             | DbError::InvalidRequest(_)
             | DbError::TransactionScope(_) => io::ErrorKind::InvalidInput,
+            // The closest kind there is: the request was well formed and the
+            // state it names is not what it requires. `AlreadyExists` would fit
+            // `if_absent` and misdescribe `if_match`.
+            DbError::PreconditionFailed(_) => io::ErrorKind::InvalidInput,
             DbError::AccountNotFound(_) | DbError::FileNotFound { .. } | DbError::IndexNotFound { .. } => {
                 io::ErrorKind::NotFound
             }
@@ -104,6 +116,7 @@ impl fmt::Display for DbError {
             DbError::InvalidField { field, reason } => write!(f, "'{}' cannot be indexed: {}", field, reason),
             DbError::InvalidRequest(detail) => write!(f, "{}", detail),
             DbError::TransactionScope(detail) => write!(f, "{}", detail),
+            DbError::PreconditionFailed(detail) => write!(f, "{}", detail),
             DbError::Io(e) => write!(f, "{}", e),
         }
     }
