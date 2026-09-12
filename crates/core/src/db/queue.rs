@@ -495,7 +495,7 @@ pub fn state_path(file_dir: &str) -> PathBuf {
 /// a queue that redelivers a few records more than it had to - not a queue that
 /// refuses to open.
 pub fn read_state(file_dir: &str) -> Option<PersistedQueue> {
-    let body = sequence::read_checked(&state_path(file_dir))?;
+    let body = crate::db::statefile::read(&state_path(file_dir)).body()?;
     let mut state = PersistedQueue::default();
     for line in body.lines() {
         if let Some(next) = line.strip_prefix("next=") {
@@ -525,10 +525,10 @@ pub fn write_state(file_dir: &str, state: &PersistedQueue, fsync: FsyncPolicy) -
     for (key, count) in deliveries {
         body.push_str(&format!("deliveries={}:{}\n", key, count));
     }
-    sequence::write_checked(&state_path(file_dir), &body, fsync)
+    crate::db::statefile::write(&state_path(file_dir), &body, fsync)
 }
 
 /// Removes a queue's persisted state, for a file that is no longer a queue.
 pub fn remove_state(file_dir: &str) -> io::Result<()> {
-    sequence::remove_if_present(&state_path(file_dir))
+    crate::db::statefile::remove_if_present(&state_path(file_dir))
 }

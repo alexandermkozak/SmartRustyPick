@@ -10,6 +10,7 @@ pub mod engine;
 #[cfg(test)]
 mod engine_tests;
 pub mod error;
+pub mod format;
 pub mod hashfile;
 #[cfg(test)]
 mod hashfile_tests;
@@ -34,6 +35,7 @@ pub mod report;
 #[cfg(test)]
 mod report_tests;
 pub mod sequence;
+pub mod statefile;
 pub mod transaction;
 #[cfg(test)]
 mod transaction_tests;

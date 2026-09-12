@@ -42,15 +42,15 @@
 //! # The state file
 //!
 //! Both counters persist into a small text file inside the file's own
-//! directory - `queue` for a queue, `autokey` for an autokey file - written
-//! checksum-first through a temporary, so a crash mid-write leaves the previous
-//! state rather than half of this one. A file that does not check out is
-//! reported as absent rather than as an error: the records are the file, and
-//! this only says where the counter had got to.
+//! directory - `queue` for a queue, `autokey` for an autokey file - in the
+//! format [`crate::db::statefile`] writes. A file that does not check out is
+//! treated as absent here: the records are the file, and this only says where
+//! the counter had got to, so starting it over costs a gap in the keys rather
+//! than anything a caller can see.
 
-use crate::db::hashfile::{self, FsyncPolicy};
-use std::fs::{self, File};
-use std::io::{self, Write};
+use crate::db::hashfile::FsyncPolicy;
+use crate::db::statefile;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -162,10 +162,8 @@ pub fn autokey_path(file_dir: &str) -> PathBuf {
 
 /// Reads an autokey file's counter, or `None` when there is none to read.
 pub fn read_autokey(file_dir: &str) -> Option<u64> {
-    let body = read_checked(&autokey_path(file_dir))?;
-    body.lines()
-        .find_map(|line| line.strip_prefix("next="))
-        .and_then(|next| next.trim().parse().ok())
+    let body = statefile::read(&autokey_path(file_dir)).body()?;
+    statefile::field(&body, "next")?.parse().ok()
 }
 
 /// Writes an autokey file's counter.
@@ -175,59 +173,10 @@ pub fn read_autokey(file_dir: &str) -> Option<u64> {
 /// behind them would mint one twice, which is the lost record this exists to
 /// prevent - and [`Sequence::raise_past`] is the second line of defence for it.
 pub fn write_autokey(file_dir: &str, next: u64, fsync: FsyncPolicy) -> io::Result<()> {
-    write_checked(&autokey_path(file_dir), &format!("next={}\n", next), fsync)
+    statefile::write(&autokey_path(file_dir), &format!("next={}\n", next), fsync)
 }
 
 /// Removes an autokey file's counter, for a file that no longer mints keys.
 pub fn remove_autokey(file_dir: &str) -> io::Result<()> {
-    remove_if_present(&autokey_path(file_dir))
-}
-
-/// Reads a checksummed state file's body, or `None` when it is absent or does
-/// not check out.
-///
-/// A file that fails its checksum is reported as absent rather than as an
-/// error. What these files hold is derived state: starting it over costs a gap
-/// in a counter or a few redeliveries, and neither is a reason to refuse to
-/// open a file whose records are perfectly good.
-pub fn read_checked(path: &Path) -> Option<String> {
-    let content = fs::read_to_string(path).ok()?;
-    let (checksum_line, body) = content.split_once('\n')?;
-    let recorded = checksum_line.strip_prefix("checksum=")?;
-    if u32::from_str_radix(recorded.trim(), 16).ok()? != hashfile::crc32c(body.as_bytes()) {
-        return None;
-    }
-    Some(body.to_string())
-}
-
-/// Writes a checksummed state file, checksum first and through a temporary, so
-/// a crash mid-write leaves the previous state rather than half of this one.
-pub fn write_checked(path: &Path, body: &str, fsync: FsyncPolicy) -> io::Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "state file has no directory"))?;
-    fs::create_dir_all(dir)?;
-    let mut name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "state file has no name"))?
-        .to_os_string();
-    name.push(".tmp");
-    let tmp = dir.join(name);
-    {
-        let mut file = File::create(&tmp)?;
-        writeln!(file, "checksum={:08x}", hashfile::crc32c(body.as_bytes()))?;
-        file.write_all(body.as_bytes())?;
-        if fsync == FsyncPolicy::Always {
-            file.sync_all()?;
-        }
-    }
-    fs::rename(tmp, path)
-}
-
-/// Removes a state file, treating one that is not there as removed.
-pub fn remove_if_present(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        other => other,
-    }
+    statefile::remove_if_present(&autokey_path(file_dir))
 }

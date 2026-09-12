@@ -96,6 +96,7 @@ test-integration: build
 	@rm -f $(RESULTS_DIR)/integration_results.md
 	$(PYTHON) test/integration/test_server.py
 	$(PYTHON) test/integration/test_headless.py
+	$(PYTHON) test/integration/test_format.py
 	$(PYTHON) test/integration/test_security.py
 	$(PYTHON) test/integration/test_durability.py
 	$(PYTHON) test/integration/test_queue.py

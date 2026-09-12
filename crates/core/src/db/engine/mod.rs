@@ -308,6 +308,10 @@ pub struct Database {
     /// queue's claim policy - cached so the write path does not read the DIR
     /// file on every request.
     file_attributes: RwLock<HashMap<TableKey, FileAttributes>>,
+    /// What opening the storage directory found - see [`crate::db::format`].
+    /// Kept so the binaries can say so on the one start where it matters, and
+    /// say nothing on every ordinary one.
+    storage_format: crate::db::format::Opened,
 }
 
 /// A table's dictionary resolved to just what serialization emits, so a result
@@ -419,6 +423,11 @@ impl Table {
 impl Database {
     pub fn new(base_storage_dir: &str, config: Option<crate::config::Config>) -> DbResult<Self> {
         let config = config.unwrap_or_else(crate::config::Config::load);
+        // First, and before a byte of the directory is read or written: a
+        // format this build does not understand has to stop the server here
+        // rather than be misread by everything below. It creates the directory
+        // too, so there is never a window in which one exists unstamped.
+        let storage_format = crate::db::format::open(base_storage_dir)?;
         let db = Database {
             storage_dir: base_storage_dir.to_string(),
             session_account: RwLock::new(String::new()),
@@ -457,11 +466,8 @@ impl Database {
             last_flush: Mutex::new(Instant::now()),
             write_marks: Mutex::new(HashMap::new()),
             file_attributes: RwLock::new(HashMap::new()),
+            storage_format,
         };
-
-        if !Path::new(&db.storage_dir).exists() {
-            fs::create_dir_all(&db.storage_dir)?;
-        }
 
         db.load_account_registry()?;
         db.ensure_system_account()?;
@@ -500,6 +506,18 @@ impl Database {
 
     /// Re-reads `accounts.reg` when it was modified by another process, so accounts
     /// created or deleted elsewhere are visible without restarting.
+    /// What opening the storage directory found. `Current` on an ordinary
+    /// start; the other outcomes are worth a line to whoever is watching.
+    pub fn storage_format(&self) -> crate::db::format::Opened {
+        self.storage_format
+    }
+
+    /// One line about the storage directory, or `None` when there is nothing to
+    /// say. The binaries print it; the engine does not print anything itself.
+    pub fn storage_format_note(&self) -> Option<String> {
+        self.storage_format.describe(&self.storage_dir)
+    }
+
     pub fn refresh_account_registry(&self) -> DbResult<()> {
         let registry_path = format!("{}/accounts.reg", self.storage_dir);
         let stamp = Self::file_stamp(&registry_path);

@@ -60,7 +60,7 @@ AI agents have been responsible for several critical improvements and fixes in t
 - **MultiValue Logic:** Implementation of hierarchical data structures (FM, VM, SVM), and the `BY.EXP` clause that
   gives each value of a multivalued field its own `LIST` row, carrying the matched position through select lists,
   `SAVE-LIST`/`GET-LIST` and the remote protocol. Fields that belong together explode together - see
-  [Association groups](#8-association-groups-correlated-multivalues-for-free) below.
+  [Association groups](#9-association-groups-correlated-multivalues-for-free) below.
 - **Dictionary Support:** Logic for field formatting and conversions (Dates, Numbers).
 - **Query Engine:** Implementation of `SELECT` and `QUERY` commands for data retrieval.
 - **Queue Files:** An ordering primitive beside the hashed one. A file created `QUEUE` mints a sequence key per
@@ -275,7 +275,44 @@ AI agents have been responsible for several critical improvements and fixes in t
   `a_table_somebody_is_holding_is_not_invalidated_out_from_under_them` is the rule that prevents it - the second fails
   deterministically when the check is removed, which the first, at one run in six, could never be trusted to do.
 
-### 8. Association groups: correlated multivalues for free
+### 8. Upgrading over a mounted volume
+
+- **The question nobody could answer.** The server is deployed as an image with `db_storage/` on a volume, and the
+  volume outlives the container by design - so swapping the tag *is* the upgrade. Nothing recorded which build wrote
+  the data and nothing checked, which made every one of those upgrades an untested assumption.
+- **The failure worth preventing is not a server that will not start.** It is a newer binary opening an older
+  directory, misreading a structure whose layout changed, and either answering wrongly or writing something the older
+  binary can no longer read - by which point the rollback is broken too. A database that refuses to start is a bad
+  morning; one that starts and is subtly wrong is a bad quarter. `db_storage/.format` exists to turn the second into
+  the first.
+- **Two numbers, and four outcomes.** A build declares the version it writes and the oldest it opens. A directory at
+  the current version starts silently; one in between is migrated in place and restamped; one outside the range is
+  **refused**, naming the version found and the range supported, before a byte is read. `SERVER.STATS` reports both
+  numbers, so "can this volume move to that image" is a question you ask the running server rather than a file inside
+  a container.
+- **In place, not a runbook.** Migrating on open was the deliberate choice over refusing until an operator runs a
+  command: an upgrade should be "pull the new tag and start it". The price is that the rollback then fails, and the
+  price is paid openly - the start prints *an older build can no longer open it*, and `docs/deployment.md` says to
+  take the backup first, because a migration is the one step in an upgrade that changing the tag back does not undo.
+- **The one assumption, made once.** Every directory that exists today has no stamp. There has only ever been one
+  lineage of this format, so an unstamped directory is version 1 - less a guess than the only thing it can be. It is
+  adopted, announced on the start that does it, and recorded, so it is never assumed again. The alternative - refusing
+  until a human passes a flag - would have broken the start-up of every existing deployment to avoid an assumption
+  that is not in doubt.
+- **"I cannot read this" is not "this never said anything".** A damaged stamp is refused, because the version it
+  carried is exactly what cannot be recovered - and treating it as absent would adopt a directory of *any* version as
+  version 1, which is the corruption the whole mechanism exists to prevent. That is why `statefile::read` returns
+  `Missing` and `Unreadable` as different answers rather than an `Option`, and why the queue's book - which genuinely
+  does not care, since starting over costs a few redeliveries - is the caller that collapses them.
+- **A ladder that cannot lose a rung.** The migrations are a list keyed by the version they start from, and a unit
+  test walks the supported range and fails if one is missing. Raise the current version without adding its step and
+  the build fails at `cargo test`; reach that state anyway and the server refuses to open the directory rather than
+  stamping a version nothing converted it to.
+- **Not every change is a version.** The constant rises only for a change an older build would *misread*. A new `DIR`
+  attribute it ignores is not one. A number that goes up for changes that did not need it makes every upgrade a
+  migration and teaches operators to stop reading it.
+
+### 9. Association groups: correlated multivalues for free
 
 - **The gap.** `BY.EXP` accepted exactly one field, and refused two with *Only one BY.EXP field may be given*. That
   refusal was honest rather than lazy: three accounts beside three dates could mean three rows or nine, and nothing in

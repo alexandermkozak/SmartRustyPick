@@ -6,7 +6,7 @@ The project has five layers of tests, all runnable from the `Makefile` and all e
 | Layer       | Command                 | What it covers                                                                                                                                  |
 |-------------|-------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
 | Unit        | `make test-unit`        | `cargo test --workspace` — the engine, query parser, dictionaries and the request handler.                                                      |
-| Integration | `make test-integration` | The real binaries over the TLS protocol: CRUD, queries, select lists, headless mode, access control, per-file durability, transactions, queue files, conditional writes, server-minted keys and the web dashboard. |
+| Integration | `make test-integration` | The real binaries over the TLS protocol: CRUD, queries, select lists, headless mode, access control, per-file durability, transactions, queue files, conditional writes, server-minted keys, the storage format check and the web dashboard. |
 | Performance | `make test-performance` | End-to-end latency distributions, throughput, scaling ratios, concurrency, concurrent queue consumers and resource usage.                       |
 | Benchmarks  | `make bench`            | Criterion micro-benchmarks of the engine: record codec, query execution, sorting, persistence.                                                  |
 | Front end   | `make ui-test`          | The dashboard's Vue slices under jsdom, plus the architecture test that keeps features from importing each other.                               |

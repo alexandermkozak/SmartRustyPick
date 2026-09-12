@@ -23,10 +23,27 @@ fn main() {
         eprintln!("Failed to ensure certificates: {}", e);
     }
 
-    // We use a directory "db_storage" to hold our tables
-    let db = Arc::new(RwLock::new(
-        Database::new("db_storage", Some(config.clone())).expect("Failed to initialize database"),
-    ));
+    // We use a directory "db_storage" to hold our tables.
+    //
+    // Opened rather than unwrapped: the one failure worth spelling out here is
+    // a storage directory written in a format this build does not understand,
+    // which is what an operator meets after swapping the image over a mounted
+    // volume. A panic would bury the explanation under a backtrace and a "the
+    // program panicked" line that reads like a bug in the server rather than a
+    // decision it made. See `docs/deployment.md`.
+    let db = match Database::new("db_storage", Some(config.clone())) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+    // Said once, on the starts where something happened to the directory, and
+    // not at all on the ordinary ones.
+    if let Some(note) = db.storage_format_note() {
+        println!("{}", note);
+    }
+    let db = Arc::new(RwLock::new(db));
 
     let addr = config.server_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
     let port = config.server_port.unwrap_or(8443);

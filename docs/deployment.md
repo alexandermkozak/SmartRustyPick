@@ -48,6 +48,7 @@ container puts all of them in a single directory: `/data`, exposed as the named 
 ├── ca.crt, ca.key  # CA generated on first start
 ├── server.crt/.key # server certificate, signed by that CA
 └── db_storage/     # accounts and tables (containing `dict` and `data.hf/`)
+    └── .format     # the storage format version, checked on every start
 ```
 
 To keep the data in a host directory instead of a named volume, replace the volume entry in `compose.yaml`:
@@ -58,6 +59,59 @@ To keep the data in a host directory instead of a named volume, replace the volu
 ```
 
 The `:z` suffix is required on SELinux-enabled hosts (common with podman) and is harmless with docker.
+
+## Upgrading and rolling back
+
+The volume outlives the container, so **replacing the image tag is the upgrade**. What makes that safe is
+`db_storage/.format`: the directory records the [storage format version](storage.md#storage-format-versions) it was
+written in, and a server checks it before reading a byte.
+
+```sh
+# Always, before an upgrade. The volume is the database.
+podman volume export srp-data > srp-data-$(date +%F).tar
+
+podman compose pull && podman compose up -d
+podman compose logs | head
+```
+
+Three things can come out of that start, and only the first is silent:
+
+| What you see | What happened |
+|--------------|----------------|
+| nothing about the format | The directory is already at the version this build writes. |
+| `db_storage migrated from storage format 1 to 2. An older build can no longer open it.` | It was brought forward in place. **The rollback below no longer works.** |
+| `Cannot open the storage directory 'db_storage': …` and the container exits | The build will not touch it. Nothing was read or written. |
+
+The refusal names the version on disk and the range the build supports, and it is the point of the whole mechanism:
+a container that will not start is recoverable in a minute, while one that started and misread the data may not be
+recoverable at all.
+
+**Rolling back.** Going back to a previous tag works as long as nothing migrated the directory:
+
+```sh
+podman compose down
+# pin the previous tag in compose.yaml, then
+podman compose up -d
+```
+
+Once a start has printed `migrated from storage format …`, the older image will refuse the volume, and that refusal is
+correct — the older build genuinely cannot read what the newer one wrote. Restore the backup taken above and start the
+old tag against that. This is why the backup is not optional: a migration is the one step in an upgrade that is not
+reversible by changing the tag back.
+
+**Checking before you move.** Ask the running server what it writes and what it will open, rather than reading a file
+inside a container:
+
+```sh
+make container-cli     # then: SERVER.STATS
+```
+
+`storage_format` is the version the directory is at (the server would not have started otherwise) and
+`storage_format_oldest_supported` is the oldest the build will open. An image whose `storage_format_oldest_supported`
+is above your directory's version cannot take it.
+
+One gap is worth knowing about: images built before this check existed do not look at `.format` at all, so they will
+open a directory of any version. The protection starts with the first image that has it, and applies from there on.
 
 ## Configuration
 

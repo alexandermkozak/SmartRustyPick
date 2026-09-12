@@ -1876,6 +1876,10 @@ The running server: how long it has been up, what it has served and which sessio
 - Required: nothing. Admin only.
 - `active_connections` lists the sessions holding a TLS connection at this instant, the caller's own included. Totals
   are counted since the process started.
+- `storage_format` is the [on-disk format version](storage.md#storage-format-versions) this build writes — and, since
+  the server started, the version the data directory is at, because it would have refused to start otherwise.
+  `storage_format_oldest_supported` is the oldest it will open. Between them they are the answer to "can I move this
+  volume to that image", asked of the running server rather than of a file inside a container.
 - Errors: `ADMIN_REQUIRED`.
 
 ```json
@@ -1888,6 +1892,7 @@ The running server: how long it has been up, what it has served and which sessio
   "total_connections": 12, "rejected_connections": 1,
   "total_requests": 340, "failed_requests": 2,
   "pending_writes": 0, "loaded_tables": 3, "authorized_clients": 2,
+  "storage_format": 1, "storage_format_oldest_supported": 1,
   "active_connections": [
     {"id": 12, "peer": "127.0.0.1:52344", "client_name": "WEB.DASHBOARD",
      "thumbprint": "9f86d081...", "is_admin": true, "connected_seconds": 300,
