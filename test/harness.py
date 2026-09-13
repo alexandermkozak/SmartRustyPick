@@ -560,6 +560,28 @@ class Dashboard:
         except urllib.error.HTTPError as error:
             return error.code, _decode(error.read()), dict(error.headers)
 
+    def bytes(self, path, method="GET", body=None, content_type="application/octet-stream"):
+        """A call whose body - in either direction - is bytes rather than JSON.
+
+        The archive endpoints are the only ones shaped this way. The reply is
+        returned undecoded, because a download that came back as text would have
+        been silently corrupted by the decode this class does everywhere else.
+        """
+        import urllib.error
+        import urllib.request
+
+        request = urllib.request.Request(f"{self.base}{path}", data=body, method=method)
+        if body is not None:
+            request.add_header("Content-Type", content_type)
+        if self.token:
+            request.add_header("Authorization", f"Bearer {self.token}")
+
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return response.status, response.read(), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), dict(error.headers)
+
 
 def _decode(raw):
     text = raw.decode("utf-8", "replace")

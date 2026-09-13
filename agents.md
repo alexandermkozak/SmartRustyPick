@@ -398,6 +398,42 @@ filesystem access to the host - the same pairing directory files already have in
   returns only data accounts was wrong. The exclusion is now stated where it happens rather than inherited from a
   quirk of the registry.
 
+### 11. The dashboard's half of a backup
+
+A browser is good at two things a CLI is not: handing you a file, and taking one. So the dashboard
+offers `EXPORT.BYTES` as a **download** and `IMPORT.BYTES` as an **upload**, and deliberately does
+not offer the path form - a path typed into a web form names a directory on a machine the person at
+the keyboard usually cannot see.
+
+- **The defaults are the safe ones, and they are the interesting part.** Verify is ticked and
+  overwrite is not, so a restore nobody configured reports and writes nothing. The flags are sent as
+  query parameters only when they are actually set: absent means off at the server, and sending
+  `overwrite=false` would be the page making a decision it was not asked to make. The test that
+  matters asserts the *URL*, because that is where consent is either present or not.
+- **Two things the dashboard could not do before.** Its protocol client only ever read a line, so it
+  gained a body-reading and a body-sending exchange - and the import one is deliberately **not
+  retried**, unlike every other call there. An `IMPORT.BYTES` that failed after the body went out
+  may or may not have been applied, and sending it again would be a second restore rather than a
+  retry of the first.
+- **The body limit became per route.** The HTTP layer allows 256 KiB because "the API exchanges
+  small JSON objects only", and an archive is a database. Raising the general bound to fit one
+  endpoint would hand every other endpoint an allowance it has no use for, so exactly one path may
+  send more. It is read off the request target before the body, so an oversized upload is refused on
+  its `Content-Length` rather than after being read into memory.
+- **A bound that had to be stated rather than discovered.** Neither the HTTP layer nor the
+  dashboard's protocol client streams, so an archive is held in memory twice while it is in flight.
+  That is fine for what a person downloads through a browser and bad beyond it, so 256 MiB is
+  refused with the advice to use the CLI - which writes to a path and holds nothing.
+- **A duplicate header caught by a test that was testing nothing.** The download set
+  `Cache-Control: no-store` itself, and the check for it passed even in a run where the endpoint was
+  returning 404 - because `write_response` already sets it on every response. The header was being
+  sent twice. Removed, with a comment saying it is covered elsewhere, so its absence does not read
+  as an oversight later.
+- **The security note is part of the feature.** An archive grants nothing the dashboard could not
+  already reach, but "the whole database as one file" is much easier to walk away with than the same
+  data read a page at a time, and the same token uploads one back. `docs/web_dashboard.md` says so
+  next to the fact that the token travels in a URL and does not expire.
+
 ### TLS Troubleshooting
 
 - **UnknownIssuer error (on server logs)**: The client certificate is not signed by a CA the server trusts. Correct by

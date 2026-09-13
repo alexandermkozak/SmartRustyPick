@@ -64,6 +64,7 @@ by default), so they follow `ca_path` rather than littering the working director
 | Authorizations | Every authorized client: name, thumbprint, allowed accounts, admin flag. Authorize a thumbprint, add or remove accounts, revoke. |
 | Certificates   | Issue a certificate signed by the server's CA, authorized in the same step, with its key downloadable once.                      |
 | Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Accounts and files can be created and dropped, durable, queue, autokey and directory files are tagged in the listing, durability and the queue and autokey flags can be turned on or off, a queue's depth and in-flight count and an autokey file's next key are reported, and the selected file's dictionary and indexes are listed and managed below. |
+| Backup         | Download an archive of one file, one account or the whole database, and restore one by uploading it — with a verify pass that reports what a restore would do and writes nothing. See [Backup and restore](#backup-and-restore). |
 
 File statistics cover the record and dictionary counts, the indexes the file carries, the hash modulus and group
 distribution, bytes on disk, the durability flag and whether the file is currently held in the server's cache. Record
@@ -294,6 +295,12 @@ it as equivalent to holding an admin certificate.
 - The page is served under `Content-Security-Policy: default-src 'none'` with only same-origin scripts and styles:
   nothing is fetched from anywhere else, and there is no inline script to smuggle anything into.
 - Values from the database are written into the page as text, never as markup.
+- **[Backup and restore](#backup-and-restore) concentrates what reaching the dashboard is worth.** It could already
+  authorize a client and read any account, so an archive grants nothing new in kind — but "download the whole database
+  as one file" is a materially easier thing to walk away with than the same data read a page at a time, and the same
+  token also uploads one back. Treat the token accordingly: it travels in a URL on first load, it does not expire, and
+  the dashboard serves plain HTTP. Binding to loopback and a reverse proxy that terminates TLS are doing more work once
+  this tab exists.
 
 ## HTTP API
 
@@ -328,6 +335,13 @@ else. The code is what decides, not the wording of the message, so a reworded re
 | `POST`   | `/api/accounts/{account}/files/{file}/indexes`            | `CREATE.INDEX`                                  |
 | `POST`   | `/api/accounts/{account}/files/{file}/indexes/{field}/rebuild` | `REBUILD.INDEX`                           |
 | `DELETE` | `/api/accounts/{account}/files/{file}/indexes/{field}`   | `DELETE.INDEX`                                  |
+| `GET`    | `/api/archive?account=&file=`                            | `EXPORT.BYTES` — answers with the archive       |
+| `POST`   | `/api/archive?into=&overwrite=&verify=`                  | `IMPORT.BYTES` — body is the archive            |
+
+The two archive endpoints are the only ones whose body is not JSON. `GET /api/archive` answers
+with the archive itself as `application/octet-stream`, named by `Content-Disposition`; `POST
+/api/archive` takes the archive as its body and answers with the usual envelope, its `archive`
+field carrying the report. Both are admin only, like the commands behind them.
 
 ```sh
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/stats
@@ -335,6 +349,46 @@ curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
      -d '{"common_name":"reporting-bot","accounts":["SALES"]}' \
      http://127.0.0.1:8080/api/certificates
 ```
+
+## Backup and restore
+
+The Backup tab is the browser-shaped half of
+[`EXPORT` and `IMPORT`](admin_commands.md#exportfile--exportaccount--exportall): an archive is a
+**download**, and a restore is an **upload**. Writing an archive to a path on the server host is
+deliberately not offered here — a path typed into a web form names a directory on a machine the
+person at the keyboard usually cannot see. For that, use the CLI or the protocol.
+
+**Exporting.** Choose an account, or leave it on *Every account* for the whole database, and
+optionally name one file. The archive is built, downloaded, and named for what it holds and when
+it was taken (`SALES-20260912-1600.srp`). The same rules as the command apply and the page says
+so where it matters: an account export holds that account still while it runs, a whole-database
+export holds everything still, and `SYSTEM` is left out of it because `$CLIENTS` holds the
+certificate thumbprints this deployment authorized.
+
+**Restoring.** Choose an archive and, optionally, an account to restore it into. Two checkboxes
+decide what may happen, and both default to the safe answer:
+
+- **Verify only** is *on* by default. It reads the archive through, checks it against what is
+  already there, and reports exactly what a restore would do without writing anything.
+- **Replace files that already exist** is *off* by default. Without it, an archive landing on a
+  file that already exists is refused whole and nothing is written. With it, the file is replaced
+  rather than merged — records it has gained since the archive was taken are gone, and the page
+  says so before the button is pressed.
+
+The report that follows lists every file with what happened to it, the records and dictionary
+entries restored, and when the archive was taken.
+
+**The size limit.** The dashboard holds a whole archive in memory while it is in flight, once off
+the protocol connection and once as the HTTP body, so it refuses either direction above 256 MiB
+and says to use `EXPORT` / `IMPORT` over the protocol or the CLI instead — those name a path on
+the host and hold nothing. That bound is the dashboard's own; the server's `max_archive_bytes`
+governs `IMPORT.BYTES` for every other client.
+
+**Who can do it.** Both endpoints are admin only, enforced by the database rather than by the
+page: the dashboard holds an ordinary admin client certificate and the refusal comes back from the
+protocol like any other. Note that this puts "download the whole database as one file" behind the
+dashboard token, which travels in a URL on first load and does not expire — see
+[Security](#security).
 
 ## Implementation
 

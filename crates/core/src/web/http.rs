@@ -17,8 +17,32 @@ const MAX_REQUEST_LINE: usize = 8 * 1024;
 const MAX_HEADER_LINE: usize = 8 * 1024;
 /// Most headers accepted in one request.
 const MAX_HEADERS: usize = 64;
-/// Largest body accepted. The API exchanges small JSON objects only.
+/// Largest body accepted. The API exchanges small JSON objects only - with one
+/// exception, [`ARCHIVE_PATH`].
 pub const MAX_BODY: usize = 256 * 1024;
+
+/// The one endpoint whose body is not a small JSON object.
+///
+/// An uploaded archive is a database, so the general bound cannot cover it and
+/// raising the general bound to fit it would hand every other endpoint an
+/// allowance it has no use for. The limit is per route instead, which is the
+/// narrow answer: exactly one path may send more, and only as much as
+/// [`crate::web::api::MAX_DASHBOARD_ARCHIVE_BYTES`].
+pub const ARCHIVE_PATH: &str = "/api/archive";
+
+/// How large a body this target may carry.
+///
+/// Read off the request target *before* the body is, which is the whole point:
+/// a body over the limit is refused on its `Content-Length` rather than after
+/// being read into memory.
+fn body_limit(target: &str) -> usize {
+    let path = target.split('?').next().unwrap_or(target);
+    if path == ARCHIVE_PATH {
+        crate::web::api::MAX_DASHBOARD_ARCHIVE_BYTES as usize
+    } else {
+        MAX_BODY
+    }
+}
 
 /// A parsed request. Header names are lowercased on the way in, so lookups do
 /// not have to care how the client capitalised them.
@@ -274,7 +298,7 @@ where
         Some(Err(_)) => return Ok(Incoming::Rejected(Response::error(400, "Invalid Content-Length"))),
         None => 0,
     };
-    if content_length > MAX_BODY {
+    if content_length > body_limit(&target) {
         return Ok(Incoming::Rejected(Response::error(413, "Request body too large")));
     }
     // Chunked bodies would need a second framing to be implemented; nothing the
@@ -394,6 +418,36 @@ mod tests {
         );
         let request = expect_request(parse(&raw).await);
         assert_eq!(request.json().unwrap()["name"], "REPORTS");
+    }
+
+    /// The body limit is per route, and the archive endpoint is the one
+    /// exception. Both halves matter: the exception exists, and it applies to
+    /// nothing else.
+    #[tokio::test]
+    async fn only_the_archive_endpoint_may_send_a_body_larger_than_the_json_limit() {
+        let oversized = MAX_BODY + 1;
+        let raw = |target: &str| format!("POST {} HTTP/1.1\r\nContent-Length: {}\r\n\r\n", target, oversized);
+
+        // Refused on the Content-Length, before a byte of it is read.
+        assert!(matches!(parse(&raw("/api/clients")).await, Incoming::Rejected(_)));
+
+        // Accepted for the archive - the parse then blocks waiting for a body
+        // that this fixture does not send, so the limit is checked by asking
+        // for one byte over the *archive* limit instead, which must still be
+        // refused.
+        let past_archive = format!(
+            "POST /api/archive HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            crate::web::api::MAX_DASHBOARD_ARCHIVE_BYTES as usize + 1
+        );
+        assert!(matches!(parse(&past_archive).await, Incoming::Rejected(_)));
+
+        // And the query string does not smuggle another path past the rule.
+        assert_eq!(
+            body_limit("/api/archive?into=SALES"),
+            crate::web::api::MAX_DASHBOARD_ARCHIVE_BYTES as usize
+        );
+        assert_eq!(body_limit("/api/archives"), MAX_BODY);
+        assert_eq!(body_limit("/api/archive/extra"), MAX_BODY);
     }
 
     #[tokio::test]

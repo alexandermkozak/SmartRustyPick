@@ -44,26 +44,34 @@ fn status_for(code: Option<ErrorCode>) -> u16 {
 /// Runs one command and turns its response into an HTTP response.
 async fn run(client: &ProtocolClient, payload: Value) -> Response {
     match client.request(payload).await {
-        Ok(response) => {
-            let status = response.get("status").and_then(Value::as_str).unwrap_or("ERROR");
-            if status == "OK" {
-                Response::json(200, &response)
-            } else {
-                let message = response
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Request failed");
-                let code = response
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .and_then(ErrorCode::from_wire);
-                Response::error(status_for(code), message)
-            }
-        }
+        Ok(response) => reply(response),
         // The database is the dashboard's upstream, so an unreachable one is a
         // gateway failure rather than the browser's fault.
         Err(e) => Response::error(502, format!("Database unreachable: {}", e)),
     }
+}
+
+/// One protocol response as an HTTP one: the envelope when it succeeded, and
+/// the engine's own error code mapped to a status when it did not.
+///
+/// Shared by the ordinary commands and by the archive upload, which cannot go
+/// through [`run`] - its request carries a body - but must answer a refusal
+/// identically. A second copy of this would be a second place for the status
+/// mapping to drift.
+fn reply(response: Value) -> Response {
+    let status = response.get("status").and_then(Value::as_str).unwrap_or("ERROR");
+    if status == "OK" {
+        return Response::json(200, &response);
+    }
+    let message = response
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Request failed");
+    let code = response
+        .get("code")
+        .and_then(Value::as_str)
+        .and_then(ErrorCode::from_wire);
+    Response::error(status_for(code), message)
 }
 
 /// A required string field of a JSON request body.
@@ -166,6 +174,143 @@ fn flag(body: &Value, name: &str) -> bool {
 }
 
 /// Dispatches an authenticated `/api/...` request.
+/// The largest archive the dashboard will move in either direction.
+///
+/// The dashboard holds a whole archive in memory while it is in flight - once
+/// as it comes off the protocol connection and once as the HTTP body - because
+/// neither this HTTP layer nor the protocol client streams. That is a fine
+/// trade for the size of archive a person downloads through a browser, and a
+/// bad one beyond it, so the bound is stated rather than discovered as a
+/// dashboard that fell over.
+///
+/// Past it the archive is refused with the advice to use `EXPORT` / `IMPORT`
+/// over the protocol or the CLI, which write to a path on the host and hold
+/// nothing.
+pub const MAX_DASHBOARD_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// `GET /api/archive` - an archive as a download.
+///
+/// The scope comes from the query, the same way the command takes it: `file`
+/// for one file of `account`, `account` alone for that account, neither for
+/// every account.
+async fn export_archive(client: &Arc<ProtocolClient>, request: &Request) -> Response {
+    let mut payload = json!({ "command": "EXPORT.BYTES" });
+    let object = payload.as_object_mut().expect("built as an object");
+    let account = request
+        .query
+        .get("account")
+        .map(String::as_str)
+        .filter(|a| !a.is_empty());
+    let file = request.query.get("file").map(String::as_str).filter(|f| !f.is_empty());
+    if let Some(account) = account {
+        object.insert("target_account".to_string(), account.into());
+    }
+    if let Some(file) = file {
+        object.insert("file".to_string(), file.into());
+    }
+    if file.is_some() && account.is_none() {
+        return Response::error(400, "Exporting one file needs the account it belongs to");
+    }
+
+    let (response, body) = match client.request_with_body(payload, MAX_DASHBOARD_ARCHIVE_BYTES).await {
+        Ok(answer) => answer,
+        Err(e) => return Response::error(502, format!("Export failed: {}", e)),
+    };
+    if response.get("status").and_then(Value::as_str) != Some("OK") {
+        // No body followed a refusal, so this is an ordinary JSON reply.
+        return reply(response);
+    }
+
+    // `Cache-Control: no-store` is not set here: `write_response` puts it on
+    // every dashboard response already, and setting it again would send the
+    // header twice. It matters most for this endpoint - an archive is a
+    // point-in-time copy of live data - which is why it is worth saying that it
+    // is covered rather than leaving the absence to look like an oversight.
+    Response::new(200, "application/octet-stream", body).with_header(
+        "Content-Disposition",
+        format!("attachment; filename=\"{}\"", archive_name(account, file)),
+    )
+}
+
+/// `POST /api/archive` - a restore from an uploaded archive.
+///
+/// The options travel in the query rather than in the body, because the body is
+/// the archive: there is nowhere else for them to go short of multipart, which
+/// would be a parser this dashboard does not otherwise need.
+async fn import_archive(client: &Arc<ProtocolClient>, request: &Request) -> Response {
+    if request.body.is_empty() {
+        return Response::error(400, "No archive was uploaded");
+    }
+    if request.body.len() as u64 > MAX_DASHBOARD_ARCHIVE_BYTES {
+        return Response::error(
+            413,
+            format!(
+                "The archive is larger than the {} MiB the dashboard will accept. Restore it with IMPORT over the                  protocol or the CLI, which reads it from a path on the server host",
+                MAX_DASHBOARD_ARCHIVE_BYTES / (1024 * 1024)
+            ),
+        );
+    }
+
+    let mut payload = json!({ "command": "IMPORT.BYTES", "length": request.body.len() });
+    let object = payload.as_object_mut().expect("built as an object");
+    if let Some(into) = request.query.get("into").filter(|into| !into.is_empty()) {
+        object.insert("target_account".to_string(), into.as_str().into());
+    }
+    // Both default to off, and absent means off. A restore that overwrote
+    // because a query parameter was missing is the one failure the flag exists
+    // to prevent.
+    if request.query.get("overwrite").is_some_and(|value| flag_text(value)) {
+        object.insert("overwrite".to_string(), true.into());
+    }
+    if request.query.get("verify").is_some_and(|value| flag_text(value)) {
+        object.insert("dry_run".to_string(), true.into());
+    }
+
+    match client.request_sending_body(payload, &request.body).await {
+        Ok(response) => reply(response),
+        Err(e) => Response::error(502, format!("Import failed: {}", e)),
+    }
+}
+
+/// A filename that says what is in the archive and when it was taken, so a
+/// downloads folder with several of them is still readable.
+fn archive_name(account: Option<&str>, file: Option<&str>) -> String {
+    let safe = |text: &str| {
+        text.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
+    let stamp = {
+        let now = time::OffsetDateTime::now_utc();
+        format!(
+            "{:04}{:02}{:02}-{:02}{:02}",
+            now.year(),
+            now.month() as u8,
+            now.day(),
+            now.hour(),
+            now.minute()
+        )
+    };
+    let what = match (account, file) {
+        (Some(account), Some(file)) => format!("{}-{}", safe(account), safe(file)),
+        (Some(account), None) => safe(account),
+        _ => "database".to_string(),
+    };
+    format!("{}-{}.{}", what, stamp, crate::db::archive::EXTENSION)
+}
+
+/// A query parameter read as a flag. Present-and-true only: `?overwrite=false`
+/// means what it says.
+fn flag_text(value: &str) -> bool {
+    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
 pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response {
     let segments = request.segments();
     let method = request.method.as_str();
@@ -499,6 +644,16 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
             .await
         }
 
+        // Backup and restore. The dashboard is a browser, so an archive is a
+        // download and a restore is an upload - the two things a browser is
+        // actually good for, and the reason `EXPORT.BYTES` / `IMPORT.BYTES`
+        // exist. Writing an archive to a path on the server host is the CLI's
+        // job and is deliberately not offered here: a path typed into a web
+        // form names a directory on a machine the person at the keyboard
+        // usually cannot see.
+        ("GET", ["api", "archive"]) => export_archive(client, request).await,
+        ("POST", ["api", "archive"]) => import_archive(client, request).await,
+
         ("GET", _) | ("HEAD", _) => Response::error(404, "No such endpoint"),
         _ => Response::error(405, "Method not allowed for this endpoint"),
     }
@@ -591,6 +746,41 @@ mod tests {
         // them looks like on the wire.
         assert!(values(&json!({}), "values").is_empty());
         assert!(values(&json!({ "values": "ACTIVE" }), "values").is_empty());
+    }
+
+    /// A downloaded archive lands in a folder beside other downloads, so its
+    /// name has to say what it holds and when it was taken.
+    #[test]
+    fn an_archive_is_named_for_what_it_holds() {
+        assert!(archive_name(Some("SALES"), None).starts_with("SALES-"));
+        assert!(archive_name(Some("SALES"), Some("ORDERS")).starts_with("SALES-ORDERS-"));
+        assert!(archive_name(None, None).starts_with("database-"));
+        assert!(archive_name(Some("SALES"), None).ends_with(".srp"));
+    }
+
+    /// An account name is user data and reaches a `Content-Disposition` header,
+    /// so anything that could end the quoted string - or climb a directory on
+    /// the way to the viewer's disk - is replaced rather than passed through.
+    #[test]
+    fn an_archive_name_cannot_carry_anything_but_a_name() {
+        let hostile = archive_name(Some("../../etc\"; rm -rf /"), None);
+        assert!(!hostile.contains('/'), "{}", hostile);
+        assert!(!hostile.contains('"'), "{}", hostile);
+        assert!(!hostile.contains(' '), "{}", hostile);
+        assert!(hostile.starts_with(".._.._etc"), "{}", hostile);
+    }
+
+    /// A restore's two dangerous options are read from the query, and absent
+    /// has to mean off. `?overwrite=false` meaning "overwrite" would be the one
+    /// failure the flag exists to prevent.
+    #[test]
+    fn a_restore_flag_is_only_set_when_it_says_so() {
+        for yes in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(flag_text(yes), "{}", yes);
+        }
+        for no in ["", "0", "false", "no", "off", "maybe"] {
+            assert!(!flag_text(no), "{}", no);
+        }
     }
 
     #[test]

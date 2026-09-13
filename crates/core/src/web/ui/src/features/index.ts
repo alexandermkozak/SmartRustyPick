@@ -10,6 +10,7 @@ import {overviewTab} from './overview'
 import {authorizationsTab} from './authorizations'
 import {certificatesTab} from './certificates'
 import {accountsTab} from './accounts'
+import {archivesTab} from './archives'
 import type {FeatureTab} from './types'
 
 /** Tabs in the order they appear. */
@@ -18,6 +19,7 @@ export const featureTabs: FeatureTab[] = [
     authorizationsTab,
     certificatesTab,
     accountsTab,
+    archivesTab,
 ]
 
 export type {FeatureTab}

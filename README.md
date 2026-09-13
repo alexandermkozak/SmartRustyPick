@@ -59,7 +59,8 @@ field formatting, and complex select operations.
   file that already exists is only replaced when asked.
 - **Remote Access**: TCP SSL server with certificate authentication and CRUD protocol.
 - **Web Dashboard**: Browser-based management of connections, certificates, accounts, files, their dictionaries and live
-  server activity, started automatically with the server.
+  server activity, started automatically with the server. Backups are a download and restores an upload, with a verify
+  pass that reports what a restore would do before anything is written.
 - **Persistent Configuration**: Customize your environment (e.g., preferred editor, SSL certificates, server address).
 - **Headless Mode**: Run the database as a background service without a CLI.
 - **Smart Login**: Automatic CLI account login based on the current working directory.
