@@ -374,3 +374,180 @@ async fn a_transfer_command_on_a_connection_that_cannot_carry_a_body_says_so() {
     assert_eq!(response.code, Some(ErrorCode::InvalidRequest));
     assert!(response.message.unwrap_or_default().contains("carries raw bytes"));
 }
+
+// ------------------------------------------- archives on the connection ---
+
+fn admin() -> ClientInfo {
+    ClientInfo {
+        name: "operator".to_string(),
+        thumbprint: "tp_admin".to_string(),
+        allowed_accounts: vec![],
+        is_admin: true,
+    }
+}
+
+/// The streamed round trip: an account exported onto the connection, then the
+/// very bytes that came off it sent back up and imported under another name.
+///
+/// The two halves are tested together deliberately. An export that produces
+/// bytes nothing can read, and an import that reads bytes nothing produces, are
+/// both passing tests in isolation.
+#[tokio::test]
+async fn an_archive_travels_out_and_back_over_the_connection() {
+    let (_dir, db) = database();
+    // Something in it that a line-oriented reader would tear apart, so the body
+    // framing is doing real work.
+    db.read()
+        .unwrap()
+        .write_directory_record(ACCOUNT, FILE, "scan.bin", &hostile(9000))
+        .unwrap();
+    db.read().unwrap().save().unwrap();
+
+    let mut written = Vec::new();
+    let outcome = transfer::export_bytes(
+        &mut written,
+        &Request {
+            command: "EXPORT.BYTES".to_string(),
+            target_account: Some(ACCOUNT.to_string()),
+            ..Default::default()
+        },
+        &db,
+        &admin(),
+    )
+    .await;
+    assert!(!outcome.close && !outcome.failed, "{:?}", outcome);
+
+    let (response, archive) = split_reply(&written);
+    assert_eq!(response.status, "OK", "{:?}", response.message);
+    assert_eq!(
+        response.length,
+        Some(archive.len() as u64),
+        "the announced length is exactly what followed it"
+    );
+    let report = response.archive.expect("an export says what it captured");
+    assert_eq!(report["source"], format!("account {}", ACCOUNT));
+
+    // The spool is this connection's alone and goes with it, however it ended.
+    let spool = std::path::Path::new(_dir.path()).join(crate::db::engine::archive::SPOOL_DIR);
+    let left = std::fs::read_dir(&spool).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(left, 0, "no spool file is left behind");
+
+    // Back up the other way, as a client would send it.
+    let request = Request {
+        command: "IMPORT.BYTES".to_string(),
+        target_account: Some("RESTORED".to_string()),
+        length: Some(archive.len() as u64),
+        ..Default::default()
+    };
+    let mut wire = serde_json::to_vec(&request).unwrap();
+    wire.push(b'\n');
+    wire.extend_from_slice(&archive);
+
+    let mut reader = reader_over(wire);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    let req: Request = serde_json::from_str(&line).unwrap();
+    assert!(
+        !reader.buffer().is_empty(),
+        "the request line carried archive bytes into the buffer with it"
+    );
+
+    let mut replied = Vec::new();
+    let outcome = transfer::import_bytes(&mut reader, &mut replied, &req, &db, &admin(), MAX, NO_STALL).await;
+    assert!(!outcome.close && !outcome.failed, "{:?}", outcome);
+
+    let (response, trailing) = split_reply(&replied);
+    assert_eq!(response.status, "OK", "{:?}", response.message);
+    assert!(trailing.is_empty(), "an IMPORT.BYTES reply carries no body");
+
+    // The same argument as the record transfer above: the bytes buffered before
+    // the body was asked for are in the archive. Reading from the underlying
+    // stream instead would drop the first sixteen, and the checksum - not this
+    // assertion - would be what caught it.
+    let restored = db
+        .read()
+        .unwrap()
+        .read_directory_record("RESTORED", FILE, "scan.bin")
+        .unwrap();
+    assert_eq!(restored.as_deref(), Some(hostile(9000).as_slice()));
+}
+
+/// An archive past the limit is refused before its body is read, and the
+/// connection is closed rather than draining it - discarding a gigabyte to
+/// report that a gigabyte is too much is the denial of service the limit exists
+/// to prevent.
+#[tokio::test]
+async fn an_oversized_archive_is_refused_without_being_read() {
+    let (_dir, db) = database();
+    let request = Request {
+        command: "IMPORT.BYTES".to_string(),
+        length: Some(4096),
+        ..Default::default()
+    };
+    let mut wire = serde_json::to_vec(&request).unwrap();
+    wire.push(b'\n');
+    wire.extend_from_slice(&hostile(4096));
+
+    let mut reader = reader_over(wire);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    let req: Request = serde_json::from_str(&line).unwrap();
+
+    let mut written = Vec::new();
+    let outcome = transfer::import_bytes(&mut reader, &mut written, &req, &db, &admin(), 1024, NO_STALL).await;
+    assert!(outcome.close, "the socket is mid-body, so the connection ends");
+    assert!(outcome.failed);
+
+    let (response, _) = split_reply(&written);
+    assert_eq!(response.code, Some(ErrorCode::InvalidData));
+    let message = response.message.unwrap_or_default();
+    assert!(
+        message.contains("IMPORT"),
+        "it names the form that has no limit: {}",
+        message
+    );
+}
+
+/// A streamed archive is admin only like the path form, and a refusal before
+/// the body still accounts for the body - the connection survives to carry the
+/// error.
+#[tokio::test]
+async fn a_streamed_archive_from_a_non_admin_is_refused_and_the_body_drained() {
+    let (_dir, db) = database();
+    let request = Request {
+        command: "IMPORT.BYTES".to_string(),
+        length: Some(64),
+        ..Default::default()
+    };
+    let mut wire = serde_json::to_vec(&request).unwrap();
+    wire.push(b'\n');
+    wire.extend_from_slice(&hostile(64));
+
+    let mut reader = reader_over(wire);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    let req: Request = serde_json::from_str(&line).unwrap();
+
+    let mut written = Vec::new();
+    let outcome = transfer::import_bytes(&mut reader, &mut written, &req, &db, &client(), MAX, NO_STALL).await;
+    assert!(!outcome.close, "the body was drained, so the connection is reusable");
+    assert!(outcome.failed);
+    let (response, _) = split_reply(&written);
+    assert_eq!(response.code, Some(ErrorCode::AdminRequired));
+
+    // An export refuses the same way, and has nothing to drain.
+    let mut written = Vec::new();
+    let outcome = transfer::export_bytes(
+        &mut written,
+        &Request {
+            command: "EXPORT.BYTES".to_string(),
+            ..Default::default()
+        },
+        &db,
+        &client(),
+    )
+    .await;
+    assert!(!outcome.close && outcome.failed);
+    let (response, _) = split_reply(&written);
+    assert_eq!(response.code, Some(ErrorCode::AdminRequired));
+}

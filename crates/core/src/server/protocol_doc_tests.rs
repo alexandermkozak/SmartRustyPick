@@ -49,6 +49,8 @@ const REQUEST_FIELDS: &[&str] = &[
     "length",
     "changes",
     "autokey",
+    "overwrite",
+    "dry_run",
     "if_absent",
     "if_match",
 ];
@@ -67,6 +69,7 @@ const RESPONSE_FIELDS: &[&str] = &[
     "key",
     "version",
     "length",
+    "archive",
 ];
 
 /// Every command string accepted by `handle_request_locked`.
@@ -109,6 +112,12 @@ const COMMANDS: &[&str] = &[
     "INDEX.STATS",
     "SET.INDEX.EXCLUDE",
     "SERVER.STATS",
+    "EXPORT.FILE",
+    "EXPORT.ACCOUNT",
+    "EXPORT.ALL",
+    "EXPORT.BYTES",
+    "IMPORT",
+    "IMPORT.BYTES",
 ];
 
 fn json_keys<T: serde::Serialize>(value: &T) -> Vec<String> {
@@ -150,6 +159,7 @@ fn response_struct_serializes_to_exactly_the_documented_fields() {
         key: Some(String::new()),
         version: Some(String::new()),
         length: Some(0),
+        archive: Some(serde_json::Value::Null),
     };
     let mut actual = json_keys(&populated);
     actual.sort();

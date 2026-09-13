@@ -43,6 +43,55 @@ Turn per-file durable writes on or off for a file that already exists, keeping i
   - The current setting shows in `LIST.FILES`, in `FILE.STATS` and in the [web dashboard](web_dashboard.md). See
     [Storage Engine](storage.md).
 
+#### EXPORT.FILE / EXPORT.ACCOUNT / EXPORT.ALL
+
+Write an [archive](storage.md#archives-backup-and-restore) of a file, an account or the whole database to a path. This
+is the backup: copying `db_storage/` from underneath a running server is not one, because writes are buffered and a
+flush rewrites groups and `meta` separately.
+
+- **Usage**: `EXPORT.FILE <file> TO <path>`, `EXPORT.ACCOUNT <account> TO <path>`, `EXPORT.ALL TO <path>`
+- **Example**: `EXPORT.ACCOUNT SALES TO /backups/sales-2026-09-12.srp`
+- **Note**:
+  - `TO` is required. An export names a file an operator will reach for in an emergency, and a default name is how a
+    backup ends up somewhere nobody looks.
+  - `EXPORT.FILE` exports a file of the **current** account.
+  - The archive is written tmp-then-rename and fsynced, so the path never names a half-written backup. A failed export
+    leaves nothing behind, staging file included.
+  - **What is held still**: the export flushes and then holds every file it names for as long as it is reading them.
+    Readers are unaffected; writers to those files wait. `EXPORT.ACCOUNT` gives you an account consistent across its
+    files and is the one worth running routinely. `EXPORT.ALL` blocks writes to the whole database for its duration —
+    a maintenance-window operation, not a nightly one.
+  - `EXPORT.ALL` leaves `SYSTEM` out. It holds the account registry, the logs, and `$CLIENTS` — the authorized client
+    certificate thumbprints — and an archive carrying that last one would grant the source machine's authorizations
+    wherever it was restored. `EXPORT.ACCOUNT SYSTEM` still works, which makes taking it a deliberate act.
+  - `DIR` is the account's listing of its own files rather than data, so it is never exported.
+  - Over the [remote protocol](protocol.md#backup-and-restore) this is admin only, and `EXPORT.BYTES` sends the archive
+    over the connection for an admin with no filesystem access to the server.
+
+#### IMPORT
+
+Restore an archive — to the same server or a different one.
+
+- **Usage**: `IMPORT <path> [AS <account>] [OVERWRITE] [VERIFY]`
+- **Example**: `IMPORT /backups/sales-2026-09-12.srp AS SALES.COPY`
+- **Note**:
+  - **`VERIFY` first.** It reads the archive through, checks it against what is already there, and prints what a real
+    import would do without writing anything. This is the mode to reach for by default.
+  - `AS <account>` restores into a different account, which is how a production file is brought up beside the original
+    for inspection. An archive holding more than one account has no single account to be renamed onto and is refused.
+  - **`OVERWRITE` is required to replace a file that already exists**, and without it the whole import is refused with
+    every colliding file named — nothing is written. With it, the file is **replaced, not merged**: a restore restores,
+    so records the live file gained since the archive was taken are gone.
+  - Nothing is applied until the archive has decoded whole and every file in it has been resolved. A truncated or
+    altered archive is refused with nothing written — not even the accounts it would have created.
+  - Indexes are rebuilt from the records that actually arrived rather than carried; a field that can no longer be
+    indexed is logged to `$LOGS` and skipped rather than failing the restore.
+  - A restored [queue file](general_commands.md#queue-files) keeps its records, their order and its policy, but their
+    **delivery counts start again** — a record that had used four of its five attempts gets all five back.
+  - A restored [directory file](general_commands.md#directory-files) gets the default place inside its own file
+    directory. The path in the archive belongs to the machine that exported it, and honouring it elsewhere would either
+    fail or succeed against somebody else's directory.
+
 #### AUTHORIZE.CONN
 
 Authorize a client certificate SHA-256 thumbprint with a name and access restrictions. This command is restricted to the

@@ -85,6 +85,12 @@ pub struct Request {
     /// reading that as "must exist" would invent a third condition nobody
     /// named.
     pub if_absent: Option<bool>,
+    /// `IMPORT`: replace a file that is already there. Absent means the same as
+    /// `false`, and an import that would land on an existing file is refused
+    /// whole rather than merging into it - see `docs/admin_commands.md`.
+    pub overwrite: Option<bool>,
+    /// `IMPORT`: read the archive, report what would happen, and write nothing.
+    pub dry_run: Option<bool>,
     /// `WRITE` and `DELETE`: apply this only if the record currently stored
     /// under the key still has this `version`, as `READ` reported it. The
     /// refusal when it does not is `PRECONDITION_FAILED`.
@@ -392,4 +398,14 @@ pub struct Response {
     /// reading it out of a field that means something else everywhere else.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub length: Option<u64>,
+    /// `EXPORT.*` and `IMPORT`: what the archive holds, and what was done with
+    /// it - the manifest, the per-file counts, and for an import whether each
+    /// file was created or replaced.
+    ///
+    /// Its own field rather than `results`, which pairs keys with records: an
+    /// archive report is neither, and a client reading "how many records did my
+    /// backup capture" out of a field that means "the rows you selected" would
+    /// be reading a coincidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive: Option<serde_json::Value>,
 }

@@ -378,6 +378,47 @@ class Client:
             return response, None
         return response, self._read_exactly(response["length"])
 
+    def export_bytes(self, *, account=None, file=None):
+        """`EXPORT.BYTES`: the reply, then exactly `length` bytes of archive.
+
+        Returns `(response, archive)`; `archive` is None when the reply carried
+        no length, which is every refusal. The scope comes from what is named -
+        a file, an account, or neither for the whole database.
+        """
+        request = {"command": "EXPORT.BYTES"}
+        if account is not None:
+            request["target_account"] = account
+        if file is not None:
+            request["file"] = file
+        response = self.request(**request)
+        if response.get("length") is None:
+            return response, None
+        return response, self._read_exactly(response["length"])
+
+    def import_bytes(self, archive, *, account=None, overwrite=None, dry_run=None, length=None):
+        """`IMPORT.BYTES`: one request line, then the archive, then one reply.
+
+        Sent in a single `sendall` for the reason `put_bytes` is: that is what a
+        client does, and it is what puts the body in the server's read buffer
+        alongside the request line.
+        """
+        header = {"command": "IMPORT.BYTES"}
+        header["length"] = len(archive) if length is None else length
+        if account is not None:
+            header["target_account"] = account
+        if overwrite is not None:
+            header["overwrite"] = overwrite
+        if dry_run is not None:
+            header["dry_run"] = dry_run
+        self.sock.sendall(json.dumps(header).encode() + b"\n" + archive)
+        while b"\n" not in self._buffer:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("Server closed the connection before responding")
+            self._buffer += chunk
+        line, self._buffer = self._buffer.split(b"\n", 1)
+        return json.loads(line.decode())
+
     def close(self):
         try:
             self.sock.shutdown(socket.SHUT_RDWR)

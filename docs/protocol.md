@@ -70,9 +70,11 @@ matched case-insensitively.
 | `if_match`        | string           | `WRITE`, `DELETE`                                                                                                  | Apply the write or delete only if the record under the key still has this `version`, as `READ` reported it. Anything else - changed, or no longer there - is refused with `PRECONDITION_FAILED` and nothing is written. Naming it alongside `if_absent` is refused with `INVALID_REQUEST`. See [Conditional writes](#conditional-writes). |
 | `visibility_timeout` | number        | `CREATE.FILE`, `SET.FILE`, `DEQUEUE`                                                                               | Seconds a claim is held before it lapses. On the file commands it sets the queue's own timeout (default 60, maximum 86400); on `DEQUEUE` it overrides that timeout for the one claim being taken. Out of range is refused with `INVALID_DATA`. |
 | `max_deliveries`  | number           | `CREATE.FILE`, `SET.FILE`                                                                                          | Deliveries a record of this queue gets before it moves to the dead-letter file. Default 5, maximum 1000. Out of range is refused with `INVALID_DATA`. |
-| `length`          | number           | `PUT.BYTES`                                                                                                        | Bytes of body that follow this request line on the connection. Required: a body is announced rather than delimited, because a record may contain any byte including a newline. Checked against `max_directory_record_bytes` *before* a byte of body is read. |
+| `length`          | number           | `PUT.BYTES`, `IMPORT.BYTES`                                                                                        | Bytes of body that follow this request line on the connection. Required: a body is announced rather than delimited, because a record may contain any byte including a newline. Checked against `max_directory_record_bytes` (`PUT.BYTES`) or `max_archive_bytes` (`IMPORT.BYTES`) *before* a byte of body is read. |
 | `directory`       | bool             | `CREATE.FILE`                                                                                                      | Make the file a [directory file](#directory-files): its records are the files of a real directory on the host. A file's type is fixed when it is created, so `SET.FILE` refuses to change it with `INVALID_REQUEST`. |
-| `path`            | string           | `CREATE.FILE`                                                                                                      | The host directory a directory file's records are the files of. Absent means the default place inside the file's own directory. Implies `directory: true`; given for an ordinary file it is refused with `INVALID_REQUEST`. |
+| `path`            | string           | `CREATE.FILE`, `EXPORT.FILE`, `EXPORT.ACCOUNT`, `EXPORT.ALL`, `IMPORT`                                             | On `CREATE.FILE`, the host directory a directory file's records are the files of; absent means the default place inside the file's own directory, and it implies `directory: true` (given for an ordinary file it is refused with `INVALID_REQUEST`). On the archive commands, the path **on the server host** the archive is written to or read from. Required there - to move an archive over the connection instead, use `EXPORT.BYTES` / `IMPORT.BYTES`. |
+| `overwrite`       | bool             | `IMPORT`, `IMPORT.BYTES`                                                                                           | Replace a file the archive lands on that is already there. Default `false`, and an import that would land on one is refused **whole** with `INVALID_REQUEST` rather than merging into it - nothing is written, and the message names every colliding file. See [Backup and restore](#backup-and-restore). |
+| `dry_run`         | bool             | `IMPORT`, `IMPORT.BYTES`                                                                                           | Read the archive, report what a real import would do, and write nothing. Still refuses a collision without `overwrite`, so a dry run that reports success is one that would succeed. |
 | `changes`         | array of objects | `TRANSACT`                                                                                                         | The writes and deletes to apply as one. Each carries its own `op`, `file`, `key`, `data`/`structured_data` and `is_dict`, so one set may span several files of the account. See [TRANSACT](#transact). |
 | `field`           | string           | `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`                                | The dictionary field the index is on. Required by all of them. See [Storage Engine](storage.md#secondary-indexes).                                                                                                                                                                         |
 | `values`          | array of strings | `CREATE.INDEX`, `SET.INDEX.EXCLUDE`                                                                                | Values the index is to skip. Optional on `CREATE.INDEX`. On `SET.INDEX.EXCLUDE` it replaces the set, and an absent or empty list clears it.                                                                                                                                                |
@@ -94,8 +96,9 @@ older server sent in its place.
 | `keys`      | array of strings          | `LIST.FILES`, `LIST.DICT`                                                                            | Plain list of names: the files in the account, or the file's dictionary entries. Both commands fill `results` as well, with what is known about each name.                                                       |
 | `count`     | integer                   | `SELECT`, `GET.NEXT`, `DEQUEUE`, `PEEK`, `LIST.CONNS`, `LIST.ACCOUNTS`, `LIST.FILES`, `LIST.DICT`    | `SELECT`: number of keys selected into the list. `GET.NEXT`: number of records in the batch just returned. `DEQUEUE` and `PEEK`: `0`, beside an `"EMPTY"` status. The list commands: number of entries returned. |
 | `positions` | array of objects or nulls | `QUERY`, `GET.NEXT`                                                                                  | Present only for an exploded result. Index-aligned with `results`: the position within the exploded field that put each row there. See [Exploded results](#exploded-results).                                    |
-| `length`    | number                    | `PUT.BYTES`, `GET.BYTES`                                                                             | On `GET.BYTES`, bytes of body that follow this response line — a client reads exactly that many next. On `PUT.BYTES`, bytes stored. Its own field rather than `count`, which counts records everywhere else. See [Raw byte transfers](#raw-byte-transfers). |
+| `length`    | number                    | `PUT.BYTES`, `GET.BYTES`, `EXPORT.BYTES`                                                             | On `GET.BYTES` and `EXPORT.BYTES`, bytes of body that follow this response line — a client reads exactly that many next. On `PUT.BYTES`, bytes stored. Its own field rather than `count`, which counts records everywhere else. See [Raw byte transfers](#raw-byte-transfers). |
 | `key`       | string                    | `WRITE`                                                                                              | The key the server minted, set **only** when the request named none and the file is an [autokey file](#server-minted-keys). A key the client supplied is never echoed back. |
+| `archive`   | object                    | `EXPORT.*`, `IMPORT`, `IMPORT.BYTES`                                                                 | What the archive holds and what was done with it: the source, the per-file counts, and for an import whether each file was created or replaced. Its own field rather than `results`, which pairs keys with records. See [Backup and restore](#backup-and-restore). |
 | `version`   | string                    | `READ`, `WRITE`                                                                                      | The token for `if_match` on a later `WRITE` or `DELETE` of this record. **Opaque**: read it, keep it, hand it back unexamined - nothing about its length or alphabet is promised beyond that it is text and that it changes whenever the record does. See [Conditional writes](#conditional-writes). |
 | `claim`     | object                    | `ENQUEUE`, `DEQUEUE`, `PEEK`                                                                         | What the queue knows about the record: its `key`, its `deliveries` count, when it was `enqueued`, and — for `DEQUEUE` — who holds it and when the claim `expires`. Its own field rather than more keys in `record`, so a payload with a field called `key` can be queued and read back unchanged. See [Queue files](#queue-files). |
 
@@ -304,6 +307,12 @@ three are not repeated in the per-command lists below.
 | `INDEX.STATS`           |       |   yes   | `account`, `file`, `field`, `limit`                  | `record`                                |
 | `SET.INDEX.EXCLUDE`     |  yes  |   yes   | `account`, `file`, `field`, `values`                 | `record`                                |
 | `SERVER.STATS`          |  yes  |    —    | —                                                    | `record`                                |
+| `EXPORT.FILE`           |  yes  |   yes   | `file`, `path`                                       | `archive` + `count`                     |
+| `EXPORT.ACCOUNT`        |  yes  |    —    | `target_account`, `path`                             | `archive` + `count`                     |
+| `EXPORT.ALL`            |  yes  |    —    | `path`                                               | `archive` + `count`                     |
+| `EXPORT.BYTES`          |  yes  |    —    | — (`file` and/or `target_account` pick the scope)    | `archive` + `length` + a body           |
+| `IMPORT`                |  yes  |    —    | `path`                                               | `archive` + `count`                     |
+| `IMPORT.BYTES`          |  yes  |    —    | `length` (+ a body)                                  | `archive` + `count`                     |
 
 ¹ A select list records the account and the file its `SELECT` ran against, so `GET.NEXT` needs
 neither on the request. The account is still checked against the client's own. See
@@ -1035,6 +1044,160 @@ Send one record of a directory file as a body following the response line.
 Both are refused with `INVALID_REQUEST` on any path that cannot carry a body — an in-process
 caller, or a client that sent the line and nothing else. The command exists; that is not
 where it works.
+
+## Backup and restore
+
+An **archive** is a database's records and the shape around them in a form that travels: the
+records under their keys, each file's dictionary, its type and per-file flags, and its index
+definitions. It is deliberately *not* a copy of the storage directory and not a copy of the
+hashfile layout — the modulus is a property of the deployment that holds the data, so a restore
+rehashes into whatever the target's `records_per_group` implies. That is what makes restoring
+into a different server, or beside the original under another account name, an ordinary thing
+to do. See [Storage Engine](storage.md#archives-backup-and-restore) for the format itself.
+
+All six commands are **admin only**. Not because any one of them is dangerous on its own: an
+export reads every record of whatever it names, so being able to run one against an arbitrary
+account is being able to read that account.
+
+### What an export holds still, and for how long
+
+An export flushes pending writes and then holds every file it names, with shared guards, for as
+long as it is reading them. Other readers are unaffected; writers to those files wait. The unit
+of consistency is exactly the scope asked for:
+
+| Scope | Consistent across | Blocks writers to |
+|-------|-------------------|-------------------|
+| `EXPORT.FILE` | that one file | that one file |
+| `EXPORT.ACCOUNT` | every file of the account | that account |
+| `EXPORT.ALL` | every account | the whole database |
+
+A record written to one file and a record written to another in the same act are either both in
+an account archive or neither is. `EXPORT.ACCOUNT` is the scope worth running routinely;
+`EXPORT.ALL` is the maintenance-window one.
+
+Two things do not follow that rule, and both are deliberate:
+
+- **A [directory file](#directory-files) has no table and so no lock**, because reading a forty
+  megabyte record must not block every writer to that file for the length of the read. Its
+  records are listed and then read one at a time; one deleted in between is left out rather than
+  written as zero bytes, and one created after the listing is not in the archive. The archive
+  states in its trailer how many records it actually carries, so an archive that says eleven
+  records always holds eleven records.
+- **`EXPORT.ALL` leaves `SYSTEM` out.** It is not a data account: it holds the account registry,
+  which a restore rebuilds as it creates accounts; `$LOGS`, which describes the deployment rather
+  than the data; and `$CLIENTS`, the authorized client certificate thumbprints. An archive
+  carrying that last one would silently grant the source machine's authorizations wherever it
+  was restored. `EXPORT.ACCOUNT` with `target_account: "SYSTEM"` still works, which makes taking
+  it a deliberate act rather than a surprise inside a backup.
+
+### What a restore does
+
+**Verify, plan, apply.** An archive's checksum is over the whole of it, so it is only known to be
+good at its last four bytes; applying as it parsed would mean a truncated archive had already
+half-restored itself by the time the truncation was found, and a half-restored account looks
+exactly like a restored one. So the archive is read through once and discarded, then every file
+in it is resolved against what is already there, and only then is it read a second time and
+applied. A refusal at either of the first two stages has written nothing at all.
+
+- A file the archive lands on that already exists requires `overwrite`. Without it the whole
+  import is refused and the message names every colliding file, not the first.
+- `overwrite` **replaces** rather than merges. A restore restores: records the live file gained
+  since the archive was taken are gone. Merging would leave records from two points in time
+  under one name with no way to tell which were which.
+- `target_account` restores into a different account, which is how a production file is brought
+  up beside the original for inspection. An archive holding more than one account has no single
+  account to be renamed onto and is refused with `INVALID_REQUEST`.
+- Accounts the archive needs are created before any record is read.
+- **Indexes are rebuilt, not carried.** The definition and its exclusions travel; the postings
+  are derived from the records that actually arrived, which is the only index that describes
+  them. A field that can no longer be indexed — its dictionary entry did not come back — is
+  logged to `$LOGS` and skipped rather than failing a restore that has otherwise succeeded.
+- **A directory file's host path is recorded and not applied.** The path in the archive belongs
+  to the machine that exported it; honouring it elsewhere would either fail or, far worse,
+  succeed against somebody else's directory. A restored directory file gets the default place
+  inside its own file directory.
+- An **autokey** file's counter is not carried either. It is derived from the keys that came
+  back, so the next minted key cannot land on a record the restore just put back.
+- A restored **queue** keeps its records, their order, their keys and its policy, and its sequence is pulled past
+  every key that came back so it cannot mint a colliding one. Its **delivery counts start again**: a record that had
+  used four of its five attempts gets all five back. This is the documented behaviour of a lost `queue` state file
+  rather than anything specific to a restore, but a restore is the likeliest way to meet it — a poison record will be
+  retried afresh after one.
+
+### EXPORT.FILE / EXPORT.ACCOUNT / EXPORT.ALL — admin
+
+Write an archive to a path on the server host.
+
+- Required: `path`, and `file` for `EXPORT.FILE` or `target_account` for `EXPORT.ACCOUNT`.
+- Response: `archive` (the manifest and per-file counts) and `count` (records written).
+- The archive is written tmp-then-rename and fsynced, so the path an operator will reach for in
+  an emergency never names a half-written backup. A failed export leaves nothing behind.
+- `DIR` is the account's listing of its own files rather than data, so it is not exported;
+  naming it on `EXPORT.FILE` is refused with `INVALID_REQUEST`.
+- Errors: `MISSING_FIELD` (no `path`, or no `file` on `EXPORT.FILE`), `ADMIN_REQUIRED`,
+  `ACCOUNT_NOT_FOUND`, `FILE_NOT_FOUND`, `INVALID_REQUEST`, `PERMISSION_DENIED`, `IO_ERROR`.
+
+```json
+{"command":"EXPORT.ACCOUNT","target_account":"SALES","path":"/backups/sales.srp"}
+{"status":"OK","count":18402,"archive":{"source":"account SALES","path":"/backups/sales.srp",
+  "files":[{"account":"SALES","file":"ORDERS","records":18402,"dictionary":6,"bytes":1904112}],
+  "records":18402,"dictionary":6,"bytes":1904112}}
+```
+
+### IMPORT — admin
+
+Read an archive from a path on the server host and put it back.
+
+- Required: `path`. Optional: `target_account`, `overwrite`, `dry_run`.
+- Response: `archive` (what the archive said about itself, and what happened to each file) and
+  `count` (records restored).
+- Errors: `MISSING_FIELD` (no `path`), `ADMIN_REQUIRED`, `INVALID_REQUEST` (not an archive, an
+  archive that is truncated or altered, a collision without `overwrite`, or a multi-account
+  archive with `target_account`), `PERMISSION_DENIED`, `IO_ERROR`.
+
+```json
+{"command":"IMPORT","path":"/backups/sales.srp","target_account":"SALES.COPY","dry_run":true}
+{"status":"OK","count":18402,"archive":{"source":"account SALES","taken":1757692800000,
+  "takenUtc":"2026-09-12 16:00:00 UTC","archiveFormat":1,"storageFormat":1,"dryRun":true,
+  "accountsCreated":[],"files":[{"account":"SALES.COPY","file":"ORDERS",
+  "action":"created","records":18402,"dictionary":6,"bytes":1904112}],"records":18402}}
+```
+
+### EXPORT.BYTES / IMPORT.BYTES — admin
+
+The same two operations with the archive on the connection instead of on the server's disk, for
+an admin with no filesystem access to the host. They are to `EXPORT`/`IMPORT` what
+[`PUT.BYTES`/`GET.BYTES`](#raw-byte-transfers) are to `STORE`/`EXTRACT`, and they follow exactly
+the same body discipline: a length announced on the line, then that many raw bytes.
+
+`EXPORT.BYTES` takes its scope from what it names — `file` for one file, `target_account` for an
+account, neither for everything — rather than from three command names.
+
+- `EXPORT.BYTES` response: `archive` and `length`, then exactly `length` bytes.
+- `IMPORT.BYTES` required: `length`, and exactly that many bytes of body. Optional:
+  `target_account`, `overwrite`, `dry_run`.
+
+Both spool through a file on the server host, and neither can avoid it:
+
+- An **export** must know the archive's length before it announces one, and an archive's length
+  is not knowable until it has been written. Building it into a spool first also means the
+  export's locks are taken and released before the transfer starts — a client on a slow link is
+  reading a copy that is already finished, not holding the database still while it reads.
+- An **import** must be able to read the archive twice, to verify it before applying it. A client
+  that stops half way has written nothing to the database.
+
+`IMPORT.BYTES` refuses an archive larger than `max_archive_bytes` (default 1 GiB) *before*
+reading the body, with the advice to put it on the server host and use `IMPORT`. Past that size
+the answer is a path, not a bigger socket.
+
+```json
+{"command":"EXPORT.BYTES","target_account":"SALES"}
+{"status":"OK","length":1912044,"archive":{"source":"account SALES", ...}}
+<1912044 raw bytes>
+```
+
+All four `*.BYTES`-shaped commands are refused with `INVALID_REQUEST` on any path that cannot
+carry a body — an in-process caller, or a client that sent the line and nothing else.
 
 ## Management commands
 

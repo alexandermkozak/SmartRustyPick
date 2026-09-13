@@ -76,7 +76,21 @@ const CHUNK: usize = 64 * 1024;
 /// True when the command is one this module owns, and the connection loop must
 /// not hand to the ordinary dispatch.
 pub fn is_transfer_command(command: &str) -> bool {
-    matches!(command, "PUT.BYTES" | "GET.BYTES")
+    matches!(
+        command,
+        // The archive pair belongs here for the same reason the record pair
+        // does, and not because an archive is a record: what they share is a
+        // body on this socket that the handler, which has no socket, cannot
+        // read. Everything after the request line is consumed here or the
+        // connection is closed.
+        "PUT.BYTES" | "GET.BYTES" | "EXPORT.BYTES" | "IMPORT.BYTES"
+    )
+}
+
+/// True when the command carries a body *up* from the client, and so has to be
+/// read or the connection abandoned.
+pub fn carries_a_body(command: &str) -> bool {
+    matches!(command, "PUT.BYTES" | "IMPORT.BYTES")
 }
 
 /// What the connection is to do next, and what to record about it.
@@ -273,6 +287,179 @@ where
     Outcome::done()
 }
 
+/// Builds an archive, announces its length, and sends it.
+///
+/// The archive is produced into a spool file first - see
+/// [`handler::open_archive`] for why the length has to be known before the
+/// bytes go out - so the export's own locks are taken and released before the
+/// transfer starts. A client on a slow link is therefore not holding the
+/// database still while it reads; it is reading a copy that was already
+/// finished.
+#[allow(clippy::result_large_err)]
+pub async fn export_bytes<W>(writer: &mut W, req: &Request, db: &SharedDb, client: &ClientInfo) -> Outcome
+where
+    W: AsyncWrite + Unpin,
+{
+    let opened = {
+        let (req, db, client) = (clone_request(req), db.clone(), client.clone());
+        match blocking(move || handler::open_archive(&req, &db, &client)).await {
+            Ok(opened) => opened,
+            Err(response) => {
+                return match write_response(writer, &response).await {
+                    Ok(()) => Outcome::refused(),
+                    Err(_) => Outcome::torn(),
+                };
+            }
+        }
+    };
+
+    let spool = opened.spool.clone();
+    let outcome = send_archive(writer, opened).await;
+    // The spool is this connection's alone, so it goes whatever happened - a
+    // client that hung up half way through leaves no debris.
+    let _ = tokio::fs::remove_file(&spool).await;
+    outcome
+}
+
+async fn send_archive<W>(writer: &mut W, opened: handler::OpenedArchive) -> Outcome
+where
+    W: AsyncWrite + Unpin,
+{
+    let response = Response {
+        status: "OK".to_string(),
+        length: Some(opened.length),
+        archive: Some(opened.report),
+        ..Default::default()
+    };
+    if write_response(writer, &response).await.is_err() {
+        return Outcome::torn();
+    }
+
+    let mut file = opened.file;
+    let mut sent = 0u64;
+    while sent < opened.length {
+        let want = ((opened.length - sent) as usize).min(CHUNK);
+        // Read on a blocking thread, as `get_bytes` does and for the same
+        // reason: the engine's files are synchronous and a large read on an
+        // async worker stalls every other connection that worker carries.
+        let read = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut buffer = vec![0u8; want];
+            let mut filled = 0;
+            while filled < want {
+                match file.read(&mut buffer[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => return (file, Err(e)),
+                }
+            }
+            buffer.truncate(filled);
+            (file, Ok(buffer))
+        })
+        .await;
+        let (handle, chunk) = match read {
+            Ok(result) => result,
+            Err(_) => return Outcome::torn(),
+        };
+        file = handle;
+        let chunk = match chunk {
+            // Short of what was announced, and the client is counting. There is
+            // no way to revise the number, so the connection is the only thing
+            // left to end.
+            Ok(chunk) if chunk.is_empty() => return Outcome::torn(),
+            Ok(chunk) => chunk,
+            Err(_) => return Outcome::torn(),
+        };
+        if writer.write_all(&chunk).await.is_err() {
+            return Outcome::torn();
+        }
+        sent += chunk.len() as u64;
+    }
+    Outcome::done()
+}
+
+/// Reads an announced archive off the connection and imports it.
+///
+/// Spooled to a file first, for the reason every import is: the checksum is at
+/// the far end, so an archive is only known to be good once all of it has
+/// arrived, and it has to be readable a second time to be applied. A client
+/// that stops half way has written nothing to the database.
+#[allow(clippy::result_large_err)]
+pub async fn import_bytes<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    req: &Request,
+    db: &SharedDb,
+    client: &ClientInfo,
+    max_archive_bytes: u64,
+    stall: Duration,
+) -> Outcome
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let announced = req.length;
+    let staged = {
+        let (req, db, client) = (clone_request(req), db.clone(), client.clone());
+        match blocking(move || handler::stage_archive(&req, &db, &client)).await {
+            Ok(staged) => staged,
+            Err(response) => {
+                // Refused with the body still to come, and the same rule as a
+                // refused PUT.BYTES: drain it only when the client said how
+                // much there is and that much is affordable to discard.
+                let drainable = announced.is_some_and(|length| length <= max_archive_bytes);
+                let _ = write_response(writer, &response).await;
+                if !drainable {
+                    return Outcome::torn();
+                }
+                return match drain(reader, announced.unwrap_or(0), stall).await {
+                    Ok(()) => Outcome::refused(),
+                    Err(_) => Outcome::torn(),
+                };
+            }
+        }
+    };
+
+    if staged.length > max_archive_bytes {
+        let response = Response {
+            status: "ERROR".to_string(),
+            message: Some(format!(
+                "The archive is {} bytes, past the {} this server accepts on a connection. Write it to a path on the                  server host and use IMPORT instead",
+                staged.length, max_archive_bytes
+            )),
+            code: Some(ErrorCode::InvalidData),
+            ..Default::default()
+        };
+        let _ = write_response(writer, &response).await;
+        let _ = tokio::fs::remove_file(&staged.spool).await;
+        // Not drained: discarding a body this size to report that it is too
+        // large is the denial of service the limit exists to prevent.
+        return Outcome::torn();
+    }
+
+    let received = receive_into(reader, &staged.spool, staged.length, stall).await;
+    let (arrived, torn) = match received {
+        Ok(arrived) => (arrived, false),
+        Err(TransferError::Body(arrived)) => (arrived, false),
+        Err(TransferError::Socket(arrived)) => (arrived, true),
+    };
+
+    let response = {
+        let (db, staged) = (db.clone(), staged);
+        blocking(move || Ok::<_, Response>(handler::commit_archive(&staged, arrived, &db)))
+            .await
+            .unwrap_or_else(|response| response)
+    };
+    let written = write_response(writer, &response).await;
+    if torn || written.is_err() {
+        Outcome::torn()
+    } else if response.status == "OK" {
+        Outcome::done()
+    } else {
+        Outcome::refused()
+    }
+}
+
 /// Where a transfer stopped, and whether the socket survived it.
 enum TransferError {
     /// The bytes could not be stored - a full disk, a permission error. The
@@ -291,13 +478,30 @@ async fn receive<R>(reader: &mut R, staged: &StagedWrite, stall: Duration) -> Re
 where
     R: AsyncRead + Unpin,
 {
-    let path = staged.staged.clone();
-    let mut file = match tokio::fs::File::create(&path).await {
+    receive_into(reader, &staged.staged, staged.length, stall).await
+}
+
+/// Moves exactly `length` bytes from the reader into `path`.
+///
+/// Shared by the record body and the archive body, which differ in what the
+/// bytes mean and in nothing else that matters here - the reader discipline,
+/// the stall bound and the drain-on-failure rule are the same three rules, and
+/// two copies of them would be two chances to get one wrong.
+async fn receive_into<R>(
+    reader: &mut R,
+    path: &std::path::Path,
+    length: u64,
+    stall: Duration,
+) -> Result<u64, TransferError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut file = match tokio::fs::File::create(path).await {
         Ok(file) => file,
         // Nowhere to put it, but the body is still coming: drain it so the
         // connection survives to carry the error.
         Err(_) => {
-            return match drain(reader, staged.length, stall).await {
+            return match drain(reader, length, stall).await {
                 Ok(()) => Err(TransferError::Body(0)),
                 Err(taken) => Err(TransferError::Socket(taken)),
             };
@@ -306,8 +510,8 @@ where
 
     let mut buffer = vec![0u8; CHUNK];
     let mut taken = 0u64;
-    while taken < staged.length {
-        let want = ((staged.length - taken) as usize).min(CHUNK);
+    while taken < length {
+        let want = ((length - taken) as usize).min(CHUNK);
         let read = match tokio::time::timeout(stall, reader.read(&mut buffer[..want])).await {
             Ok(Ok(0)) => return Err(TransferError::Socket(taken)),
             Ok(Ok(n)) => n,
@@ -317,7 +521,7 @@ where
             // The disk gave out. The body is still owed to the socket, so it is
             // drained rather than abandoned - the alternative is a connection
             // that cannot be reused for a failure that was not its fault.
-            let owed = staged.length - taken - read as u64;
+            let owed = length - taken - read as u64;
             return match drain(reader, owed, stall).await {
                 Ok(()) => Err(TransferError::Body(taken + read as u64)),
                 Err(further) => Err(TransferError::Socket(taken + read as u64 + further)),
@@ -390,6 +594,12 @@ fn clone_request(req: &Request) -> Request {
         file: req.file.clone(),
         key: req.key.clone(),
         length: req.length,
+        // The archive transfers read these four as well: which scope to export,
+        // and what a restore is allowed to do.
+        target_account: req.target_account.clone(),
+        path: req.path.clone(),
+        overwrite: req.overwrite,
+        dry_run: req.dry_run,
         ..Default::default()
     }
 }

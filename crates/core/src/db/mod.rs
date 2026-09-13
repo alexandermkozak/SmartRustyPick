@@ -1,3 +1,8 @@
+pub mod archive;
+#[cfg(test)]
+mod archive_engine_tests;
+#[cfg(test)]
+mod archive_tests;
 pub mod base64;
 #[cfg(test)]
 mod db_tests;

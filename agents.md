@@ -349,6 +349,55 @@ AI agents have been responsible for several critical improvements and fixes in t
   the ones that did. Every unit test passed; it took driving the real CLI to see four rows where two belonged. The
   function is total now, and says in its own documentation why the obvious spelling is wrong.
 
+### 10. Backup and restore: the copy that was never a backup
+
+The only way to copy a database was to copy `db_storage/` out from underneath a running server, and that fails three
+separate ways at once - writes buffered for up to `flush_interval_ms`, a flush that rewrites groups and *then*
+rewrites `meta` so a copy landing between them gets halves that disagree, and nothing coordinating the copy across
+the files of an account. An **archive** replaces it: `EXPORT.FILE`, `EXPORT.ACCOUNT`, `EXPORT.ALL` and `IMPORT` in the
+CLI and the protocol, plus `EXPORT.BYTES` / `IMPORT.BYTES` carrying one over the connection for an admin with no
+filesystem access to the host - the same pairing directory files already have in `STORE`/`EXTRACT` and
+`PUT.BYTES`/`GET.BYTES`.
+
+- **It carries records, not layout.** The modulus is a property of the deployment that holds the data - how many
+  records it has and what its `records_per_group` is - not of the data. So an archive carries records under their keys
+  and the target rehashes them, which is what makes restoring into another machine, or beside the original under a
+  second account name, ordinary rather than a special case. The integration suite restores into a **second server with
+  its own storage directory**, because that is the claim a backup actually makes and nothing in-process can show it.
+- **The shape leads and the counts follow.** A restore needs the manifest before it can do anything - it must create a
+  file, with the right type and flags, before it has anywhere to put the first record. The counts cannot be up there
+  with it, and the reason is the one file type that has no lock: a directory file has **no table**, deliberately, so
+  records can be added and removed underneath the walk and how many were written is not knowable until the last one
+  has been. A trailer lets the archive state the count exactly instead of stating an intention. It is also why the
+  body is tagged rather than counted - a tag per record needs no number in front of the run, so the same writer
+  streams to a socket and to a file.
+- **A reader never applies as it parses.** The checksum is over the whole archive, so it is only known good at its last
+  four bytes. Applying as it read would mean a truncated archive had already half-restored itself by the time the
+  truncation was found - and a half-restored account looks exactly like a restored one. An import is therefore verify,
+  plan, apply: read through and discarded, every file resolved against what is already there, and only then read a
+  second time. Which is why an import takes a *path* and the streamed form spools to a file first.
+- **Two tests worth more than the rest.** Every prefix of an archive is refused, and every single-byte flip anywhere in
+  one is caught - both as exhaustive loops over a sample archive rather than as one hand-picked case. They are what
+  make "an archive that does not decode was never a backup" a property instead of a claim.
+- **The refusals are the interface, again.** A file the archive lands on that already exists needs `OVERWRITE`, and
+  without it the whole import is refused with *every* colliding file named rather than the first. `OVERWRITE` then
+  replaces rather than merges: a restore restores, and merging would leave records from two points in time under one
+  name with no way to tell which were which.
+- **What is deliberately not carried.** An index's postings (rebuilt from the records that actually arrived, the only
+  index that describes them). A directory file's host path - it belongs to the machine that exported it, and honouring
+  it elsewhere would either fail or, far worse, succeed against somebody else's directory. An autokey file's counter,
+  which is derived from the keys that came back so the next minted key cannot land on a record the restore just put
+  back. And `SYSTEM` in a whole-database export, because `$CLIENTS` holds the certificate thumbprints this deployment
+  authorized and an archive carrying them would grant the source machine's authorizations wherever it was restored.
+- **The bug a flaky test found.** `two_exports_of_unchanged_data_are_identical` passed alone and failed under the full
+  parallel suite. The archives were not identical and never could be: they differ in `taken_millis` and therefore in
+  the CRC32C over it, and the test only passed when both exports happened to land in the same millisecond. The test
+  was wrong, not the code - the true property is that two exports differ *only* in when they were taken, and it now
+  says so and excludes both the stamp and the checksum over it rather than comparing lossy text that hid the tail.
+- **The other bug a test found.** `Source::All` was including `SYSTEM`, because the assumption that `list_accounts()`
+  returns only data accounts was wrong. The exclusion is now stated where it happens rather than inherited from a
+  quirk of the registry.
+
 ### TLS Troubleshooting
 
 - **UnknownIssuer error (on server logs)**: The client certificate is not signed by a CA the server trusts. Correct by
