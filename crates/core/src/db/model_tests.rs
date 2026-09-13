@@ -248,3 +248,129 @@ fn text_values_are_unaffected_by_the_byte_representation() {
     assert_eq!(decoded.fields[1].values[0].first_text().unwrap(), "NAME");
     assert_eq!(decoded.fields[1].values[1].first_text().unwrap(), "OTHER");
 }
+
+// ---------------------------------------------------------------------------
+// Capabilities (#111): the two questions `is_admin` used to answer at once.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_admin_still_means_every_capability_and_every_account() {
+    // The compatibility promise: an authorization written before capabilities
+    // existed behaves exactly as it did, so nothing has to be migrated.
+    let admin = ClientInfo {
+        name: "root".to_string(),
+        is_admin: true,
+        ..Default::default()
+    };
+    for capability in Capability::ALL {
+        assert!(admin.can(capability), "{capability} must be held by ADMIN");
+    }
+    assert!(admin.may_reach("ANY_ACCOUNT"));
+    assert!(admin.may_reach("SYSTEM"));
+    assert_eq!(admin.effective_capabilities(), Capability::ALL.to_vec());
+}
+
+#[test]
+fn test_a_capability_does_not_grant_an_account() {
+    // The whole point: a credential that provisions is not thereby a credential
+    // that reads. A client holding accounts:manage can create an account and
+    // cannot look inside it - or inside anybody else's.
+    let provisioner = ClientInfo {
+        name: "provisioner".to_string(),
+        capabilities: vec![Capability::AccountsManage],
+        ..Default::default()
+    };
+    assert!(provisioner.can(Capability::AccountsManage));
+    assert!(!provisioner.may_reach("SALES"));
+    assert!(!provisioner.may_reach("SYSTEM"));
+    // Nor does one capability imply another: authorizing clients is the step
+    // that would turn provisioning into total power, so it is held separately.
+    assert!(!provisioner.can(Capability::ClientsManage));
+    assert!(!provisioner.can(Capability::ServerObserve));
+}
+
+#[test]
+fn test_an_account_does_not_grant_a_capability() {
+    // And the converse, which is what stops the two growing back together.
+    let user = ClientInfo {
+        name: "user".to_string(),
+        allowed_accounts: vec!["SALES".to_string()],
+        ..Default::default()
+    };
+    assert!(user.may_reach("SALES"));
+    assert!(!user.may_reach("SUPPORT"));
+    for capability in Capability::ALL {
+        assert!(!user.can(capability), "{capability} must not come with an account");
+    }
+    assert!(user.effective_capabilities().is_empty());
+}
+
+#[test]
+fn test_capability_names_round_trip_and_unknown_names_are_refused() {
+    for capability in Capability::ALL {
+        assert_eq!(Capability::parse(capability.as_str()), Some(capability));
+        // Case-insensitively, because an operator typing at a prompt should not
+        // have to remember which half of `Accounts:Manage` is capitalised.
+        assert_eq!(Capability::parse(&capability.as_str().to_uppercase()), Some(capability));
+        assert_eq!(
+            Capability::parse(&format!("  {}  ", capability.as_str())),
+            Some(capability)
+        );
+    }
+    // A typo must not read as a grant that quietly does nothing.
+    assert_eq!(Capability::parse("accounts:mange"), None);
+    assert_eq!(Capability::parse("accounts"), None);
+    assert_eq!(Capability::parse("admin"), None);
+    assert_eq!(Capability::parse(""), None);
+}
+
+#[test]
+fn test_effective_capabilities_are_sorted_and_deduplicated() {
+    // The listing is an inventory, so it must not depend on the order values
+    // happened to be written into `$CLIENTS`.
+    let client = ClientInfo {
+        name: "ops".to_string(),
+        capabilities: vec![
+            Capability::ServerObserve,
+            Capability::AccountsManage,
+            Capability::ServerObserve,
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        client.effective_capabilities(),
+        vec![Capability::AccountsManage, Capability::ServerObserve]
+    );
+}
+
+#[test]
+fn test_the_days_until_expiry_are_counted_off_the_calendar() {
+    let at = |offset: time::Duration| ClientInfo {
+        name: "c".to_string(),
+        expires_at: Some(
+            (time::OffsetDateTime::now_utc() + offset)
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        ),
+        ..Default::default()
+    };
+
+    // The case that made this calendar arithmetic: a certificate issued moments
+    // ago for seven days has 6.99 days of duration left, and must not read as 6
+    // beside a date seven days out.
+    assert_eq!(at(time::Duration::days(7)).expires_in_days(), Some(7));
+    assert_eq!(at(time::Duration::days(1)).expires_in_days(), Some(1));
+    // Later today is today.
+    assert_eq!(at(time::Duration::minutes(1)).expires_in_days(), Some(0));
+    // And past is past, however recently.
+    assert_eq!(at(time::Duration::days(-1)).expires_in_days(), Some(-1));
+
+    // No expiry recorded means none reported; nothing is inferred.
+    assert_eq!(ClientInfo::default().expires_in_days(), None);
+    // Nor from something that is not a date.
+    let broken = ClientInfo {
+        expires_at: Some("soon-ish".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(broken.expires_in_days(), None);
+}

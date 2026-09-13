@@ -39,16 +39,24 @@ pub struct ProtocolClient {
 
 impl ProtocolClient {
     /// Builds a client that authenticates with `cert_path`/`key_path` and trusts
-    /// only the given CA - the same CA the server verifies clients against.
-    pub fn new(addr: &str, cert_path: &str, key_path: &str, ca_path: &str) -> std::io::Result<Self> {
+    /// exactly the CAs the listener does.
+    ///
+    /// The same set on both sides, from the same loader: during a CA rotation
+    /// the server certificate may be signed by either the outgoing or the
+    /// incoming CA, and a dashboard trusting only one of them goes dark at
+    /// whichever end of the transition it guessed wrong about.
+    pub fn new(addr: &str, cert_path: &str, key_path: &str, config: &crate::config::Config) -> std::io::Result<Self> {
         let mut roots = RootCertStore::empty();
-        for cert in load_certs(ca_path)? {
+        for cert in crate::server::certs::load_trusted_cas(config)? {
             roots
                 .add(cert)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         }
 
-        let config = ClientConfig::builder()
+        // The same version list the listener pins, from the same constant: a
+        // 1.3-only server with a default client is merely redundant, but the
+        // reverse is a client that would quietly accept a downgrade.
+        let config = ClientConfig::builder_with_protocol_versions(crate::server::TLS_VERSIONS)
             .with_root_certificates(roots)
             .with_client_auth_cert(load_certs(cert_path)?, load_key(key_path)?)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;

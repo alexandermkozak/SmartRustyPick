@@ -1,4 +1,6 @@
 use crate::config::Config;
+use crate::private_files;
+use crate::secret::Secret;
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::fs::File;
 use std::io::{self, BufReader as SyncBufReader};
@@ -16,11 +18,32 @@ fn sibling(path: &str, extension: &str) -> String {
     sibling.to_string_lossy().into_owned()
 }
 
+/// Creates the directory a generated artefact lives in, owner-only.
+///
+/// `0700` rather than `0600`-files-in-a-public-directory because the entries are
+/// named after their common names: the listing alone is the set of clients this
+/// CA has ever issued for.
 fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
     match Path::new(path).parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+        Some(parent) if !parent.as_os_str().is_empty() => private_files::dir(parent),
         _ => Ok(()),
     }
+}
+
+/// Whether `cert_path` still chains to the CA at `ca_path`, and is still within
+/// its own validity.
+///
+/// `openssl verify` answers both at once, which is what is wanted here: a server
+/// certificate signed by a CA that is no longer configured and one that has
+/// expired are the same problem from the operator's side - the listener is about
+/// to stop working for reasons nothing announces.
+fn server_cert_is_current(cert_path: &str, ca_path: &str) -> bool {
+    std::process::Command::new("openssl")
+        .args(["verify", "-CAfile", ca_path, cert_path])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
@@ -33,11 +56,21 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
     let key_exists = Path::new(key_path).exists();
     let ca_exists = Path::new(ca_path).exists();
 
-    if cert_exists && key_exists && ca_exists {
+    // Everything present *and* the server certificate still chains to the
+    // configured CA. The second half is what makes a CA rotation work: pointing
+    // `ca_path` at a new CA otherwise leaves the listener presenting a
+    // certificate signed by the old one, which no client using the new CA can
+    // verify - a failure whose cause is nowhere on screen. It also renews a
+    // server certificate that has simply expired, which nothing else does.
+    if cert_exists && key_exists && ca_exists && server_cert_is_current(cert_path, ca_path) {
         return Ok(());
     }
 
-    println!("Generating certificates for first-time startup...");
+    if cert_exists && key_exists && ca_exists {
+        println!("The server certificate no longer matches {}; re-signing it.", ca_path);
+    } else {
+        println!("Generating certificates for first-time startup...");
+    }
 
     for path in [cert_path, key_path, ca_path, ca_key_path] {
         ensure_parent_dir(path)?;
@@ -46,6 +79,10 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
     // 1. Generate CA key and certificate if needed
     if !Path::new(ca_key_path).exists() || !ca_exists {
         println!("Generating CA certificate...");
+        // openssl truncates an existing `-keyout` rather than replacing it, so the
+        // mode is decided here and there is no instant at which the CA key is
+        // readable by anyone else.
+        private_files::reserve(ca_key_path.as_str())?;
         let status = std::process::Command::new("openssl")
             .args([
                 "req",
@@ -69,22 +106,38 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
             ])
             .status()?;
         if !status.success() {
+            let _ = std::fs::remove_file(ca_key_path.as_str());
             return Err(std::io::Error::other("Failed to generate CA certificate"));
         }
     }
 
-    // 2. Generate server key and CSR
+    // 2. Generate the server key, if there is not one already. A re-sign keeps
+    //    the existing key: rotating the CA changes who vouches for the server,
+    //    not who the server is, and replacing the key would invalidate nothing
+    //    while breaking any client that had pinned it.
     if !key_exists {
-        println!("Generating server certificate...");
+        println!("Generating server key...");
+        private_files::reserve(key_path.as_str())?;
+        let status = std::process::Command::new("openssl")
+            .args(["genrsa", "-out", key_path, "2048"])
+            .status()?;
+        if !status.success() {
+            let _ = std::fs::remove_file(key_path.as_str());
+            return Err(std::io::Error::other("Failed to generate the server key"));
+        }
+    }
+
+    // 3. Sign the server certificate against the configured CA. Reached on a
+    //    first start and on a re-sign alike, which is what keeps the two paths
+    //    from drifting into producing different certificates.
+    {
+        println!("Signing the server certificate...");
         let csr_path = &sibling(cert_path, "csr");
         let status = std::process::Command::new("openssl")
             .args([
                 "req",
                 "-new",
-                "-nodes",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
+                "-key",
                 key_path,
                 "-out",
                 csr_path.as_str(),
@@ -93,10 +146,10 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
             ])
             .status()?;
         if !status.success() {
+            let _ = std::fs::remove_file(csr_path);
             return Err(std::io::Error::other("Failed to generate server CSR"));
         }
 
-        // 3. Sign server certificate with CA
         let ext_path = &sibling(cert_path, "ext");
         std::fs::write(
             ext_path,
@@ -140,18 +193,77 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
 /// The PEM bodies are carried alongside the paths so a caller that never
 /// touches the server's filesystem - the dashboard handing a certificate to a
 /// browser - can still deliver the material.
-#[derive(Debug, Clone, serde::Serialize)]
+///
+/// **Deliberately not `Serialize`, and deliberately not `Debug`.** This is the
+/// one struct in the project that holds a private key and a passphrase at the
+/// same time; a derive would put both into any response or log line that ever
+/// touched it. [`record`](GeneratedCert::record) is the single way out, and it
+/// names every field it emits, so the protocol shape is a written decision
+/// rather than a consequence of the field order here.
 pub struct GeneratedCert {
     pub common_name: String,
     pub thumbprint: String,
     pub certificate_pem: String,
     pub private_key_pem: String,
+    /// Every CA this deployment trusts, concatenated.
+    ///
+    /// Every CA rather than only the signing one, because the client verifies
+    /// the *server* against this. During a rotation the server certificate may
+    /// be re-signed by the incoming CA, and a client holding only the outgoing
+    /// one would stop connecting at exactly that step.
     pub ca_pem: String,
     pub cert_path: String,
     pub key_path: String,
     /// Present only when the PKCS#12 bundle could be produced.
     pub pfx_path: Option<String>,
+    /// When the certificate stops being valid, as an RFC 3339 UTC timestamp,
+    /// read from the certificate itself. `None` only if it could not be read;
+    /// an absent expiry says "unknown" rather than "none".
+    pub expires_at: Option<String>,
+    /// The bundle's import passphrase, present exactly when `pfx_path` is.
+    ///
+    /// Generated per issuance, never written down, and delivered only through
+    /// [`record`](GeneratedCert::record) to the caller that asked for the
+    /// certificate. A bundle whose passphrase is stored beside it is decorative,
+    /// so the only copy is the one the caller is handed.
+    pub pfx_passphrase: Option<Secret>,
 }
+
+impl GeneratedCert {
+    /// The issuance response, field by field.
+    ///
+    /// The private key and the passphrase are in here on purpose: this is the
+    /// certificate-issuance path, which exists to deliver exactly that material
+    /// and is the one exception `docs/security.md` carves out of "no secret
+    /// reaches a response body".
+    pub fn record(&self) -> serde_json::Value {
+        serde_json::json!({
+            "common_name": self.common_name,
+            "thumbprint": self.thumbprint,
+            "certificate_pem": self.certificate_pem,
+            "private_key_pem": self.private_key_pem,
+            "ca_pem": self.ca_pem,
+            "cert_path": self.cert_path,
+            "key_path": self.key_path,
+            "pfx_path": self.pfx_path,
+            "expires_at": self.expires_at,
+            "pfx_passphrase": self.pfx_passphrase.as_ref().map(Secret::expose),
+        })
+    }
+}
+
+/// Names the environment variable openssl reads the export passphrase from.
+///
+/// `-passout pass:<value>` would put it on the command line, where `ps` shows it
+/// to every user on the host. A child's environment is readable through
+/// `/proc/<pid>/environ` by its owner alone, which is the same boundary the key
+/// file itself sits behind.
+const PFX_PASSPHRASE_VAR: &str = "SRP_PFX_PASSPHRASE";
+
+/// 18 bytes - 144 bits as 36 hex characters. Hex rather than anything prettier
+/// because the passphrase is read off a screen and typed into an import dialog,
+/// and a character set with no ambiguity is worth more there than brevity.
+const PFX_PASSPHRASE_BYTES: usize = 18;
 
 /// Rejects names that would turn into an `openssl` option or escape the
 /// certificate directory. The name reaches a command line and a file path, so
@@ -209,6 +321,53 @@ fn cert_output_dir(ca_path: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Reads the `notAfter` date out of a signed certificate, as an RFC 3339 UTC
+/// timestamp.
+///
+/// Read from the certificate rather than computed as `now + days`, because the
+/// certificate is what a client will actually be judged against. The two agree
+/// today; if `openssl` ever interpreted `-days` differently, a computed date
+/// would report an expiry the deployment does not have - and a wrong expiry is
+/// precisely the outage that reporting it at all is meant to prevent.
+///
+/// `None` when the date cannot be read. An absent expiry says "unknown", which
+/// is honest; a guessed one is not.
+fn not_after(cert_path: &str) -> Option<String> {
+    let output = std::process::Command::new("openssl")
+        .args(["x509", "-enddate", "-noout", "-in", cert_path])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    parse_not_after(line.trim())
+}
+
+/// The parser, reachable from the tests that pin openssl's output format.
+#[cfg(test)]
+pub fn parse_not_after_for_test(line: &str) -> Option<String> {
+    parse_not_after(line)
+}
+
+/// `notAfter=Oct  6 20:16:55 2026 GMT` to `2026-10-06T20:16:55Z`.
+///
+/// Split out from [`not_after`] so the format can be pinned by a test without
+/// generating a certificate. Note the day is **space padded** - openssl prints
+/// `Oct  6`, with two spaces - which is why this is a real format description
+/// and not a `split_whitespace`.
+fn parse_not_after(line: &str) -> Option<String> {
+    const OPENSSL_DATE: &[time::format_description::BorrowedFormatItem<'_>] = time::macros::format_description!(
+        "[month repr:short case_sensitive:false] [day padding:space] [hour]:[minute]:[second] [year] GMT"
+    );
+    let value = line.strip_prefix("notAfter=")?;
+    let parsed = time::PrimitiveDateTime::parse(value, OPENSSL_DATE).ok()?;
+    parsed
+        .assume_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
+}
+
 /// Issues a client certificate signed by the configured CA.
 ///
 /// `days` bounds the certificate's life, which is what lets a caller mint a
@@ -240,7 +399,7 @@ pub fn generate_client_cert(
     }
 
     let out_dir = cert_output_dir(&ca_file);
-    std::fs::create_dir_all(&out_dir)?;
+    private_files::dir(&out_dir)?;
     let out = |extension: &str| {
         out_dir
             .join(format!("{}.{}", common_name, extension))
@@ -256,11 +415,15 @@ pub fn generate_client_cert(
     let failed = |step: &str| io::Error::other(format!("{} failed", step));
     let ran = |result: io::Result<std::process::ExitStatus>| matches!(result, Ok(status) if status.success());
 
-    // The private key never leaves this directory except through the caller.
+    // The private key never leaves this directory except through the caller, and
+    // it is owner-only before openssl has written a byte into it - `genrsa -out`
+    // truncates the file this reserves instead of creating one at the umask.
+    private_files::reserve(&key_file)?;
     if !ran(std::process::Command::new("openssl")
         .args(["genrsa", "-out", &key_file, "2048"])
         .status())
     {
+        let _ = std::fs::remove_file(&key_file);
         return Err(failed("Generating the RSA key"));
     }
 
@@ -310,32 +473,56 @@ pub fn generate_client_cert(
         return Err(failed("Signing the certificate"));
     }
 
-    let pfx_path = if write_pfx
-        && ran(std::process::Command::new("openssl")
-            .args([
-                "pkcs12",
-                "-export",
-                "-out",
-                &pfx_file,
-                "-inkey",
-                &key_file,
-                "-in",
-                &crt_file,
-                "-certfile",
-                &ca_file,
-                "-passout",
-                "pass:",
-            ])
-            .status())
-    {
-        Some(pfx_file)
+    // `-certfile` takes a path, so the trusted set is written out beside the
+    // certificate for the length of the export. It holds only public CA
+    // certificates, but it is created owner-only like everything else here and
+    // removed afterwards rather than left as scratch.
+    let ca_bundle_file = out("cabundle");
+    // The bundle and its passphrase are produced together or not at all: a
+    // `.pfx` whose passphrase nobody holds is not a credential, and a passphrase
+    // for a bundle that was never written is a puzzle for whoever reads the
+    // response.
+    let bundle = if write_pfx {
+        let passphrase = Secret::random_hex(PFX_PASSPHRASE_BYTES)?;
+        let exported = private_files::write(&ca_bundle_file, trusted_ca_pem(config)?).is_ok()
+            && private_files::reserve(&pfx_file).is_ok()
+            && ran(std::process::Command::new("openssl")
+                .args([
+                    "pkcs12",
+                    "-export",
+                    "-out",
+                    &pfx_file,
+                    "-inkey",
+                    &key_file,
+                    "-in",
+                    &crt_file,
+                    "-certfile",
+                    &ca_bundle_file,
+                    "-passout",
+                    &format!("env:{}", PFX_PASSPHRASE_VAR),
+                ])
+                .env(PFX_PASSPHRASE_VAR, passphrase.expose())
+                .status());
+        let _ = std::fs::remove_file(&ca_bundle_file);
+        if exported {
+            Some((pfx_file, passphrase))
+        } else {
+            // A reserved-but-unwritten bundle is an empty file claiming to be a
+            // credential; the caller is told there is none, so there must be none.
+            let _ = std::fs::remove_file(&pfx_file);
+            None
+        }
     } else {
         None
+    };
+    let (pfx_path, pfx_passphrase) = match bundle {
+        Some((path, passphrase)) => (Some(path), Some(passphrase)),
+        None => (None, None),
     };
 
     let certificate_pem = std::fs::read_to_string(&crt_file)?;
     let private_key_pem = std::fs::read_to_string(&key_file)?;
-    let ca_pem = std::fs::read_to_string(&ca_file)?;
+    let ca_pem = trusted_ca_pem(config)?;
     let thumbprint = thumbprint_of_pem(&certificate_pem)?;
 
     Ok(GeneratedCert {
@@ -344,10 +531,63 @@ pub fn generate_client_cert(
         certificate_pem,
         private_key_pem,
         ca_pem,
+        expires_at: not_after(&crt_file),
         cert_path: crt_file,
         key_path: key_file,
         pfx_path,
+        pfx_passphrase,
     })
+}
+
+/// Every certificate from every CA the deployment trusts, in one list.
+///
+/// One loader for the listener and for the dashboard's client, because the two
+/// must agree: a server trusting two CAs while its own client trusts one is a
+/// rotation that half-works, and the half that fails is the dashboard going
+/// dark the moment the server certificate is re-signed.
+///
+/// A missing or unreadable file is an error rather than a skip. A CA that
+/// quietly failed to load is a set of clients that stop connecting with nothing
+/// anywhere saying why.
+pub fn load_trusted_cas(config: &Config) -> io::Result<Vec<CertificateDer<'static>>> {
+    let mut trusted = Vec::new();
+    for path in config.trusted_ca_paths() {
+        let loaded = load_certs(&path)
+            .map_err(|e| io::Error::new(e.kind(), format!("Could not read the trusted CA at {}: {}", path, e)))?;
+        if loaded.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} contains no certificate", path),
+            ));
+        }
+        trusted.extend(loaded);
+    }
+    if trusted.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "No trusted CA is configured: set ca_path",
+        ));
+    }
+    Ok(trusted)
+}
+
+/// The PEM text of every trusted CA, concatenated, for handing to a client.
+///
+/// A client verifies the *server* against this, so during a rotation it has to
+/// carry every CA that might have signed the server certificate - otherwise a
+/// client issued today stops working the moment the server certificate is
+/// re-signed by the incoming CA, which is the step the overlap exists to make
+/// safe.
+pub fn trusted_ca_pem(config: &Config) -> io::Result<String> {
+    let mut bundle = String::new();
+    for path in config.trusted_ca_paths() {
+        let pem = std::fs::read_to_string(&path)?;
+        if !bundle.is_empty() && !bundle.ends_with('\n') {
+            bundle.push('\n');
+        }
+        bundle.push_str(&pem);
+    }
+    Ok(bundle)
 }
 
 pub fn load_certs(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {

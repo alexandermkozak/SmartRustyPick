@@ -49,6 +49,7 @@
 
 use crate::db::error::{DbError, DbResult};
 use crate::db::hashfile::FsyncPolicy;
+use crate::private_files;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -196,7 +197,7 @@ pub fn write(root: &Path, key: &str, bytes: &[u8], max_bytes: u64, fsync: FsyncP
     let path = record_path(root, key)?;
     let tmp = tmp_path(root);
     let result = (|| -> io::Result<()> {
-        let mut file = File::create(&tmp)?;
+        let mut file = private_files::create(&tmp)?;
         file.write_all(bytes)?;
         file.flush()?;
         if fsync == FsyncPolicy::Always {
@@ -225,7 +226,7 @@ pub fn store(root: &Path, key: &str, source: &Path, max_bytes: u64, fsync: Fsync
     let mut copied = 0u64;
     let result = (|| -> io::Result<()> {
         let mut input = File::open(source)?;
-        let mut file = File::create(&tmp)?;
+        let mut file = private_files::create(&tmp)?;
         copied = io::copy(&mut input, &mut file)?;
         file.flush()?;
         if fsync == FsyncPolicy::Always {
@@ -260,6 +261,10 @@ pub fn extract(root: &Path, key: &str, destination: &Path) -> DbResult<Option<u6
         Some(dir) => tmp_path(dir),
         None => tmp_path(Path::new(".")),
     };
+    // Deliberately not `private_files::create`: the destination is a path the
+    // caller named, outside the database, and an export that lands unreadable to
+    // everyone but the server's user is a surprise rather than a protection.
+    // `docs/security.md` records this as the one exception.
     let copied = (|| -> io::Result<u64> {
         let mut out = File::create(&tmp)?;
         let copied = io::copy(&mut input, &mut out)?;

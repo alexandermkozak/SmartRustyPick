@@ -32,7 +32,8 @@ account.
 #### SET.FILE
 
 Turn per-file durable writes on or off for a file that already exists, keeping its data. Over the
-[remote protocol](protocol.md) this is admin only, like `CREATE.FILE`; in the CLI it applies to the current account.
+[remote protocol](protocol.md) this is authorized against the client's allowed accounts, like `CREATE.FILE` — a file
+lives in one account and affects nothing outside it; in the CLI it applies to the current account.
 
 - **Usage**: `SET.FILE <name> DURABLE | BUFFERED`
 - **Example**: `SET.FILE LEDGER DURABLE`
@@ -97,15 +98,26 @@ Restore an archive — to the same server or a different one.
 Authorize a client certificate SHA-256 thumbprint with a name and access restrictions. This command is restricted to the
 `SYSTEM` account.
 
-- **Usage**: `AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts>`
+- **Usage**: `AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts | capabilities>`
 - **Example (Admin)**: `AUTHORIZE.CONN ef9d7b4d5... my-laptop ADMIN`
 - **Example (Restricted)**: `AUTHORIZE.CONN ef9d7b4d5... my-laptop MYAPP,TESTDB`
+- **Example (Provisioning)**: `AUTHORIZE.CONN ef9d7b4d5... deploy-bot accounts:manage`
+- **Example (Mixed)**: `AUTHORIZE.CONN ef9d7b4d5... ops MYAPP,server:observe`
 - **Note**:
-  - `ADMIN` connections have no account restrictions.
-  - Restricted connections MUST provide a comma-separated list of allowed accounts.
+  - The third argument is one comma-separated list. A token is a **capability** if it names one, and an **account**
+    otherwise; `ADMIN` is recognised on its own.
+  - The capabilities are `accounts:manage`, `clients:manage` and `server:observe`. See
+    [Authorization](protocol.md#authorization) for which commands each one covers. An unrecognised capability name is
+    refused rather than ignored, so a typo cannot read as a grant that quietly does nothing.
+  - **A capability does not grant an account.** A client holding `accounts:manage` can create an account and cannot
+    read a single record in it — which is what lets a provisioning credential exist without being a master key over
+    every account in the database. Granting access afterwards is `ADD.CLIENT.ACCOUNT`, under `clients:manage`.
+  - `ADMIN` connections have no account restrictions and hold every capability, exactly as before. An authorization
+    written before capabilities existed behaves identically; nothing has to be migrated.
+  - A client must be given at least one of the three: `ADMIN`, an account, or a capability.
   - If a restricted client has only ONE allowed account, the server defaults to that account if none is specified in the
     request.
-  - The authorization is stored in the `$CLIENTS` file within the `SYSTEM` account.
+  - The authorization is stored in the `$CLIENTS` file within the `SYSTEM` account, capabilities in attribute 4.
 
 #### ADD.CLIENT.ACCOUNT
 
@@ -133,16 +145,21 @@ Deauthorize a client certificate by its assigned name. This command is restricte
 List all authorized certificate names and their thumbprints. This command is restricted to the `SYSTEM` account.
 
 - **Usage**: `LIST.CONNS`
-- **Note**: The same listing is available to admin clients over the [remote protocol](protocol.md) and in the
-  [web dashboard](web_dashboard.md), which is how the dashboard manages authorizations.
+- **Output**: name, thumbprint, allowed accounts, capabilities and expiry. `ADMIN` is expanded to the full capability
+  set, so a row says what a credential is *for* rather than leaving it to be inferred from a flag. The expiry reads
+  `unknown` for a client authorized with `AUTHORIZE.CONN`, which names a thumbprint and never sees the certificate
+  behind it — no date is invented for one.
+- **Note**: The same listing is available over the [remote protocol](protocol.md) to a client holding `server:observe`
+  (or `ADMIN`), and in the [web dashboard](web_dashboard.md), which is how the dashboard manages authorizations.
 
 #### GENERATE.CERT
 
 Generate and sign a new client certificate and private key using the system's CA, and automatically authorize it. This
 command is restricted to the `SYSTEM` account and runs interactively.
 
-- **Usage**: `GENERATE.CERT <common_name>`
+- **Usage**: `GENERATE.CERT <common_name> [DAYS <n>]`
 - **Example**: `GENERATE.CERT myclient`
+- **Example (short-lived)**: `GENERATE.CERT ci-runner DAYS 7`
 - **Note**: Admin clients can issue certificates the same way over the [remote protocol](protocol.md); the
   [web dashboard](web_dashboard.md) uses that to generate and download certificates from a browser.
 - **Output**: Creates `myclient.crt`, `myclient.key` and `myclient.pfx` in the current directory. The CSR is an input to
@@ -151,14 +168,28 @@ command is restricted to the `SYSTEM` account and runs interactively.
   1. Generates files for the specified `<common_name>`.
   2. Prompts for an **Authorization Name** (defaults to `<common_name>`).
   3. Prompts for **Admin status** (Y/N).
-  4. If not Admin, prompts for a comma-separated list of **Allowed Accounts**.
+  4. If not Admin, prompts for a comma-separated list of **accounts and/or capabilities**, parsed exactly as
+     `AUTHORIZE.CONN` parses its grant list.
   5. Automatically performs the `AUTHORIZE.CONN` step.
 - **Note**:
-  - The `.pfx` file is generated with an empty password. It bundles the private key, the client certificate and the CA
-    that signed it. The CA belongs in there: a client that selects its certificate by building a chain - Windows'
-    Schannel, and so .NET's `SslStream` - will not offer a certificate it cannot chain to the CA the server asked for,
-    and the server then drops the connection as unauthenticated.
-  - If authorization is skipped (e.g., non-admin with no accounts), you can still use `AUTHORIZE.CONN` manually later.
+  - The `.pfx` file is **passphrase-protected**. A passphrase is generated for each issuance, printed once by this
+    command (and shown once in the [web dashboard](web_dashboard.md)), and stored nowhere — not beside the bundle, not
+    in `$LOGS`, and not on any command line, since it reaches `openssl` through the child process's environment rather
+    than its arguments. Deliver it to whoever imports the bundle by some route other than the bundle itself. If it is
+    lost, re-issue the certificate; there is nothing to recover.
+  - The bundle carries the private key, the client certificate and the CA that signed it. The CA belongs in there: a
+    client that selects its certificate by building a chain - Windows' Schannel, and so .NET's `SslStream` - will not
+    offer a certificate it cannot chain to the CA the server asked for, and the server then drops the connection as
+    unauthenticated.
+  - If authorization is skipped (e.g., non-admin with neither an account nor a capability), you can still use
+    `AUTHORIZE.CONN` manually later.
+  - **`DAYS` sets the lifetime**, defaulting to 365 and bounded by `max_client_cert_days` in `config.toml`. A request
+    above the ceiling, or for `0` days, is **refused rather than shortened** — a caller that believes it holds a
+    7-day certificate and actually holds a year-long one has a credential outliving what it was scoped for. There is
+    no CRL and no OCSP (see [Security](security.md)), so `DEAUTHORIZE.CONN` only helps if somebody notices a leak;
+    a short lifetime is the withdrawal that happens whether or not anyone does.
+  - The command prints the expiry beside the thumbprint, and `LIST.CONNS` carries it for every certificate this
+    database issued.
 
 #### START.SERVER
 

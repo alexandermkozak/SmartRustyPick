@@ -82,8 +82,8 @@ fn field<'a>(body: &'a Value, name: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-/// An account list, accepting both `["A","B"]` and `"A, B"` so the page can send
-/// whichever it has.
+/// A list of names - accounts or capabilities - accepting both `["A","B"]` and
+/// `"A, B"` so the page can send whichever it has.
 fn accounts(body: &Value, name: &str) -> Vec<String> {
     match body.get(name) {
         Some(Value::Array(values)) => values
@@ -333,8 +333,14 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
             };
             let is_admin = flag(&body, "is_admin");
             let allowed = accounts(&body, "accounts");
-            if !is_admin && allowed.is_empty() {
-                return Response::error(400, "A non-admin client needs at least one allowed account");
+            // Unknown names are the server's to refuse, not this layer's: one
+            // list of capabilities, checked in one place.
+            let capabilities = accounts(&body, "capabilities");
+            if !is_admin && allowed.is_empty() && capabilities.is_empty() {
+                return Response::error(
+                    400,
+                    "A non-admin client needs at least one allowed account or capability",
+                );
             }
             run(
                 client,
@@ -344,6 +350,7 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                     "thumbprint": thumbprint,
                     "accounts_list": allowed,
                     "is_admin": is_admin,
+                    "capabilities": capabilities,
                 }),
             )
             .await
@@ -376,19 +383,27 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
             };
             let is_admin = flag(&body, "is_admin");
             let allowed = accounts(&body, "accounts");
-            if !is_admin && allowed.is_empty() {
-                return Response::error(400, "A non-admin certificate needs at least one allowed account");
+            let capabilities = accounts(&body, "capabilities");
+            if !is_admin && allowed.is_empty() && capabilities.is_empty() {
+                return Response::error(
+                    400,
+                    "A non-admin certificate needs at least one allowed account or capability",
+                );
             }
-            run(
-                client,
-                json!({
-                    "command": "GENERATE.CERT",
-                    "name": common_name,
-                    "accounts_list": allowed,
-                    "is_admin": is_admin,
-                }),
-            )
-            .await
+            // The bound is the server's to enforce, so an out-of-range value is
+            // passed on and refused there rather than being second-guessed here
+            // with a copy of the deployment's ceiling.
+            let mut request = json!({
+                "command": "GENERATE.CERT",
+                "name": common_name,
+                "accounts_list": allowed,
+                "is_admin": is_admin,
+                "capabilities": capabilities,
+            });
+            if let Some(days) = body.get("days").and_then(|value| value.as_u64()) {
+                request["days"] = json!(days);
+            }
+            run(client, request).await
         }
 
         // Accounts and their files: what exists, how big it is, and how it is

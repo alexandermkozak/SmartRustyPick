@@ -13,6 +13,7 @@ use crate::db::hashfile::{self, FsyncPolicy, SectionMeta};
 use crate::db::health::{HealthSummary, Verdict};
 use crate::db::index::{self, IndexReport, IndexStats, IndexValue};
 use crate::db::models::*;
+use crate::private_files;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -721,6 +722,19 @@ impl Database {
                         .insert("ADMIN".to_string(), Record::from_display_string("3^ADMIN^L^5"));
                     updated = true;
                 }
+                if !table.dictionary.contains_key("CAPABILITIES") {
+                    table.dictionary.insert(
+                        "CAPABILITIES".to_string(),
+                        Record::from_display_string("4^CAPABILITIES^L^40"),
+                    );
+                    updated = true;
+                }
+                if !table.dictionary.contains_key("EXPIRES") {
+                    table
+                        .dictionary
+                        .insert("EXPIRES".to_string(), Record::from_display_string("5^EXPIRES^L^20"));
+                    updated = true;
+                }
             }
             "$SAVEDLISTS" => {
                 if !table.dictionary.contains_key("TABLE") {
@@ -789,11 +803,37 @@ impl Database {
                     .and_then(|v| v.first_text())
                     .map(|s| s == "Y")
                     .unwrap_or(false);
+                // Field 3 is absent on every entry written before capabilities
+                // existed, which reads as "none" - so an old database keeps
+                // working and `ADMIN` keeps carrying what it always did. An
+                // unrecognised name is dropped rather than guessed at: a client
+                // whose capability list cannot be read must end up with less
+                // authority than intended, never more.
+                let mut capabilities = Vec::new();
+                if let Some(cap_field) = record.fields.get(SYS_CLIENTS_CAPABILITIES_IDX) {
+                    for value in &cap_field.values {
+                        if let Some(name) = value.first_text()
+                            && let Some(capability) = Capability::parse(name.as_ref())
+                            && !capabilities.contains(&capability)
+                        {
+                            capabilities.push(capability);
+                        }
+                    }
+                }
+                let expires_at = record
+                    .fields
+                    .get(SYS_CLIENTS_EXPIRES_IDX)
+                    .and_then(|f| f.values.first())
+                    .and_then(|v| v.first_text())
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty());
                 clients.push(ClientInfo {
                     name: name.clone(),
                     thumbprint: tp_lower,
                     allowed_accounts,
                     is_admin,
+                    capabilities,
+                    expires_at,
                 });
             }
         }
@@ -1408,7 +1448,7 @@ impl Database {
         {
             fs::create_dir_all(parent)?;
         }
-        let file = File::create(path)?;
+        let file = private_files::create(path)?;
         let mut writer = BufWriter::new(file);
 
         let mut keys: Vec<_> = map.keys().cloned().collect();
@@ -2127,7 +2167,7 @@ impl Database {
             fs::create_dir_all(&table_dir)?;
         }
         Self::init_data_section(&table_dir, self.records_per_group)?;
-        File::create(format!("{}/dict", table_dir))?;
+        private_files::create(format!("{}/dict", table_dir))?;
 
         let has_dir = {
             let mut listings = wlock(&self.available_tables);
@@ -2743,14 +2783,14 @@ impl Database {
         })
     }
 
-    pub fn add_authorized_client(
-        &self,
-        name: &str,
-        thumbprint: &str,
-        allowed_accounts: Vec<String>,
-        is_admin: bool,
-    ) -> DbResult<()> {
+    pub fn add_authorized_client(&self, name: &str, thumbprint: &str, grant: ClientGrant) -> DbResult<()> {
         self.run_in_system_account(|db| {
+            let ClientGrant {
+                allowed_accounts,
+                is_admin,
+                capabilities,
+                expires_at,
+            } = &grant;
             let thumbprint_lower = thumbprint.to_lowercase();
 
             // Update $CLIENTS table
@@ -2758,7 +2798,7 @@ impl Database {
                 let handle = db.get_table_mut("$CLIENTS")?;
                 let mut table = handle.write();
                 let mut record = Record::new();
-                while record.fields.len() <= SYS_CLIENTS_ADMIN_IDX {
+                while record.fields.len() <= SYS_CLIENTS_EXPIRES_IDX {
                     record.fields.push(Field::default());
                 }
                 // Field 0: Thumbprint
@@ -2766,13 +2806,32 @@ impl Database {
                     .values
                     .push(Value::text(&thumbprint_lower));
                 // Field 1: Allowed Accounts
-                for acc in &allowed_accounts {
+                for acc in allowed_accounts {
                     record.fields[SYS_CLIENTS_ACCOUNTS_IDX].values.push(Value::text(acc));
                 }
                 // Field 2: Admin flag
                 record.fields[SYS_CLIENTS_ADMIN_IDX]
                     .values
-                    .push(Value::text(if is_admin { "Y" } else { "" }));
+                    .push(Value::text(if *is_admin { "Y" } else { "" }));
+                // Field 3: Capabilities, one per value. An ADMIN entry is left
+                // empty rather than expanded: `ADMIN` already means all of them,
+                // and writing them out would make a listing ambiguous about
+                // whether the flag or the list is the authority.
+                if !*is_admin {
+                    for capability in capabilities {
+                        record.fields[SYS_CLIENTS_CAPABILITIES_IDX]
+                            .values
+                            .push(Value::text(capability.as_str()));
+                    }
+                }
+
+                // Field 4: when the certificate expires, if this database issued
+                // it. Left empty for an AUTHORIZE.CONN, which never sees one.
+                if let Some(expires_at) = expires_at {
+                    record.fields[SYS_CLIENTS_EXPIRES_IDX]
+                        .values
+                        .push(Value::text(expires_at));
+                }
 
                 table.insert_record(name, record);
             }

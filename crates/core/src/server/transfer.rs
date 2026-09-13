@@ -496,7 +496,7 @@ async fn receive_into<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut file = match tokio::fs::File::create(path).await {
+    let mut file = match crate::private_files::create_async(path).await {
         Ok(file) => file,
         // Nowhere to put it, but the body is still coming: drain it so the
         // connection survives to carry the error.

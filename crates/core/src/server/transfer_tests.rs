@@ -49,6 +49,7 @@ fn client() -> ClientInfo {
         thumbprint: "tp".to_string(),
         allowed_accounts: vec![ACCOUNT.to_string()],
         is_admin: false,
+        ..Default::default()
     }
 }
 
@@ -92,6 +93,20 @@ fn reader_over(bytes: Vec<u8>) -> BufReader<std::io::Cursor<Vec<u8>>> {
     BufReader::with_capacity(16, std::io::Cursor::new(bytes))
 }
 
+/// The same, but with a capacity that *guarantees* the read which finds the
+/// newline over-reads into the body.
+///
+/// `BufReader` refills in capacity-sized chunks, so whether any body bytes are
+/// left in the buffer afterwards depends on whether the request line happens to
+/// end on a chunk boundary. With a fixed capacity that is a property of how long
+/// the line serializes to, which changes whenever a field is added to `Request`.
+/// The precondition the test below asserts would then be satisfied by accident,
+/// and could stop being satisfied for reasons with nothing to do with the
+/// transfer path. Sizing the buffer from the line makes it deliberate.
+fn reader_straddling_after(line_len: usize, bytes: Vec<u8>) -> BufReader<std::io::Cursor<Vec<u8>>> {
+    BufReader::with_capacity(line_len + 8, std::io::Cursor::new(bytes))
+}
+
 #[tokio::test]
 async fn a_body_is_read_through_the_buffer_the_request_line_was() {
     let (_dir, db) = database();
@@ -101,9 +116,12 @@ async fn a_body_is_read_through_the_buffer_the_request_line_was() {
     // stream, as a client writes them.
     let mut wire = serde_json::to_vec(&put("scan.bin", body.len() as u64)).unwrap();
     wire.push(b'\n');
+    let line_len = wire.len();
     wire.extend_from_slice(&body);
 
-    let mut reader = reader_over(wire);
+    // Eight bytes of the 4096-byte body land in the buffer with the line; the
+    // rest is still on the stream, which is exactly the straddle being tested.
+    let mut reader = reader_straddling_after(line_len, wire);
     let mut written = Vec::new();
 
     // The line is read the way the connection loop reads it, which fills the
@@ -383,6 +401,7 @@ fn admin() -> ClientInfo {
         thumbprint: "tp_admin".to_string(),
         allowed_accounts: vec![],
         is_admin: true,
+        ..Default::default()
     }
 }
 

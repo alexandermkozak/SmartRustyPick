@@ -23,6 +23,7 @@ pub mod http;
 mod tests;
 
 use crate::config::Config;
+use crate::secret::Secret;
 use crate::server::SharedDb;
 use crate::server::certs::generate_client_cert;
 use crate::server::handler::write_lock;
@@ -115,42 +116,8 @@ fn loopback_target(addr: &str) -> String {
     format!("{}:{}", host_of(addr), port)
 }
 
-/// A token nobody can guess, from the system's entropy source.
-///
-/// Falls back to `openssl rand` - already a hard dependency for certificate
-/// handling - rather than to anything time-derived, because a predictable token
-/// is worse than no dashboard at all.
-fn random_token() -> std::io::Result<String> {
-    use std::io::Read;
-    if let Ok(mut source) = std::fs::File::open("/dev/urandom") {
-        let mut bytes = [0u8; 24];
-        if source.read_exact(&mut bytes).is_ok() {
-            return Ok(hex::encode(bytes));
-        }
-    }
-    let output = std::process::Command::new("openssl")
-        .args(["rand", "-hex", "24"])
-        .output()?;
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !output.status.success() || token.len() < 32 {
-        return Err(std::io::Error::other("Could not generate a dashboard token"));
-    }
-    Ok(token)
-}
-
-/// Constant-time comparison, so a wrong token cannot be narrowed down by how
-/// long the rejection took.
-fn tokens_match(expected: &str, provided: &str) -> bool {
-    if expected.len() != provided.len() {
-        return false;
-    }
-    expected
-        .as_bytes()
-        .iter()
-        .zip(provided.as_bytes())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
-}
+/// How many bytes of entropy a generated dashboard token carries.
+const TOKEN_BYTES: usize = 24;
 
 /// Issues the dashboard's certificate and authorizes it, replacing whatever the
 /// previous boot left behind.
@@ -160,16 +127,31 @@ fn tokens_match(expected: &str, provided: &str) -> bool {
 /// straight to the engine and everything afterwards goes over the wire.
 fn issue_dashboard_certificate(config: &Config, db: &SharedDb) -> std::io::Result<crate::server::certs::GeneratedCert> {
     let generated = generate_client_cert(config, DASHBOARD_COMMON_NAME, DASHBOARD_CERT_DAYS, false)?;
-    write_lock(db).add_authorized_client(DASHBOARD_CLIENT_NAME, &generated.thumbprint, Vec::new(), true)?;
+    // Still ADMIN: the dashboard manages accounts, files, indexes and clients,
+    // and lists every account to do it, so it needs both halves of what ADMIN
+    // used to conflate. Narrowing it is a dashboard question - which of its
+    // panels an operator wants - rather than an authorization one.
+    write_lock(db).add_authorized_client(
+        DASHBOARD_CLIENT_NAME,
+        &generated.thumbprint,
+        crate::db::ClientGrant {
+            is_admin: true,
+            expires_at: generated.expires_at.clone(),
+            ..Default::default()
+        },
+    )?;
     Ok(generated)
 }
 
 async fn run(config: Arc<Config>, db: SharedDb, protocol_addr: String) -> std::io::Result<()> {
     let protocol_target = loopback_target(&protocol_addr);
     let bind_addr = config.web_bind_addr();
+    // A `Secret` from here on: the token is inert in a `{:?}`, cannot be
+    // serialized into a response, and is compared in constant time by the type
+    // rather than by a comparator this module has to remember to call.
     let token = match config.web_token.clone() {
-        Some(token) if !token.trim().is_empty() => token.trim().to_string(),
-        _ => random_token()?,
+        Some(configured) if !configured.trim().is_empty() => Secret::new(configured.trim().to_string()),
+        _ => Secret::random_hex(TOKEN_BYTES)?,
     };
 
     // Certificate work shells out to openssl and takes the database lock, so it
@@ -182,21 +164,25 @@ async fn run(config: Arc<Config>, db: SharedDb, protocol_addr: String) -> std::i
             .map_err(std::io::Error::other)??
     };
 
-    let ca_path = config.ca_path.clone().ok_or_else(|| {
-        std::io::Error::new(
+    if config.ca_path.is_none() {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "ca_path is required for the dashboard",
-        )
-    })?;
+        ));
+    }
     let client = Arc::new(ProtocolClient::new(
         &protocol_target,
         &generated.cert_path,
         &generated.key_path,
-        &ca_path,
+        &config,
     )?);
 
     let listener = TcpListener::bind(&bind_addr).await?;
-    println!("Web dashboard on http://{}/?token={}", bind_addr, token);
+    // The one place a token is deliberately printed: it is how the operator
+    // reaches the dashboard at all, and the exception `docs/security.md` names
+    // beside certificate issuance. Its lifecycle - a URL that stays valid for
+    // the life of the process - is #54's problem, not this line's.
+    println!("Web dashboard on http://{}/?token={}", bind_addr, token.expose());
     println!(
         "  authorized as {} (thumbprint {}), reissued on every start",
         DASHBOARD_CLIENT_NAME, generated.thumbprint
@@ -240,7 +226,7 @@ async fn run(config: Arc<Config>, db: SharedDb, protocol_addr: String) -> std::i
 async fn serve_connection(
     stream: tokio::net::TcpStream,
     client: Arc<ProtocolClient>,
-    token: Arc<String>,
+    token: Arc<Secret>,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -271,25 +257,22 @@ async fn serve_connection(
 
 /// Whether a request carries the dashboard token, in any of the three places a
 /// browser or a script can put it.
-fn authenticated(request: &http::Request, token: &str) -> bool {
+fn authenticated(request: &http::Request, token: &Secret) -> bool {
     if let Some(cookie) = request.cookie(TOKEN_COOKIE)
-        && tokens_match(token, &cookie)
+        && token.matches(&cookie)
     {
         return true;
     }
     if let Some(header) = request.header("authorization")
         && let Some(bearer) = header.strip_prefix("Bearer ")
-        && tokens_match(token, bearer.trim())
+        && token.matches(bearer.trim())
     {
         return true;
     }
-    request
-        .query
-        .get("token")
-        .is_some_and(|value| tokens_match(token, value))
+    request.query.get("token").is_some_and(|value| token.matches(value))
 }
 
-async fn handle(client: &Arc<ProtocolClient>, token: &str, request: &http::Request) -> Response {
+async fn handle(client: &Arc<ProtocolClient>, token: &Secret, request: &http::Request) -> Response {
     // Liveness needs no token: it says the dashboard is up and nothing else.
     if request.path == "/health" {
         return Response::json(200, &serde_json::json!({ "status": "ok" }));
@@ -308,7 +291,7 @@ async fn handle(client: &Arc<ProtocolClient>, token: &str, request: &http::Reque
             match request.query.get("token") {
                 Some(_) => response.with_header(
                     "Set-Cookie",
-                    format!("{}={}; Path=/; HttpOnly; SameSite=Strict", TOKEN_COOKIE, token),
+                    format!("{}={}; Path=/; HttpOnly; SameSite=Strict", TOKEN_COOKIE, token.expose()),
                 ),
                 None => response,
             }

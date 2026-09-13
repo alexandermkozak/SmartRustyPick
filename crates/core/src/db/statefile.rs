@@ -29,7 +29,8 @@
 //! directory gets opened by a build that should have refused it.
 
 use crate::db::hashfile::{self, FsyncPolicy};
-use std::fs::{self, File};
+use crate::private_files;
+use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -92,7 +93,7 @@ pub fn write(path: &Path, body: &str, fsync: FsyncPolicy) -> io::Result<()> {
     name.push(".tmp");
     let tmp = dir.join(name);
     {
-        let mut file = File::create(&tmp)?;
+        let mut file = private_files::create(&tmp)?;
         writeln!(file, "checksum={:08x}", hashfile::crc32c(body.as_bytes()))?;
         file.write_all(body.as_bytes())?;
         if fsync == FsyncPolicy::Always {

@@ -48,3 +48,26 @@ export function timestamp(seconds: number | null | undefined): string {
     if (!seconds) return '—'
     return new Date(seconds * 1000).toLocaleString()
 }
+
+/**
+ * A certificate expiry as a date and how long is left: `2027-09-13 · 364 days`.
+ *
+ * The remaining days are what the reader is actually deciding on — a date alone
+ * makes every row arithmetic — and an already-expired certificate says so
+ * rather than showing a negative number, because "-3 days" is a sentence nobody
+ * reads correctly at a glance.
+ */
+export function expiry(
+    at: string | null | undefined,
+    days: number | null | undefined,
+): {text: string; state: 'unknown' | 'expired' | 'soon' | 'ok'} {
+    // Authorized by thumbprint alone: the database never saw the certificate.
+    if (!at) return {text: 'unknown', state: 'unknown'}
+    const date = at.slice(0, 10)
+    if (days === null || days === undefined) return {text: date, state: 'ok'}
+    if (days < 0) return {text: `${date} · expired`, state: 'expired'}
+    if (days === 0) return {text: `${date} · today`, state: 'soon'}
+    // Thirty days is the usual outer edge of "arrange the reissue now"; it is a
+    // display threshold only, and nothing in the server depends on it.
+    return {text: `${date} · ${days} days`, state: days <= 30 ? 'soon' : 'ok'}
+}

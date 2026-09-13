@@ -2,8 +2,8 @@ use crate::db::archive;
 use crate::db::engine::archive::{ImportPlan, ImportReport};
 use crate::db::engine::dictionary::DEFAULT_FIELD_WIDTH;
 use crate::db::{
-    Change, ChangeOp, Condition, Database, DbError, ExplodeSpec, IndexStats, QueryNode, Record, SortSpec, Table,
-    TableHandle,
+    Capability, Change, ChangeOp, ClientGrant, Condition, Database, DbError, ExplodeSpec, IndexStats, QueryNode,
+    Record, SortSpec, Table, TableHandle,
 };
 use crate::server::models::{ChangeSpec, ErrorCode, Request, Response};
 use std::collections::HashMap;
@@ -28,11 +28,6 @@ pub fn read_lock(db: &SharedDb) -> RwLockReadGuard<'_, Database> {
 pub fn write_lock(db: &SharedDb) -> RwLockWriteGuard<'_, Database> {
     db.write().unwrap_or_else(|e| e.into_inner())
 }
-
-/// Lifetime of a certificate issued through `GENERATE.CERT`. A year matches
-/// what the CLI has always handed out; the dashboard's own certificate is far
-/// shorter lived and is issued separately.
-const CLIENT_CERT_DAYS: u32 = 365;
 
 /// An error reply: the code a client branches on, and the message a person
 /// reads. Both, always - a refusal that carries only prose is one no client can
@@ -390,6 +385,107 @@ fn is_record_command(command: &str) -> bool {
         // touches, which is the opposite of what per-file locking bought.
         "READ" | "WRITE" | "DELETE" | "QUERY" | "TRANSACT" | "ENQUEUE" | "DEQUEUE" | "ACK" | "NACK" | "PEEK"
     )
+}
+
+/// The lifetime a `GENERATE.CERT` should use, or the refusal explaining why not.
+///
+/// A request above `max_client_cert_days` is **refused rather than clamped**. A
+/// caller that believes it holds a 30-day certificate and actually holds a
+/// 365-day one is worse off than one that got an error - it has planned a
+/// reissue it does not need and, more to the point, a credential that outlives
+/// what it was scoped for. The same argument settles the floor: zero is refused
+/// rather than quietly becoming one.
+#[allow(clippy::result_large_err)]
+pub(crate) fn requested_cert_days(requested: Option<u32>, config: &crate::config::Config) -> Result<u32, Response> {
+    let ceiling = config.max_client_cert_days();
+    match requested {
+        // The default is capped too: a deployment that sets a ceiling below
+        // 365 means it, and a caller that named nothing should get the shortest
+        // thing this deployment is willing to issue rather than a refusal.
+        None => Ok(crate::config::DEFAULT_CLIENT_CERT_DAYS.min(ceiling)),
+        Some(0) => Err(error(
+            ErrorCode::InvalidRequest,
+            "A certificate lifetime of 0 days is not a certificate; ask for at least 1",
+        )),
+        Some(days) if days > ceiling => Err(error(
+            ErrorCode::InvalidRequest,
+            format!(
+                "A lifetime of {} days exceeds this deployment's maximum of {}; raise max_client_cert_days to allow it",
+                days, ceiling
+            ),
+        )),
+        Some(days) => Ok(days),
+    }
+}
+
+/// Commands that do not operate on a *current* account, so having none to
+/// resolve is not a reason to refuse them.
+///
+/// Two kinds. `GET.NEXT` takes its account from the select list, so there is
+/// nothing to resolve from the request; a client with more than one allowed
+/// account would otherwise be turned away for not naming what it does not need
+/// to name. The rest name a `target_account`, a client, or nothing at all - and
+/// since capabilities (#111) a client may legitimately hold **no accounts**,
+/// which is exactly what a provisioning credential looks like. Refusing those
+/// here would make a capability unusable by the credential it exists for.
+fn needs_no_current_account(command: &str) -> bool {
+    matches!(
+        command,
+        "GET.NEXT"
+            | "CREATE.ACCOUNT"
+            | "DELETE.ACCOUNT"
+            | "CREATE.TEST.ACCOUNT"
+            | "AUTHORIZE.CONN"
+            | "DEAUTHORIZE.CONN"
+            | "ADD.CLIENT.ACCOUNT"
+            | "REMOVE.CLIENT.ACCOUNT"
+            | "GENERATE.CERT"
+            | "LIST.CONNS"
+            | "SERVER.STATS"
+    )
+}
+
+/// The refusal for a command the client does not hold the capability for.
+///
+/// Still `ADMIN_REQUIRED`: the code is part of the protocol's pinned surface and
+/// `ADMIN` remains a way to satisfy every one of these, so renaming it would
+/// break clients to describe the same refusal. The message says which capability
+/// would have been enough, because "Admin privileges required" sent to a client
+/// that needs one narrow grant tells an operator to reach for the widest one.
+fn capability_required(capability: Capability) -> String {
+    format!(
+        "Not authorized: this command requires ADMIN or the '{}' capability",
+        capability
+    )
+}
+
+/// Turns a request's capability names into capabilities, refusing anything
+/// unrecognised.
+///
+/// A typo must not read as a grant that quietly does nothing: an operator who
+/// writes `accounts:mange` and gets `OK` back believes a credential exists that
+/// does not, and will find out when the provisioning job fails at three in the
+/// morning rather than here.
+#[allow(clippy::result_large_err)]
+fn requested_capabilities(names: Option<&[String]>) -> Result<Vec<Capability>, Response> {
+    let mut granted = Vec::new();
+    for name in names.unwrap_or(&[]) {
+        match Capability::parse(name) {
+            Some(capability) if !granted.contains(&capability) => granted.push(capability),
+            Some(_) => {}
+            None => {
+                return Err(error(
+                    ErrorCode::InvalidData,
+                    format!(
+                        "Unknown capability '{}'. Known capabilities: {}",
+                        name,
+                        Capability::ALL.map(|c| c.as_str()).join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(granted)
 }
 
 pub fn handle_request(req: Request, db: &SharedDb, client_info: &crate::db::ClientInfo) -> Response {
@@ -1495,7 +1591,7 @@ fn delete_record(db: &Database, acc: &str, req: Request) -> Response {
 fn allowed_account<'a>(req: &'a Request, client_info: &'a crate::db::ClientInfo) -> Option<&'a str> {
     match req.account.as_deref() {
         Some(acc) => {
-            if client_info.is_admin || client_info.allowed_accounts.iter().any(|a| a == acc) {
+            if client_info.may_reach(acc) {
                 Some(acc)
             } else {
                 None
@@ -1731,7 +1827,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
 
     let target_account = if let Some(acc) = req.account.clone() {
         // Client specified an account
-        if !client_info.is_admin && !client_info.allowed_accounts.contains(&acc) {
+        if !client_info.may_reach(&acc) {
             let msg = format!("Access denied for account {}: Not in allowed list", acc);
             let _ = db.log_error("REMOTE", &msg);
             return error(ErrorCode::AccessDenied, msg);
@@ -1745,11 +1841,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         } else if client_info.is_admin {
             // Admin can access SYSTEM or other accounts, but must specify one if multiple are possible.
             None
-        } else if command == "GET.NEXT" {
-            // GET.NEXT takes its account from the select list, so there is
-            // nothing to resolve from the request and nothing to refuse. Any
-            // client with more than one allowed account would otherwise be
-            // turned away here for not naming what it does not need to name.
+        } else if needs_no_current_account(&command) {
             None
         } else {
             return error(ErrorCode::AccountNotSpecified, "Account not specified");
@@ -1918,7 +2010,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             // could page one somebody else selected in an account it may not
             // reach - the account check at the top of this function never saw it,
             // because the request never named the account.
-            if !client_info.is_admin && !client_info.allowed_accounts.contains(&list_account) {
+            if !client_info.may_reach(&list_account) {
                 let msg = format!("Access denied for account {}: Not in allowed list", list_account);
                 let _ = db.log_error("REMOTE", &msg);
                 return error(ErrorCode::AccessDenied, msg);
@@ -2023,8 +2115,11 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "CREATE.ACCOUNT" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            if !client_info.can(Capability::AccountsManage) {
+                return error(
+                    ErrorCode::AdminRequired,
+                    capability_required(Capability::AccountsManage),
+                );
             }
             let name = match req.target_account {
                 Some(n) => n,
@@ -2044,8 +2139,11 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             // The CLI restricts this to the SYSTEM account; over the wire the
             // equivalent is an admin certificate, the same gate the other
             // account commands sit behind.
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            if !client_info.can(Capability::AccountsManage) {
+                return error(
+                    ErrorCode::AdminRequired,
+                    capability_required(Capability::AccountsManage),
+                );
             }
             let name = match req.target_account {
                 Some(n) => n,
@@ -2068,8 +2166,11 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "DELETE.ACCOUNT" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            if !client_info.can(Capability::AccountsManage) {
+                return error(
+                    ErrorCode::AdminRequired,
+                    capability_required(Capability::AccountsManage),
+                );
             }
             let name = match req.target_account {
                 Some(n) => n,
@@ -2086,9 +2187,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "CREATE.FILE" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
-            }
+            // Account-scoped: A file lives in one account and affects nothing outside it,
+            // so it is authorized against the allowed-account list the way
+            // SET.DICT already is. `target_account` above refused an account
+            // this client may not reach; there is nothing system-wide left to
+            // gate, and requiring ADMIN here made anything that could shape an
+            // account able to read every other one.
             if target_account.is_none() {
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
@@ -2114,9 +2218,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         "SET.FILE" => {
             // Promoting a file to durable is a storage decision for the account,
             // like creating one, so it is gated the same way.
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
-            }
+            // Account-scoped: Changing a file's storage flags affects one account's file,
+            // so it is authorized against the allowed-account list the way
+            // SET.DICT already is. `target_account` above refused an account
+            // this client may not reach; there is nothing system-wide left to
+            // gate, and requiring ADMIN here made anything that could shape an
+            // account able to read every other one.
             if target_account.is_none() {
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
@@ -2158,9 +2265,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "DELETE.FILE" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
-            }
+            // Account-scoped: Dropping a file affects one account's file,
+            // so it is authorized against the allowed-account list the way
+            // SET.DICT already is. `target_account` above refused an account
+            // this client may not reach; there is nothing system-wide left to
+            // gate, and requiring ADMIN here made anything that could shape an
+            // account able to read every other one.
             if target_account.is_none() {
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
@@ -2178,11 +2288,14 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 Err(e) => db_error(e),
             }
         }
-        // Backup and restore. Admin only, all four of them, and not because
-        // they are dangerous one at a time: an export reads every record of
-        // whatever it names, so the ability to run one against an arbitrary
-        // account is the ability to read that account. That is precisely the
-        // gate `is_admin` is.
+        // Backup and restore. Still `is_admin` rather than a capability, and
+        // deliberately so: an export reads every record of whatever it names
+        // and an import writes them, so these are data access wearing an
+        // administrative shape. A capability that granted them would be a
+        // capability that grants reading every account, which is the exact
+        // conflation the rest of this function just took apart. They stay on
+        // the flag that means "may reach every account" until someone decides
+        // what a scoped export should be - see `docs/security.md`.
         "EXPORT.FILE" | "EXPORT.ACCOUNT" | "EXPORT.ALL" => {
             if !client_info.is_admin {
                 return error(ErrorCode::AdminRequired, "Admin privileges required");
@@ -2232,9 +2345,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         // about a file, so they are gated exactly as creating the file is;
         // listing them is not, any more than listing the files is.
         "CREATE.INDEX" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
-            }
+            // Account-scoped: An index is a storage decision about one account's file,
+            // so it is authorized against the allowed-account list the way
+            // SET.DICT already is. `target_account` above refused an account
+            // this client may not reach; there is nothing system-wide left to
+            // gate, and requiring ADMIN here made anything that could shape an
+            // account able to read every other one.
             if target_account.is_none() {
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
@@ -2253,9 +2369,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         // everything else, and excluding that value keeps what the index is
         // good at without paying for the entry that saves nothing.
         "SET.INDEX.EXCLUDE" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
-            }
+            // Account-scoped: Excluding a value is a storage decision about one account's index,
+            // so it is authorized against the allowed-account list the way
+            // SET.DICT already is. `target_account` above refused an account
+            // this client may not reach; there is nothing system-wide left to
+            // gate, and requiring ADMIN here made anything that could shape an
+            // account able to read every other one.
             if target_account.is_none() {
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
@@ -2293,9 +2412,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "REBUILD.INDEX" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
-            }
+            // Account-scoped: Rebuilding an index touches one account's file,
+            // so it is authorized against the allowed-account list the way
+            // SET.DICT already is. `target_account` above refused an account
+            // this client may not reach; there is nothing system-wide left to
+            // gate, and requiring ADMIN here made anything that could shape an
+            // account able to read every other one.
             if target_account.is_none() {
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
@@ -2309,9 +2431,12 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "DELETE.INDEX" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
-            }
+            // Account-scoped: Dropping an index touches one account's file,
+            // so it is authorized against the allowed-account list the way
+            // SET.DICT already is. `target_account` above refused an account
+            // this client may not reach; there is nothing system-wide left to
+            // gate, and requiring ADMIN here made anything that could shape an
+            // account able to read every other one.
             if target_account.is_none() {
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
@@ -2346,8 +2471,8 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "AUTHORIZE.CONN" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            if !client_info.can(Capability::ClientsManage) {
+                return error(ErrorCode::AdminRequired, capability_required(Capability::ClientsManage));
             }
             let thumbprint = match req.thumbprint {
                 Some(t) => t,
@@ -2361,9 +2486,28 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     return error(ErrorCode::MissingField, "Name not specified");
                 }
             };
+            let capabilities = match requested_capabilities(req.capabilities.as_deref()) {
+                Ok(capabilities) => capabilities,
+                Err(response) => return response,
+            };
             let accounts = req.accounts_list.unwrap_or_default();
             let is_admin = req.is_admin.unwrap_or(false);
-            match db.add_authorized_client(&name, &thumbprint, accounts, is_admin) {
+            if !is_admin && accounts.is_empty() && capabilities.is_empty() {
+                return error(
+                    ErrorCode::InvalidRequest,
+                    "A client needs ADMIN, at least one account, or at least one capability",
+                );
+            }
+            // No `expires_at`: AUTHORIZE.CONN names a thumbprint and never sees
+            // the certificate behind it, so this database does not know when it
+            // stops being valid and says so rather than guessing.
+            let grant = ClientGrant {
+                allowed_accounts: accounts,
+                is_admin,
+                capabilities,
+                expires_at: None,
+            };
+            match db.add_authorized_client(&name, &thumbprint, grant) {
                 Ok(_) => Response {
                     status: "OK".to_string(),
                     ..Default::default()
@@ -2372,8 +2516,8 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "DEAUTHORIZE.CONN" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            if !client_info.can(Capability::ClientsManage) {
+                return error(ErrorCode::AdminRequired, capability_required(Capability::ClientsManage));
             }
             let name = match req.name {
                 Some(n) => n,
@@ -2391,8 +2535,8 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "ADD.CLIENT.ACCOUNT" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            if !client_info.can(Capability::ClientsManage) {
+                return error(ErrorCode::AdminRequired, capability_required(Capability::ClientsManage));
             }
             let name = match req.name {
                 Some(n) => n,
@@ -2412,8 +2556,8 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "REMOVE.CLIENT.ACCOUNT" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            if !client_info.can(Capability::ClientsManage) {
+                return error(ErrorCode::AdminRequired, capability_required(Capability::ClientsManage));
             }
             let name = match req.name {
                 Some(n) => n,
@@ -2433,8 +2577,8 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "LIST.CONNS" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            if !client_info.can(Capability::ServerObserve) {
+                return error(ErrorCode::AdminRequired, capability_required(Capability::ServerObserve));
             }
             // Re-read first: another process (a CLI beside this server) may have
             // authorized or revoked a client since the last request.
@@ -2449,6 +2593,22 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                             "thumbprint": info.thumbprint,
                             "accounts": info.allowed_accounts,
                             "is_admin": info.is_admin,
+                            // Expanded, so an ADMIN entry lists what it can do
+                            // rather than requiring the flag to be read beside
+                            // it. This is what makes the listing an inventory of
+                            // what each credential is *for*.
+                            "capabilities": info
+                                .effective_capabilities()
+                                .iter()
+                                .map(|c| c.as_str())
+                                .collect::<Vec<_>>(),
+                            // Null when this database did not issue the
+                            // certificate and so does not know. The remaining
+                            // days come with the date because that is the form
+                            // the decision to reissue is actually made in, and
+                            // computing it per reader is a date library each.
+                            "expires_at": info.expires_at,
+                            "expires_in_days": info.expires_in_days(),
                         }),
                     )
                 })
@@ -2466,7 +2626,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             let stats: Vec<crate::db::AccountStats> = db
                 .account_statistics()
                 .into_iter()
-                .filter(|account| client_info.is_admin || client_info.allowed_accounts.contains(&account.name))
+                .filter(|account| client_info.may_reach(&account.name))
                 .collect();
             let results = stats
                 .into_iter()
@@ -2640,8 +2800,8 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "SERVER.STATS" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            if !client_info.can(Capability::ServerObserve) {
+                return error(ErrorCode::AdminRequired, capability_required(Capability::ServerObserve));
             }
             let mut snapshot =
                 serde_json::to_value(crate::server::stats::snapshot()).unwrap_or(serde_json::Value::Null);
@@ -2676,8 +2836,8 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             }
         }
         "GENERATE.CERT" => {
-            if !client_info.is_admin {
-                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            if !client_info.can(Capability::ClientsManage) {
+                return error(ErrorCode::AdminRequired, capability_required(Capability::ClientsManage));
             }
             let common_name = match req.name {
                 Some(n) => n,
@@ -2694,25 +2854,43 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     );
                 }
             };
+            // Checked before a key is generated: a refusal that arrives after
+            // openssl has written one leaves a private key on disk for a client
+            // that was never authorized.
+            let capabilities = match requested_capabilities(req.capabilities.as_deref()) {
+                Ok(capabilities) => capabilities,
+                Err(response) => return response,
+            };
+            let days = match requested_cert_days(req.days, &config) {
+                Ok(days) => days,
+                Err(response) => return response,
+            };
             // A generated certificate is useless until it is authorized, and a
             // caller that has to send a second command can leave orphaned keys
             // behind. Both happen here, or neither does.
-            match crate::server::certs::generate_client_cert(&config, &common_name, CLIENT_CERT_DAYS, true) {
+            match crate::server::certs::generate_client_cert(&config, &common_name, days, true) {
                 Ok(generated) => {
                     let accounts = req.accounts_list.unwrap_or_default();
                     let is_admin = req.is_admin.unwrap_or(false);
-                    if !is_admin && accounts.is_empty() {
+                    if !is_admin && accounts.is_empty() && capabilities.is_empty() {
                         return error(
                             ErrorCode::InvalidRequest,
-                            "A non-admin certificate needs at least one allowed account",
+                            "A non-admin certificate needs at least one allowed account or capability",
                         );
                     }
-                    if let Err(e) = db.add_authorized_client(&common_name, &generated.thumbprint, accounts, is_admin) {
+                    let grant = ClientGrant {
+                        allowed_accounts: accounts,
+                        is_admin,
+                        capabilities,
+                        // Known here, because this is the path that issued it.
+                        expires_at: generated.expires_at.clone(),
+                    };
+                    if let Err(e) = db.add_authorized_client(&common_name, &generated.thumbprint, grant) {
                         return db_error_in("Certificate generated but authorization failed", e);
                     }
                     Response {
                         status: "OK".to_string(),
-                        record: Some(serde_json::to_value(&generated).unwrap_or(serde_json::Value::Null)),
+                        record: Some(generated.record()),
                         ..Default::default()
                     }
                 }

@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import ssl
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
@@ -49,6 +50,18 @@ def client_entry(dashboard, name):
         if entry_name == name:
             return info
     return None
+
+
+def openssl_reads_pkcs12(path, passin):
+    """Whether openssl can open the bundle with this -passin argument."""
+    return (
+        subprocess.run(
+            ["openssl", "pkcs12", "-in", path, "-nokeys", "-passin", passin],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
 
 
 def protocol_call(port, certificate, private_key, ca, request):
@@ -656,6 +669,31 @@ def main():
                 "/api/certificates", method="POST", payload={"common_name": "no-accounts"}
             )
             suite.check_eq("A certificate with no accounts and no admin rights is refused", status, 400)
+
+            # The bundle is only a credential if its passphrase came back with
+            # it, and only protected if an empty password is refused. Checked
+            # against the real `.pfx` the server wrote, not against the response.
+            passphrase = issued.get("pfx_passphrase") or ""
+            suite.check(
+                "The issued bundle carries a passphrase",
+                len(passphrase) >= 32 and issued.get("pfx_path"),
+                f"pfx_passphrase={passphrase!r} pfx_path={issued.get('pfx_path')!r}",
+            )
+            pfx = issued.get("pfx_path") or ""
+            if pfx and os.path.exists(pfx):
+                suite.check(
+                    "and it opens the bundle",
+                    openssl_reads_pkcs12(pfx, f"pass:{passphrase}"),
+                )
+                suite.check(
+                    "while an empty password does not",
+                    not openssl_reads_pkcs12(pfx, "pass:"),
+                )
+                with open(pfx, "rb") as handle:
+                    suite.check(
+                        "and the passphrase is nowhere in the bundle itself",
+                        passphrase.encode() not in handle.read(),
+                    )
 
             issued_crt = os.path.join(workspace.path, "dash-issued.crt")
             issued_key = os.path.join(workspace.path, "dash-issued.key")

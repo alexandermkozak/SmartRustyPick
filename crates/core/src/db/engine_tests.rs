@@ -107,7 +107,15 @@ fn test_authorized_clients_refresh_across_processes() {
 
     let tp = "aabbccdd";
     writer
-        .add_authorized_client("CLIENT1", tp, vec!["SYSTEM".to_string()], false)
+        .add_authorized_client(
+            "CLIENT1",
+            tp,
+            ClientGrant {
+                allowed_accounts: vec!["SYSTEM".to_string()],
+                is_admin: false,
+                ..Default::default()
+            },
+        )
         .unwrap();
 
     reader.refresh_clients_if_stale().unwrap();

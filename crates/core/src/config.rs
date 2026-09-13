@@ -2,13 +2,24 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct Config {
     pub editor: Option<String>,
     pub server_port: Option<u16>,
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
+    /// The CA that signs new client certificates, and the first of the CAs the
+    /// listener trusts.
     pub ca_path: Option<String>,
+    /// Further CAs the listener trusts but does not issue from.
+    ///
+    /// This is what makes a CA rotation something other than a flag day. Every
+    /// client certificate is signed by one CA, so replacing it invalidates all
+    /// of them at once - unless the retiring CA stays trusted while clients are
+    /// reissued one at a time. Put the outgoing CA here, move `ca_path` to the
+    /// new one, and remove this entry when nothing is signed by the old one any
+    /// more. See `docs/security.md`.
+    pub additional_ca_paths: Option<Vec<String>>,
     pub server_addr: Option<String>,
     pub log_detail: Option<String>,
     pub max_log_records: Option<usize>,
@@ -76,6 +87,35 @@ pub struct Config {
     /// Maximum number of connections the server holds open at once. Additional
     /// connections are rejected until one of the existing ones closes.
     pub max_connections: Option<usize>,
+    /// Longest client certificate lifetime, in days, this deployment will issue.
+    ///
+    /// A request above it is **refused**, not clamped: a caller that believes it
+    /// holds a 30-day certificate and actually holds a 365-day one is worse off
+    /// than one that got an error. Defaults to 365, which is what every
+    /// certificate lasted before the lifetime could be asked for at all, so the
+    /// default changes nothing.
+    pub max_client_cert_days: Option<u32>,
+}
+
+/// Written out rather than derived, so that `web_token` is redacted.
+///
+/// Nothing prints a `Config` today. The point is that the next thing to do it -
+/// a startup trace, a `{:?}` in an error path - cannot put the dashboard
+/// credential into `$LOGS` or a terminal by accident. Every other field here is
+/// a path, a port or a limit, and is more useful visible than hidden.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("editor", &self.editor)
+            .field("server_port", &self.server_port)
+            .field("cert_path", &self.cert_path)
+            .field("key_path", &self.key_path)
+            .field("ca_path", &self.ca_path)
+            .field("server_addr", &self.server_addr)
+            .field("log_detail", &self.log_detail)
+            .field("web_token", &self.web_token.as_ref().map(|_| "[redacted]"))
+            .finish_non_exhaustive()
+    }
 }
 
 /// A single misbehaving (or compromised) authorised client should not be able to
@@ -96,6 +136,11 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_TRANSFER_STALL_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 0; // disabled
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
+/// The lifetime a client certificate gets when nobody asks for one, and the
+/// ceiling when the deployment sets none. Both are 365 because that is what
+/// every certificate lasted before either could be chosen.
+pub const DEFAULT_CLIENT_CERT_DAYS: u32 = 365;
 
 /// Files kept in memory at once. Generous, because eviction is what forces two
 /// connections working on different files to interfere with each other, and a
@@ -156,6 +201,33 @@ impl Config {
     pub fn max_connections(&self) -> usize {
         self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS)
     }
+
+    /// Every CA the listener trusts: the issuing one first, then any the
+    /// deployment has added for a rotation. Order matters only in that
+    /// `ca_path` is the one new certificates are signed by.
+    ///
+    /// Paths are returned even if the file is missing; the caller reports that
+    /// far better than this can, and a silently dropped CA is a client that
+    /// stops connecting for no stated reason.
+    pub fn trusted_ca_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self.ca_path.iter().cloned().collect();
+        for extra in self.additional_ca_paths.iter().flatten() {
+            let extra = extra.trim();
+            if !extra.is_empty() && !paths.iter().any(|held| held == extra) {
+                paths.push(extra.to_string());
+            }
+        }
+        paths
+    }
+
+    /// The longest client certificate this deployment will issue. Never zero:
+    /// a ceiling of zero would mean no certificate could be issued at all,
+    /// which is a configuration mistake rather than a policy.
+    pub fn max_client_cert_days(&self) -> u32 {
+        self.max_client_cert_days
+            .filter(|days| *days > 0)
+            .unwrap_or(DEFAULT_CLIENT_CERT_DAYS)
+    }
 }
 
 /// The settings a fresh installation runs with.
@@ -175,6 +247,8 @@ impl Default for Config {
             ca_path: None,
             server_addr: Some("127.0.0.1".to_string()),
             log_detail: Some("normal".to_string()),
+            additional_ca_paths: None,
+            max_client_cert_days: None,
             max_log_records: Some(100),
             records_per_group: None,
             max_directory_record_bytes: None,
@@ -285,5 +359,32 @@ mod tests {
 
         config.idle_timeout_ms = Some(500);
         assert_eq!(config.idle_timeout(), Some(std::time::Duration::from_millis(500)));
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::Config;
+
+    #[test]
+    fn test_a_printed_config_does_not_carry_the_dashboard_token() {
+        let config = Config {
+            web_token: Some("s3cret-token-value".to_string()),
+            cert_path: Some(".local/certs/server.crt".to_string()),
+            ..Config::default()
+        };
+        let printed = format!("{:?}", config);
+
+        assert!(!printed.contains("s3cret-token-value"), "{printed}");
+        assert!(printed.contains("[redacted]"), "{printed}");
+        // The rest stays visible: a redacted config nobody can read is a config
+        // nobody will print, and then the redaction has protected nothing.
+        assert!(printed.contains(".local/certs/server.crt"), "{printed}");
+    }
+
+    #[test]
+    fn test_an_absent_token_reads_as_absent_rather_than_as_redacted() {
+        let printed = format!("{:?}", Config::default());
+        assert!(printed.contains("web_token: None"), "{printed}");
     }
 }

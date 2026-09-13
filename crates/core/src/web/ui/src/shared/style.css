@@ -608,6 +608,33 @@ td.actions {
   white-space: nowrap;
 }
 
+/* The PKCS#12 passphrase exists in this one render and nowhere else - the
+   server keeps no copy - so it is framed as something to act on rather than as
+   another row of detail. The warning colour, not the danger one: nothing has
+   gone wrong, but reading past it loses the bundle. */
+.passphrase {
+  margin: 0.8rem 0;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+}
+
+.passphrase p {
+  margin: 0 0 0.4rem;
+}
+
+.passphrase p:last-child {
+  margin: 0.4rem 0 0;
+}
+
+.passphrase code {
+  display: block;
+  font-family: var(--mono);
+  font-size: 1rem;
+  word-break: break-all;
+  user-select: all;
+}
+
 .issued h3,
 .card h3 {
   margin: 0 0 0.6rem;
@@ -621,6 +648,68 @@ td.actions {
 
 main section {
   display: block;
+}
+
+/* --- Capabilities -----------------------------------------------------------
+   A capability is granted by checkbox rather than typed, so the picker carries
+   the explanation each one needs: "clients:manage" does not say on its own that
+   it is the grant that can escalate into any other. */
+.capabilities {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.5rem 0.7rem;
+  margin: 0;
+}
+
+.capabilities legend {
+  padding: 0 0.3rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.capabilities .check {
+  align-items: flex-start;
+  margin: 0.3rem 0;
+}
+
+.capabilities .check span {
+  display: block;
+}
+
+.capabilities code {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-left: 0.3rem;
+}
+
+.capabilities small {
+  display: block;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.capabilities[disabled] {
+  opacity: 0.55;
+}
+
+/* An expiry is only worth showing if the urgent ones stand out; the colours are
+   the same three the health verdicts already use. */
+.expiry-expired {
+  color: var(--danger);
+}
+
+.expiry-soon {
+  color: var(--warn);
+}
+
+.expiry-unknown {
+  color: var(--muted);
+}
+
+.capability-cell {
+  font-family: var(--mono);
+  font-size: 0.8rem;
 }
 
 /* --- Health -----------------------------------------------------------------

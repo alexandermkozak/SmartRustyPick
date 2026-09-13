@@ -47,29 +47,23 @@ fn a_bind_address_is_classified_by_who_can_reach_it() {
 }
 
 #[test]
-fn tokens_have_to_match_exactly() {
-    assert!(tokens_match("abc123", "abc123"));
-    assert!(!tokens_match("abc123", "abc124"));
-    assert!(!tokens_match("abc123", "abc12"));
-    assert!(!tokens_match("abc123", ""));
-}
-
-#[test]
-fn generated_tokens_are_long_and_unique() {
-    let first = random_token().expect("a token can be generated");
-    let second = random_token().expect("a token can be generated");
+fn a_generated_token_is_long_enough_to_be_unguessable() {
+    // Matching and uniqueness belong to `Secret` and are tested with it. What is
+    // this module's decision is `TOKEN_BYTES`, which is the only thing standing
+    // between the dashboard and a guess.
+    let token = Secret::random_hex(TOKEN_BYTES).expect("a token can be generated");
     assert!(
-        first.len() >= 32,
+        token.expose().len() >= 32,
         "token is too short to be unguessable: {}",
-        first.len()
+        token.expose().len()
     );
-    assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
-    assert_ne!(first, second);
+    assert!(token.expose().chars().all(|c| c.is_ascii_hexdigit()));
 }
 
 #[test]
 fn the_token_is_accepted_from_a_cookie_a_bearer_header_or_the_url() {
-    let token = "s3cret";
+    let token = Secret::new("s3cret".to_string());
+    let token = &token;
     assert!(authenticated(
         &request("/", &[("Cookie", "srp_token=s3cret")], &[]),
         token

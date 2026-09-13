@@ -39,7 +39,8 @@ implies otherwise is worse than none:
   patterns are not hidden, and encryption at rest will not hide them.
 - **Side channels** — timing, cache, power.
 - **A misbehaving but authorized client.** A client holding an authorized certificate is trusted within its allowed
-  accounts. Authorization is the control there, not encryption.
+  accounts, and within the capabilities it holds. Authorization is the control there, not encryption — which is why
+  what a credential is authorized *for* is worth bounding, and why capabilities exist (below).
 - **Availability.** Connections are bounded (`max_connections`) and handshakes time out (`handshake_timeout_ms`), which
   keeps a flood from building unbounded backlog. That is resource hygiene, not a denial-of-service defence.
 
@@ -47,11 +48,12 @@ implies otherwise is worse than none:
 
 | Surface | What protects it | What does not |
 | --- | --- | --- |
-| Protocol listener | TLS with **mutual** authentication: the client certificate is verified against `ca_path`, then its SHA-256 thumbprint must appear in `$CLIENTS`. An unknown thumbprint is logged and the connection is dropped with no response. | The TLS floor is rustls' default, so **TLS 1.2 is still accepted**; version and cipher suites are not pinned by this project. |
+| Protocol listener | **TLS 1.3 only**, pinned by this project on both the listener and the dashboard's client rather than inherited from rustls, with **mutual** authentication: the client certificate is verified against `ca_path`, then its SHA-256 thumbprint must appear in `$CLIENTS`. An unknown thumbprint is logged and the connection is dropped with no response. | Cipher suites are rustls' TLS 1.3 set, deliberately not overridden. Traffic analysis is unaffected — see the scope above. |
 | Records, dictionaries, saved lists, `$LOGS` | Nothing. | Written as **plaintext** frames (`[key_len][key][data_len][data]`, see [Storage Engine](storage.md)). The CRC32C trailer is integrity against a torn write, not authentication: it is keyless, so anyone who can edit a group file can recompute it. |
 | Web dashboard | Bound to `127.0.0.1:8080` by default. Its token is compared in constant time and stored in an `HttpOnly; SameSite=Strict` cookie. It is an ordinary protocol client with a certificate reissued every boot and valid for a day. | **Plain HTTP.** The cookie has no `Secure` attribute, the startup URL carries the token in a query string, and `POST /api/certificates` returns a freshly generated **private key** in the response body. Defensible on loopback; not once `web_addr` points anywhere else. |
-| CA, server and client keys | Nothing beyond the filesystem. | Unencrypted PEM (`openssl req -nodes`, `openssl genrsa`). PKCS#12 bundles are exported with an **empty password**. No explicit mode is set on any of them anywhere in the workspace, so the umask decides who can read them. |
-| Certificate lifetime | Client certificates last 365 days, the CA 3650. Deauthorization by name takes effect on the client's next request. | There is **no revocation path** — no CRL, no OCSP, no CA rotation. Removing a thumbprint from `$CLIENTS` is the only revocation, and it works only for this database. |
+| CA, server and client keys | Filesystem permissions: `.local/certs/` is `0700` and every key, certificate and PKCS#12 bundle in it is `0600`, on Unix. The mode is set *before* `openssl` writes the key, so there is no instant at which a private key is readable by anyone else. PKCS#12 bundles carry a per-issuance passphrase, delivered once to the caller and stored nowhere. | The PEM key files themselves are **unencrypted** (`openssl req -nodes`, `openssl genrsa`), so on the host the mode is all that protects them. The passphrase protects the bundle only once it leaves — anyone who can read `.local/certs/` has the `.key` beside it. |
+| Certificate lifetime and revocation | A client certificate's lifetime is chosen at issuance (`GENERATE.CERT … DAYS n`), defaulting to 365 and capped by `max_client_cert_days`; a request above the cap is refused, not shortened. Every issued certificate's expiry is reported by `GENERATE.CERT` and `LIST.CONNS`. Revocation is the `$CLIENTS` thumbprint allowlist, checked on every connection (decision 5). The CA can be rotated with an overlap via `additional_ca_paths`. | **No CRL and no OCSP**, deliberately — so a deauthorized certificate is still a validly signed one, and anything trusting this CA without consulting `$CLIENTS` would accept it. Revocation also needs somebody to notice the leak; a short lifetime is what does not. The CA still lasts 3650 days and the server certificate 365, neither choosable. |
+| Files on disk | Every file this project writes — group files, `meta`, dictionaries, index state, queue books, the transaction intent log, directory-file records, archives and their staging siblings — is created `0600` on Unix, and a file written by an earlier build is tightened the next time it is rewritten. | **Directories** under `db_storage/` are left at the umask, so account and file names remain listable by anyone who can read the volume — which changes nothing, since those names are directory names either way (see below). **Windows sets no mode at all**: `PermissionsExt` is Unix-only, so there the files land at whatever the default ACL grants. |
 | `config.toml` | — | It is **committed to the repository** and has a `web_token` field. Treat it as a non-secret file; a token set there is a token in git history. |
 
 `$LOGS` is capped at `max_log_records` (default 100) and holds the message plus, in `detailed` mode, a UTC timestamp.
@@ -65,11 +67,11 @@ Extending the diagram in [Web Dashboard](web_dashboard.md), with what is protect
 ```
                         ┌─ trusted host ──────────────────────────────────────────────┐
                         │                                                             │
-  browser ──HTTP──────▶ │ dashboard ──TLS 1.3/1.2, mutual auth──▶ protocol server     │
+  browser ──HTTP──────▶ │ dashboard ──TLS 1.3, mutual auth──────▶ protocol server     │
    (plaintext,          │  (ordinary client,                        │                 │
     loopback only)      │   1-day certificate)                      ▼                 │
                         │                                         engine              │
-  remote client ────────┼──TLS 1.3/1.2, mutual auth───────────────▶ │                 │
+  remote client ────────┼──TLS 1.3, mutual auth───────────────────▶ │                 │
    (thumbprint          │                                           ▼                 │
     authorized)         │                       db_storage/  ──── PLAINTEXT today     │
                         │                       .local/certs/ ──── PLAINTEXT keys     │
@@ -135,6 +137,102 @@ audit trail readable in a stolen directory would undo much of what encrypting th
 This is the case that forces the ordering: the engine cannot list an account's files without reading `DIR`, so an
 encrypted database is unreadable until it is unlocked — consistent with decision 1's refusal to start without a key.
 
+### 4. Authorization is two questions, not one
+
+`ADMIN` used to be one flag doing two jobs: it bypassed the account allowlist on the data plane **and** it gated every
+administrative command. The consequence was that anything which had to create an account or a file was thereby
+authorized to read and overwrite every record in the database. A deployment script, a CI job, a service that onboards
+accounts — each needed a credential that was also a master key.
+
+The two jobs are now separate, and neither implies the other:
+
+- **Which accounts may this connection touch?** The allowed-account list. Everything that names a target account is
+  checked against it, including `CREATE.FILE`, `SET.FILE`, `DELETE.FILE` and the index commands — a file, a dictionary
+  and an index live inside one account and affect nothing outside it, so they are authorized the way the records in
+  them already were. A client that may rewrite every record in a file was never restrained by being unable to index it.
+- **What may this connection do that is not about one account?** A capability: `accounts:manage`, `clients:manage` or
+  `server:observe`. The table of which commands each covers is in [the protocol reference](protocol.md#authorization).
+
+**Creating an account does not grant access to it.** That is the property that makes a provisioning credential worth
+having: it can create the account and cannot read a record in it, and it cannot grant itself the access either, because
+granting is `clients:manage` — deliberately a different capability, since a client that may authorize clients may
+authorize an admin.
+
+`ADMIN` still means every capability and every account, so an authorization written before capabilities existed behaves
+exactly as it did and nothing has to be migrated. `EXPORT.*` and `IMPORT*` stay on `ADMIN` rather than moving behind a
+capability: an export reads every record of whatever it names, so a capability granting it would grant reading every
+account — the conflation this decision exists to undo.
+
+A secondary benefit worth stating, because it is what an operator actually sees: `LIST.CONNS` can now distinguish a
+credential that exists to run backups from one that exists to provision accounts. Both used to read `ADMIN`.
+
+### 5. The thumbprint allowlist *is* the revocation mechanism
+
+Stated rather than implied, because the absence of a CRL reads as an oversight until it is written down as a choice.
+
+**There is no CRL and no OCSP, deliberately.** `WebPkiClientVerifier` is built with no revocation source. What takes
+their place is `$CLIENTS`: after the certificate chain verifies, the certificate's SHA-256 thumbprint must appear in
+that table, and `DEAUTHORIZE.CONN` removes it. The check happens **on every connection**, against a table re-read when
+it changes on disk — so a revocation takes effect on the revoked client's next connection, with no distribution delay,
+no freshness window and no second service to keep running. For a single-server database that is a better answer than a
+CRL, not a poorer one.
+
+Its limit is precise and worth stating: **a deauthorized certificate is still a validly signed certificate.** Anything
+that trusts this CA without consulting `$CLIENTS` will accept it. Nothing else does today — this CA exists to sign
+clients for this database — but it is the reason the CA's own key matters as much as it does, and the reason `ca.key`
+should not be copied anywhere it does not have to be.
+
+Two consequences follow, and both are now handled rather than merely noted:
+
+- **Revocation needs somebody to notice.** `DEAUTHORIZE.CONN` only helps if a leak is spotted. A short certificate
+  lifetime is the withdrawal that happens whether or not anyone notices, which is why `GENERATE.CERT` takes a lifetime
+  and `max_client_cert_days` bounds it. Issue a credential the life its job needs, not a year.
+- **A CA cannot be replaced in one step.** Every client certificate is signed by one CA. `additional_ca_paths` keeps
+  the outgoing CA trusted while clients are reissued, so the rotation is a transition rather than a flag day; the
+  procedure is in [Deployment](deployment.md#rotating-the-ca). CAs listed there are trusted for incoming clients but
+  never used to sign, so the question "which CA issued this" always has one answer.
+
+Not yet answered: **key rotation**, because there are no keys yet. Rewrapping a DEK under a new passphrase and
+re-encrypting under a new DEK both belong with the encryption work (#56, #57) and are tracked in #60 alongside this.
+
+### 6. What may never be logged
+
+The rule, so that the encryption work has something to check itself against — a key that leaks into a log line defeats
+all of it:
+
+> **Key material, passphrases and tokens never reach `$LOGS`, stdout, stderr, a protocol response, or an HTTP response
+> body.**
+
+There are exactly two deliberate exceptions, and both exist to *deliver* the thing they carry:
+
+1. **Certificate issuance.** `GENERATE.CERT` returns `private_key_pem` and `pfx_passphrase` to the caller that asked
+   for the certificate. That is the entire purpose of the command; there is no other way to get a key to a client.
+2. **The dashboard startup URL**, which prints the session token because it is how the operator reaches the dashboard
+   at all. Its lifecycle — a URL valid for the life of the process — is a known gap, tracked in #54.
+
+How the rule is held rather than remembered:
+
+- A `Secret` is the only type a passphrase, key or token is held in. It has no `Display`, no `Serialize` and no
+  `Clone`; its `Debug` prints `[redacted]` and it zeroizes on drop. `expose()` is the single way out, so every
+  legitimate disclosure is visible in review as the exception it is.
+- `GeneratedCert` deliberately derives neither `Debug` nor `Serialize`. It is the one struct holding a private key and
+  a passphrase at once, so a derive would carry both into any response or log line that ever touched it; `record()`
+  names each field it emits instead.
+- `Config` has a hand-written `Debug` that redacts `web_token`. Nothing prints a `Config` today — the point is that the
+  next thing to do it cannot leak the dashboard credential by accident.
+- A PKCS#12 passphrase reaches `openssl` through the child's environment, never `-passout pass:<value>`, which `ps`
+  shows to every user on the host.
+- The integration suite issues a certificate and then searches every byte the database wrote for its key and
+  passphrase. `$LOGS` and `$SAVEDLISTS` are inside that search, so the assertion does not depend on how either is
+  queried.
+
+**Certificate thumbprints are logged in full, on purpose.** A thumbprint is a public fingerprint — holding one grants
+nothing without the private key beside it — it is already stored in full in `$CLIENTS` for every authorized client, and
+the rejected-connection log line is how an operator discovers what to authorize next. Truncating it would cost a real
+workflow to hide an identifier that is not a secret. Peer addresses and denied-account names are logged for the same
+reason: they are the access-control record, and `$LOGS` is in scope for encryption at rest (decision 3) rather than
+being thinned out.
+
 ## What the operator is responsible for
 
 - **Key custody.** The KEK is yours to store, deliver and rotate. It must not live in the backup it protects, and a
@@ -144,22 +242,30 @@ encrypted database is unreadable until it is unlocked — consistent with decisi
 - **The dashboard's exposure.** It is loopback and plain HTTP by design. Put it behind a TLS-terminating reverse proxy
   before binding it anywhere else, and expect the token cookie to need `Secure` once you do. The startup URL contains
   the token: treat it like a password, not like a bookmark.
-- **File modes.** Until the code sets them, `.local/certs/` and its keys land at whatever the umask allows. `0700` on
-  the directory and `0600` on the keys is the expectation.
+- **File modes on Windows.** On Unix the code sets them: `0700` on `.local/certs/`, `0600` on every key and on every
+  file under `db_storage/`. On Windows nothing is set, and the inherited ACL is yours to get right. One deliberate
+  exception on both: `EXTRACT` writes to a path you named, outside the database, so it follows your umask like any
+  other export rather than landing unreadable to everyone but the service user.
 - **`config.toml`.** It is committed. Keep secrets out of it and source them from the environment or a gitignored
   override.
-- **Certificate hygiene.** There is no revocation but the thumbprint list. Issue narrowly, keep `LIST.CONNS` short, and
-  deauthorize what you no longer recognise.
+- **Certificate hygiene.** Revocation is the thumbprint list (decision 5), and it only helps if you notice. "Narrowly"
+  is expressible in two dimensions now: grant the capability a credential needs instead of `ADMIN`, and give it the
+  lifetime its job needs instead of a year — a certificate issued to a container, a CI job or a scheduled task has no
+  reason to outlive it. **A short lifetime is the withdrawal that happens whether or not anyone notices a leak.** The
+  trade is real and worth taking knowingly: it swaps one failure mode (a leaked credential valid for a year) for
+  another (a caller that stops reissuing and expires), which is why the expiry is reported everywhere a credential is
+  — `GENERATE.CERT`, `LIST.CONNS`, the CLI listing and the dashboard, flagged when it is close. Reissuing before then
+  is the caller's job; the server does not do it for you. Check `LIST.CONNS` for entries still holding `ADMIN` or a
+  year that do not need either.
 
 ## Still open
 
 Recorded here so they are not mistaken for settled:
 
-- Pinning a TLS 1.3 floor and an explicit cipher suite list, rather than inheriting rustls' defaults.
+- Whether Windows gets real ACL tightening, or stays documented as an operator responsibility.
 - Whether the dashboard gets native TLS, refuses a non-loopback bind without it, or keeps key-bearing endpoints
   loopback-only regardless of bind address.
-- CA rotation and a real revocation path.
-- How a PKCS#12 passphrase is chosen and delivered, given the bundle exists precisely to be moved between machines.
+- Whether the PEM key files themselves should be encrypted at rest, now that the bundle made from them is.
 - Encryption granularity (per group file or per record) and nonce management, which are storage-engine questions rather
   than threat-model ones.
 

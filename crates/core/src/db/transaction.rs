@@ -48,7 +48,8 @@
 
 use crate::db::hashfile::{crc32c, sync_dir};
 use crate::db::models::Record;
-use std::fs::{self, File};
+use crate::private_files;
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -296,7 +297,7 @@ pub fn write_intent(storage_dir: &str, account: &str, changes: &[Change]) -> io:
     let path = dir.join(intent_name());
     let tmp = path.with_extension("tmp");
     {
-        let mut file = File::create(&tmp)?;
+        let mut file = private_files::create(&tmp)?;
         file.write_all(&encode(account, changes))?;
         file.flush()?;
         file.sync_all()?;

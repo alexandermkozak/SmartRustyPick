@@ -61,7 +61,7 @@ by default), so they follow `ca_path` rather than littering the working director
 | Tab            | Contents                                                                                                                         |
 |----------------|----------------------------------------------------------------------------------------------------------------------------------|
 | Overview       | Uptime, listener, connection and request totals, pending writes, tables in memory, every connection open right now, and a storage roll-up naming the accounts that need attention. |
-| Authorizations | Every authorized client: name, thumbprint, allowed accounts, admin flag. Authorize a thumbprint, add or remove accounts, revoke. |
+| Authorizations | Every authorized client: name, thumbprint, allowed accounts, capabilities, admin flag. Authorize a thumbprint with accounts and/or capabilities, add or remove accounts, revoke. |
 | Certificates   | Issue a certificate signed by the server's CA, authorized in the same step, with its key downloadable once.                      |
 | Accounts       | Every account with its file count, record count and size on disk; drill into an account's files and one file's statistics. Accounts and files can be created and dropped, durable, queue, autokey and directory files are tagged in the listing, durability and the queue and autokey flags can be turned on or off, a queue's depth and in-flight count and an autokey file's next key are reported, and the selected file's dictionary and indexes are listed and managed below. |
 | Backup         | Download an archive of one file, one account or the whole database, and restore one by uploading it — with a verify pass that reports what a restore would do and writes nothing. See [Backup and restore](#backup-and-restore). |
@@ -157,8 +157,8 @@ writing to the file is allowed to leave out.
 `ENQUEUE` is what appends to one — so the database refuses a file claiming both, and a button that always failed would
 be worse than no button.
 
-Both go out as the ordinary `SET.FILE` command, so they are refused unless the dashboard's own certificate is an admin
-one, and only the attribute the button names is sent — the database leaves an omitted one alone, so making a file a
+Both go out as the ordinary `SET.FILE` command, so they are refused unless the dashboard's own certificate may reach
+the account the file is in, and only the attribute the button names is sent — the database leaves an omitted one alone, so making a file a
 queue cannot quietly change its durability back. The page re-reads the file from the database rather than assuming the
 click took effect: a server running with `durable_writes = true` reports every file as durable whatever the button
 asked for. See [Storage Engine](storage.md).
@@ -181,8 +181,10 @@ Ticking **Queue** reveals two more fields — how long a claim is held and
 how many deliveries a record gets — which travel with the create rather than following it, so a queue is never briefly
 running on a timeout nobody asked for; left blank, the database's own defaults apply. Ticking **Directory** reveals an
 optional host path and clears the others, because a directory file is none of them: its records are host files, on disk
-the moment a write returns, with no order to claim from and a name of their own for a key. All four are admin commands, so a dashboard
-whose certificate is not an admin one is refused by the database and says so.
+the moment a write returns, with no order to claim from and a name of their own for a key. Creating and dropping a
+**file** is authorized against the account it is in; creating and dropping an **account** needs the `accounts:manage`
+capability (see [Authorization](protocol.md#authorization)). A dashboard whose certificate holds neither is refused by
+the database and says so.
 
 Both drops confirm first, naming what goes with them — an account drop names the number of files it takes. Two things
 are deliberately not offered:
@@ -278,15 +280,16 @@ every navigation and stays cheap, while the histogram sorts the index's values. 
 the histogram is re-read afterwards as well as the list — the thing the operator was looking at when they pressed the
 button is the thing that has just changed.
 
-The three that change something are admin commands, so a dashboard whose certificate is not an admin one is refused by
-the database and says so. Nothing here decides whether a field *can* be indexed — `CREATE.INDEX` does, and a refusal
+The three that change something are authorized against the account the file is in, so a dashboard whose certificate
+cannot reach that account is refused by the database and says so. Nothing here decides whether a field *can* be indexed — `CREATE.INDEX` does, and a refusal
 appears in the banner in the database's own words. Every change re-reads both the index list and the file's statistics,
 so the counts on screen are the ones that now hold rather than the ones the click was expected to produce.
 
 ## Security
 
 The dashboard can authorize clients, hand out private keys, and drop an account and everything in it, so treat reaching
-it as equivalent to holding an admin certificate.
+it as equivalent to holding an admin certificate. Its own certificate **is** an admin one: it manages accounts, files,
+indexes and clients, and lists every account to do it, so it needs both halves of what `ADMIN` carries.
 
 - It **binds to `127.0.0.1` by default**. Point `web_addr` elsewhere only behind a reverse proxy that terminates TLS;
   the dashboard itself serves plain HTTP and says so at startup when it is bound to a non-loopback address.
