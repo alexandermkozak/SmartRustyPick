@@ -304,6 +304,87 @@ def seed_database(admin_thumbprint, user_thumbprint):
     return output
 
 
+def check_ca_rotation(suite, certs, user_crt, user_key):
+    """A CA can be rotated with an overlap, instead of as a flag day (issue #60).
+
+    Every client certificate is signed by one CA, so replacing it invalidates
+    all of them at once - unless the retiring CA stays trusted while clients are
+    reissued one at a time. That overlap is the whole feature, so it is tested
+    against a real listener with two genuinely different CAs rather than against
+    the configuration that describes it.
+    """
+    incoming = certs.sibling_ca("ca-incoming")
+    new_crt, new_key, new_tp = incoming.client("reissued")
+
+    port = harness.free_port()
+    # `certs` still signs the server certificate and any new issuance; the
+    # incoming CA is trusted but does not issue. This is the shape of a
+    # transition window.
+    harness.write_config(port, certs, additional_cas=[incoming.ca_crt])
+    output = harness.run_cli(
+        [f"AUTHORIZE.CONN {new_tp} reissued-client ADMIN", "SAVE", "EXIT"],
+        args=["--account", "SYSTEM"],
+    )
+    if "Error" in output:
+        suite.check("The reissued client can be authorized", False, output)
+        return
+
+    server = harness.start_server()
+    try:
+        harness.wait_for_port(port, process=server)
+
+        # The client signed by the CA that was there all along.
+        resp = as_client(port, user_crt, user_key, certs.ca_crt, {"command": "LIST.FILES", "account": ACCOUNT})
+        suite.check_eq(
+            "A client signed by the original CA connects during the overlap",
+            resp.get("status"),
+            "OK",
+        )
+
+        # And one signed by a CA that did not exist when the server certificate
+        # was made. It presents the trusted bundle as its root, because during a
+        # rotation the server may be signed by either.
+        bundle = os.path.join(os.path.dirname(incoming.ca_crt), "trusted-bundle.crt")
+        with open(bundle, "w") as handle:
+            for path in (certs.ca_crt, incoming.ca_crt):
+                with open(path) as source:
+                    handle.write(source.read())
+        resp = as_client(port, new_crt, new_key, bundle, {"command": "LIST.ACCOUNTS"})
+        suite.check_eq(
+            "and one signed by the incoming CA connects too",
+            resp.get("status"),
+            "OK",
+        )
+    finally:
+        harness.stop(server)
+
+    # Rotation complete: the outgoing CA is dropped. The certificate signed by
+    # it stops being accepted, which is the other half of the claim - an overlap
+    # that never ends is not a rotation.
+    harness.write_config(port, incoming, additional_cas=None)
+    # The server certificate is still signed by the original CA, so the listener
+    # re-signs it against the one now configured rather than presenting one no
+    # current client can verify.
+    server = harness.start_server()
+    try:
+        harness.wait_for_port(port, process=server)
+        refused = False
+        try:
+            as_client(port, user_crt, user_key, certs.ca_crt, {"command": "LIST.ACCOUNTS"})
+        except Exception:  # noqa: BLE001 - any handshake failure is the point
+            refused = True
+        suite.check("Once the old CA is retired, its client is refused", refused)
+
+        resp = as_client(port, new_crt, new_key, incoming.ca_crt, {"command": "LIST.ACCOUNTS"})
+        suite.check_eq(
+            "while the reissued client keeps working",
+            resp.get("status"),
+            "OK",
+        )
+    finally:
+        harness.stop(server)
+
+
 def check_connection_limits(suite, certs, user_crt, user_key):
     """Exercises the request-size, handshake, idle and connection-count limits
     (issue #13) against a dedicated server with tight settings, so the suite
@@ -485,6 +566,7 @@ def main():
                 check_certificate_lifetimes(suite, admin)
 
             check_tls_floor(suite, port, user_crt, user_key, certs.ca_crt)
+            check_ca_rotation(suite, certs, user_crt, user_key)
             check_connection_limits(suite, certs, user_crt, user_key)
         except Exception as exc:  # noqa: BLE001 - report instead of aborting the whole run
             suite.error("Security suite", exc)

@@ -17,6 +17,12 @@ editor = "nano"
 # flush_interval_ms = 250
 # flush_max_pending = 256
 
+# Further CAs the listener trusts but does not issue from. Every client
+# certificate is signed by one CA, so replacing it invalidates all of them at
+# once unless the outgoing one stays trusted while clients are reissued. See
+# the CA rotation procedure in docs/deployment.md.
+# additional_ca_paths = [".local/certs/ca-old.crt"]
+
 # Longest client certificate this deployment will issue, in days (default 365).
 # GENERATE.CERT can ask for fewer; asking for more is refused rather than
 # quietly shortened. There is no revocation list, so a short lifetime is the

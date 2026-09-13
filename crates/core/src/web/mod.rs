@@ -164,17 +164,17 @@ async fn run(config: Arc<Config>, db: SharedDb, protocol_addr: String) -> std::i
             .map_err(std::io::Error::other)??
     };
 
-    let ca_path = config.ca_path.clone().ok_or_else(|| {
-        std::io::Error::new(
+    if config.ca_path.is_none() {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "ca_path is required for the dashboard",
-        )
-    })?;
+        ));
+    }
     let client = Arc::new(ProtocolClient::new(
         &protocol_target,
         &generated.cert_path,
         &generated.key_path,
-        &ca_path,
+        &config,
     )?);
 
     let listener = TcpListener::bind(&bind_addr).await?;

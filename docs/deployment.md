@@ -230,8 +230,51 @@ Register the client thumbprint with the server as described in
 [Administration Commands](admin_commands.md), then connect as documented in the
 [Remote Protocol](protocol.md).
 
+Clients issued by `GENERATE.CERT` get a passphrase-protected bundle; the hand-rolled `-passout pass:` above is an
+empty password and is only acceptable for a bundle you are about to import and delete.
+
 To pre-provision your own certificates, drop `ca.crt`, `server.crt` and
-`server.key` into the data volume before the first start; existing files are never overwritten.
+`server.key` into the data volume before the first start. Existing files are never replaced, with one exception: if
+the server certificate no longer chains to the configured `ca_path` — because the CA was rotated, or because the
+certificate expired — it is re-signed against the current CA, keeping its key. Without that a rotation would leave the
+listener presenting a certificate no current client can verify, and an expired server certificate could only be fixed
+by hand.
+
+### Rotating the CA
+
+Every client certificate is signed by one CA, so replacing it invalidates all of them at once. `additional_ca_paths`
+is what turns that flag day into a transition: CAs listed there are **trusted but not issued from**, so the outgoing
+one can keep working while clients are reissued one at a time.
+
+1. **Make the incoming CA.** Any CA will do; the shape the server generates is:
+
+   ```sh
+   openssl req -x509 -new -nodes -newkey rsa:2048 -days 3650 \
+       -keyout ca-new.key -out ca-new.crt -subj '/CN=SmartRustyPick Root CA' \
+       -addext 'basicConstraints=critical,CA:TRUE' \
+       -addext 'keyUsage=critical,keyCertSign,cRLSign'
+   ```
+
+2. **Point `ca_path` at it and keep the old one trusted**, then restart:
+
+   ```toml
+   ca_path = ".local/certs/ca-new.crt"
+   additional_ca_paths = [".local/certs/ca.crt"]
+   ```
+
+   On that restart the server re-signs its own certificate against `ca-new.crt`. Both CAs are now trusted for
+   incoming clients, and every certificate `GENERATE.CERT` issues from here is signed by the new one and carries
+   **both** CAs in its `ca_pem` — so a client can verify the server whichever CA signed it.
+
+3. **Reissue clients** with `GENERATE.CERT`, at whatever pace suits. `LIST.CONNS` shows each certificate's expiry, so
+   you can see what is left to do.
+
+4. **Drop `additional_ca_paths`** once nothing is signed by the old CA, and restart. Anything still holding an old
+   certificate stops connecting at that point, which is what completes the rotation — an overlap that never ends is
+   not a rotation. Destroy `ca.key` afterwards.
+
+The CA currently lasts 3650 days and the server certificate 365; neither lifetime is configurable (client certificate
+lifetimes are, see `max_client_cert_days`).
 
 ## Building the image manually
 

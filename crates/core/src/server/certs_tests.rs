@@ -198,3 +198,138 @@ fn test_an_issued_certificate_reports_when_it_expires() {
         "a longer lifetime must produce a later expiry"
     );
 }
+
+/// The CA rotation, end to end against real openssl (#60).
+///
+/// A rotation is only useful if it has an overlap: every client certificate is
+/// signed by one CA, so replacing it invalidates all of them at once unless the
+/// retiring CA stays trusted while clients are reissued one at a time.
+#[test]
+fn test_two_cas_can_be_trusted_at_once_while_clients_are_reissued() {
+    if !openssl_present() {
+        return;
+    }
+    let guard = TempDir::new("ca_rotation");
+    let root = std::path::Path::new(guard.path());
+
+    // The deployment as it stands: one CA, a server certificate, one client.
+    let mut config = config_in(&guard);
+    certs::ensure_certificates(&config).unwrap();
+    let old_ca = config.ca_path.clone().unwrap();
+    let old_client = certs::generate_client_cert(&config, "old-client", 30, false).unwrap();
+
+    // Rotation step one: a second CA exists, and `ca_path` names it while the
+    // outgoing one stays trusted.
+    let new_ca = root.join("certs/ca-new.crt").to_string_lossy().into_owned();
+    let new_ca_key = root.join("certs/ca-new.key").to_string_lossy().into_owned();
+    private_files::reserve(&new_ca_key).unwrap();
+    let made = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-new",
+            "-x509",
+            "-days",
+            "30",
+            "-nodes",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            &new_ca_key,
+            "-out",
+            &new_ca,
+            "-subj",
+            "/CN=SmartRustyPick Root CA 2",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ])
+        .status()
+        .unwrap();
+    assert!(made.success(), "the fixture needs a second CA");
+
+    config.ca_path = Some(new_ca.clone());
+    config.additional_ca_paths = Some(vec![old_ca.clone()]);
+
+    // Both are trusted, and the bundle handed to a client carries both - which
+    // is what lets it verify the server whichever CA has signed it.
+    let trusted = certs::load_trusted_cas(&config).unwrap();
+    assert_eq!(trusted.len(), 2, "both CAs must be in the trust set");
+    let bundle = certs::trusted_ca_pem(&config).unwrap();
+    assert_eq!(
+        bundle.matches("BEGIN CERTIFICATE").count(),
+        2,
+        "the client bundle must carry both CAs"
+    );
+
+    // The server certificate is re-signed against the incoming CA, keeping its
+    // key - otherwise the listener would present one no new client can verify.
+    let key_before = std::fs::read(config.key_path.as_ref().unwrap()).unwrap();
+    certs::ensure_certificates(&config).unwrap();
+    assert_eq!(
+        std::fs::read(config.key_path.as_ref().unwrap()).unwrap(),
+        key_before,
+        "a re-sign must keep the server's key"
+    );
+    assert!(
+        verifies(config.cert_path.as_ref().unwrap(), &new_ca),
+        "the server certificate must now chain to the incoming CA"
+    );
+
+    // The client issued before the rotation is still valid under the CA that
+    // signed it, and a client issued now is signed by the incoming one. During
+    // the overlap the listener trusts both, so neither is locked out.
+    assert!(verifies(&old_client.cert_path, &old_ca));
+    let new_client = certs::generate_client_cert(&config, "new-client", 30, false).unwrap();
+    assert!(verifies(&new_client.cert_path, &new_ca));
+    assert!(
+        !verifies(&new_client.cert_path, &old_ca),
+        "the fixture is only meaningful if the two CAs are actually different"
+    );
+
+    // Rotation step two: the outgoing CA is dropped once nothing is signed by
+    // it. The old client is then no longer trusted, which is the point.
+    config.additional_ca_paths = None;
+    let trusted = certs::load_trusted_cas(&config).unwrap();
+    assert_eq!(trusted.len(), 1);
+    assert!(
+        certs::trusted_ca_pem(&config)
+            .unwrap()
+            .matches("BEGIN CERTIFICATE")
+            .count()
+            == 1,
+        "a retired CA must leave the client bundle too"
+    );
+}
+
+/// Whether openssl can chain `cert` to `ca`.
+fn verifies(cert: &str, ca: &str) -> bool {
+    std::process::Command::new("openssl")
+        .args(["verify", "-CAfile", ca, cert])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[test]
+fn test_a_ca_that_cannot_be_read_is_an_error_rather_than_a_silent_drop() {
+    let guard = TempDir::new("ca_missing");
+    let mut config = config_in(&guard);
+    config.ca_path = Some(format!("{}/certs/absent.crt", guard.path()));
+    // A CA that quietly failed to load is a set of clients that stop connecting
+    // with nothing anywhere saying why, so it must fail loudly at startup.
+    let refused = certs::load_trusted_cas(&config).unwrap_err();
+    assert!(
+        refused.to_string().contains("absent.crt"),
+        "the error should name the file: {refused}"
+    );
+
+    let empty = format!("{}/certs/empty.crt", guard.path());
+    private_files::dir(format!("{}/certs", guard.path())).unwrap();
+    private_files::write(&empty, "").unwrap();
+    config.additional_ca_paths = Some(vec![empty.clone()]);
+    config.ca_path = None;
+    let refused = certs::load_trusted_cas(&config).unwrap_err();
+    assert!(refused.to_string().contains("no certificate"), "{refused}");
+}

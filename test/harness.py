@@ -283,6 +283,17 @@ class Certificates:
             "subjectAltName=DNS:localhost,IP:127.0.0.1\n",
         )
 
+    def sibling_ca(self, name):
+        """A second, independent CA in a directory of its own.
+
+        For rotation tests: a certificate signed by this one does not chain to
+        the first, so "the server trusts both" is a claim with something behind
+        it rather than two names for the same key.
+        """
+        directory = self._path(name)
+        os.makedirs(directory, exist_ok=True)
+        return Certificates(directory)
+
     def client(self, name):
         """Issue a client certificate and return a (crt, key, sha256 thumbprint) triple."""
         crt, key = self._sign(
@@ -493,7 +504,7 @@ def wait_for_seed(client, probe, timeout=STARTUP_TIMEOUT, process=None, **reques
     raise TimeoutError(f"The CLI's seed never became visible within {timeout}s (last response: {last})")
 
 
-def write_config(port, certs=None, extra="", web_port=None, web_token=None):
+def write_config(port, certs=None, extra="", web_port=None, web_token=None, additional_cas=None):
     """Write a config.toml into the current working directory.
 
     When `certs` is None no TLS paths are emitted, which keeps the CLI from
@@ -511,6 +522,9 @@ def write_config(port, certs=None, extra="", web_port=None, web_token=None):
             f'key_path = "{certs.server_key}"',
             f'ca_path = "{certs.ca_crt}"',
         ]
+        if additional_cas:
+            listed = ", ".join(f'"{path}"' for path in additional_cas)
+            lines.append(f"additional_ca_paths = [{listed}]")
     if web_port is None:
         lines.append("web_enabled = false")
     else:

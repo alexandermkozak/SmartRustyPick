@@ -8,7 +8,18 @@ pub struct Config {
     pub server_port: Option<u16>,
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
+    /// The CA that signs new client certificates, and the first of the CAs the
+    /// listener trusts.
     pub ca_path: Option<String>,
+    /// Further CAs the listener trusts but does not issue from.
+    ///
+    /// This is what makes a CA rotation something other than a flag day. Every
+    /// client certificate is signed by one CA, so replacing it invalidates all
+    /// of them at once - unless the retiring CA stays trusted while clients are
+    /// reissued one at a time. Put the outgoing CA here, move `ca_path` to the
+    /// new one, and remove this entry when nothing is signed by the old one any
+    /// more. See `docs/security.md`.
+    pub additional_ca_paths: Option<Vec<String>>,
     pub server_addr: Option<String>,
     pub log_detail: Option<String>,
     pub max_log_records: Option<usize>,
@@ -191,6 +202,24 @@ impl Config {
         self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS)
     }
 
+    /// Every CA the listener trusts: the issuing one first, then any the
+    /// deployment has added for a rotation. Order matters only in that
+    /// `ca_path` is the one new certificates are signed by.
+    ///
+    /// Paths are returned even if the file is missing; the caller reports that
+    /// far better than this can, and a silently dropped CA is a client that
+    /// stops connecting for no stated reason.
+    pub fn trusted_ca_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self.ca_path.iter().cloned().collect();
+        for extra in self.additional_ca_paths.iter().flatten() {
+            let extra = extra.trim();
+            if !extra.is_empty() && !paths.iter().any(|held| held == extra) {
+                paths.push(extra.to_string());
+            }
+        }
+        paths
+    }
+
     /// The longest client certificate this deployment will issue. Never zero:
     /// a ceiling of zero would mean no certificate could be issued at all,
     /// which is a configuration mistake rather than a policy.
@@ -218,6 +247,7 @@ impl Default for Config {
             ca_path: None,
             server_addr: Some("127.0.0.1".to_string()),
             log_detail: Some("normal".to_string()),
+            additional_ca_paths: None,
             max_client_cert_days: None,
             max_log_records: Some(100),
             records_per_group: None,

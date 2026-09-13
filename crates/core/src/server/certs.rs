@@ -30,6 +30,22 @@ fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
     }
 }
 
+/// Whether `cert_path` still chains to the CA at `ca_path`, and is still within
+/// its own validity.
+///
+/// `openssl verify` answers both at once, which is what is wanted here: a server
+/// certificate signed by a CA that is no longer configured and one that has
+/// expired are the same problem from the operator's side - the listener is about
+/// to stop working for reasons nothing announces.
+fn server_cert_is_current(cert_path: &str, ca_path: &str) -> bool {
+    std::process::Command::new("openssl")
+        .args(["verify", "-CAfile", ca_path, cert_path])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
     let cert_path = config.cert_path.as_ref().expect("cert_path missing");
     let key_path = config.key_path.as_ref().expect("key_path missing");
@@ -40,11 +56,21 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
     let key_exists = Path::new(key_path).exists();
     let ca_exists = Path::new(ca_path).exists();
 
-    if cert_exists && key_exists && ca_exists {
+    // Everything present *and* the server certificate still chains to the
+    // configured CA. The second half is what makes a CA rotation work: pointing
+    // `ca_path` at a new CA otherwise leaves the listener presenting a
+    // certificate signed by the old one, which no client using the new CA can
+    // verify - a failure whose cause is nowhere on screen. It also renews a
+    // server certificate that has simply expired, which nothing else does.
+    if cert_exists && key_exists && ca_exists && server_cert_is_current(cert_path, ca_path) {
         return Ok(());
     }
 
-    println!("Generating certificates for first-time startup...");
+    if cert_exists && key_exists && ca_exists {
+        println!("The server certificate no longer matches {}; re-signing it.", ca_path);
+    } else {
+        println!("Generating certificates for first-time startup...");
+    }
 
     for path in [cert_path, key_path, ca_path, ca_key_path] {
         ensure_parent_dir(path)?;
@@ -85,19 +111,33 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
         }
     }
 
-    // 2. Generate server key and CSR
+    // 2. Generate the server key, if there is not one already. A re-sign keeps
+    //    the existing key: rotating the CA changes who vouches for the server,
+    //    not who the server is, and replacing the key would invalidate nothing
+    //    while breaking any client that had pinned it.
     if !key_exists {
-        println!("Generating server certificate...");
-        let csr_path = &sibling(cert_path, "csr");
+        println!("Generating server key...");
         private_files::reserve(key_path.as_str())?;
+        let status = std::process::Command::new("openssl")
+            .args(["genrsa", "-out", key_path, "2048"])
+            .status()?;
+        if !status.success() {
+            let _ = std::fs::remove_file(key_path.as_str());
+            return Err(std::io::Error::other("Failed to generate the server key"));
+        }
+    }
+
+    // 3. Sign the server certificate against the configured CA. Reached on a
+    //    first start and on a re-sign alike, which is what keeps the two paths
+    //    from drifting into producing different certificates.
+    {
+        println!("Signing the server certificate...");
+        let csr_path = &sibling(cert_path, "csr");
         let status = std::process::Command::new("openssl")
             .args([
                 "req",
                 "-new",
-                "-nodes",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
+                "-key",
                 key_path,
                 "-out",
                 csr_path.as_str(),
@@ -106,11 +146,10 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
             ])
             .status()?;
         if !status.success() {
-            let _ = std::fs::remove_file(key_path.as_str());
+            let _ = std::fs::remove_file(csr_path);
             return Err(std::io::Error::other("Failed to generate server CSR"));
         }
 
-        // 3. Sign server certificate with CA
         let ext_path = &sibling(cert_path, "ext");
         std::fs::write(
             ext_path,
@@ -166,6 +205,12 @@ pub struct GeneratedCert {
     pub thumbprint: String,
     pub certificate_pem: String,
     pub private_key_pem: String,
+    /// Every CA this deployment trusts, concatenated.
+    ///
+    /// Every CA rather than only the signing one, because the client verifies
+    /// the *server* against this. During a rotation the server certificate may
+    /// be re-signed by the incoming CA, and a client holding only the outgoing
+    /// one would stop connecting at exactly that step.
     pub ca_pem: String,
     pub cert_path: String,
     pub key_path: String,
@@ -428,13 +473,19 @@ pub fn generate_client_cert(
         return Err(failed("Signing the certificate"));
     }
 
+    // `-certfile` takes a path, so the trusted set is written out beside the
+    // certificate for the length of the export. It holds only public CA
+    // certificates, but it is created owner-only like everything else here and
+    // removed afterwards rather than left as scratch.
+    let ca_bundle_file = out("cabundle");
     // The bundle and its passphrase are produced together or not at all: a
     // `.pfx` whose passphrase nobody holds is not a credential, and a passphrase
     // for a bundle that was never written is a puzzle for whoever reads the
     // response.
     let bundle = if write_pfx {
         let passphrase = Secret::random_hex(PFX_PASSPHRASE_BYTES)?;
-        let exported = private_files::reserve(&pfx_file).is_ok()
+        let exported = private_files::write(&ca_bundle_file, trusted_ca_pem(config)?).is_ok()
+            && private_files::reserve(&pfx_file).is_ok()
             && ran(std::process::Command::new("openssl")
                 .args([
                     "pkcs12",
@@ -446,12 +497,13 @@ pub fn generate_client_cert(
                     "-in",
                     &crt_file,
                     "-certfile",
-                    &ca_file,
+                    &ca_bundle_file,
                     "-passout",
                     &format!("env:{}", PFX_PASSPHRASE_VAR),
                 ])
                 .env(PFX_PASSPHRASE_VAR, passphrase.expose())
                 .status());
+        let _ = std::fs::remove_file(&ca_bundle_file);
         if exported {
             Some((pfx_file, passphrase))
         } else {
@@ -470,7 +522,7 @@ pub fn generate_client_cert(
 
     let certificate_pem = std::fs::read_to_string(&crt_file)?;
     let private_key_pem = std::fs::read_to_string(&key_file)?;
-    let ca_pem = std::fs::read_to_string(&ca_file)?;
+    let ca_pem = trusted_ca_pem(config)?;
     let thumbprint = thumbprint_of_pem(&certificate_pem)?;
 
     Ok(GeneratedCert {
@@ -485,6 +537,57 @@ pub fn generate_client_cert(
         pfx_path,
         pfx_passphrase,
     })
+}
+
+/// Every certificate from every CA the deployment trusts, in one list.
+///
+/// One loader for the listener and for the dashboard's client, because the two
+/// must agree: a server trusting two CAs while its own client trusts one is a
+/// rotation that half-works, and the half that fails is the dashboard going
+/// dark the moment the server certificate is re-signed.
+///
+/// A missing or unreadable file is an error rather than a skip. A CA that
+/// quietly failed to load is a set of clients that stop connecting with nothing
+/// anywhere saying why.
+pub fn load_trusted_cas(config: &Config) -> io::Result<Vec<CertificateDer<'static>>> {
+    let mut trusted = Vec::new();
+    for path in config.trusted_ca_paths() {
+        let loaded = load_certs(&path)
+            .map_err(|e| io::Error::new(e.kind(), format!("Could not read the trusted CA at {}: {}", path, e)))?;
+        if loaded.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} contains no certificate", path),
+            ));
+        }
+        trusted.extend(loaded);
+    }
+    if trusted.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "No trusted CA is configured: set ca_path",
+        ));
+    }
+    Ok(trusted)
+}
+
+/// The PEM text of every trusted CA, concatenated, for handing to a client.
+///
+/// A client verifies the *server* against this, so during a rotation it has to
+/// carry every CA that might have signed the server certificate - otherwise a
+/// client issued today stops working the moment the server certificate is
+/// re-signed by the incoming CA, which is the step the overlap exists to make
+/// safe.
+pub fn trusted_ca_pem(config: &Config) -> io::Result<String> {
+    let mut bundle = String::new();
+    for path in config.trusted_ca_paths() {
+        let pem = std::fs::read_to_string(&path)?;
+        if !bundle.is_empty() && !bundle.ends_with('\n') {
+            bundle.push('\n');
+        }
+        bundle.push_str(&pem);
+    }
+    Ok(bundle)
 }
 
 pub fn load_certs(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {

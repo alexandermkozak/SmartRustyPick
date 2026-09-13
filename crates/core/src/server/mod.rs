@@ -78,7 +78,9 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
 
     let certs = load_certs(config.cert_path.as_ref().unwrap())?;
     let key = load_key(config.key_path.as_ref().unwrap())?;
-    let ca_certs = load_certs(config.ca_path.as_ref().unwrap())?;
+    // Every configured CA, not just the issuing one: a client signed by a CA
+    // being retired keeps connecting while it is reissued under the new one.
+    let ca_certs = certs::load_trusted_cas(&config)?;
 
     let mut root_cert_store = RootCertStore::empty();
     for cert in ca_certs {

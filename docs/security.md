@@ -52,7 +52,7 @@ implies otherwise is worse than none:
 | Records, dictionaries, saved lists, `$LOGS` | Nothing. | Written as **plaintext** frames (`[key_len][key][data_len][data]`, see [Storage Engine](storage.md)). The CRC32C trailer is integrity against a torn write, not authentication: it is keyless, so anyone who can edit a group file can recompute it. |
 | Web dashboard | Bound to `127.0.0.1:8080` by default. Its token is compared in constant time and stored in an `HttpOnly; SameSite=Strict` cookie. It is an ordinary protocol client with a certificate reissued every boot and valid for a day. | **Plain HTTP.** The cookie has no `Secure` attribute, the startup URL carries the token in a query string, and `POST /api/certificates` returns a freshly generated **private key** in the response body. Defensible on loopback; not once `web_addr` points anywhere else. |
 | CA, server and client keys | Filesystem permissions: `.local/certs/` is `0700` and every key, certificate and PKCS#12 bundle in it is `0600`, on Unix. The mode is set *before* `openssl` writes the key, so there is no instant at which a private key is readable by anyone else. PKCS#12 bundles carry a per-issuance passphrase, delivered once to the caller and stored nowhere. | The PEM key files themselves are **unencrypted** (`openssl req -nodes`, `openssl genrsa`), so on the host the mode is all that protects them. The passphrase protects the bundle only once it leaves — anyone who can read `.local/certs/` has the `.key` beside it. |
-| Certificate lifetime | A client certificate's lifetime is chosen at issuance (`GENERATE.CERT … DAYS n`), defaulting to 365 and capped by `max_client_cert_days`; a request above the cap is refused, not shortened. Every issued certificate's expiry is reported by `GENERATE.CERT` and `LIST.CONNS`. Deauthorization by name takes effect on the client's next request. | There is **no revocation path** — no CRL, no OCSP, no CA rotation. Removing a thumbprint from `$CLIENTS` is the only revocation, it works only for this database, and it only helps if somebody notices. The CA still lasts 3650 days and the server certificate 365, neither choosable. |
+| Certificate lifetime and revocation | A client certificate's lifetime is chosen at issuance (`GENERATE.CERT … DAYS n`), defaulting to 365 and capped by `max_client_cert_days`; a request above the cap is refused, not shortened. Every issued certificate's expiry is reported by `GENERATE.CERT` and `LIST.CONNS`. Revocation is the `$CLIENTS` thumbprint allowlist, checked on every connection (decision 5). The CA can be rotated with an overlap via `additional_ca_paths`. | **No CRL and no OCSP**, deliberately — so a deauthorized certificate is still a validly signed one, and anything trusting this CA without consulting `$CLIENTS` would accept it. Revocation also needs somebody to notice the leak; a short lifetime is what does not. The CA still lasts 3650 days and the server certificate 365, neither choosable. |
 | Files on disk | Every file this project writes — group files, `meta`, dictionaries, index state, queue books, the transaction intent log, directory-file records, archives and their staging siblings — is created `0600` on Unix, and a file written by an earlier build is tightened the next time it is rewritten. | **Directories** under `db_storage/` are left at the umask, so account and file names remain listable by anyone who can read the volume — which changes nothing, since those names are directory names either way (see below). **Windows sets no mode at all**: `PermissionsExt` is Unix-only, so there the files land at whatever the default ACL grants. |
 | `config.toml` | — | It is **committed to the repository** and has a `web_token` field. Treat it as a non-secret file; a token set there is a token in git history. |
 
@@ -166,7 +166,36 @@ account — the conflation this decision exists to undo.
 A secondary benefit worth stating, because it is what an operator actually sees: `LIST.CONNS` can now distinguish a
 credential that exists to run backups from one that exists to provision accounts. Both used to read `ADMIN`.
 
-### 5. What may never be logged
+### 5. The thumbprint allowlist *is* the revocation mechanism
+
+Stated rather than implied, because the absence of a CRL reads as an oversight until it is written down as a choice.
+
+**There is no CRL and no OCSP, deliberately.** `WebPkiClientVerifier` is built with no revocation source. What takes
+their place is `$CLIENTS`: after the certificate chain verifies, the certificate's SHA-256 thumbprint must appear in
+that table, and `DEAUTHORIZE.CONN` removes it. The check happens **on every connection**, against a table re-read when
+it changes on disk — so a revocation takes effect on the revoked client's next connection, with no distribution delay,
+no freshness window and no second service to keep running. For a single-server database that is a better answer than a
+CRL, not a poorer one.
+
+Its limit is precise and worth stating: **a deauthorized certificate is still a validly signed certificate.** Anything
+that trusts this CA without consulting `$CLIENTS` will accept it. Nothing else does today — this CA exists to sign
+clients for this database — but it is the reason the CA's own key matters as much as it does, and the reason `ca.key`
+should not be copied anywhere it does not have to be.
+
+Two consequences follow, and both are now handled rather than merely noted:
+
+- **Revocation needs somebody to notice.** `DEAUTHORIZE.CONN` only helps if a leak is spotted. A short certificate
+  lifetime is the withdrawal that happens whether or not anyone notices, which is why `GENERATE.CERT` takes a lifetime
+  and `max_client_cert_days` bounds it. Issue a credential the life its job needs, not a year.
+- **A CA cannot be replaced in one step.** Every client certificate is signed by one CA. `additional_ca_paths` keeps
+  the outgoing CA trusted while clients are reissued, so the rotation is a transition rather than a flag day; the
+  procedure is in [Deployment](deployment.md#rotating-the-ca). CAs listed there are trusted for incoming clients but
+  never used to sign, so the question "which CA issued this" always has one answer.
+
+Not yet answered: **key rotation**, because there are no keys yet. Rewrapping a DEK under a new passphrase and
+re-encrypting under a new DEK both belong with the encryption work (#56, #57) and are tracked in #60 alongside this.
+
+### 6. What may never be logged
 
 The rule, so that the encryption work has something to check itself against — a key that leaks into a log line defeats
 all of it:
@@ -219,7 +248,7 @@ being thinned out.
   other export rather than landing unreadable to everyone but the service user.
 - **`config.toml`.** It is committed. Keep secrets out of it and source them from the environment or a gitignored
   override.
-- **Certificate hygiene.** There is no revocation but the thumbprint list, and it only helps if you notice. "Narrowly"
+- **Certificate hygiene.** Revocation is the thumbprint list (decision 5), and it only helps if you notice. "Narrowly"
   is expressible in two dimensions now: grant the capability a credential needs instead of `ADMIN`, and give it the
   lifetime its job needs instead of a year — a certificate issued to a container, a CI job or a scheduled task has no
   reason to outlive it. **A short lifetime is the withdrawal that happens whether or not anyone notices a leak.** The
@@ -236,7 +265,6 @@ Recorded here so they are not mistaken for settled:
 - Whether Windows gets real ACL tightening, or stays documented as an operator responsibility.
 - Whether the dashboard gets native TLS, refuses a non-loopback bind without it, or keeps key-bearing endpoints
   loopback-only regardless of bind address.
-- CA rotation and a real revocation path.
 - Whether the PEM key files themselves should be encrypted at rest, now that the bundle made from them is.
 - Encryption granularity (per group file or per record) and nonce management, which are storage-engine questions rather
   than threat-model ones.
