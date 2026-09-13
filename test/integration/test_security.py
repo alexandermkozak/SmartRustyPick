@@ -17,6 +17,47 @@ ACCOUNT = "TEST_ACC"
 ADMIN_REQUIRED = "ADMIN_REQUIRED"
 
 
+def tls_handshake(port, certificate, private_key, ca, maximum=None, minimum=None):
+    """Attempts one handshake at a bounded TLS version, reporting what happened.
+
+    Returns the negotiated version on success, or the exception text on failure.
+    The client offers a valid certificate either way, so a refusal is about the
+    protocol version and nothing else.
+    """
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
+    context.load_cert_chain(certfile=certificate, keyfile=private_key)
+    if maximum is not None:
+        context.maximum_version = maximum
+    if minimum is not None:
+        context.minimum_version = minimum
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname="localhost") as tls:
+                return tls.version(), None
+    except (ssl.SSLError, OSError) as exc:
+        return None, str(exc)
+
+
+def check_tls_floor(suite, port, user_crt, user_key, ca):
+    """The listener speaks TLS 1.3 and refuses anything older (issue #52).
+
+    A client capped at 1.2 is the whole test: it holds a certificate this CA
+    issued, so the only reason the handshake can fail is the version floor.
+    """
+    version, failure = tls_handshake(port, user_crt, user_key, ca)
+    suite.check_eq("An ordinary client negotiates TLS 1.3", version, "TLSv1.3")
+
+    version, failure = tls_handshake(port, user_crt, user_key, ca, maximum=ssl.TLSVersion.TLSv1_2)
+    suite.check_eq("A client capped at TLS 1.2 is refused", version, None)
+    # The refusal must come from the version negotiation rather than from a
+    # certificate problem, or the test would pass for the wrong reason.
+    suite.check(
+        "and refused over the protocol version, not the certificate",
+        failure is not None and "version" in failure.lower(),
+        failure or "the handshake succeeded",
+    )
+
+
 def seed_database(admin_thumbprint, user_thumbprint):
     """Create the account and the two client authorisations through the CLI.
 
@@ -205,6 +246,7 @@ def main():
                     "Non-admin may reach its own account", resp.get("code"), "RECORD_NOT_FOUND"
                 )
 
+            check_tls_floor(suite, port, user_crt, user_key, certs.ca_crt)
             check_connection_limits(suite, certs, user_crt, user_key)
         except Exception as exc:  # noqa: BLE001 - report instead of aborting the whole run
             suite.error("Security suite", exc)

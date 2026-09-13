@@ -25,6 +25,24 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 
+/// The TLS versions this project speaks, on both the listener and the
+/// dashboard's client.
+///
+/// rustls' own default also allows TLS 1.2, which would make this project's
+/// transport posture a property of a dependency's release notes rather than a
+/// decision - and one that could move in either direction on a `cargo update`.
+/// Nothing here needs 1.2: every client is the dashboard, or a holder of a
+/// certificate this CA issued, all of them modern and all of them under the
+/// operator's control. A third-party client that cannot do TLS 1.3 will stop
+/// connecting, which is expected to affect nobody and is stated in
+/// `docs/protocol.md` rather than left to be discovered.
+///
+/// Cipher suites are deliberately *not* pinned alongside it. TLS 1.3's set is
+/// three suites, all of them acceptable, and rustls orders them by what the
+/// host can do fastest - AES where there is hardware AES, ChaCha20 where there
+/// is not. Overriding that is the one way to get it wrong.
+pub const TLS_VERSIONS: &[&tokio_rustls::rustls::SupportedProtocolVersion] = &[&tokio_rustls::rustls::version::TLS13];
+
 static ACTIVE_CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
 
 /// The configuration the running server was started with.
@@ -73,7 +91,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
         .build()
         .map_err(|e| tokio::io::Error::new(tokio::io::ErrorKind::InvalidInput, e))?;
 
-    let server_config = tokio_rustls::rustls::ServerConfig::builder()
+    let server_config = tokio_rustls::rustls::ServerConfig::builder_with_protocol_versions(TLS_VERSIONS)
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(certs, key)
         .map_err(|e| tokio::io::Error::new(tokio::io::ErrorKind::InvalidInput, e))?;

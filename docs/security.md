@@ -47,7 +47,7 @@ implies otherwise is worse than none:
 
 | Surface | What protects it | What does not |
 | --- | --- | --- |
-| Protocol listener | TLS with **mutual** authentication: the client certificate is verified against `ca_path`, then its SHA-256 thumbprint must appear in `$CLIENTS`. An unknown thumbprint is logged and the connection is dropped with no response. | The TLS floor is rustls' default, so **TLS 1.2 is still accepted**; version and cipher suites are not pinned by this project. |
+| Protocol listener | **TLS 1.3 only**, pinned by this project on both the listener and the dashboard's client rather than inherited from rustls, with **mutual** authentication: the client certificate is verified against `ca_path`, then its SHA-256 thumbprint must appear in `$CLIENTS`. An unknown thumbprint is logged and the connection is dropped with no response. | Cipher suites are rustls' TLS 1.3 set, deliberately not overridden. Traffic analysis is unaffected — see the scope above. |
 | Records, dictionaries, saved lists, `$LOGS` | Nothing. | Written as **plaintext** frames (`[key_len][key][data_len][data]`, see [Storage Engine](storage.md)). The CRC32C trailer is integrity against a torn write, not authentication: it is keyless, so anyone who can edit a group file can recompute it. |
 | Web dashboard | Bound to `127.0.0.1:8080` by default. Its token is compared in constant time and stored in an `HttpOnly; SameSite=Strict` cookie. It is an ordinary protocol client with a certificate reissued every boot and valid for a day. | **Plain HTTP.** The cookie has no `Secure` attribute, the startup URL carries the token in a query string, and `POST /api/certificates` returns a freshly generated **private key** in the response body. Defensible on loopback; not once `web_addr` points anywhere else. |
 | CA, server and client keys | Filesystem permissions: `.local/certs/` is `0700` and every key, certificate and PKCS#12 bundle in it is `0600`, on Unix. The mode is set *before* `openssl` writes the key, so there is no instant at which a private key is readable by anyone else. PKCS#12 bundles carry a per-issuance passphrase, delivered once to the caller and stored nowhere. | The PEM key files themselves are **unencrypted** (`openssl req -nodes`, `openssl genrsa`), so on the host the mode is all that protects them. The passphrase protects the bundle only once it leaves — anyone who can read `.local/certs/` has the `.key` beside it. |
@@ -66,11 +66,11 @@ Extending the diagram in [Web Dashboard](web_dashboard.md), with what is protect
 ```
                         ┌─ trusted host ──────────────────────────────────────────────┐
                         │                                                             │
-  browser ──HTTP──────▶ │ dashboard ──TLS 1.3/1.2, mutual auth──▶ protocol server     │
+  browser ──HTTP──────▶ │ dashboard ──TLS 1.3, mutual auth──────▶ protocol server     │
    (plaintext,          │  (ordinary client,                        │                 │
     loopback only)      │   1-day certificate)                      ▼                 │
                         │                                         engine              │
-  remote client ────────┼──TLS 1.3/1.2, mutual auth───────────────▶ │                 │
+  remote client ────────┼──TLS 1.3, mutual auth───────────────────▶ │                 │
    (thumbprint          │                                           ▼                 │
     authorized)         │                       db_storage/  ──── PLAINTEXT today     │
                         │                       .local/certs/ ──── PLAINTEXT keys     │
@@ -158,7 +158,6 @@ encrypted database is unreadable until it is unlocked — consistent with decisi
 
 Recorded here so they are not mistaken for settled:
 
-- Pinning a TLS 1.3 floor and an explicit cipher suite list, rather than inheriting rustls' defaults.
 - Whether Windows gets real ACL tightening, or stays documented as an operator responsibility.
 - Whether the dashboard gets native TLS, refuses a non-loopback bind without it, or keeps key-bearing endpoints
   loopback-only regardless of bind address.

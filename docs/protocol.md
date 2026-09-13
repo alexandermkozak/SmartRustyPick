@@ -12,7 +12,12 @@ command, its requirements, its response shape and its errors.
 
 ## Transport and authentication
 
-- Connections use TLS (1.3, or 1.2 as a fallback).
+- Connections use **TLS 1.3 only**. The floor is pinned by this project rather than inherited from rustls'
+  defaults, so a `cargo update` cannot widen it; a client that cannot negotiate 1.3 is refused at the
+  handshake with a protocol-version alert. Every client here is the dashboard or a holder of a certificate
+  this CA issued, so nothing is expected to be affected — but a third-party client capped at TLS 1.2 will
+  stop connecting. Cipher suites are left to rustls' TLS 1.3 set, which is ordered by what the host can do
+  fastest.
 - The client **must** present a certificate. The server verifies it against the configured
   CA, then computes the certificate's SHA-256 thumbprint (lowercase hex) and looks it up in
   the authorized-clients table. An unknown thumbprint is logged and the connection is

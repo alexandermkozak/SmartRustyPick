@@ -48,7 +48,10 @@ impl ProtocolClient {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         }
 
-        let config = ClientConfig::builder()
+        // The same version list the listener pins, from the same constant: a
+        // 1.3-only server with a default client is merely redundant, but the
+        // reverse is a client that would quietly accept a downgrade.
+        let config = ClientConfig::builder_with_protocol_versions(crate::server::TLS_VERSIONS)
             .with_root_certificates(roots)
             .with_client_auth_cert(load_certs(cert_path)?, load_key(key_path)?)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
