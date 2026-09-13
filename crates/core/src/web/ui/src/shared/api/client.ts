@@ -92,5 +92,87 @@ export async function keys(path: string): Promise<string[]> {
     return response.keys ?? []
 }
 
+/**
+ * A request whose reply is bytes rather than JSON, with the filename the server
+ * chose.
+ *
+ * The one endpoint shaped like this is the archive download. It is here rather
+ * than in the slice because this module owns the transport - what the bytes
+ * mean is still the feature's business.
+ */
+export async function fetchBytes(path: string): Promise<{blob: Blob; filename: string}> {
+    const response = await send(path, {})
+    // A refusal is still JSON, so it is read and raised the way every other
+    // failure is rather than handed back as a zero-byte download.
+    if (!response.ok) throw await failure(response)
+    return {blob: await response.blob(), filename: filenameFrom(response)}
+}
+
+/**
+ * A request whose body is bytes rather than JSON, answering with the usual
+ * envelope. The archive upload.
+ */
+export async function sendBytes<T>(path: string, body: Blob): Promise<T> {
+    const response = await send(path, {
+        method: 'POST',
+        body,
+        headers: {'Content-Type': 'application/octet-stream'},
+    })
+    if (!response.ok) throw await failure(response)
+    return (await response.json()) as T
+}
+
+/** The fetch every call here goes through, with the dev-token rule applied once. */
+async function send(path: string, init: RequestInit): Promise<Response> {
+    const headers = new Headers(init.headers)
+    const token = developmentToken()
+    if (token) headers.set('Authorization', `Bearer ${token}`)
+    try {
+        return await fetch(path, {credentials: 'same-origin', ...init, headers})
+    } catch (cause) {
+        throw new ApiError(
+            0,
+            cause instanceof Error ? cause.message : 'The dashboard is unreachable',
+        )
+    }
+}
+
+/** A non-OK response as an `ApiError`, taking the server's own message if it sent one. */
+async function failure(response: Response): Promise<ApiError> {
+    let message = `Request failed (${response.status})`
+    try {
+        const payload = (await response.json()) as {error?: string} | null
+        if (payload?.error) message = payload.error
+    } catch {
+        // Not JSON. The status is all there is, and it says enough.
+    }
+    return new ApiError(response.status, message)
+}
+
+/** The name from `Content-Disposition`, or a fallback the browser can still save. */
+function filenameFrom(response: Response): string {
+    const header = response.headers.get('Content-Disposition') ?? ''
+    const match = /filename="?([^"]+)"?/.exec(header)
+    return match?.[1] ?? 'archive.srp'
+}
+
+/**
+ * Hands the viewer bytes the page is holding.
+ *
+ * The object URL is revoked rather than left behind: an archive is a database,
+ * and a page that keeps one alive in the tab for as long as it is open is
+ * holding a copy of the data nobody asked it to keep.
+ */
+export function saveBlob(filename: string, blob: Blob): void {
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
 /** Percent-encodes one path segment; account and file names are user data. */
 export const encode = encodeURIComponent

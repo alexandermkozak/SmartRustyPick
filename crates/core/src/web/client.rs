@@ -107,18 +107,137 @@ impl ProtocolClient {
         Err(last_error.unwrap_or_else(|| std::io::Error::other("Request failed")))
     }
 
+    /// Sends one request and reads a response line followed by a raw body.
+    ///
+    /// `EXPORT.BYTES` is the only thing here that answers with bytes rather than
+    /// a line, and it announces how many before sending them - so the body is
+    /// read to exactly that length through the same `BufReader` the line came
+    /// from. Reading it from the underlying stream instead would drop whatever
+    /// arrived in the same segment as the line, which is most of the first
+    /// chunk. The rest of the codebase makes this mistake impossible by
+    /// construction; here it is simply the only reader there is.
+    ///
+    /// Retried once like an ordinary request: an export reads and changes
+    /// nothing, so running it again on a fresh connection is safe.
+    pub async fn request_with_body(
+        &self,
+        payload: serde_json::Value,
+        limit: u64,
+    ) -> std::io::Result<(serde_json::Value, Vec<u8>)> {
+        let mut session = self.session.lock().await;
+        let mut last_error = None;
+
+        for attempt in 0..2 {
+            if session.is_none() {
+                match self.connect().await {
+                    Ok(fresh) => *session = Some(fresh),
+                    Err(e) => {
+                        last_error = Some(e);
+                        continue;
+                    }
+                }
+            }
+
+            let held = session.as_mut().expect("session was just established");
+            match Self::exchange_for_body(held, &payload, limit).await {
+                Ok(answer) => return Ok(answer),
+                Err(e) => {
+                    // Whether the line or the body failed, the socket's offset
+                    // is no longer known: a half-read body leaves it inside
+                    // somebody's archive.
+                    *session = None;
+                    last_error = Some(e);
+                    if attempt == 1 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| std::io::Error::other("Request failed")))
+    }
+
+    /// Sends one request with a raw body after it, and reads one response line.
+    ///
+    /// **Never retried**, unlike every other call here. An `IMPORT.BYTES` that
+    /// failed after the body went out may or may not have been applied, and
+    /// sending it again would be a second restore rather than a retry of the
+    /// first. A connection error is reported as one and the operator decides.
+    pub async fn request_sending_body(
+        &self,
+        payload: serde_json::Value,
+        body: &[u8],
+    ) -> std::io::Result<serde_json::Value> {
+        let mut session = self.session.lock().await;
+        if session.is_none() {
+            *session = Some(self.connect().await?);
+        }
+        let held = session.as_mut().expect("session was just established");
+        match Self::exchange_with_body(held, &payload, body).await {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                *session = None;
+                Err(e)
+            }
+        }
+    }
+
+    async fn exchange_for_body(
+        session: &mut Session,
+        payload: &serde_json::Value,
+        limit: u64,
+    ) -> std::io::Result<(serde_json::Value, Vec<u8>)> {
+        let response = Self::exchange(session, payload).await?;
+        let Some(length) = response.get("length").and_then(serde_json::Value::as_u64) else {
+            // A refusal carries no length and no body, so the connection is
+            // still at a request boundary and the caller gets the error.
+            return Ok((response, Vec::new()));
+        };
+        if length > limit {
+            // The body is on the socket and will not be read, so this session
+            // cannot be reused. Returning the error drops it.
+            return Err(std::io::Error::other(format!(
+                "The archive is {} bytes, past the {} the dashboard will hold in memory",
+                length, limit
+            )));
+        }
+        let (reader, _) = session;
+        let mut body = vec![0u8; length as usize];
+        reader.read_exact(&mut body).await?;
+        Ok((response, body))
+    }
+
+    async fn exchange_with_body(
+        session: &mut Session,
+        payload: &serde_json::Value,
+        body: &[u8],
+    ) -> std::io::Result<serde_json::Value> {
+        let (reader, writer) = session;
+        let mut line = serde_json::to_string(payload)?;
+        line.push('\n');
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(body).await?;
+        writer.flush().await?;
+        Self::read_line(reader).await
+    }
+
     async fn exchange(session: &mut Session, payload: &serde_json::Value) -> std::io::Result<serde_json::Value> {
         let (reader, writer) = session;
         let mut line = serde_json::to_string(payload)?;
         line.push('\n');
         writer.write_all(line.as_bytes()).await?;
         writer.flush().await?;
+        Self::read_line(reader).await
+    }
 
+    /// One bounded response line. Shared by every exchange here, so a reply
+    /// that precedes a body is read under exactly the same rules as one that
+    /// does not.
+    async fn read_line(
+        reader: &mut BufReader<tokio::io::ReadHalf<TlsStream<TcpStream>>>,
+    ) -> std::io::Result<serde_json::Value> {
         let mut response = String::new();
-        let read = (&mut *reader)
-            .take(MAX_RESPONSE_BYTES as u64)
-            .read_line(&mut response)
-            .await?;
+        let read = reader.take(MAX_RESPONSE_BYTES as u64).read_line(&mut response).await?;
         if read == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,

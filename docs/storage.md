@@ -924,6 +924,71 @@ Raise it only for a change an older build would **misread**. A new `DIR` attribu
 records it never opens, is not one: a version that rises without the format really changing makes every upgrade a
 migration and teaches operators that the number means nothing.
 
+## Archives: Backup and Restore
+
+Copying `db_storage/` out from under a running server is the thing that does not work, and it fails in three separate
+ways: writes are buffered for up to `flush_interval_ms`, a flush rewrites every changed group and *then* rewrites
+`meta` so a copy landing between the two gets halves that disagree, and nothing coordinates such a copy across the
+files of an account. An **archive** is the answer — see [the protocol](protocol.md#backup-and-restore) for the
+commands and [Administration Commands](admin_commands.md#exportfile--exportaccount--exportall) for the CLI.
+
+An archive is records under their keys, each file's dictionary, its type and per-file flags, and its index
+definitions. It is explicitly **not** a copy of the hashfile layout. The modulus is a property of the deployment that
+holds the data — how many records it has and what its `records_per_group` is — not of the data itself, so an archive
+carries records and the target rehashes them. That is what makes restoring into a different machine, or beside the
+original under another account name, ordinary rather than a special case.
+
+### The frame
+
+```text
+[magic "SRPARC01"]
+[manifest_len u64][manifest JSON]        - the shape: which files, and what they are
+  per file, in the manifest's order:
+    repeated [tag u8]:
+      1 -> a data record:      [key_len u64][key][data_len u64][bytes]
+      2 -> a dictionary entry: the same
+      0 -> end of this file's records
+[tag 0xFF]
+[trailer_len u64][trailer JSON]          - the counts: what was actually written
+[crc32c u32]                             - over every byte before it
+```
+
+Tmp-then-rename with a checksum trailer, the same discipline a group file and a
+[transaction intent](#transactions) use, and for the same reason: a torn tail has to be distinguishable from a short
+archive. An archive that does not decode was never a backup, and saying so is the whole of its value.
+
+**The shape leads and the counts follow**, which is the one part of the layout worth explaining. A restore needs the
+manifest before it can do anything — it has to create a file, with the right type and flags, before it has anywhere to
+put the first record. The counts cannot be up there with it: an ordinary file is exported under its own lock so its
+count is known in advance, but a [directory file](#directory-files) has no table and therefore no lock, so records can
+be added and removed underneath the walk and how many were written is not knowable until the last one has been. A
+trailer lets the archive state the count exactly rather than state an intention. It is also why the body is tagged
+rather than counted: a tag per record needs no number in front of the run, so an archive streams to a socket as
+readily as to a file.
+
+**A reader never applies as it parses.** The checksum is over the whole archive, so it is only known to be good at its
+last four bytes; applying as it read would mean a truncated archive had already half-restored itself by the time the
+truncation was found, and a half-restored account looks exactly like a restored one. An import is therefore two passes
+over a seekable source — verify, then apply — which is why the streamed form spools to a file first, exactly as an
+inbound [raw transfer](protocol.md#raw-byte-transfers) does with a record body.
+
+### The archive format version
+
+`archive_format` in the manifest is versioned separately from the
+[storage format](#storage-format-versions), and deliberately: an archive outlives the deployment that wrote it and is
+the thing you reach for when a storage directory cannot be opened at all, so tying its readability to the storage
+format would defeat the reason it exists. Raising the oldest archive version a build reads strands backups already
+taken, which is a far heavier act than stranding a storage directory.
+
+### What an export holds still
+
+An export flushes, then holds every file it names with shared guards for as long as it is reading them — readers are
+unaffected, writers to those files wait. Locks are taken in `(account, file)` order, the same discipline
+[transactions](#concurrency-and-lock-ordering) use, because those are the only two places in the engine that hold more
+than one file lock and a shared order is what keeps them from deadlocking against each other. The unit of consistency
+is exactly the scope asked for: one file, one account, or the whole database. `EXPORT.ACCOUNT` is the scope worth
+running routinely; `EXPORT.ALL` blocks writes database-wide for its duration and is the maintenance-window one.
+
 ## Concurrency and Lock Ordering
 
 Every loaded file carries its own read/write lock, and the database's own state - the account registry, each account's
@@ -1012,6 +1077,10 @@ The following optional keys in `config.toml` control the storage engine:
   `always` unless this is set explicitly.
 - `flush_interval_ms` (default 250): Maximum time a change stays in memory before being flushed.
 - `flush_max_pending` (default 256): Maximum number of pending writes before a flush is triggered.
+- `max_archive_bytes` (default 1073741824, 1 GiB): Largest archive `IMPORT.BYTES` accepts on a connection. An inbound
+  archive is spooled to disk before any of it is applied, so this bounds what one connection can make the server write
+  while it decides whether to trust it. Past the limit the answer is a path on the host and `IMPORT`, not a bigger
+  socket.
 - `transfer_stall_timeout_ms` (default 30000): How long a [raw byte transfer](protocol.md#raw-byte-transfers) may make
   no progress before the connection is closed. It bounds a *stalled* transfer rather than the total duration, because a
   slow link moving a large record is not a stalled one, and `idle_timeout_ms` cannot see the case at all - a half-sent

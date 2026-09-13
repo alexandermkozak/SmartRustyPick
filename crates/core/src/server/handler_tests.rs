@@ -3404,3 +3404,233 @@ fn set_file_turns_minting_on_and_off_and_the_listing_says_which() {
         Some(ErrorCode::InvalidRequest)
     );
 }
+
+// ------------------------------------------------- backup and restore ---
+
+/// An admin certificate, which is what the four archive commands sit behind.
+fn archive_admin() -> ClientInfo {
+    ClientInfo {
+        name: "backup_operator".to_string(),
+        thumbprint: "tp_backup".to_string(),
+        allowed_accounts: vec![],
+        is_admin: true,
+    }
+}
+
+fn archive_db(label: &str) -> (TempDir, Arc<RwLock<Database>>) {
+    let dir = TempDir::new(label);
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_test_account("BACKUP_TEST").unwrap();
+    (dir, Arc::new(RwLock::new(db)))
+}
+
+/// The round trip over the wire: an account exported to a path, dropped, and
+/// imported back under a different name.
+#[test]
+fn export_and_import_move_an_account_over_the_protocol() {
+    let (dir, db_arc) = archive_db("handler_archive");
+    let admin = archive_admin();
+    let path = format!("{}/backup.srp", dir.path());
+
+    let exported = handle_request(
+        Request {
+            command: "EXPORT.ACCOUNT".to_string(),
+            target_account: Some("BACKUP_TEST".to_string()),
+            path: Some(path.clone()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(exported.status, "OK", "{:?}", exported.message);
+    let report = exported.archive.expect("an export reports what it captured");
+    assert_eq!(report["source"], "account BACKUP_TEST");
+    assert!(report["records"].as_u64().unwrap() > 0);
+    assert!(Path::new(&path).exists());
+
+    let imported = handle_request(
+        Request {
+            command: "IMPORT".to_string(),
+            path: Some(path.clone()),
+            target_account: Some("RESTORED".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(imported.status, "OK", "{:?}", imported.message);
+    let report = imported.archive.expect("an import reports what it did");
+    assert_eq!(report["accountsCreated"][0], "RESTORED");
+    assert!(
+        report["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file["action"] == "created")
+    );
+
+    // And the records are actually reachable under the new account.
+    let read = handle_request(
+        Request {
+            command: "READ".to_string(),
+            account: Some("RESTORED".to_string()),
+            file: Some("USERS".to_string()),
+            key: Some("1".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(read.status, "OK", "{:?}", read.message);
+}
+
+/// Every one of them is admin only. An export reads every record of whatever it
+/// names, so a non-admin able to run one against an arbitrary account would be
+/// a non-admin able to read it.
+#[test]
+fn the_archive_commands_are_admin_only() {
+    let (dir, db_arc) = archive_db("handler_archive_admin");
+    let ordinary = ClientInfo {
+        name: "app".to_string(),
+        thumbprint: "tp_app".to_string(),
+        allowed_accounts: vec!["BACKUP_TEST".to_string()],
+        is_admin: false,
+    };
+
+    for command in ["EXPORT.FILE", "EXPORT.ACCOUNT", "EXPORT.ALL", "IMPORT"] {
+        let response = handle_request(
+            Request {
+                command: command.to_string(),
+                account: Some("BACKUP_TEST".to_string()),
+                target_account: Some("BACKUP_TEST".to_string()),
+                file: Some("USERS".to_string()),
+                path: Some(format!("{}/nope.srp", dir.path())),
+                ..Default::default()
+            },
+            &db_arc,
+            &ordinary,
+        );
+        assert_eq!(
+            response.code,
+            Some(ErrorCode::AdminRequired),
+            "{} was not gated",
+            command
+        );
+    }
+    assert!(
+        !Path::new(&format!("{}/nope.srp", dir.path())).exists(),
+        "and nothing was written on the way to refusing"
+    );
+}
+
+/// A command that needs a path and was given none says which of the two forms
+/// the caller wanted, rather than "missing field".
+#[test]
+fn an_archive_command_without_a_path_names_the_streamed_form_instead() {
+    let (_dir, db_arc) = archive_db("handler_archive_path");
+    let admin = archive_admin();
+
+    for (command, other) in [("EXPORT.ALL", "EXPORT.BYTES"), ("IMPORT", "IMPORT.BYTES")] {
+        let response = handle_request(
+            Request {
+                command: command.to_string(),
+                ..Default::default()
+            },
+            &db_arc,
+            &admin,
+        );
+        assert_eq!(response.code, Some(ErrorCode::MissingField));
+        let message = response.message.unwrap_or_default();
+        assert!(
+            message.contains(other),
+            "{} should point at {}: {}",
+            command,
+            other,
+            message
+        );
+    }
+}
+
+/// The collision rule over the wire: refused whole without `overwrite`, and the
+/// dry run reports without writing.
+#[test]
+fn an_import_over_the_protocol_needs_overwrite_and_honours_a_dry_run() {
+    let (dir, db_arc) = archive_db("handler_archive_overwrite");
+    let admin = archive_admin();
+    let path = format!("{}/backup.srp", dir.path());
+
+    let exported = handle_request(
+        Request {
+            command: "EXPORT.ACCOUNT".to_string(),
+            target_account: Some("BACKUP_TEST".to_string()),
+            path: Some(path.clone()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(exported.status, "OK");
+
+    let refused = handle_request(
+        Request {
+            command: "IMPORT".to_string(),
+            path: Some(path.clone()),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(refused.code, Some(ErrorCode::InvalidRequest));
+    assert!(refused.message.unwrap_or_default().contains("OVERWRITE"));
+
+    let dry = handle_request(
+        Request {
+            command: "IMPORT".to_string(),
+            path: Some(path.clone()),
+            overwrite: Some(true),
+            dry_run: Some(true),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(dry.status, "OK", "{:?}", dry.message);
+    let report = dry.archive.unwrap();
+    assert_eq!(report["dryRun"], true);
+    assert!(
+        report["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file["action"] == "replaced")
+    );
+}
+
+/// Sent down the ordinary dispatch, a streamed command says the command exists
+/// and this is not where it works - the same answer PUT.BYTES gives.
+#[test]
+fn the_streamed_archive_commands_refuse_a_path_that_cannot_carry_a_body() {
+    let (_dir, db_arc) = archive_db("handler_archive_stream");
+    let admin = archive_admin();
+
+    for command in ["EXPORT.BYTES", "IMPORT.BYTES"] {
+        let response = handle_request(
+            Request {
+                command: command.to_string(),
+                length: Some(0),
+                ..Default::default()
+            },
+            &db_arc,
+            &admin,
+        );
+        assert_eq!(response.code, Some(ErrorCode::InvalidRequest), "{}", command);
+        assert!(
+            response
+                .message
+                .unwrap_or_default()
+                .contains("raw bytes on the connection"),
+            "{}",
+            command
+        );
+    }
+}

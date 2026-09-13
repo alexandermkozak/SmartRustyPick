@@ -1,3 +1,5 @@
+use crate::db::archive;
+use crate::db::engine::archive::{ImportPlan, ImportReport};
 use crate::db::engine::dictionary::DEFAULT_FIELD_WIDTH;
 use crate::db::{
     Change, ChangeOp, Condition, Database, DbError, ExplodeSpec, IndexStats, QueryNode, Record, SortSpec, Table,
@@ -248,6 +250,107 @@ fn account_index_listing(indexes: Vec<(String, IndexStats)>) -> Response {
             .map(|(file, stats)| (format!("{}/{}", file, stats.field), stats))
             .collect(),
     )
+}
+
+/// The scope an `EXPORT.*` command names, or the refusal to send.
+///
+/// `EXPORT.FILE` takes its account the way every record command does - the
+/// request's, or the client's single allowed one - while `EXPORT.ACCOUNT` names
+/// its account outright, because an admin exporting somebody else's account is
+/// the ordinary case rather than the exception.
+#[allow(clippy::result_large_err)]
+fn export_source(command: &str, req: &Request, acc: &str) -> Result<archive::Source, Response> {
+    // A streamed export says what it wants the same way a path one does: a file
+    // if it names one, an account if it names one, everything otherwise.
+    let command = if command == "EXPORT.BYTES" {
+        if req.file.as_deref().is_some_and(|f| !f.trim().is_empty()) {
+            "EXPORT.FILE"
+        } else if req.target_account.as_deref().is_some_and(|a| !a.trim().is_empty()) {
+            "EXPORT.ACCOUNT"
+        } else {
+            "EXPORT.ALL"
+        }
+    } else {
+        command
+    };
+    match command {
+        "EXPORT.FILE" => {
+            let file = requested_file(req)?.to_string();
+            Ok(archive::Source::File {
+                account: acc.to_string(),
+                file,
+            })
+        }
+        "EXPORT.ACCOUNT" => {
+            let account = req
+                .target_account
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or(acc);
+            if account.is_empty() {
+                return Err(error(ErrorCode::AccountNotSpecified, "Account not specified"));
+            }
+            Ok(archive::Source::Account {
+                account: account.to_string(),
+            })
+        }
+        _ => Ok(archive::Source::All),
+    }
+}
+
+/// What a restore was asked to do. Both flags default to off, and absent means
+/// off rather than "unchanged": an import that silently overwrote because a
+/// field was missing would be the one failure this whole command guards
+/// against.
+fn import_plan(req: &Request) -> ImportPlan {
+    ImportPlan {
+        into_account: req
+            .target_account
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_string),
+        overwrite: req.overwrite.unwrap_or(false),
+        dry_run: req.dry_run.unwrap_or(false),
+    }
+}
+
+fn export_report(source: &archive::Source, path: &str, trailer: &archive::Trailer) -> serde_json::Value {
+    serde_json::json!({
+        "source": source.describe(),
+        "path": path,
+        "files": trailer.files.iter().map(|file| serde_json::json!({
+            "account": file.account,
+            "file": file.name,
+            "records": file.records,
+            "dictionary": file.dictionary,
+            "bytes": file.bytes,
+        })).collect::<Vec<_>>(),
+        "records": trailer.records(),
+        "dictionary": trailer.dictionary(),
+        "bytes": trailer.bytes(),
+    })
+}
+
+fn import_report(report: &ImportReport) -> serde_json::Value {
+    let manifest = &report.summary.manifest;
+    serde_json::json!({
+        "source": manifest.source.describe(),
+        "taken": manifest.taken_millis,
+        "takenUtc": manifest.taken_utc(),
+        "archiveFormat": manifest.archive_format,
+        "storageFormat": manifest.storage_format,
+        "dryRun": report.dry_run,
+        "accountsCreated": report.accounts_created,
+        "files": report.files.iter().map(|file| serde_json::json!({
+            "account": file.account,
+            "file": file.name,
+            "action": file.action.as_word(),
+            "records": file.records,
+            "dictionary": file.dictionary,
+            "bytes": file.bytes,
+        })).collect::<Vec<_>>(),
+        "records": report.records(),
+    })
 }
 
 fn listing_of(entries: Vec<(String, IndexStats)>) -> Response {
@@ -808,6 +911,127 @@ pub struct StagedWrite {
     /// The temporary the body is written into, inside the file's own directory
     /// so an abandoned transfer is swept by the ordinary read path.
     pub staged: std::path::PathBuf,
+}
+
+/// An archive spooled and opened for streaming out, with the length that same
+/// handle carries and the spool to remove once it has gone.
+pub struct OpenedArchive {
+    pub file: std::fs::File,
+    pub length: u64,
+    /// Removed by the sender when the transfer ends, however it ends.
+    pub spool: std::path::PathBuf,
+    /// What the archive holds, for the response line that precedes the bytes.
+    pub report: serde_json::Value,
+}
+
+/// Builds the archive an `EXPORT.BYTES` will send.
+///
+/// The whole archive is produced into a spool file **before** a byte of it is
+/// announced, because the protocol announces a length and the length of an
+/// archive is not knowable until it has been written. The alternative - send
+/// first and say how much afterwards - is the framing the raw transfer path
+/// already rejected: a record contains newlines like any other byte, so there
+/// is no terminator to look for and the length has to come first.
+#[allow(clippy::result_large_err)]
+pub fn open_archive(
+    req: &Request,
+    db: &SharedDb,
+    client_info: &crate::db::ClientInfo,
+) -> Result<OpenedArchive, Response> {
+    if !client_info.is_admin {
+        return Err(error(ErrorCode::AdminRequired, "Admin privileges required"));
+    }
+    let db = read_lock(db);
+    let command = req.command.to_uppercase();
+    let account = transfer_account(req, client_info).unwrap_or("");
+    let source = export_source(&command, req, account)?;
+
+    let spool = db
+        .archive_spool("export")
+        .map_err(|e| db_error_in("Export failed", e))?;
+    let trailer = match db.export_to_path(&source, &spool) {
+        Ok(trailer) => trailer,
+        Err(e) => {
+            let _ = std::fs::remove_file(&spool);
+            return Err(db_error_in("Export failed", e));
+        }
+    };
+    let file = match std::fs::File::open(&spool) {
+        Ok(file) => file,
+        Err(e) => {
+            let _ = std::fs::remove_file(&spool);
+            return Err(db_error_in("Export failed", DbError::Io(e)));
+        }
+    };
+    let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+    Ok(OpenedArchive {
+        file,
+        length,
+        report: export_report(&source, "(sent on this connection)", &trailer),
+        spool,
+    })
+}
+
+/// Where an inbound `IMPORT.BYTES` body is spooled, and what to do with it once
+/// it has all arrived.
+pub struct StagedArchive {
+    pub length: u64,
+    pub spool: std::path::PathBuf,
+    pub plan: ImportPlan,
+}
+
+/// Everything an `IMPORT.BYTES` can be refused for before a byte is read.
+#[allow(clippy::result_large_err)]
+pub fn stage_archive(
+    req: &Request,
+    db: &SharedDb,
+    client_info: &crate::db::ClientInfo,
+) -> Result<StagedArchive, Response> {
+    if !client_info.is_admin {
+        return Err(error(ErrorCode::AdminRequired, "Admin privileges required"));
+    }
+    let Some(length) = req.length else {
+        return Err(error(
+            ErrorCode::MissingField,
+            "length not specified: IMPORT.BYTES announces how many bytes of archive follow it",
+        ));
+    };
+    let spool = read_lock(db)
+        .archive_spool("import")
+        .map_err(|e| db_error_in("Import failed", e))?;
+    Ok(StagedArchive {
+        length,
+        spool,
+        plan: import_plan(req),
+    })
+}
+
+/// Imports a spooled archive and removes the spool, whatever happened.
+pub fn commit_archive(staged: &StagedArchive, arrived: u64, db: &SharedDb) -> Response {
+    let response = if arrived != staged.length {
+        // The body ran short, so what is on disk is a prefix of an archive. The
+        // checksum would refuse it anyway; saying so here names the transfer
+        // rather than the archive, which is the truer account of what failed.
+        error(
+            ErrorCode::InvalidData,
+            format!(
+                "The archive was announced as {} bytes and {} arrived, so nothing was imported",
+                staged.length, arrived
+            ),
+        )
+    } else {
+        match read_lock(db).import(&staged.spool, &staged.plan) {
+            Ok(report) => Response {
+                status: "OK".to_string(),
+                count: Some(report.records() as usize),
+                archive: Some(import_report(&report)),
+                ..Default::default()
+            },
+            Err(e) => db_error_in("Import failed", e),
+        }
+    };
+    let _ = std::fs::remove_file(&staged.spool);
+    response
 }
 
 /// A record opened for streaming out, with the length that same handle carries.
@@ -1576,7 +1800,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
         // Listed here so the command exists everywhere the protocol says it
         // does, and is documented like any other; the connection loop takes it
         // before this is reached, because only it has the socket.
-        "PUT.BYTES" | "GET.BYTES" => transfer_command_elsewhere(&command),
+        "PUT.BYTES" | "GET.BYTES" | "EXPORT.BYTES" | "IMPORT.BYTES" => transfer_command_elsewhere(&command),
         // The queue commands, for the same callers as the record arms above:
         // the shared path in [`handle_request`] serves them whenever it can
         // resolve the account on its own.
@@ -1952,6 +2176,56 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     ..Default::default()
                 },
                 Err(e) => db_error(e),
+            }
+        }
+        // Backup and restore. Admin only, all four of them, and not because
+        // they are dangerous one at a time: an export reads every record of
+        // whatever it names, so the ability to run one against an arbitrary
+        // account is the ability to read that account. That is precisely the
+        // gate `is_admin` is.
+        "EXPORT.FILE" | "EXPORT.ACCOUNT" | "EXPORT.ALL" => {
+            if !client_info.is_admin {
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            }
+            let source = match export_source(&command, &req, acc) {
+                Ok(source) => source,
+                Err(response) => return response,
+            };
+            let Some(path) = req.path.as_deref().filter(|p| !p.trim().is_empty()) else {
+                return error(
+                    ErrorCode::MissingField,
+                    "No path given. EXPORT writes the archive to a path on the server host; to receive it over this                      connection instead, use EXPORT.BYTES",
+                );
+            };
+            match db.export_to_path(&source, std::path::Path::new(path)) {
+                Ok(trailer) => Response {
+                    status: "OK".to_string(),
+                    count: Some(trailer.records() as usize),
+                    archive: Some(export_report(&source, path, &trailer)),
+                    ..Default::default()
+                },
+                Err(e) => db_error_in("Export failed", e),
+            }
+        }
+        "IMPORT" => {
+            if !client_info.is_admin {
+                return error(ErrorCode::AdminRequired, "Admin privileges required");
+            }
+            let Some(path) = req.path.as_deref().filter(|p| !p.trim().is_empty()) else {
+                return error(
+                    ErrorCode::MissingField,
+                    "No path given. IMPORT reads the archive from a path on the server host; to send it over this                      connection instead, use IMPORT.BYTES",
+                );
+            };
+            let plan = import_plan(&req);
+            match db.import(std::path::Path::new(path), &plan) {
+                Ok(report) => Response {
+                    status: "OK".to_string(),
+                    count: Some(report.records() as usize),
+                    archive: Some(import_report(&report)),
+                    ..Default::default()
+                },
+                Err(e) => db_error_in("Import failed", e),
             }
         }
         // Indexes. Creating, rebuilding and dropping one are storage decisions

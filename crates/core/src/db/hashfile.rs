@@ -126,14 +126,49 @@ const CRC32C_TABLE: [u32; 256] = {
     table
 };
 
+/// A CRC32C taken over bytes that do not all exist at once.
+///
+/// The group files hand [`crc32c`] a slice because they build the whole frame
+/// in memory before writing it. An archive cannot: it is written and read a
+/// chunk at a time and may be larger than memory, so its checksum has to
+/// accumulate. One table, two ways of feeding it - a second copy of the
+/// Castagnoli table for the streaming case is the kind of near-duplicate that
+/// drifts.
+#[derive(Debug, Clone, Copy)]
+pub struct Crc32c(u32);
+
+impl Default for Crc32c {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Crc32c {
+    pub fn new() -> Self {
+        Crc32c(0xFFFF_FFFF)
+    }
+
+    /// Folds `data` in. Splitting the same bytes across calls gives the same
+    /// answer as one call with all of them, which is what lets a reader
+    /// checksum a stream it is consuming in fixed-size chunks.
+    pub fn update(&mut self, data: &[u8]) {
+        for byte in data {
+            self.0 = (self.0 >> 8) ^ CRC32C_TABLE[((self.0 ^ *byte as u32) & 0xFF) as usize];
+        }
+    }
+
+    /// The checksum of everything fed in so far.
+    pub fn finish(&self) -> u32 {
+        !self.0
+    }
+}
+
 /// CRC32C of `data`. Cheap, and strong enough to catch the truncated or
 /// half-written tails this format has to worry about.
 pub fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for byte in data {
-        crc = (crc >> 8) ^ CRC32C_TABLE[((crc ^ *byte as u32) & 0xFF) as usize];
-    }
-    !crc
+    let mut crc = Crc32c::new();
+    crc.update(data);
+    crc.finish()
 }
 
 /// `fsync` of a directory, so a rename inside it is durable.

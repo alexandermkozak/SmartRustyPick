@@ -664,6 +664,63 @@ def main():
             )
             suite.check_eq("The issued certificate can connect and read", response["status"], "OK")
 
+            # --- backup and restore through the dashboard --------------------
+            # The two endpoints that are not JSON in either direction, so the
+            # thing worth checking is that the bytes survive the HTTP layer.
+            status, archive, headers = dashboard.bytes(f"/api/archive?account={ACCOUNT}")
+            suite.check_eq("The dashboard downloads an archive", status, 200)
+            suite.check(
+                "as an attachment named for what it holds",
+                headers.get("Content-Disposition", "").startswith(f'attachment; filename="{ACCOUNT}-'),
+                headers.get("Content-Disposition", ""),
+            )
+            suite.check(
+                "and the bytes are an archive rather than a JSON envelope",
+                isinstance(archive, bytes) and archive.startswith(b"SRPARC01"),
+                repr(archive[:32]) if isinstance(archive, bytes) else type(archive).__name__,
+            )
+            # The dashboard sets this on every response, so the check is that
+            # the download is not an exception to it - and that it is sent once
+            # rather than twice by a route that set it again itself.
+            suite.check_eq(
+                "An archive is never cached between the server and the browser",
+                headers.get("Cache-Control"),
+                "no-store",
+            )
+
+            status, payload, _ = dashboard.bytes(
+                f"/api/archive?into=WEB_COPY&verify=true", method="POST", body=archive
+            )
+            report = json.loads(payload).get("archive") if status == 200 else {}
+            suite.check_eq("A verify reports without writing", status, 200)
+            suite.check_eq("and says so", (report or {}).get("dryRun"), True)
+            _, accounts, _ = dashboard.call("/api/accounts")
+            listed = [name for name, _ in (accounts or {}).get("results", [])]
+            suite.check("A verify created no account", "WEB_COPY" not in listed, str(listed))
+
+            status, payload, _ = dashboard.bytes(
+                f"/api/archive?into=WEB_COPY", method="POST", body=archive
+            )
+            suite.check_eq("An upload restores the archive", status, 200)
+            restored = json.loads(payload).get("archive") if status == 200 else {}
+            suite.check_eq(
+                "into the account it was told to",
+                (restored or {}).get("accountsCreated"),
+                ["WEB_COPY"],
+            )
+            response = protocol_call(
+                port, admin_crt, admin_key, certs.ca_crt,
+                {"command": "READ", "account": "WEB_COPY", "file": FILE, "key": "K1"},
+            )
+            suite.check_eq("and the records are readable in it", response["status"], "OK")
+
+            # A damaged archive is refused by the engine, and the dashboard
+            # passes that refusal on as a 400 rather than a 500.
+            status, payload, _ = dashboard.bytes(
+                "/api/archive?into=WEB_TRUNCATED", method="POST", body=archive[:-8]
+            )
+            suite.check_eq("A truncated upload is refused", status, 400)
+
             # --- authorization management -----------------------------------
             status, _, _ = dashboard.call(
                 "/api/clients",

@@ -103,6 +103,7 @@ test-integration: build
 	$(PYTHON) test/integration/test_directory.py
 	$(PYTHON) test/integration/test_conditional.py
 	$(PYTHON) test/integration/test_transaction.py
+	$(PYTHON) test/integration/test_archive.py
 	$(PYTHON) test/integration/test_web.py
 
 test-performance: build

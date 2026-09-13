@@ -67,8 +67,9 @@ The volume outlives the container, so **replacing the image tag is the upgrade**
 written in, and a server checks it before reading a byte.
 
 ```sh
-# Always, before an upgrade. The volume is the database.
-podman volume export srp-data > srp-data-$(date +%F).tar
+# Always, before an upgrade. Take a real backup, not a copy of the volume -
+# see Backups below for why the difference matters.
+make container-cli     # then: EXPORT.ALL TO /data/backups/pre-upgrade.srp
 
 podman compose pull && podman compose up -d
 podman compose logs | head
@@ -95,9 +96,11 @@ podman compose up -d
 ```
 
 Once a start has printed `migrated from storage format …`, the older image will refuse the volume, and that refusal is
-correct — the older build genuinely cannot read what the newer one wrote. Restore the backup taken above and start the
-old tag against that. This is why the backup is not optional: a migration is the one step in an upgrade that is not
-reversible by changing the tag back.
+correct — the older build genuinely cannot read what the newer one wrote. Start the old tag against an empty volume and
+`IMPORT` the archive taken above into it. This is why the backup is not optional: a migration is the one step in an
+upgrade that is not reversible by changing the tag back, and an archive is readable by builds on both sides of it —
+the [archive format is versioned separately](storage.md#the-archive-format-version) from the storage format, precisely
+so that a backup outlives the directory it came from.
 
 **Checking before you move.** Ask the running server what it writes and what it will open, rather than reading a file
 inside a container:
@@ -112,6 +115,59 @@ is above your directory's version cannot take it.
 
 One gap is worth knowing about: images built before this check existed do not look at `.format` at all, so they will
 open a directory of any version. The protection starts with the first image that has it, and applies from there on.
+
+## Backups
+
+**Do not back up by copying the volume while the server is running.** It is the one thing that looks like a backup and
+is not:
+
+- writes are buffered in memory for up to `flush_interval_ms`, so a copy can miss acknowledged writes;
+- a flush writes every changed group and *then* rewrites `meta`, so a copy landing between the two gets halves that
+  disagree;
+- nothing coordinates such a copy across the files of an account, so even a clean per-file copy is not a coherent
+  account.
+
+Use [`EXPORT`](admin_commands.md#exportfile--exportaccount--exportall) instead. It flushes, holds the files it names,
+and writes a self-describing archive with a checksum over the whole of it, so an archive that restores at all restores
+to a state the database actually passed through.
+
+```sh
+make container-cli
+# then, inside the CLI:
+#   EXPORT.ACCOUNT SALES TO /data/backups/sales-2026-09-12.srp    (nightly)
+#   EXPORT.ALL TO /data/backups/all-2026-09-12.srp                (maintenance window)
+```
+
+`EXPORT.ACCOUNT` holds one account still and is the one to run routinely. `EXPORT.ALL` blocks writes to the whole
+database for as long as it takes, so it belongs in a window where that is acceptable — and it leaves `SYSTEM` out,
+because `$CLIENTS` holds the certificate thumbprints this deployment authorized and they have no business travelling
+inside a routine backup.
+
+Put the archives somewhere the volume is not. A backup on the disk you are protecting against is not one:
+
+```yaml
+# compose.yaml - a second volume, so a lost data volume does not take the backups with it
+volumes:
+  - srp-data:/data
+  - srp-backups:/data/backups
+```
+
+**Restoring.** Verify first, always — it reads the archive through and reports what a real import would do without
+writing anything:
+
+```sh
+make container-cli
+# then:
+#   IMPORT /data/backups/all-2026-09-12.srp VERIFY
+#   IMPORT /data/backups/all-2026-09-12.srp OVERWRITE
+```
+
+An archive restores into a **different** deployment as readily as the one it came from — the hashfile layout is not
+carried, so the target rehashes into its own `records_per_group`. `IMPORT … AS <account>` brings a production account
+up beside the original for inspection without touching it.
+
+A client with no filesystem access to the server host can move an archive over the connection instead, with
+[`EXPORT.BYTES` / `IMPORT.BYTES`](protocol.md#exportbytes--importbytes--admin).
 
 ## Configuration
 

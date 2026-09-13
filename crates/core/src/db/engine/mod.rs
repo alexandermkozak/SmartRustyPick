@@ -1,3 +1,4 @@
+pub mod archive;
 mod cache;
 #[cfg(test)]
 mod cache_tests;
@@ -485,6 +486,13 @@ impl Database {
         // run committed but did not finish writing is applied here, in the one
         // moment when nothing else is looking at the files it touches.
         db.replay_transaction_log()?;
+
+        // An archive spooled through a connection that died mid transfer is
+        // debris and never part of the database - nothing reads one that the
+        // transfer which made it is not still holding. Swept here rather than
+        // on each transfer, because start-up is the one moment when no transfer
+        // is in flight.
+        db.sweep_archive_spool();
 
         Ok(db)
     }

@@ -349,6 +349,91 @@ AI agents have been responsible for several critical improvements and fixes in t
   the ones that did. Every unit test passed; it took driving the real CLI to see four rows where two belonged. The
   function is total now, and says in its own documentation why the obvious spelling is wrong.
 
+### 10. Backup and restore: the copy that was never a backup
+
+The only way to copy a database was to copy `db_storage/` out from underneath a running server, and that fails three
+separate ways at once - writes buffered for up to `flush_interval_ms`, a flush that rewrites groups and *then*
+rewrites `meta` so a copy landing between them gets halves that disagree, and nothing coordinating the copy across
+the files of an account. An **archive** replaces it: `EXPORT.FILE`, `EXPORT.ACCOUNT`, `EXPORT.ALL` and `IMPORT` in the
+CLI and the protocol, plus `EXPORT.BYTES` / `IMPORT.BYTES` carrying one over the connection for an admin with no
+filesystem access to the host - the same pairing directory files already have in `STORE`/`EXTRACT` and
+`PUT.BYTES`/`GET.BYTES`.
+
+- **It carries records, not layout.** The modulus is a property of the deployment that holds the data - how many
+  records it has and what its `records_per_group` is - not of the data. So an archive carries records under their keys
+  and the target rehashes them, which is what makes restoring into another machine, or beside the original under a
+  second account name, ordinary rather than a special case. The integration suite restores into a **second server with
+  its own storage directory**, because that is the claim a backup actually makes and nothing in-process can show it.
+- **The shape leads and the counts follow.** A restore needs the manifest before it can do anything - it must create a
+  file, with the right type and flags, before it has anywhere to put the first record. The counts cannot be up there
+  with it, and the reason is the one file type that has no lock: a directory file has **no table**, deliberately, so
+  records can be added and removed underneath the walk and how many were written is not knowable until the last one
+  has been. A trailer lets the archive state the count exactly instead of stating an intention. It is also why the
+  body is tagged rather than counted - a tag per record needs no number in front of the run, so the same writer
+  streams to a socket and to a file.
+- **A reader never applies as it parses.** The checksum is over the whole archive, so it is only known good at its last
+  four bytes. Applying as it read would mean a truncated archive had already half-restored itself by the time the
+  truncation was found - and a half-restored account looks exactly like a restored one. An import is therefore verify,
+  plan, apply: read through and discarded, every file resolved against what is already there, and only then read a
+  second time. Which is why an import takes a *path* and the streamed form spools to a file first.
+- **Two tests worth more than the rest.** Every prefix of an archive is refused, and every single-byte flip anywhere in
+  one is caught - both as exhaustive loops over a sample archive rather than as one hand-picked case. They are what
+  make "an archive that does not decode was never a backup" a property instead of a claim.
+- **The refusals are the interface, again.** A file the archive lands on that already exists needs `OVERWRITE`, and
+  without it the whole import is refused with *every* colliding file named rather than the first. `OVERWRITE` then
+  replaces rather than merges: a restore restores, and merging would leave records from two points in time under one
+  name with no way to tell which were which.
+- **What is deliberately not carried.** An index's postings (rebuilt from the records that actually arrived, the only
+  index that describes them). A directory file's host path - it belongs to the machine that exported it, and honouring
+  it elsewhere would either fail or, far worse, succeed against somebody else's directory. An autokey file's counter,
+  which is derived from the keys that came back so the next minted key cannot land on a record the restore just put
+  back. And `SYSTEM` in a whole-database export, because `$CLIENTS` holds the certificate thumbprints this deployment
+  authorized and an archive carrying them would grant the source machine's authorizations wherever it was restored.
+- **The bug a flaky test found.** `two_exports_of_unchanged_data_are_identical` passed alone and failed under the full
+  parallel suite. The archives were not identical and never could be: they differ in `taken_millis` and therefore in
+  the CRC32C over it, and the test only passed when both exports happened to land in the same millisecond. The test
+  was wrong, not the code - the true property is that two exports differ *only* in when they were taken, and it now
+  says so and excludes both the stamp and the checksum over it rather than comparing lossy text that hid the tail.
+- **The other bug a test found.** `Source::All` was including `SYSTEM`, because the assumption that `list_accounts()`
+  returns only data accounts was wrong. The exclusion is now stated where it happens rather than inherited from a
+  quirk of the registry.
+
+### 11. The dashboard's half of a backup
+
+A browser is good at two things a CLI is not: handing you a file, and taking one. So the dashboard
+offers `EXPORT.BYTES` as a **download** and `IMPORT.BYTES` as an **upload**, and deliberately does
+not offer the path form - a path typed into a web form names a directory on a machine the person at
+the keyboard usually cannot see.
+
+- **The defaults are the safe ones, and they are the interesting part.** Verify is ticked and
+  overwrite is not, so a restore nobody configured reports and writes nothing. The flags are sent as
+  query parameters only when they are actually set: absent means off at the server, and sending
+  `overwrite=false` would be the page making a decision it was not asked to make. The test that
+  matters asserts the *URL*, because that is where consent is either present or not.
+- **Two things the dashboard could not do before.** Its protocol client only ever read a line, so it
+  gained a body-reading and a body-sending exchange - and the import one is deliberately **not
+  retried**, unlike every other call there. An `IMPORT.BYTES` that failed after the body went out
+  may or may not have been applied, and sending it again would be a second restore rather than a
+  retry of the first.
+- **The body limit became per route.** The HTTP layer allows 256 KiB because "the API exchanges
+  small JSON objects only", and an archive is a database. Raising the general bound to fit one
+  endpoint would hand every other endpoint an allowance it has no use for, so exactly one path may
+  send more. It is read off the request target before the body, so an oversized upload is refused on
+  its `Content-Length` rather than after being read into memory.
+- **A bound that had to be stated rather than discovered.** Neither the HTTP layer nor the
+  dashboard's protocol client streams, so an archive is held in memory twice while it is in flight.
+  That is fine for what a person downloads through a browser and bad beyond it, so 256 MiB is
+  refused with the advice to use the CLI - which writes to a path and holds nothing.
+- **A duplicate header caught by a test that was testing nothing.** The download set
+  `Cache-Control: no-store` itself, and the check for it passed even in a run where the endpoint was
+  returning 404 - because `write_response` already sets it on every response. The header was being
+  sent twice. Removed, with a comment saying it is covered elsewhere, so its absence does not read
+  as an oversight later.
+- **The security note is part of the feature.** An archive grants nothing the dashboard could not
+  already reach, but "the whole database as one file" is much easier to walk away with than the same
+  data read a page at a time, and the same token uploads one back. `docs/web_dashboard.md` says so
+  next to the fact that the token travels in a URL and does not expire.
+
 ### TLS Troubleshooting
 
 - **UnknownIssuer error (on server logs)**: The client certificate is not signed by a CA the server trusts. Correct by

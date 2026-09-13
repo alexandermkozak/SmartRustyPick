@@ -51,9 +51,16 @@ field formatting, and complex select operations.
   reading one costs that read rather than making the whole file resident. `STORE` and `EXTRACT` stream a host file in
   and out locally, and `PUT.BYTES` / `GET.BYTES` do the same over the network - a length announced on the request line
   and the record's bytes carried raw on the connection, so a remote client needs no filesystem access to the server.
+- **Backup and Restore**: `EXPORT` writes an archive of a file, an account or the whole database while the server is
+  running - it flushes, holds what it names, and writes a self-describing, checksummed archive, so what comes back is a
+  state the database actually passed through rather than a smear across a flush. It carries records and shape rather
+  than the hashfile layout, so `IMPORT` restores into another machine, or beside the original under a second account
+  name, as readily as into the deployment it came from. Nothing is applied until the whole archive has decoded, and a
+  file that already exists is only replaced when asked.
 - **Remote Access**: TCP SSL server with certificate authentication and CRUD protocol.
 - **Web Dashboard**: Browser-based management of connections, certificates, accounts, files, their dictionaries and live
-  server activity, started automatically with the server.
+  server activity, started automatically with the server. Backups are a download and restores an upload, with a verify
+  pass that reports what a restore would do before anything is written.
 - **Persistent Configuration**: Customize your environment (e.g., preferred editor, SSL certificates, server address).
 - **Headless Mode**: Run the database as a background service without a CLI.
 - **Smart Login**: Automatic CLI account login based on the current working directory.

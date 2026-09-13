@@ -79,7 +79,7 @@ describe('the dashboard shell', () => {
     it('offers every management view', () => {
         const wrapper = mount(App)
         const tabs = wrapper.findAll('.tab').map((tab) => tab.text())
-        expect(tabs).toEqual(['Overview', 'Authorizations', 'Certificates', 'Accounts'])
+        expect(tabs).toEqual(['Overview', 'Authorizations', 'Certificates', 'Accounts', 'Backup'])
     })
 
     it('shows the server it is connected to once the first poll lands', async () => {

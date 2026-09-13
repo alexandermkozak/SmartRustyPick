@@ -1,4 +1,6 @@
 use smart_rusty_pick_core::config::Config;
+use smart_rusty_pick_core::db::archive::Source;
+use smart_rusty_pick_core::db::engine::archive::{FileAction, ImportPlan, ImportReport};
 use smart_rusty_pick_core::db::{
     Database, DirectoryPolicy, DirectoryRecord, ExplodeSpec, Field, FileAttributes, QueueDelivery, Record, SelectEntry,
     SelectList, ValuePosition, queue, report,
@@ -200,6 +202,12 @@ fn main() -> io::Result<()> {
             }
             "EXTRACT" => {
                 handle_extract(&mut db.write().unwrap(), &parts);
+            }
+            "EXPORT.FILE" | "EXPORT.ACCOUNT" | "EXPORT.ALL" => {
+                handle_export(&db.read().unwrap(), &command, &parts);
+            }
+            "IMPORT" => {
+                handle_import(&db.read().unwrap(), &parts);
             }
             "SAVE-LIST" => {
                 handle_save_list(&mut db.write().unwrap(), &parts);
@@ -1301,9 +1309,179 @@ fn print_help(current_account: &str) {
         println!("  LIST.CONNS                            - List authorized connections.");
         println!("  GENERATE.CERT <common_name>           - Generate and sign a new client certificate (SYSTEM only).");
     }
+    println!("  EXPORT.FILE <file> TO <path>          - Archive one file of this account.");
+    println!("  EXPORT.ACCOUNT <name> TO <path>       - Archive an account, consistent across its files.");
+    println!("  EXPORT.ALL TO <path>                  - Archive every account. Blocks writes while it runs.");
+    println!("  IMPORT <path> [AS <name>] [OVERWRITE] [VERIFY] - Restore an archive. VERIFY reports and writes");
+    println!("                                          nothing; OVERWRITE is required to replace a file.");
     println!("  START.SERVER [<addr:port>] <cert_path> <key_path> <ca_path> - Start TCP SSL server.");
     println!("  SAVE                                  - Save all changes to disk.");
     println!("  EXIT or QUIT                          - Exit the shell.");
+}
+
+/// `EXPORT.FILE <file> TO <path>`, `EXPORT.ACCOUNT <account> TO <path>` and
+/// `EXPORT.ALL TO <path>`.
+///
+/// One handler for the three, because they differ only in what they name: the
+/// scope is a [`Source`] and everything after it - the quiesce, the archive,
+/// the tmp-then-rename - is the same operation.
+fn handle_export(db: &Database, command: &str, parts: &[&str]) {
+    let usage = match command {
+        "EXPORT.FILE" => "Usage: EXPORT.FILE <file> TO <path>",
+        "EXPORT.ACCOUNT" => "Usage: EXPORT.ACCOUNT <account> TO <path>",
+        _ => "Usage: EXPORT.ALL TO <path>",
+    };
+
+    // `TO` is required rather than optional, and the path is whatever follows
+    // it. An export names a file an operator will reach for in an emergency;
+    // inventing a default name for it is how a backup ends up somewhere nobody
+    // looks.
+    let Some(to) = parts.iter().position(|part| part.eq_ignore_ascii_case("TO")) else {
+        println!("{}", usage);
+        return;
+    };
+    let path = parts[to + 1..].join(" ");
+    if path.is_empty() {
+        println!("{}", usage);
+        return;
+    }
+
+    let source = match command {
+        "EXPORT.FILE" => {
+            if to != 2 {
+                println!("{}", usage);
+                return;
+            }
+            let account = db.current_account();
+            if account.is_empty() {
+                println!("Error: Not logged into an account");
+                return;
+            }
+            Source::File {
+                account,
+                file: parts[1].to_uppercase(),
+            }
+        }
+        "EXPORT.ACCOUNT" => {
+            if to != 2 {
+                println!("{}", usage);
+                return;
+            }
+            Source::Account {
+                account: parts[1].to_uppercase(),
+            }
+        }
+        _ => {
+            if to != 1 {
+                println!("{}", usage);
+                return;
+            }
+            Source::All
+        }
+    };
+
+    match db.export_to_path(&source, std::path::Path::new(&path)) {
+        Ok(trailer) => {
+            println!(
+                "Exported {} to {}: {} file(s), {} record(s), {} dictionary entr(ies), {} bytes of records",
+                source.describe(),
+                path,
+                trailer.files.len(),
+                trailer.records(),
+                trailer.dictionary(),
+                trailer.bytes()
+            );
+            for file in &trailer.files {
+                println!("  {}/{}: {} record(s)", file.account, file.name, file.records);
+            }
+        }
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+/// `IMPORT <path> [AS <account>] [OVERWRITE] [VERIFY]`.
+///
+/// `VERIFY` is the dry run, and it is worth reaching for first: it reads the
+/// archive through, checks it against what is already there, and prints what a
+/// real import would do.
+fn handle_import(db: &Database, parts: &[&str]) {
+    const USAGE: &str = "Usage: IMPORT <path> [AS <account>] [OVERWRITE] [VERIFY]";
+    if parts.len() < 2 {
+        println!("{}", USAGE);
+        return;
+    }
+
+    let mut plan = ImportPlan::default();
+    let mut path = String::new();
+    let mut index = 1;
+    while index < parts.len() {
+        match parts[index].to_uppercase().as_str() {
+            "AS" => {
+                let Some(account) = parts.get(index + 1) else {
+                    println!("{}", USAGE);
+                    return;
+                };
+                plan.into_account = Some(account.to_uppercase());
+                index += 2;
+            }
+            "OVERWRITE" => {
+                plan.overwrite = true;
+                index += 1;
+            }
+            "VERIFY" => {
+                plan.dry_run = true;
+                index += 1;
+            }
+            _ if path.is_empty() => {
+                path = parts[index].to_string();
+                index += 1;
+            }
+            other => {
+                println!("Unknown option '{}'. {}", other, USAGE);
+                return;
+            }
+        }
+    }
+    if path.is_empty() {
+        println!("{}", USAGE);
+        return;
+    }
+
+    match db.import(std::path::Path::new(&path), &plan) {
+        Ok(report) => print_import(&report, &path),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn print_import(report: &ImportReport, path: &str) {
+    let manifest = &report.summary.manifest;
+    println!(
+        "{} {}: {}, taken {}",
+        if report.dry_run { "Verified" } else { "Imported" },
+        path,
+        manifest.source.describe(),
+        manifest.taken_utc()
+    );
+    for file in &report.files {
+        println!(
+            "  {}/{} {} - {} record(s), {} dictionary entr(ies)",
+            file.account,
+            file.name,
+            match (report.dry_run, file.action) {
+                (true, FileAction::Created) => "would be created",
+                (true, FileAction::Replaced) => "would be replaced",
+                (false, action) => action.as_word(),
+            },
+            file.records,
+            file.dictionary
+        );
+    }
+    if !report.accounts_created.is_empty() {
+        println!("  account(s) created: {}", report.accounts_created.join(", "));
+    }
+    if report.dry_run {
+        println!("Nothing was written.");
+    }
 }
 
 fn handle_save_list(db: &mut Database, parts: &[&str]) {

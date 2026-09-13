@@ -213,6 +213,7 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
             let stall_timeout = config
                 .transfer_stall_timeout()
                 .unwrap_or(std::time::Duration::from_secs(86_400));
+            let max_archive_bytes = config.max_archive_bytes();
             let max_record_bytes = {
                 let db = db.clone();
                 tokio::task::spawn_blocking(move || read_lock(&db).max_directory_record_bytes())
@@ -289,19 +290,33 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                         // line reader must never be handed a socket sitting in
                         // the middle of somebody's PDF.
                         if transfer::is_transfer_command(&command) {
-                            let outcome = if command == "PUT.BYTES" {
-                                transfer::put_bytes(
-                                    &mut reader,
-                                    &mut writer,
-                                    &req,
-                                    &db,
-                                    &client,
-                                    max_record_bytes,
-                                    stall_timeout,
-                                )
-                                .await
-                            } else {
-                                transfer::get_bytes(&mut writer, &req, &db, &client).await
+                            let outcome = match command.as_str() {
+                                "PUT.BYTES" => {
+                                    transfer::put_bytes(
+                                        &mut reader,
+                                        &mut writer,
+                                        &req,
+                                        &db,
+                                        &client,
+                                        max_record_bytes,
+                                        stall_timeout,
+                                    )
+                                    .await
+                                }
+                                "IMPORT.BYTES" => {
+                                    transfer::import_bytes(
+                                        &mut reader,
+                                        &mut writer,
+                                        &req,
+                                        &db,
+                                        &client,
+                                        max_archive_bytes,
+                                        stall_timeout,
+                                    )
+                                    .await
+                                }
+                                "EXPORT.BYTES" => transfer::export_bytes(&mut writer, &req, &db, &client).await,
+                                _ => transfer::get_bytes(&mut writer, &req, &db, &client).await,
                             };
                             stats::note_request(connection_id, &command, outcome.failed);
                             if outcome.close {

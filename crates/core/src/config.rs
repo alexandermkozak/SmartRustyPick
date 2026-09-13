@@ -21,6 +21,14 @@ pub struct Config {
     /// turns a mistake there into a refusal instead of an allocation the
     /// machine cannot meet. Defaults to 64 MiB.
     pub max_directory_record_bytes: Option<u64>,
+    /// Largest archive `IMPORT.BYTES` will accept on a connection, in bytes.
+    ///
+    /// An inbound archive is spooled to disk before any of it is applied, so
+    /// this bounds what one connection can make the server write while it
+    /// decides whether to trust it. An archive past the limit is refused with
+    /// the advice to put it on the server host and use `IMPORT`, which reads it
+    /// from a path and needs no such allowance. Defaults to 1 GiB.
+    pub max_archive_bytes: Option<u64>,
     /// How many files may be held in memory at once. Each is locked
     /// individually, so a larger cache is what lets writers to different files
     /// run in parallel instead of taking turns being loaded and evicted.
@@ -75,6 +83,11 @@ pub struct Config {
 /// that contain that damage. See `docs/admin_commands.md`'s server section and
 /// the README's configuration table for what each one guards against.
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024; // 1 MiB
+/// An archive of a small account is a few kilobytes and one with a directory
+/// file is however large that directory is. A gigabyte is generous for the
+/// first and nowhere near enough for the second - which is the point: past it
+/// the answer is a path on the host, not a bigger socket.
+pub const DEFAULT_MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 pub const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 /// A transfer that has made no progress for this long is a stuck client, not a
 /// slow one. Unlike the idle timeout it is on by default: a body was announced,
@@ -111,6 +124,10 @@ impl Config {
 
     pub fn max_request_bytes(&self) -> usize {
         self.max_request_bytes.unwrap_or(DEFAULT_MAX_REQUEST_BYTES)
+    }
+
+    pub fn max_archive_bytes(&self) -> u64 {
+        self.max_archive_bytes.unwrap_or(DEFAULT_MAX_ARCHIVE_BYTES)
     }
 
     /// How long a byte transfer may make no progress. `None` means disabled.
@@ -161,6 +178,7 @@ impl Default for Config {
             max_log_records: Some(100),
             records_per_group: None,
             max_directory_record_bytes: None,
+            max_archive_bytes: None,
             max_loaded_tables: None,
             durable_writes: None,
             fsync: None,

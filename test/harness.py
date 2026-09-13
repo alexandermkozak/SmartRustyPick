@@ -378,6 +378,47 @@ class Client:
             return response, None
         return response, self._read_exactly(response["length"])
 
+    def export_bytes(self, *, account=None, file=None):
+        """`EXPORT.BYTES`: the reply, then exactly `length` bytes of archive.
+
+        Returns `(response, archive)`; `archive` is None when the reply carried
+        no length, which is every refusal. The scope comes from what is named -
+        a file, an account, or neither for the whole database.
+        """
+        request = {"command": "EXPORT.BYTES"}
+        if account is not None:
+            request["target_account"] = account
+        if file is not None:
+            request["file"] = file
+        response = self.request(**request)
+        if response.get("length") is None:
+            return response, None
+        return response, self._read_exactly(response["length"])
+
+    def import_bytes(self, archive, *, account=None, overwrite=None, dry_run=None, length=None):
+        """`IMPORT.BYTES`: one request line, then the archive, then one reply.
+
+        Sent in a single `sendall` for the reason `put_bytes` is: that is what a
+        client does, and it is what puts the body in the server's read buffer
+        alongside the request line.
+        """
+        header = {"command": "IMPORT.BYTES"}
+        header["length"] = len(archive) if length is None else length
+        if account is not None:
+            header["target_account"] = account
+        if overwrite is not None:
+            header["overwrite"] = overwrite
+        if dry_run is not None:
+            header["dry_run"] = dry_run
+        self.sock.sendall(json.dumps(header).encode() + b"\n" + archive)
+        while b"\n" not in self._buffer:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("Server closed the connection before responding")
+            self._buffer += chunk
+        line, self._buffer = self._buffer.split(b"\n", 1)
+        return json.loads(line.decode())
+
     def close(self):
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
@@ -518,6 +559,28 @@ class Dashboard:
                 return response.status, _decode(response.read()), dict(response.headers)
         except urllib.error.HTTPError as error:
             return error.code, _decode(error.read()), dict(error.headers)
+
+    def bytes(self, path, method="GET", body=None, content_type="application/octet-stream"):
+        """A call whose body - in either direction - is bytes rather than JSON.
+
+        The archive endpoints are the only ones shaped this way. The reply is
+        returned undecoded, because a download that came back as text would have
+        been silently corrupted by the decode this class does everywhere else.
+        """
+        import urllib.error
+        import urllib.request
+
+        request = urllib.request.Request(f"{self.base}{path}", data=body, method=method)
+        if body is not None:
+            request.add_header("Content-Type", content_type)
+        if self.token:
+            request.add_header("Authorization", f"Bearer {self.token}")
+
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return response.status, response.read(), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), dict(error.headers)
 
 
 def _decode(raw):
