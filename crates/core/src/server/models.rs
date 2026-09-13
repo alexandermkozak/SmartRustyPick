@@ -26,6 +26,12 @@ pub struct Request {
     pub name: Option<String>,
     pub accounts_list: Option<Vec<String>>,
     pub is_admin: Option<bool>,
+    /// `AUTHORIZE.CONN` and `GENERATE.CERT`: the capabilities to grant, by wire
+    /// name (`accounts:manage`, `clients:manage`, `server:observe`). Absent
+    /// means none, which is what every caller written before capabilities
+    /// existed sends - so those callers keep granting exactly what they did.
+    /// Ignored when `is_admin` is set, since `ADMIN` already carries all of them.
+    pub capabilities: Option<Vec<String>>,
     /// `CREATE.FILE`: create the file with per-file durable writes enabled.
     /// `SET.FILE`: turn per-file durable writes on or off for a file that
     /// already exists. Required there, since an absent flag must not be read as

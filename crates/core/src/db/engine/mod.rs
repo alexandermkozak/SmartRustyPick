@@ -722,6 +722,13 @@ impl Database {
                         .insert("ADMIN".to_string(), Record::from_display_string("3^ADMIN^L^5"));
                     updated = true;
                 }
+                if !table.dictionary.contains_key("CAPABILITIES") {
+                    table.dictionary.insert(
+                        "CAPABILITIES".to_string(),
+                        Record::from_display_string("4^CAPABILITIES^L^40"),
+                    );
+                    updated = true;
+                }
             }
             "$SAVEDLISTS" => {
                 if !table.dictionary.contains_key("TABLE") {
@@ -790,11 +797,29 @@ impl Database {
                     .and_then(|v| v.first_text())
                     .map(|s| s == "Y")
                     .unwrap_or(false);
+                // Field 3 is absent on every entry written before capabilities
+                // existed, which reads as "none" - so an old database keeps
+                // working and `ADMIN` keeps carrying what it always did. An
+                // unrecognised name is dropped rather than guessed at: a client
+                // whose capability list cannot be read must end up with less
+                // authority than intended, never more.
+                let mut capabilities = Vec::new();
+                if let Some(cap_field) = record.fields.get(SYS_CLIENTS_CAPABILITIES_IDX) {
+                    for value in &cap_field.values {
+                        if let Some(name) = value.first_text()
+                            && let Some(capability) = Capability::parse(name.as_ref())
+                            && !capabilities.contains(&capability)
+                        {
+                            capabilities.push(capability);
+                        }
+                    }
+                }
                 clients.push(ClientInfo {
                     name: name.clone(),
                     thumbprint: tp_lower,
                     allowed_accounts,
                     is_admin,
+                    capabilities,
                 });
             }
         }
@@ -2750,6 +2775,7 @@ impl Database {
         thumbprint: &str,
         allowed_accounts: Vec<String>,
         is_admin: bool,
+        capabilities: Vec<Capability>,
     ) -> DbResult<()> {
         self.run_in_system_account(|db| {
             let thumbprint_lower = thumbprint.to_lowercase();
@@ -2759,7 +2785,7 @@ impl Database {
                 let handle = db.get_table_mut("$CLIENTS")?;
                 let mut table = handle.write();
                 let mut record = Record::new();
-                while record.fields.len() <= SYS_CLIENTS_ADMIN_IDX {
+                while record.fields.len() <= SYS_CLIENTS_CAPABILITIES_IDX {
                     record.fields.push(Field::default());
                 }
                 // Field 0: Thumbprint
@@ -2774,6 +2800,17 @@ impl Database {
                 record.fields[SYS_CLIENTS_ADMIN_IDX]
                     .values
                     .push(Value::text(if is_admin { "Y" } else { "" }));
+                // Field 3: Capabilities, one per value. An ADMIN entry is left
+                // empty rather than expanded: `ADMIN` already means all of them,
+                // and writing them out would make a listing ambiguous about
+                // whether the flag or the list is the authority.
+                if !is_admin {
+                    for capability in &capabilities {
+                        record.fields[SYS_CLIENTS_CAPABILITIES_IDX]
+                            .values
+                            .push(Value::text(capability.as_str()));
+                    }
+                }
 
                 table.insert_record(name, record);
             }

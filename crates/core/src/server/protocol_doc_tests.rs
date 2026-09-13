@@ -37,6 +37,7 @@ const REQUEST_FIELDS: &[&str] = &[
     "name",
     "accounts_list",
     "is_admin",
+    "capabilities",
     "durable",
     "field",
     "values",

@@ -48,6 +48,7 @@ function revoke(name: string): void {
           <th>Name</th>
           <th>Thumbprint</th>
           <th>Accounts</th>
+          <th>Capabilities</th>
           <th>Role</th>
           <th></th>
         </tr>
@@ -60,6 +61,9 @@ function revoke(name: string): void {
               {{ shortThumbprint(client.info.thumbprint) }}
             </td>
             <td>{{ client.info.accounts.join(', ') || (client.info.is_admin ? 'all' : '—') }}</td>
+            <!-- The server expands ADMIN, so this column says what a credential
+                 can do without having to be read together with the Role one. -->
+            <td class="capability-cell">{{ client.info.capabilities.join(', ') || '—' }}</td>
             <td>
               <RolePill :is-admin="client.info.is_admin" />
             </td>
@@ -73,7 +77,7 @@ function revoke(name: string): void {
             </td>
           </tr>
           <tr v-if="editing === client.name" class="editor-row">
-            <td colspan="5">
+            <td colspan="6">
               <form class="inline-form" @submit.prevent="change(client.name, false)">
                 <input
                   v-model="draft"

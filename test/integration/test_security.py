@@ -18,6 +18,102 @@ ACCOUNT = "TEST_ACC"
 ADMIN_REQUIRED = "ADMIN_REQUIRED"
 
 
+def as_client(port, certificate, private_key, ca, request):
+    """One request over the protocol on a connection of its own.
+
+    A capability is a property of the certificate, so the only honest way to
+    test one is to connect with that certificate rather than to ask the admin
+    connection what it thinks would happen.
+    """
+    with harness.Client(port, certificate, private_key, ca) as client:
+        return client.request(**request)
+
+
+def check_capabilities(suite, admin, certs, port, user_crt, user_key):
+    """A capability grants a command without granting an account (issue #111).
+
+    `ADMIN` used to be one flag doing two jobs, so anything that could create an
+    account could also read every record in the database. These checks are the
+    split: a provisioning credential does its job and can do nothing else.
+    """
+    # Issued with a capability and no accounts at all - the shape that was not
+    # expressible before.
+    resp = admin.request(
+        command="GENERATE.CERT",
+        name="provisioner",
+        capabilities=["accounts:manage"],
+    )
+    if resp.get("status") != "OK":
+        suite.check("A capability-only certificate is issued", False, resp.get("message", ""))
+        return
+    issued = resp.get("record") or {}
+    suite.check(
+        "A certificate can be issued with a capability and no accounts",
+        issued.get("cert_path") and issued.get("key_path"),
+    )
+
+    # LIST.CONNS reports it as what it is, rather than as an unexplained flag.
+    listing = dict(admin.request(command="LIST.CONNS").get("results") or [])
+    entry = listing.get("provisioner") or {}
+    suite.check_eq("and it is listed with its capability", entry.get("capabilities"), ["accounts:manage"])
+    suite.check_eq("without being an admin", entry.get("is_admin"), False)
+    suite.check_eq("and with no accounts", entry.get("accounts"), [])
+
+    # Now connect as that credential and find out what it can actually do.
+    prov_crt, prov_key = issued["cert_path"], issued["key_path"]
+
+    resp = as_client(port, prov_crt, prov_key, certs.ca_crt,
+                     {"command": "CREATE.ACCOUNT", "target_account": "PROVISIONED"})
+    suite.check_eq("The provisioner can create an account", resp.get("status"), "OK")
+
+    # ...and nothing else. Creating an account does not grant access to it.
+    for command, extra in [
+        ("READ", {"file": "DIR", "key": "X"}),
+        ("WRITE", {"file": "DIR", "key": "X", "data": "V"}),
+        ("LIST.FILES", {}),
+        ("CREATE.FILE", {"file": "SNEAKY"}),
+    ]:
+        resp = as_client(port, prov_crt, prov_key, certs.ca_crt,
+                             {"command": command, "account": "PROVISIONED", **extra})
+        suite.check_eq(
+            f"and cannot {command} in the account it just created",
+            resp.get("code"),
+            "ACCESS_DENIED",
+        )
+
+    # Nor into somebody else's.
+    resp = as_client(port, prov_crt, prov_key, certs.ca_crt,
+                     {"command": "READ", "account": ACCOUNT, "file": "GOOD_FILE", "key": "K1"})
+    suite.check_eq("nor read another account", resp.get("code"), "ACCESS_DENIED")
+
+    # Nor hand itself the access, which is the escalation the split exists to
+    # prevent: granting accounts is `clients:manage`, a different capability.
+    resp = as_client(port, prov_crt, prov_key, certs.ca_crt,
+                     {"command": "ADD.CLIENT.ACCOUNT", "name": "provisioner",
+                          "accounts_list": ["PROVISIONED"]})
+    suite.check_eq("nor grant itself an account", resp.get("code"), "ADMIN_REQUIRED")
+    suite.check(
+        "and the refusal names the capability it lacked",
+        "clients:manage" in (resp.get("message") or ""),
+        resp.get("message", ""),
+    )
+
+    # A client allowed an account may now shape it, which is the other half of
+    # the split: it could already rewrite every record in the file.
+    resp = as_client(port, user_crt, user_key, certs.ca_crt,
+                         {"command": "CREATE.FILE", "account": ACCOUNT, "file": "SHAPED_BY_USER"})
+    suite.check_eq("A client allowed an account may create a file in it", resp.get("status"), "OK")
+
+    resp = as_client(port, user_crt, user_key, certs.ca_crt,
+                         {"command": "CREATE.FILE", "account": "PROVISIONED", "file": "NOPE"})
+    suite.check_eq("but not in an account it is not allowed", resp.get("code"), "ACCESS_DENIED")
+
+    # A typo must not read as a grant that quietly does nothing.
+    resp = admin.request(command="AUTHORIZE.CONN", thumbprint="abc123", name="typo",
+                         capabilities=["accounts:mange"])
+    suite.check_eq("An unknown capability is refused, not ignored", resp.get("code"), "INVALID_DATA")
+
+
 def check_no_secret_leakage(suite, admin, workspace_path):
     """Issuing a certificate must not leave its key material anywhere (issue #55).
 
@@ -262,8 +358,16 @@ def main():
                 resp = admin.request(command="CREATE.ACCOUNT", target_account="NEW_ACC")
                 suite.check_eq("Admin CREATE.ACCOUNT is allowed", resp["status"], "OK")
 
-                resp = user.request(command="CREATE.FILE", file="EVIL_FILE", account=ACCOUNT)
-                suite.check_eq("Non-admin CREATE.FILE is blocked", resp.get("code"), ADMIN_REQUIRED)
+                # Since #111 a file is authorized against the account it lives in
+                # rather than against an administrative rank: the user is allowed
+                # TEST_ACC, and could already rewrite every record in it.
+                resp = user.request(command="CREATE.FILE", file="USERS_OWN_FILE", account=ACCOUNT)
+                suite.check_eq("Non-admin CREATE.FILE in its own account is allowed", resp["status"], "OK")
+
+                resp = user.request(command="CREATE.FILE", file="EVIL_FILE", account="NEW_ACC")
+                suite.check_eq(
+                    "Non-admin CREATE.FILE in another account is blocked", resp.get("code"), "ACCESS_DENIED"
+                )
 
                 resp = admin.request(command="CREATE.FILE", file="GOOD_FILE", account=ACCOUNT)
                 suite.check_eq("Admin CREATE.FILE is allowed", resp["status"], "OK")
@@ -299,6 +403,7 @@ def main():
                 )
 
                 check_no_secret_leakage(suite, admin, workspace.path)
+                check_capabilities(suite, admin, certs, port, user_crt, user_key)
 
             check_tls_floor(suite, port, user_crt, user_key, certs.ca_crt)
             check_connection_limits(suite, certs, user_crt, user_key)

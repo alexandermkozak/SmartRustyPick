@@ -20,4 +20,5 @@ export interface CertificateRequest {
     common_name: string
     accounts: string[]
     is_admin: boolean
+    capabilities: string[]
 }

@@ -127,7 +127,17 @@ const TOKEN_BYTES: usize = 24;
 /// straight to the engine and everything afterwards goes over the wire.
 fn issue_dashboard_certificate(config: &Config, db: &SharedDb) -> std::io::Result<crate::server::certs::GeneratedCert> {
     let generated = generate_client_cert(config, DASHBOARD_COMMON_NAME, DASHBOARD_CERT_DAYS, false)?;
-    write_lock(db).add_authorized_client(DASHBOARD_CLIENT_NAME, &generated.thumbprint, Vec::new(), true)?;
+    // Still ADMIN: the dashboard manages accounts, files, indexes and clients,
+    // and lists every account to do it, so it needs both halves of what ADMIN
+    // used to conflate. Narrowing it is a dashboard question - which of its
+    // panels an operator wants - rather than an authorization one.
+    write_lock(db).add_authorized_client(
+        DASHBOARD_CLIENT_NAME,
+        &generated.thumbprint,
+        Vec::new(),
+        true,
+        Vec::new(),
+    )?;
     Ok(generated)
 }
 

@@ -39,7 +39,8 @@ implies otherwise is worse than none:
   patterns are not hidden, and encryption at rest will not hide them.
 - **Side channels** — timing, cache, power.
 - **A misbehaving but authorized client.** A client holding an authorized certificate is trusted within its allowed
-  accounts. Authorization is the control there, not encryption.
+  accounts, and within the capabilities it holds. Authorization is the control there, not encryption — which is why
+  what a credential is authorized *for* is worth bounding, and why capabilities exist (below).
 - **Availability.** Connections are bounded (`max_connections`) and handshakes time out (`handshake_timeout_ms`), which
   keeps a flood from building unbounded backlog. That is resource hygiene, not a denial-of-service defence.
 
@@ -136,7 +137,36 @@ audit trail readable in a stolen directory would undo much of what encrypting th
 This is the case that forces the ordering: the engine cannot list an account's files without reading `DIR`, so an
 encrypted database is unreadable until it is unlocked — consistent with decision 1's refusal to start without a key.
 
-### 4. What may never be logged
+### 4. Authorization is two questions, not one
+
+`ADMIN` used to be one flag doing two jobs: it bypassed the account allowlist on the data plane **and** it gated every
+administrative command. The consequence was that anything which had to create an account or a file was thereby
+authorized to read and overwrite every record in the database. A deployment script, a CI job, a service that onboards
+accounts — each needed a credential that was also a master key.
+
+The two jobs are now separate, and neither implies the other:
+
+- **Which accounts may this connection touch?** The allowed-account list. Everything that names a target account is
+  checked against it, including `CREATE.FILE`, `SET.FILE`, `DELETE.FILE` and the index commands — a file, a dictionary
+  and an index live inside one account and affect nothing outside it, so they are authorized the way the records in
+  them already were. A client that may rewrite every record in a file was never restrained by being unable to index it.
+- **What may this connection do that is not about one account?** A capability: `accounts:manage`, `clients:manage` or
+  `server:observe`. The table of which commands each covers is in [the protocol reference](protocol.md#authorization).
+
+**Creating an account does not grant access to it.** That is the property that makes a provisioning credential worth
+having: it can create the account and cannot read a record in it, and it cannot grant itself the access either, because
+granting is `clients:manage` — deliberately a different capability, since a client that may authorize clients may
+authorize an admin.
+
+`ADMIN` still means every capability and every account, so an authorization written before capabilities existed behaves
+exactly as it did and nothing has to be migrated. `EXPORT.*` and `IMPORT*` stay on `ADMIN` rather than moving behind a
+capability: an export reads every record of whatever it names, so a capability granting it would grant reading every
+account — the conflation this decision exists to undo.
+
+A secondary benefit worth stating, because it is what an operator actually sees: `LIST.CONNS` can now distinguish a
+credential that exists to run backups from one that exists to provision accounts. Both used to read `ADMIN`.
+
+### 5. What may never be logged
 
 The rule, so that the encryption work has something to check itself against — a key that leaks into a log line defeats
 all of it:
@@ -190,7 +220,8 @@ being thinned out.
 - **`config.toml`.** It is committed. Keep secrets out of it and source them from the environment or a gitignored
   override.
 - **Certificate hygiene.** There is no revocation but the thumbprint list. Issue narrowly, keep `LIST.CONNS` short, and
-  deauthorize what you no longer recognise.
+  deauthorize what you no longer recognise. "Narrowly" is now expressible: grant the capability a credential needs
+  instead of `ADMIN`, and check `LIST.CONNS` for entries still holding the flag that do not need it.
 
 ## Still open
 

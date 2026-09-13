@@ -13,6 +13,7 @@ pub const SYS_ACCOUNTS_PATH_IDX: usize = 0;
 pub const SYS_CLIENTS_THUMBPRINT_IDX: usize = 0;
 pub const SYS_CLIENTS_ACCOUNTS_IDX: usize = 1;
 pub const SYS_CLIENTS_ADMIN_IDX: usize = 2;
+pub const SYS_CLIENTS_CAPABILITIES_IDX: usize = 3;
 pub const SYS_LOGS_MESSAGE_IDX: usize = 0;
 pub const SYS_LOGS_DETAIL_IDX: usize = 1;
 // DIR entries describe the files of an account: field 1 is the entry type,
@@ -1143,13 +1144,119 @@ impl SelectList {
     }
 }
 
+/// One thing a client is allowed to do that is not about a particular account.
+///
+/// `ADMIN` used to be the only answer to "may this client administer the
+/// system", and it was also the answer to "may this client read every account" -
+/// one flag doing two jobs. Anything that had to create an account or a file was
+/// thereby authorized to read and overwrite every record in the database, so
+/// there was no way to express "may set this database up" without also granting
+/// "may read all of it".
+///
+/// A capability is the first job without the second. The set is deliberately
+/// small: three names cover the cases that exist, and a capability nobody can
+/// point at a command for is a capability that should not be minted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Capability {
+    /// `CREATE.ACCOUNT`, `DELETE.ACCOUNT`, `CREATE.TEST.ACCOUNT`.
+    ///
+    /// Holding it does **not** grant access to the accounts it creates. That is
+    /// the point: provisioning automation needs to make an account and hand it
+    /// to somebody else, and separating the two is what makes a provisioning
+    /// credential worth having rather than a master key with extra steps.
+    AccountsManage,
+    /// `AUTHORIZE.CONN`, `DEAUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`,
+    /// `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT`.
+    ///
+    /// This one is close to total power by a second step - a client that may
+    /// authorize clients may authorize an admin - so it is separated from
+    /// `AccountsManage` precisely so that provisioning need not carry it.
+    ClientsManage,
+    /// `SERVER.STATS`, `LIST.CONNS`. Reads about the server, never its records.
+    ServerObserve,
+}
+
+impl Capability {
+    /// The wire name, which is also what `$CLIENTS` stores and what the CLI
+    /// accepts. `area:verb`, so a listing reads as an inventory of what each
+    /// credential is *for*.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Capability::AccountsManage => "accounts:manage",
+            Capability::ClientsManage => "clients:manage",
+            Capability::ServerObserve => "server:observe",
+        }
+    }
+
+    /// Parses a wire name, case-insensitively. `None` for anything unknown:
+    /// a capability that does not exist must not be silently ignored, because
+    /// a typo would then read as a grant that quietly does nothing.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "accounts:manage" => Some(Capability::AccountsManage),
+            "clients:manage" => Some(Capability::ClientsManage),
+            "server:observe" => Some(Capability::ServerObserve),
+            _ => None,
+        }
+    }
+
+    /// Every capability, for help text and for expanding `ADMIN` in a listing.
+    pub const ALL: [Capability; 3] = [
+        Capability::AccountsManage,
+        Capability::ClientsManage,
+        Capability::ServerObserve,
+    ];
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ClientInfo {
     /// The `$CLIENTS` record key: the name the client was authorized under.
     pub name: String,
     pub thumbprint: String,
     pub allowed_accounts: Vec<String>,
+    /// Every capability plus every account. Kept as its own flag rather than
+    /// rewritten into a capability list so that an existing `$CLIENTS` entry
+    /// means exactly what it meant before and nothing has to be migrated.
     pub is_admin: bool,
+    /// Capabilities granted individually. Empty on every entry written before
+    /// capabilities existed, which is why `ADMIN` had to keep its meaning.
+    pub capabilities: Vec<Capability>,
+}
+
+impl ClientInfo {
+    /// Whether this client holds `capability`. `ADMIN` holds all of them.
+    pub fn can(&self, capability: Capability) -> bool {
+        self.is_admin || self.capabilities.contains(&capability)
+    }
+
+    /// Whether this client may touch `account` at all - the data-plane question,
+    /// asked wherever a command names a target account.
+    ///
+    /// Separate from [`can`](ClientInfo::can) on purpose: these are the two jobs
+    /// `is_admin` used to do at once, and keeping them as two predicates is what
+    /// stops them growing back together.
+    pub fn may_reach(&self, account: &str) -> bool {
+        self.is_admin || self.allowed_accounts.iter().any(|a| a == account)
+    }
+
+    /// What this client is authorized for, as wire names - `ADMIN` expanded to
+    /// the full set, so a listing never has to be read together with a flag to
+    /// be understood.
+    pub fn effective_capabilities(&self) -> Vec<Capability> {
+        if self.is_admin {
+            return Capability::ALL.to_vec();
+        }
+        let mut held = self.capabilities.clone();
+        held.sort();
+        held.dedup();
+        held
+    }
 }
 
 /// What a management view needs to know about one account, gathered without

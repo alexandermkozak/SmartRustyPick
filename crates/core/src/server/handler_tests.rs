@@ -1,3 +1,4 @@
+use crate::db::Capability;
 use crate::db::{ClientInfo, Database, ValuePosition};
 use crate::server::handler::handle_request;
 use crate::server::models::{ErrorCode, Request};
@@ -17,6 +18,7 @@ fn test_handle_request_read_write() {
         thumbprint: "test_tp".to_string(),
         allowed_accounts: vec!["SERVER_TEST".to_string()],
         is_admin: false,
+        ..Default::default()
     };
 
     // Test WRITE
@@ -82,6 +84,7 @@ fn test_create_and_delete_file_target_the_requested_account() {
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
         is_admin: true,
+        ..Default::default()
     };
 
     let resp = handle_request(
@@ -157,6 +160,7 @@ fn test_create_file_durable_flag_is_honoured() {
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
         is_admin: true,
+        ..Default::default()
     };
 
     for (file, durable) in [("LEDGER", true), ("SCRATCH", false)] {
@@ -232,12 +236,14 @@ fn test_set_file_promotes_and_demotes_an_existing_file() {
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
         is_admin: true,
+        ..Default::default()
     };
     let client = ClientInfo {
         name: "test_client".to_string(),
         thumbprint: "client_tp".to_string(),
         allowed_accounts: vec!["SET_TEST".to_string()],
         is_admin: false,
+        ..Default::default()
     };
 
     let set = |durable: Option<bool>, who: &ClientInfo| {
@@ -332,16 +338,39 @@ fn test_set_file_promotes_and_demotes_an_existing_file() {
         "Nothing to set: name durable, autokey, queue, visibility_timeout or max_deliveries"
     );
 
-    // Storage decisions are administrative, like creating the file was.
+    // A storage decision about a file is scoped to the account that file is in,
+    // so the client allowed that account may make it (#111). It could already
+    // write every record in the file; being unable to change how they are
+    // flushed restrained nothing.
     let resp = set(Some(true), &client);
-    assert_eq!(resp.status, "ERROR");
-    assert_eq!(resp.code, Some(ErrorCode::AdminRequired));
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
     assert!(
-        !db_arc
+        db_arc
             .write()
             .unwrap()
             .is_table_durable_for_account("SET_TEST", "LEDGER")
     );
+
+    // An outsider still cannot, and is refused for the reason that is actually
+    // true: the account, not a missing administrative rank.
+    let outsider = ClientInfo {
+        name: "outsider".to_string(),
+        thumbprint: "outsider_tp".to_string(),
+        allowed_accounts: vec!["SOMEWHERE_ELSE".to_string()],
+        is_admin: false,
+        ..Default::default()
+    };
+    let resp = set(Some(false), &outsider);
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.code, Some(ErrorCode::AccessDenied));
+    assert!(
+        db_arc
+            .write()
+            .unwrap()
+            .is_table_durable_for_account("SET_TEST", "LEDGER"),
+        "a refused SET.FILE must not have changed anything"
+    );
+    assert_eq!(set(Some(false), &client).status, "OK");
 
     // A file that does not exist is a not-found error, not a silent success.
     let resp = handle_request(
@@ -372,6 +401,7 @@ fn test_handle_request_query_select() {
         thumbprint: "test_tp".to_string(),
         allowed_accounts: vec!["QUERY_TEST".to_string()],
         is_admin: true, // Admin to access SYSTEM if needed, but we use QUERY_TEST
+        ..Default::default()
     };
 
     // Test QUERY
@@ -435,6 +465,7 @@ fn test_management_commands_report_accounts_files_and_statistics() {
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
         is_admin: true,
+        ..Default::default()
     };
 
     let resp = handle_request(
@@ -528,6 +559,7 @@ fn test_management_commands_respect_the_clients_permissions() {
         thumbprint: "test_tp".to_string(),
         allowed_accounts: vec!["VISIBLE".to_string()],
         is_admin: false,
+        ..Default::default()
     };
 
     // An account the client cannot reach must not even be named to it.
@@ -575,7 +607,7 @@ fn test_management_commands_respect_the_clients_permissions() {
 fn test_list_conns_and_server_stats_describe_the_running_server() {
     let dir = TempDir::new("server_stats");
     let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
-    db.add_authorized_client("reporting-bot", "AB12CD", vec!["SALES".to_string()], false)
+    db.add_authorized_client("reporting-bot", "AB12CD", vec!["SALES".to_string()], false, Vec::new())
         .unwrap();
     db.set_current_account("");
 
@@ -585,6 +617,7 @@ fn test_list_conns_and_server_stats_describe_the_running_server() {
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
         is_admin: true,
+        ..Default::default()
     };
 
     let resp = handle_request(
@@ -637,6 +670,7 @@ fn exploded_test_db(label: &str) -> (TempDir, Arc<RwLock<Database>>, ClientInfo)
         thumbprint: "test_tp".to_string(),
         allowed_accounts: vec!["EXP_TEST".to_string()],
         is_admin: false,
+        ..Default::default()
     };
     (dir, Arc::new(RwLock::new(db)), client_info)
 }
@@ -849,6 +883,7 @@ fn dictionary_test_db(name: &str) -> (TempDir, Arc<RwLock<Database>>, ClientInfo
         thumbprint: "dict_tp".to_string(),
         allowed_accounts: vec!["DICT_TEST".to_string()],
         is_admin: false,
+        ..Default::default()
     };
     (dir, Arc::new(RwLock::new(db)), client_info)
 }
@@ -1152,6 +1187,7 @@ fn test_an_account_created_over_the_protocol_gets_a_dir_file() {
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
         is_admin: true,
+        ..Default::default()
     };
 
     let resp = handle_request(
@@ -1229,6 +1265,7 @@ fn test_a_file_created_in_an_account_that_lost_its_dir_brings_it_back() {
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
         is_admin: true,
+        ..Default::default()
     };
 
     let resp = handle_request(
@@ -1271,6 +1308,7 @@ fn test_create_test_account_populates_the_demo_fixture_over_the_protocol() {
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
         is_admin: true,
+        ..Default::default()
     };
 
     let resp = handle_request(
@@ -1388,6 +1426,7 @@ fn test_the_demo_account_is_admin_only_and_needs_a_name() {
         thumbprint: "reporting_tp".to_string(),
         allowed_accounts: vec!["PLAIN".to_string()],
         is_admin: false,
+        ..Default::default()
     };
     let resp = handle_request(
         Request {
@@ -1405,6 +1444,7 @@ fn test_the_demo_account_is_admin_only_and_needs_a_name() {
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: Vec::new(),
         is_admin: true,
+        ..Default::default()
     };
     let resp = handle_request(
         Request {
@@ -1430,6 +1470,7 @@ fn a_directory_file_round_trips_arbitrary_bytes_over_the_protocol() {
         thumbprint: "tp".to_string(),
         allowed_accounts: vec![],
         is_admin: true,
+        ..Default::default()
     };
     let request = |command: &str| Request {
         command: command.to_string(),
@@ -1705,6 +1746,7 @@ fn the_hot_paths_lock_a_file_a_fixed_number_of_times() {
         thumbprint: "hot_tp".to_string(),
         allowed_accounts: vec!["HOT".to_string()],
         is_admin: false,
+        ..Default::default()
     };
 
     let request = |command: &str, key: &str| Request {
@@ -1839,6 +1881,7 @@ fn test_index_commands_create_list_rebuild_and_drop_over_the_wire() {
         thumbprint: "tp".to_string(),
         allowed_accounts: vec![],
         is_admin: true,
+        ..Default::default()
     };
     let index_request = |command: &str, field: Option<&str>| Request {
         command: command.to_string(),
@@ -1920,6 +1963,7 @@ fn test_index_commands_report_what_they_were_not_given() {
         thumbprint: "tp".to_string(),
         allowed_accounts: vec![],
         is_admin: true,
+        ..Default::default()
     };
     let refusal = |req: Request| {
         let resp = handle_request(req, &db_arc, &admin);
@@ -1969,7 +2013,7 @@ fn test_index_commands_report_what_they_were_not_given() {
 }
 
 #[test]
-fn test_changing_an_index_needs_admin_but_reading_them_does_not() {
+fn test_changing_an_index_follows_the_account_allowlist_and_reading_them_is_open() {
     // Creating an index is a storage decision about a file, gated like creating
     // the file. Listing them is not, any more than listing the files is.
     let dir = TempDir::new("server_index_perm");
@@ -1983,8 +2027,12 @@ fn test_changing_an_index_needs_admin_but_reading_them_does_not() {
         thumbprint: "tp".to_string(),
         allowed_accounts: vec!["IDX_PERM".to_string()],
         is_admin: false,
+        ..Default::default()
     };
 
+    // An index is a storage decision about one account's file, so the client
+    // allowed that account may make it (#111). Requiring ADMIN here meant that
+    // anything able to index a file could read every other account.
     for command in ["CREATE.INDEX", "REBUILD.INDEX", "DELETE.INDEX"] {
         let resp = handle_request(
             Request {
@@ -1997,8 +2045,31 @@ fn test_changing_an_index_needs_admin_but_reading_them_does_not() {
             &db_arc,
             &user,
         );
+        assert_eq!(resp.status, "OK", "{} must be allowed: {:?}", command, resp.message);
+    }
+
+    // Somebody else's account is still refused, for the reason that is true.
+    let outsider = ClientInfo {
+        name: "outsider".to_string(),
+        thumbprint: "outsider_tp".to_string(),
+        allowed_accounts: vec!["SOMEWHERE_ELSE".to_string()],
+        is_admin: false,
+        ..Default::default()
+    };
+    for command in ["CREATE.INDEX", "REBUILD.INDEX", "DELETE.INDEX"] {
+        let resp = handle_request(
+            Request {
+                command: command.to_string(),
+                account: Some("IDX_PERM".to_string()),
+                file: Some("USERS".to_string()),
+                field: Some("EMAIL".to_string()),
+                ..Default::default()
+            },
+            &db_arc,
+            &outsider,
+        );
         assert_eq!(resp.status, "ERROR", "{} must be refused", command);
-        assert_eq!(resp.code, Some(ErrorCode::AdminRequired));
+        assert_eq!(resp.code, Some(ErrorCode::AccessDenied));
     }
 
     let resp = handle_request(
@@ -2034,12 +2105,24 @@ fn every_refusal_carries_a_code_and_a_message() {
         thumbprint: "tp".to_string(),
         allowed_accounts: Vec::new(),
         is_admin: true,
+        ..Default::default()
     };
     let ordinary = ClientInfo {
         name: "plain".to_string(),
         thumbprint: "tp2".to_string(),
         allowed_accounts: vec!["CODES".to_string()],
         is_admin: false,
+        ..Default::default()
+    };
+    // Allowed nothing at all, so a command that names CODES is refused on the
+    // account rather than on a capability. `ordinary` may shape the account it
+    // is allowed (#111), so it is no longer the right client for that case.
+    let outsider = ClientInfo {
+        name: "outsider".to_string(),
+        thumbprint: "tp3".to_string(),
+        allowed_accounts: vec!["SOMEWHERE_ELSE".to_string()],
+        is_admin: false,
+        ..Default::default()
     };
 
     // One refusal per command, spanning the missing field, the missing thing,
@@ -2212,8 +2295,21 @@ fn every_refusal_carries_a_code_and_a_message() {
                 field: Some("NAME".to_string()),
                 ..in_account("SET.INDEX.EXCLUDE", Some("USERS"))
             },
-            &ordinary,
-            ErrorCode::AdminRequired,
+            &outsider,
+            ErrorCode::AccessDenied,
+        ),
+        (
+            Request {
+                field: Some("NAME".to_string()),
+                ..in_account("CREATE.INDEX", Some("USERS"))
+            },
+            &outsider,
+            ErrorCode::AccessDenied,
+        ),
+        (
+            in_account("CREATE.FILE", Some("NEW")),
+            &outsider,
+            ErrorCode::AccessDenied,
         ),
         (named("SERVER.STATS"), &ordinary, ErrorCode::AdminRequired),
         (
@@ -2259,6 +2355,7 @@ fn a_query_string_that_is_not_a_query_is_refused_rather_than_read_as_no_query() 
         thumbprint: "tp".to_string(),
         allowed_accounts: vec!["BAD_QUERY".to_string()],
         is_admin: false,
+        ..Default::default()
     };
     let ask = |command: &str, query: Option<&str>| {
         handle_request(
@@ -2310,12 +2407,14 @@ fn queue_fixture(label: &str) -> (TempDir, Arc<RwLock<Database>>, ClientInfo, Cl
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: vec!["QUEUE_TEST".to_string()],
         is_admin: true,
+        ..Default::default()
     };
     let worker = ClientInfo {
         name: "worker-1".to_string(),
         thumbprint: "worker_tp".to_string(),
         allowed_accounts: vec!["QUEUE_TEST".to_string()],
         is_admin: false,
+        ..Default::default()
     };
     (dir, db_arc, admin, worker)
 }
@@ -2366,12 +2465,21 @@ fn test_create_file_makes_a_queue_and_the_listing_says_so() {
     assert_eq!(flag("JOBS"), serde_json::json!(true));
     assert_eq!(flag("PLAIN"), serde_json::json!(false));
 
-    // Creating one is a storage decision, like any other CREATE.FILE.
+    // Creating one is a storage decision about the worker's own account, so the
+    // worker may make it (#111) - it is the account boundary that matters, not
+    // an administrative rank.
+    let mut allowed = queue_request("CREATE.FILE", "WORKERS_OWN");
+    allowed.queue = Some(true);
+    let resp = handle_request(allowed, &db_arc, &worker);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+
+    // In somebody else's account it is still refused, and named as what it is.
     let mut denied = queue_request("CREATE.FILE", "SNEAKY");
+    denied.account = Some("SOMEWHERE_ELSE".to_string());
     denied.queue = Some(true);
     assert_eq!(
         handle_request(denied, &db_arc, &worker).code,
-        Some(ErrorCode::AdminRequired)
+        Some(ErrorCode::AccessDenied)
     );
 }
 
@@ -2619,6 +2727,7 @@ fn two_accounts_one_file_name() -> (TempDir, Arc<RwLock<Database>>, ClientInfo) 
         thumbprint: "tp_both".to_string(),
         allowed_accounts: vec!["ALPHA".to_string(), "BETA".to_string()],
         is_admin: false,
+        ..Default::default()
     };
 
     for (account, key, name) in [("ALPHA", "1", "alpha one"), ("BETA", "9", "beta nine")] {
@@ -2735,6 +2844,7 @@ fn get_next_denies_a_client_that_may_not_reach_the_account_the_list_belongs_to()
         thumbprint: "tp_out".to_string(),
         allowed_accounts: vec!["BETA".to_string()],
         is_admin: false,
+        ..Default::default()
     };
 
     let response = handle_request(
@@ -2760,6 +2870,7 @@ fn get_next_walks_an_admins_list_without_an_account_on_any_request() {
         thumbprint: "tp_admin".to_string(),
         allowed_accounts: vec![],
         is_admin: true,
+        ..Default::default()
     };
 
     select_in(&db_arc, &admin, "ALPHA", "ADMINLIST");
@@ -2833,6 +2944,7 @@ fn transact_fixture() -> (TempDir, Arc<RwLock<Database>>, ClientInfo) {
         thumbprint: "txn_tp".to_string(),
         allowed_accounts: vec!["TXN_TEST".to_string()],
         is_admin: false,
+        ..Default::default()
     };
     (dir, Arc::new(RwLock::new(db)), client)
 }
@@ -3080,6 +3192,7 @@ fn conditional_fixture(label: &str) -> (TempDir, Arc<RwLock<Database>>, ClientIn
         thumbprint: "admin_tp".to_string(),
         allowed_accounts: vec!["COND".to_string()],
         is_admin: true,
+        ..Default::default()
     };
     (dir, db_arc, admin)
 }
@@ -3414,6 +3527,7 @@ fn archive_admin() -> ClientInfo {
         thumbprint: "tp_backup".to_string(),
         allowed_accounts: vec![],
         is_admin: true,
+        ..Default::default()
     }
 }
 
@@ -3495,6 +3609,7 @@ fn the_archive_commands_are_admin_only() {
         thumbprint: "tp_app".to_string(),
         allowed_accounts: vec!["BACKUP_TEST".to_string()],
         is_admin: false,
+        ..Default::default()
     };
 
     for command in ["EXPORT.FILE", "EXPORT.ACCOUNT", "EXPORT.ALL", "IMPORT"] {
@@ -3633,4 +3748,184 @@ fn the_streamed_archive_commands_refuse_a_path_that_cannot_carry_a_body() {
             command
         );
     }
+}
+
+/// A provisioning credential creates accounts and cannot read a single record
+/// in any of them - which is the whole reason capabilities exist (#111).
+#[test]
+fn test_a_provisioning_credential_cannot_read_what_it_creates() {
+    let dir = TempDir::new("provisioner");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db_arc = Arc::new(RwLock::new(db));
+
+    let provisioner = ClientInfo {
+        name: "provisioner".to_string(),
+        thumbprint: "prov_tp".to_string(),
+        allowed_accounts: Vec::new(),
+        is_admin: false,
+        capabilities: vec![Capability::AccountsManage],
+    };
+
+    // It can do the job it exists for.
+    let resp = handle_request(
+        Request {
+            command: "CREATE.ACCOUNT".to_string(),
+            target_account: Some("TENANT".to_string()),
+            ..Default::default()
+        },
+        &db_arc,
+        &provisioner,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+
+    // And nothing else. Creating an account does not grant access to it, so
+    // every data-plane command against it is refused - including the one that
+    // would let it shape the account it just made.
+    for command in ["READ", "WRITE", "QUERY", "SELECT", "CREATE.FILE", "LIST.FILES"] {
+        let resp = handle_request(
+            Request {
+                command: command.to_string(),
+                account: Some("TENANT".to_string()),
+                file: Some("ANY".to_string()),
+                key: Some("K1".to_string()),
+                query_string: Some("ANY".to_string()),
+                ..Default::default()
+            },
+            &db_arc,
+            &provisioner,
+        );
+        assert_eq!(resp.status, "ERROR", "{command} must be refused");
+        assert_eq!(
+            resp.code,
+            Some(ErrorCode::AccessDenied),
+            "{command} must be refused on the account, not on a rank"
+        );
+    }
+
+    // Nor may it hand itself the access, which is the step that would turn
+    // provisioning back into total power. That is `clients:manage`, deliberately
+    // a different grant.
+    for command in ["ADD.CLIENT.ACCOUNT", "AUTHORIZE.CONN", "GENERATE.CERT"] {
+        let resp = handle_request(
+            Request {
+                command: command.to_string(),
+                name: Some("provisioner".to_string()),
+                thumbprint: Some("prov_tp".to_string()),
+                accounts_list: Some(vec!["TENANT".to_string()]),
+                ..Default::default()
+            },
+            &db_arc,
+            &provisioner,
+        );
+        assert_eq!(resp.status, "ERROR", "{command} must be refused");
+        assert_eq!(resp.code, Some(ErrorCode::AdminRequired));
+        assert!(
+            resp.message.as_deref().is_some_and(|m| m.contains("clients:manage")),
+            "{command} should say which capability was missing: {:?}",
+            resp.message
+        );
+    }
+
+    // And it cannot observe the server either: three capabilities, held
+    // separately, none implying another.
+    assert_eq!(
+        handle_request(
+            Request {
+                command: "SERVER.STATS".to_string(),
+                ..Default::default()
+            },
+            &db_arc,
+            &provisioner,
+        )
+        .code,
+        Some(ErrorCode::AdminRequired)
+    );
+}
+
+/// An unknown capability name is refused rather than dropped, so a typo cannot
+/// read as a grant that quietly does nothing.
+#[test]
+fn test_authorizing_with_an_unknown_capability_is_refused() {
+    let dir = TempDir::new("unknown_capability");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "root".to_string(),
+        thumbprint: "root_tp".to_string(),
+        is_admin: true,
+        ..Default::default()
+    };
+
+    let resp = handle_request(
+        Request {
+            command: "AUTHORIZE.CONN".to_string(),
+            thumbprint: Some("aabbcc".to_string()),
+            name: Some("typo-bot".to_string()),
+            capabilities: Some(vec!["accounts:mange".to_string()]),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.code, Some(ErrorCode::InvalidData));
+    let message = resp.message.unwrap();
+    assert!(message.contains("accounts:mange"), "{message}");
+    assert!(message.contains("accounts:manage"), "{message}");
+
+    // Nothing was written: a refused authorization must not half-exist.
+    assert!(db_arc.write().unwrap().client_for_thumbprint("aabbcc").is_none());
+}
+
+/// A capability granted over the wire survives the round trip into `$CLIENTS`
+/// and back out of it, and `LIST.CONNS` reports it.
+#[test]
+fn test_capabilities_round_trip_through_the_clients_table() {
+    let dir = TempDir::new("capability_roundtrip");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "root".to_string(),
+        thumbprint: "root_tp".to_string(),
+        is_admin: true,
+        ..Default::default()
+    };
+
+    let resp = handle_request(
+        Request {
+            command: "AUTHORIZE.CONN".to_string(),
+            thumbprint: Some("DDEEFF".to_string()),
+            name: Some("ops-bot".to_string()),
+            capabilities: Some(vec!["server:observe".to_string(), "accounts:manage".to_string()]),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+
+    // Read back through the registry the server actually enforces against,
+    // including the lowercasing of the thumbprint it does on the way in.
+    let stored = db_arc.write().unwrap().client_for_thumbprint("ddeeff").unwrap();
+    assert_eq!(
+        stored.effective_capabilities(),
+        vec![Capability::AccountsManage, Capability::ServerObserve]
+    );
+    assert!(!stored.is_admin, "capabilities must not imply ADMIN");
+    assert!(stored.allowed_accounts.is_empty());
+
+    let resp = handle_request(
+        Request {
+            command: "LIST.CONNS".to_string(),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    let results = resp.results.unwrap();
+    let listed = &results.iter().find(|(name, _)| name == "ops-bot").unwrap().1;
+    assert_eq!(
+        listed["capabilities"],
+        serde_json::json!(["accounts:manage", "server:observe"])
+    );
 }

@@ -2,8 +2,8 @@ use smart_rusty_pick_core::config::Config;
 use smart_rusty_pick_core::db::archive::Source;
 use smart_rusty_pick_core::db::engine::archive::{FileAction, ImportPlan, ImportReport};
 use smart_rusty_pick_core::db::{
-    Database, DirectoryPolicy, DirectoryRecord, ExplodeSpec, Field, FileAttributes, QueueDelivery, Record, SelectEntry,
-    SelectList, ValuePosition, queue, report,
+    Capability, Database, DirectoryPolicy, DirectoryRecord, ExplodeSpec, Field, FileAttributes, QueueDelivery, Record,
+    SelectEntry, SelectList, ValuePosition, queue, report,
 };
 use smart_rusty_pick_core::server;
 use std::io::{self, Write};
@@ -2404,43 +2404,76 @@ fn handle_list_files(db: &mut Database) {
     }
 }
 
+/// Splits the grant list an `AUTHORIZE.CONN` carries into its three kinds.
+///
+/// One argument rather than three because a grant list reads as one thing -
+/// "what may this client do" - and because the two forms that existed before
+/// capabilities (`ADMIN`, or a comma-separated account list) stay valid and
+/// mean exactly what they meant. A token is a capability if it names one, and
+/// an account otherwise; capability names carry a colon, which an account name
+/// conventionally does not.
+fn parse_grants(argument: &str) -> (bool, Vec<String>, Vec<Capability>) {
+    let mut is_admin = false;
+    let mut accounts = Vec::new();
+    let mut capabilities = Vec::new();
+    for token in argument.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if token.eq_ignore_ascii_case("ADMIN") {
+            is_admin = true;
+        } else if let Some(capability) = Capability::parse(token) {
+            if !capabilities.contains(&capability) {
+                capabilities.push(capability);
+            }
+        } else {
+            // Accounts have always been uppercased here; capabilities are not,
+            // because their wire names are lowercase.
+            accounts.push(token.to_uppercase());
+        }
+    }
+    (is_admin, accounts, capabilities)
+}
+
 fn handle_authorize_conn(db: &mut Database, parts: &[&str]) {
     if parts.len() < 4 {
-        println!("Usage: AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts>");
-        println!("  'accounts' is a comma separated list of allowed accounts.");
+        println!("Usage: AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts | capabilities>");
+        println!("  A comma separated list, mixing account names with capabilities:");
+        println!("    {}", Capability::ALL.map(|c| c.as_str()).join(", "));
+        println!("  ADMIN is every capability and every account, as it always was.");
         return;
     }
     let thumbprint = parts[1];
     let name = parts[2];
-    let arg3 = parts[3].to_uppercase();
+    let (is_admin, accounts, capabilities) = parse_grants(parts[3]);
 
-    let (is_admin, accounts) = if arg3 == "ADMIN" {
-        (true, Vec::new())
-    } else {
-        (
-            false,
-            arg3.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-        )
-    };
-
-    if !is_admin && accounts.is_empty() {
-        println!("Error: Must provide ADMIN or at least one account.");
+    if !is_admin && accounts.is_empty() && capabilities.is_empty() {
+        println!("Error: Must provide ADMIN, at least one account, or at least one capability.");
         return;
     }
 
-    match db.add_authorized_client(name, thumbprint, accounts, is_admin) {
-        Ok(_) => {
-            if is_admin {
-                println!("Authorized: {} as {} (ADMIN)", thumbprint, name);
-            } else {
-                println!("Authorized: {} as {}", thumbprint, name);
-            }
-        }
+    let granted = describe_grants(is_admin, &accounts, &capabilities);
+    match db.add_authorized_client(name, thumbprint, accounts, is_admin, capabilities) {
+        Ok(_) => println!("Authorized: {} as {} ({})", thumbprint, name, granted),
         Err(e) => println!("Error authorizing: {}", e),
     }
+}
+
+/// What was granted, for the line printed back. An authorization that reports
+/// only success leaves the operator to re-read the listing to find out whether
+/// a mistyped account became an account or was refused.
+fn describe_grants(is_admin: bool, accounts: &[String], capabilities: &[Capability]) -> String {
+    if is_admin {
+        return "ADMIN".to_string();
+    }
+    let mut parts = Vec::new();
+    if !accounts.is_empty() {
+        parts.push(format!("accounts: {}", accounts.join(", ")));
+    }
+    if !capabilities.is_empty() {
+        parts.push(format!(
+            "capabilities: {}",
+            capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    parts.join("; ")
 }
 
 fn handle_add_client_account(db: &mut Database, parts: &[&str]) {
@@ -2509,29 +2542,41 @@ fn handle_deauthorize_conn(db: &mut Database, parts: &[&str]) {
 }
 
 fn handle_list_conns(db: &mut Database) {
-    println!("{:<20} {:<64}", "Name", "Thumbprint");
-    println!("{:-<20} {:-<64}", "", "");
+    // Read through the parsed registry rather than off `$CLIENTS` directly, so
+    // this listing and the server's `LIST.CONNS` answer from the same place and
+    // an entry whose capability list cannot be parsed is shown the way the
+    // server would actually enforce it.
+    let _ = db.refresh_clients_if_stale();
+    let clients = db.authorized_clients();
 
-    let _ = db.run_in_system_account(|db| {
-        let handle = db.get_table_mut("$CLIENTS")?;
-        let table = handle.read();
-        let mut names: Vec<_> = table.records.keys().cloned().collect();
-        names.sort();
-
-        for name in names {
-            if let Some(record) = table.records.get(&name) {
-                let thumbprint = record
-                    .fields
-                    .first()
-                    .and_then(|f| f.values.first())
-                    .and_then(|v| v.first_text())
-                    .map(|tp| tp.to_string())
-                    .unwrap_or_else(|| "N/A".to_string());
-                println!("{:<20} {:<64}", name, thumbprint);
-            }
-        }
-        Ok(())
-    });
+    println!("{:<20} {:<64} {:<30} Capabilities", "Name", "Thumbprint", "Accounts");
+    println!("{:-<20} {:-<64} {:-<30} {:-<40}", "", "", "", "");
+    for info in clients {
+        let accounts = if info.is_admin {
+            "(every account)".to_string()
+        } else if info.allowed_accounts.is_empty() {
+            "-".to_string()
+        } else {
+            info.allowed_accounts.join(",")
+        };
+        // Expanded for ADMIN, so the row says what the credential can do rather
+        // than leaving it to be inferred from a flag in another column.
+        let capabilities = info
+            .effective_capabilities()
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let capabilities = if capabilities.is_empty() {
+            "-".to_string()
+        } else {
+            capabilities
+        };
+        println!(
+            "{:<20} {:<64} {:<30} {}",
+            info.name, info.thumbprint, accounts, capabilities
+        );
+    }
 }
 
 fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
@@ -2585,37 +2630,36 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
     io::stdin().read_line(&mut is_admin_input).unwrap();
     let is_admin = is_admin_input.trim().to_uppercase() == "Y";
 
-    let accounts = if is_admin {
-        Vec::new()
+    // One prompt for both, parsed the same way `AUTHORIZE.CONN` parses its
+    // grant list, so the interactive path and the command cannot disagree about
+    // what a token means.
+    let (accounts, capabilities) = if is_admin {
+        (Vec::new(), Vec::new())
     } else {
-        print!("Enter comma-separated list of allowed accounts: ");
+        println!(
+            "Capabilities available: {}",
+            Capability::ALL.map(|c| c.as_str()).join(", ")
+        );
+        print!("Enter comma-separated accounts and/or capabilities: ");
         io::stdout().flush().unwrap();
-        let mut accs_input = String::new();
-        io::stdin().read_line(&mut accs_input).unwrap();
-        accs_input
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
+        let mut grants_input = String::new();
+        io::stdin().read_line(&mut grants_input).unwrap();
+        let (_, accounts, capabilities) = parse_grants(grants_input.trim());
+        (accounts, capabilities)
     };
 
-    if !is_admin && accounts.is_empty() {
-        println!("Error: Non-admin connections must have at least one allowed account.");
+    if !is_admin && accounts.is_empty() && capabilities.is_empty() {
+        println!("Error: A non-admin connection needs at least one allowed account or capability.");
         println!("Authorization skipped. Use AUTHORIZE.CONN to authorize manually.");
         return;
     }
 
-    match db.add_authorized_client(&auth_name, &generated.thumbprint, accounts, is_admin) {
-        Ok(_) => {
-            if is_admin {
-                println!(
-                    "Successfully authorized: {} as {} (ADMIN)",
-                    generated.thumbprint, auth_name
-                );
-            } else {
-                println!("Successfully authorized: {} as {}", generated.thumbprint, auth_name);
-            }
-        }
+    let granted = describe_grants(is_admin, &accounts, &capabilities);
+    match db.add_authorized_client(&auth_name, &generated.thumbprint, accounts, is_admin, capabilities) {
+        Ok(_) => println!(
+            "Successfully authorized: {} as {} ({})",
+            generated.thumbprint, auth_name, granted
+        ),
         Err(e) => println!("Error authorizing: {}", e),
     }
 }

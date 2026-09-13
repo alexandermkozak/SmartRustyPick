@@ -22,9 +22,44 @@ command, its requirements, its response shape and its errors.
   CA, then computes the certificate's SHA-256 thumbprint (lowercase hex) and looks it up in
   the authorized-clients table. An unknown thumbprint is logged and the connection is
   dropped without a response.
-- Each authorized client carries a **name**, a set of **allowed accounts** and an **admin**
-  flag. These govern which accounts the connection may touch and whether it may run admin
-  commands.
+- Each authorized client carries a **name**, a set of **allowed accounts**, an **admin**
+  flag and a set of **capabilities**. Together these answer two separate questions, which
+  `ADMIN` used to answer at once.
+
+## Authorization
+
+Two questions are asked of every request, and they are deliberately not the same question:
+
+**Which accounts may this connection touch?** The allowed-account list. Every command that names a
+target account — `READ`, `WRITE`, `QUERY`, the queue commands, and also `CREATE.FILE`, `SET.FILE`,
+`DELETE.FILE`, `SET.DICT` and the index commands — is checked against it and refused with
+`ACCESS_DENIED` otherwise. A file, a dictionary and an index all live inside one account and affect
+nothing outside it, so they are authorized the way the records in them are: a client that may
+rewrite every record in a file is not meaningfully restrained by being unable to index it.
+
+**What may this connection do that is not about one account?** A capability:
+
+| Capability | Commands |
+| --- | --- |
+| `accounts:manage` | `CREATE.ACCOUNT`, `DELETE.ACCOUNT`, `CREATE.TEST.ACCOUNT` |
+| `clients:manage` | `AUTHORIZE.CONN`, `DEAUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`, `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT` |
+| `server:observe` | `SERVER.STATS`, `LIST.CONNS` |
+
+A command gated on a capability the client does not hold is refused with `ADMIN_REQUIRED`, whose
+message names the capability that would have been enough.
+
+**`ADMIN` means every capability and every account**, exactly as it always did, so an authorization
+written before capabilities existed behaves identically and nothing has to be migrated.
+
+**Creating an account does not grant access to it.** A client holding `accounts:manage` can create
+an account and cannot read it; granting access is a separate `ADD.CLIENT.ACCOUNT` under
+`clients:manage`. That separation is the point — it is what lets a provisioning credential exist
+without being a master key over every account in the database.
+
+`EXPORT.*` and `IMPORT*` remain `ADMIN`-only and are not behind a capability. An export reads every
+record of whatever it names and an import writes them, so they are data access in an administrative
+shape; a capability granting them would grant reading every account, which is the conflation the
+rest of this section exists to undo.
 - Authorize a client with the `AUTHORIZE.CONN` command (available from the CLI and over the wire), or let
   `GENERATE.CERT` issue and authorize a certificate in one step. `LIST.CONNS`
   reports what is currently authorized.
@@ -68,6 +103,7 @@ matched case-insensitively.
 | `name`            | string           | `AUTHORIZE.CONN`, `DEAUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`, `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT`               | Human-readable client name; the identifier for later management. For `GENERATE.CERT` it is also the certificate's common name, so it is limited to letters, digits, `.`, `-` and `_`.                                                                                                     |
 | `accounts_list`   | array of strings | `AUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`, `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT`                                   | Allowed accounts for the client. Default `[]`.                                                                                                                                                                                                                                            |
 | `is_admin`        | bool             | `AUTHORIZE.CONN`, `GENERATE.CERT`                                                                                  | Grant the client admin rights. Default `false`.                                                                                                                                                                                                                                           |
+| `capabilities`    | array of strings | `AUTHORIZE.CONN`, `GENERATE.CERT`                                                                                  | Capabilities to grant, by name (`accounts:manage`, `clients:manage`, `server:observe`). Default `[]`. An unknown name is refused with `INVALID_DATA` rather than ignored. Ignored when `is_admin` is set, which already carries all of them.                                                 |
 | `durable`         | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Per-file durable writes. Optional for `CREATE.FILE`, default `false` - except on a queue, which defaults to `true`. On `SET.FILE` an absent flag leaves the file's durability alone. See [Storage Engine](storage.md). |
 | `queue`           | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Make the file a [queue file](#queue-files): ordered records, claimed one at a time. Optional; on `SET.FILE` an absent flag leaves the file as it is, and `false` returns a queue to an ordinary file without touching its records. |
 | `autokey`         | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Make the file mint the key of a `WRITE` that names none - see [Server-minted keys](#server-minted-keys). Optional; on `SET.FILE` an absent flag leaves it as it is. Refused with `INVALID_REQUEST` alongside `queue` or `directory`: a queue already mints every key it stores, and a directory file's keys are the names of host files. |
@@ -1206,11 +1242,11 @@ carry a body — an in-process caller, or a client that sent the line and nothin
 
 ## Management commands
 
-### CREATE.ACCOUNT / DELETE.ACCOUNT — admin
+### CREATE.ACCOUNT / DELETE.ACCOUNT — `accounts:manage`
 
 Create or drop an account. Names the account with `target_account`, not `account`.
 
-- Required: `target_account`. Admin only.
+- Required: `target_account`. Requires `accounts:manage` (or `ADMIN`).
 - A created account comes with its `DIR` file, the listing that describes the files it holds
   and carries their durability flags. Everything that reads one treats a missing `DIR` as an
   error rather than as an empty account, so no client has to remember to create it.
@@ -1228,12 +1264,12 @@ Create or drop an account. Names the account with `target_account`, not `account
 {"status": "OK"}
 ```
 
-### CREATE.TEST.ACCOUNT — admin
+### CREATE.TEST.ACCOUNT — `accounts:manage`
 
 Create an account already populated with the demo fixture — the same one the CLI's
 `CREATE.TEST.ACCOUNT` makes, so there is something to query without typing records in first.
 
-- Required: `target_account`. Admin only. The CLI restricts the command to the `SYSTEM`
+- Required: `target_account`. Requires `accounts:manage` (or `ADMIN`). The CLI restricts the command to the `SYSTEM`
   account; over the wire an admin certificate is the equivalent gate.
 - The account gets a `DIR`, a `USERS` file and a `PRODUCTS` file, each with a dictionary and a
   couple of records. Between them they reach every level of the hierarchy — `ROLES` is
@@ -1263,12 +1299,12 @@ Create an account already populated with the demo fixture — the same one the C
                             "files": ["ATTACHMENTS", "DIR", "EVENTS", "JOBS", "PRODUCTS", "USERS"]}}
 ```
 
-### CREATE.FILE — admin
+### CREATE.FILE
 
 Create a table (data and dictionary sections) in `account`.
 
 - Required: `account`, `file`. Optional: `durable`, `autokey`, `queue`,
-  `visibility_timeout`, `max_deliveries`, `directory`, `path`. Admin only.
+  `visibility_timeout`, `max_deliveries`, `directory`, `path`. Authorized against the client's allowed accounts, like `SET.DICT` - no administrative rank needed.
 - The file is added to the account's `DIR` listing, which is created first if the account
   has not got one.
 - With `durable: true` the file is marked mission critical in the account's `DIR` entry, so
@@ -1313,14 +1349,14 @@ entry spells it — an entry that says nothing means "the default place", and an
 asking where the records went wants the answer and not the rule. It is `null` for every
 other file.
 
-### SET.FILE — admin
+### SET.FILE
 
 Change what a file already is, without recreating it — so a file can be promoted to mission
 critical or demoted back, made a queue or returned to an ordinary file, and a queue's claim
 policy retuned, all while keeping the records it holds.
 
 - Required: `account`, `file`, and at least one of `durable`, `autokey`, `queue`,
-  `visibility_timeout` or `max_deliveries`. Admin only.
+  `visibility_timeout` or `max_deliveries`. Authorized against the client's allowed accounts, like `SET.DICT` - no administrative rank needed.
 - **Only what is named changes.** An omitted field leaves that attribute alone, so a request
   about durability cannot quietly stop a file being a queue, and one about a queue's timeout
   cannot quietly demote it to buffered writes.
@@ -1364,11 +1400,11 @@ policy retuned, all while keeping the records it holds.
                             "path": null}}
 ```
 
-### DELETE.FILE — admin
+### DELETE.FILE
 
 Drop a table from `account`.
 
-- Required: `account`, `file`. Admin only.
+- Required: `account`, `file`. Authorized against the client's allowed accounts, like `SET.DICT` - no administrative rank needed.
 - Errors: `ADMIN_REQUIRED`, `ACCOUNT_NOT_SPECIFIED`, `MISSING_FIELD` (no `file`),
   `FILE_NOT_FOUND`.
 
@@ -1380,29 +1416,29 @@ Drop a table from `account`.
 {"status": "OK"}
 ```
 
-### AUTHORIZE.CONN — admin
+### AUTHORIZE.CONN — `clients:manage`
 
 Authorize a client certificate.
 
 - Required: `thumbprint`, `name`. Optional: `accounts_list` (default `[]`), `is_admin`
-  (default `false`). Admin only.
+  (default `false`), `capabilities` (default `[]`). Requires `clients:manage` (or `ADMIN`).
 - Errors: `ADMIN_REQUIRED`, `MISSING_FIELD` (no `thumbprint` or `name`).
 
 ```json
 {"command": "AUTHORIZE.CONN", "thumbprint": "9f86d081...", "name": "reporting-bot",
- "accounts_list": ["SALES"], "is_admin": false}
+ "accounts_list": ["SALES"], "is_admin": false, "capabilities": ["server:observe"]}
 ```
 
 ```json
 {"status": "OK"}
 ```
 
-### DEAUTHORIZE.CONN — admin
+### DEAUTHORIZE.CONN — `clients:manage`
 
 Revoke a client by name. An active connection for that client is dropped after its next
 request with `message: "Client deauthorized"`.
 
-- Required: `name`. Admin only.
+- Required: `name`. Requires `clients:manage` (or `ADMIN`).
 - Errors: `ADMIN_REQUIRED`, `MISSING_FIELD` (no `name`), `CLIENT_NOT_FOUND`.
 
 ```json
@@ -1413,12 +1449,12 @@ request with `message: "Client deauthorized"`.
 {"status": "OK"}
 ```
 
-### ADD.CLIENT.ACCOUNT / REMOVE.CLIENT.ACCOUNT — admin
+### ADD.CLIENT.ACCOUNT / REMOVE.CLIENT.ACCOUNT — `clients:manage`
 
 Add or remove allowed accounts for an existing client. Each account in `accounts_list` is
 applied in turn; the first failure aborts and is reported.
 
-- Required: `name`. Optional: `accounts_list` (default `[]`). Admin only.
+- Required: `name`. Optional: `accounts_list` (default `[]`). Requires `clients:manage` (or `ADMIN`).
 - Errors: `ADMIN_REQUIRED`, `MISSING_FIELD` (no `name`). The message of a failure part way
   through names the account it stopped on.
 
@@ -1430,14 +1466,14 @@ applied in turn; the first failure aborts and is reported.
 {"status": "OK"}
 ```
 
-### GENERATE.CERT — admin
+### GENERATE.CERT — `clients:manage`
 
 Issue a client certificate signed by the server's CA and authorize it in one step. The private key is generated on the
 server, written next to the CA (alongside a PKCS#12 bundle when `openssl` can produce one) and returned in the response,
 which is the only time it is sent anywhere.
 
 - Required: `name`, which is both the certificate's common name and the authorization name. Optional: `accounts_list`,
-  `is_admin` (default `false`). Admin only.
+  `is_admin` (default `false`), `capabilities` (default `[]`). Requires `clients:manage` (or `ADMIN`).
 - A non-admin certificate must be given at least one account, since a client with neither admin rights nor an allowed
   account could do nothing.
 - Certificates are valid for 365 days. Re-issuing under an existing name replaces that client's authorization, which
@@ -1469,12 +1505,12 @@ which is the only time it is sent anywhere.
 }}
 ```
 
-### LIST.CONNS — admin
+### LIST.CONNS — `server:observe`
 
 List every authorized client. `results` pairs the authorization name with its details; this is the authorization list,
 not the list of open sessions, which `SERVER.STATS` carries.
 
-- Required: nothing. Admin only.
+- Required: nothing. Requires `server:observe` (or `ADMIN`).
 - Errors: `ADMIN_REQUIRED`.
 
 ```json
@@ -1483,7 +1519,8 @@ not the list of open sessions, which `SERVER.STATS` carries.
 
 ```json
 {"status": "OK", "count": 1,
- "results": [["reporting-bot", {"thumbprint": "9f86d081...", "accounts": ["SALES"], "is_admin": false}]]}
+ "results": [["reporting-bot", {"thumbprint": "9f86d081...", "accounts": ["SALES"], "is_admin": false,
+                                "capabilities": ["server:observe"]}]]}
 ```
 
 ### LIST.ACCOUNTS
@@ -1833,7 +1870,7 @@ Create or replace one dictionary entry, named by `key`, from the attributes in
                             "definition": "2^PRICE^R^10^^^^MD2"}}
 ```
 
-### CREATE.INDEX / REBUILD.INDEX — admin
+### CREATE.INDEX / REBUILD.INDEX
 
 Build a [secondary index](storage.md#secondary-indexes) on a dictionary field, so
 `WITH <field> = <value>` resolves through the index instead of scanning the file.
@@ -1875,7 +1912,7 @@ reported as `stale`, and the way to bring one back after its section has been da
 }}
 ```
 
-### DELETE.INDEX — admin
+### DELETE.INDEX
 
 Drop an index and remove its section from disk. The file's records are untouched, and
 queries that were using it go back to scanning.
@@ -1996,7 +2033,7 @@ One index in full: its statistics, its verdicts, and the values that dominate it
 }}
 ```
 
-### SET.INDEX.EXCLUDE — admin
+### SET.INDEX.EXCLUDE
 
 Replace the values one index deliberately does not hold.
 
@@ -2042,11 +2079,11 @@ empty string"` is the other common spelling: a sparse field most records simply 
 }}
 ```
 
-### SERVER.STATS — admin
+### SERVER.STATS — `server:observe`
 
 The running server: how long it has been up, what it has served and which sessions are open right now.
 
-- Required: nothing. Admin only.
+- Required: nothing. Requires `server:observe` (or `ADMIN`).
 - `active_connections` lists the sessions holding a TLS connection at this instant, the caller's own included. Totals
   are counted since the process started.
 - `storage_format` is the [on-disk format version](storage.md#storage-format-versions) this build writes — and, since

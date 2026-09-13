@@ -650,6 +650,54 @@ main section {
   display: block;
 }
 
+/* --- Capabilities -----------------------------------------------------------
+   A capability is granted by checkbox rather than typed, so the picker carries
+   the explanation each one needs: "clients:manage" does not say on its own that
+   it is the grant that can escalate into any other. */
+.capabilities {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.5rem 0.7rem;
+  margin: 0;
+}
+
+.capabilities legend {
+  padding: 0 0.3rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.capabilities .check {
+  align-items: flex-start;
+  margin: 0.3rem 0;
+}
+
+.capabilities .check span {
+  display: block;
+}
+
+.capabilities code {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-left: 0.3rem;
+}
+
+.capabilities small {
+  display: block;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.capabilities[disabled] {
+  opacity: 0.55;
+}
+
+.capability-cell {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+}
+
 /* --- Health -----------------------------------------------------------------
    A verdict is the one thing in a listing worth reading before the numbers, so
    it is coloured rather than left as another grey row. Three states only:

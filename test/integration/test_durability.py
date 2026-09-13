@@ -200,14 +200,29 @@ def main():
                     "SET.FILE says the file is not there", resp.get("code"), "FILE_NOT_FOUND"
                 )
 
-            # Durability is a storage decision, so it is admin only - a client
-            # that may read and write the account still may not change it.
+            # Durability is a storage decision about one account's file, so since
+            # #111 it follows the account allowlist rather than an administrative
+            # rank: a client that may rewrite every record in the file was never
+            # restrained by being unable to change how they are flushed.
             with harness.Client(port, reader_crt, reader_key, certs.ca_crt) as reader:
                 resp = reader.request(
                     command="SET.FILE", file=BUFFERED_FILE, account=ACCOUNT, durable=False
                 )
-                suite.check_eq("A non-admin client may not set durability", resp["status"], "ERROR")
-                suite.check_eq("The refusal says why", resp.get("code"), "ADMIN_REQUIRED")
+                suite.check_eq(
+                    "A client allowed the account may set durability on its files",
+                    resp["status"],
+                    "OK",
+                )
+
+                # In an account it is not allowed, it is refused - and for the
+                # reason that is actually true.
+                resp = reader.request(
+                    command="SET.FILE", file=BUFFERED_FILE, account="SYSTEM", durable=False
+                )
+                suite.check_eq(
+                    "but not in an account it is not allowed", resp["status"], "ERROR"
+                )
+                suite.check_eq("The refusal says why", resp.get("code"), "ACCESS_DENIED")
         except Exception as exc:  # noqa: BLE001 - report instead of aborting the whole run
             suite.error("Durability suite", exc)
         finally:
