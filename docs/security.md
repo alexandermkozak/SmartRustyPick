@@ -52,7 +52,7 @@ implies otherwise is worse than none:
 | Records, dictionaries, saved lists, `$LOGS` | Nothing. | Written as **plaintext** frames (`[key_len][key][data_len][data]`, see [Storage Engine](storage.md)). The CRC32C trailer is integrity against a torn write, not authentication: it is keyless, so anyone who can edit a group file can recompute it. |
 | Web dashboard | Bound to `127.0.0.1:8080` by default. Its token is compared in constant time and stored in an `HttpOnly; SameSite=Strict` cookie. It is an ordinary protocol client with a certificate reissued every boot and valid for a day. | **Plain HTTP.** The cookie has no `Secure` attribute, the startup URL carries the token in a query string, and `POST /api/certificates` returns a freshly generated **private key** in the response body. Defensible on loopback; not once `web_addr` points anywhere else. |
 | CA, server and client keys | Filesystem permissions: `.local/certs/` is `0700` and every key, certificate and PKCS#12 bundle in it is `0600`, on Unix. The mode is set *before* `openssl` writes the key, so there is no instant at which a private key is readable by anyone else. PKCS#12 bundles carry a per-issuance passphrase, delivered once to the caller and stored nowhere. | The PEM key files themselves are **unencrypted** (`openssl req -nodes`, `openssl genrsa`), so on the host the mode is all that protects them. The passphrase protects the bundle only once it leaves — anyone who can read `.local/certs/` has the `.key` beside it. |
-| Certificate lifetime | Client certificates last 365 days, the CA 3650. Deauthorization by name takes effect on the client's next request. | There is **no revocation path** — no CRL, no OCSP, no CA rotation. Removing a thumbprint from `$CLIENTS` is the only revocation, and it works only for this database. |
+| Certificate lifetime | A client certificate's lifetime is chosen at issuance (`GENERATE.CERT … DAYS n`), defaulting to 365 and capped by `max_client_cert_days`; a request above the cap is refused, not shortened. Every issued certificate's expiry is reported by `GENERATE.CERT` and `LIST.CONNS`. Deauthorization by name takes effect on the client's next request. | There is **no revocation path** — no CRL, no OCSP, no CA rotation. Removing a thumbprint from `$CLIENTS` is the only revocation, it works only for this database, and it only helps if somebody notices. The CA still lasts 3650 days and the server certificate 365, neither choosable. |
 | Files on disk | Every file this project writes — group files, `meta`, dictionaries, index state, queue books, the transaction intent log, directory-file records, archives and their staging siblings — is created `0600` on Unix, and a file written by an earlier build is tightened the next time it is rewritten. | **Directories** under `db_storage/` are left at the umask, so account and file names remain listable by anyone who can read the volume — which changes nothing, since those names are directory names either way (see below). **Windows sets no mode at all**: `PermissionsExt` is Unix-only, so there the files land at whatever the default ACL grants. |
 | `config.toml` | — | It is **committed to the repository** and has a `web_token` field. Treat it as a non-secret file; a token set there is a token in git history. |
 
@@ -219,9 +219,15 @@ being thinned out.
   other export rather than landing unreadable to everyone but the service user.
 - **`config.toml`.** It is committed. Keep secrets out of it and source them from the environment or a gitignored
   override.
-- **Certificate hygiene.** There is no revocation but the thumbprint list. Issue narrowly, keep `LIST.CONNS` short, and
-  deauthorize what you no longer recognise. "Narrowly" is now expressible: grant the capability a credential needs
-  instead of `ADMIN`, and check `LIST.CONNS` for entries still holding the flag that do not need it.
+- **Certificate hygiene.** There is no revocation but the thumbprint list, and it only helps if you notice. "Narrowly"
+  is expressible in two dimensions now: grant the capability a credential needs instead of `ADMIN`, and give it the
+  lifetime its job needs instead of a year — a certificate issued to a container, a CI job or a scheduled task has no
+  reason to outlive it. **A short lifetime is the withdrawal that happens whether or not anyone notices a leak.** The
+  trade is real and worth taking knowingly: it swaps one failure mode (a leaked credential valid for a year) for
+  another (a caller that stops reissuing and expires), which is why the expiry is reported everywhere a credential is
+  — `GENERATE.CERT`, `LIST.CONNS`, the CLI listing and the dashboard, flagged when it is close. Reissuing before then
+  is the caller's job; the server does not do it for you. Check `LIST.CONNS` for entries still holding `ADMIN` or a
+  year that do not need either.
 
 ## Still open
 

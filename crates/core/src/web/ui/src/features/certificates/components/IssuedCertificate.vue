@@ -12,6 +12,7 @@ const details = computed<Array<[string, string]>>(() => [
   ['Certificate', props.certificate.cert_path],
   ['Private key', props.certificate.key_path],
   ['PKCS#12', props.certificate.pfx_path ?? 'not generated'],
+  ['Expires', props.certificate.expires_at ?? 'unknown'],
 ])
 
 /**

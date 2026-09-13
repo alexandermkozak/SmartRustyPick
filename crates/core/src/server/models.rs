@@ -26,6 +26,11 @@ pub struct Request {
     pub name: Option<String>,
     pub accounts_list: Option<Vec<String>>,
     pub is_admin: Option<bool>,
+    /// `GENERATE.CERT`: how many days the certificate should be valid for.
+    /// Absent means the default (365). A value above `max_client_cert_days` is
+    /// refused rather than clamped, so a caller never believes it holds a
+    /// shorter-lived certificate than it does.
+    pub days: Option<u32>,
     /// `AUTHORIZE.CONN` and `GENERATE.CERT`: the capabilities to grant, by wire
     /// name (`accounts:manage`, `clients:manage`, `server:observe`). Absent
     /// means none, which is what every caller written before capabilities

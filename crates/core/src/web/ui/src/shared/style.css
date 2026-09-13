@@ -693,6 +693,20 @@ main section {
   opacity: 0.55;
 }
 
+/* An expiry is only worth showing if the urgent ones stand out; the colours are
+   the same three the health verdicts already use. */
+.expiry-expired {
+  color: var(--danger);
+}
+
+.expiry-soon {
+  color: var(--warn);
+}
+
+.expiry-unknown {
+  color: var(--muted);
+}
+
 .capability-cell {
   font-family: var(--mono);
   font-size: 0.8rem;

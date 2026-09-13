@@ -14,6 +14,7 @@ pub const SYS_CLIENTS_THUMBPRINT_IDX: usize = 0;
 pub const SYS_CLIENTS_ACCOUNTS_IDX: usize = 1;
 pub const SYS_CLIENTS_ADMIN_IDX: usize = 2;
 pub const SYS_CLIENTS_CAPABILITIES_IDX: usize = 3;
+pub const SYS_CLIENTS_EXPIRES_IDX: usize = 4;
 pub const SYS_LOGS_MESSAGE_IDX: usize = 0;
 pub const SYS_LOGS_DETAIL_IDX: usize = 1;
 // DIR entries describe the files of an account: field 1 is the entry type,
@@ -1214,6 +1215,25 @@ impl std::fmt::Display for Capability {
     }
 }
 
+/// Everything an authorization grants, in one argument.
+///
+/// A struct rather than four more parameters: each of these answers a different
+/// question about the credential, and a call site reading
+/// `add_authorized_client(name, tp, accounts, false, caps, expiry)` says less
+/// about what is being granted than one naming its fields does.
+#[derive(Clone, Debug, Default)]
+pub struct ClientGrant {
+    pub allowed_accounts: Vec<String>,
+    pub is_admin: bool,
+    pub capabilities: Vec<Capability>,
+    /// When the certificate stops being valid, RFC 3339 UTC, if it is known.
+    ///
+    /// Known only when this database issued the certificate. `AUTHORIZE.CONN`
+    /// takes a thumbprint and never sees a certificate, so an authorization made
+    /// that way has no expiry to record - and reports none, rather than a guess.
+    pub expires_at: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ClientInfo {
     /// The `$CLIENTS` record key: the name the client was authorized under.
@@ -1227,6 +1247,9 @@ pub struct ClientInfo {
     /// Capabilities granted individually. Empty on every entry written before
     /// capabilities existed, which is why `ADMIN` had to keep its meaning.
     pub capabilities: Vec<Capability>,
+    /// When this client's certificate expires, RFC 3339 UTC, when the database
+    /// knows - which is when it issued it. See [`ClientGrant::expires_at`].
+    pub expires_at: Option<String>,
 }
 
 impl ClientInfo {
@@ -1243,6 +1266,28 @@ impl ClientInfo {
     /// stops them growing back together.
     pub fn may_reach(&self, account: &str) -> bool {
         self.is_admin || self.allowed_accounts.iter().any(|a| a == account)
+    }
+
+    /// How many days until this client's certificate expires, negative if it
+    /// already has, `None` if the expiry is unknown.
+    ///
+    /// Computed rather than stored, because a stored answer is wrong tomorrow.
+    /// Days rather than a duration because that is the unit the decision is made
+    /// in: nobody reissues a certificate because it has four hours left.
+    ///
+    /// **Calendar days between the two dates**, not the duration divided by 24
+    /// hours. Truncating a duration would report a certificate issued moments
+    /// ago for seven days as having six left, because it expires in 6.99 - which
+    /// reads as a bug to everyone who sees it, and reads as one beside the date
+    /// shown next to it. Counting dates gives the answer a person gets from a
+    /// calendar, which is what the date beside it invites them to check.
+    pub fn expires_in_days(&self) -> Option<i64> {
+        let expires = time::OffsetDateTime::parse(
+            self.expires_at.as_deref()?,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .ok()?;
+        Some((expires.date() - time::OffsetDateTime::now_utc().date()).whole_days())
     }
 
     /// What this client is authorized for, as wire names - `ADMIN` expanded to

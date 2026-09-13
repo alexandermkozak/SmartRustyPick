@@ -12,6 +12,7 @@ const form = reactive({
   accounts: '',
   is_admin: false,
   capabilities: [] as string[],
+  days: '',
 })
 
 function submit(): void {
@@ -23,11 +24,14 @@ function submit(): void {
       .filter(Boolean),
     is_admin: form.is_admin,
     capabilities: form.capabilities,
+    // Left out entirely when blank, so the server's default applies rather than
+    // this form having to know what it is.
+    ...(form.days.trim() ? {days: Number(form.days)} : {}),
   })
 }
 
 function reset(): void {
-  Object.assign(form, {common_name: '', accounts: '', is_admin: false, capabilities: []})
+  Object.assign(form, {common_name: '', accounts: '', is_admin: false, capabilities: [], days: ''})
 }
 
 defineExpose({reset})
@@ -55,6 +59,21 @@ defineExpose({reset})
       Administrator certificate
     </label>
     <CapabilityPicker v-model="form.capabilities" :disabled="form.is_admin" />
+    <label>
+      Lifetime in days
+      <input
+        v-model="form.days"
+        autocomplete="off"
+        min="1"
+        placeholder="365 (the server's default)"
+        step="1"
+        type="number"
+      />
+    </label>
+    <p class="hint">
+      There is no revocation list, so a short lifetime is the withdrawal that happens whether or not
+      anyone notices a leak. A value above the deployment's ceiling is refused, not shortened.
+    </p>
     <p v-if="!form.is_admin && !form.accounts.trim() && !form.capabilities.length" class="hint">
       A non-admin certificate needs at least one allowed account or capability.
     </p>

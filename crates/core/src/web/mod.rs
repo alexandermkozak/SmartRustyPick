@@ -134,9 +134,11 @@ fn issue_dashboard_certificate(config: &Config, db: &SharedDb) -> std::io::Resul
     write_lock(db).add_authorized_client(
         DASHBOARD_CLIENT_NAME,
         &generated.thumbprint,
-        Vec::new(),
-        true,
-        Vec::new(),
+        crate::db::ClientGrant {
+            is_admin: true,
+            expires_at: generated.expires_at.clone(),
+            ..Default::default()
+        },
     )?;
     Ok(generated)
 }

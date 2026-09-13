@@ -161,8 +161,24 @@ fn test_system_clients_file() -> io::Result<()> {
 
     {
         let db = Database::new(base_dir, Some(isolated_config()))?;
-        db.add_authorized_client("CLIENT1", "aabbccdd", vec!["ACC1".to_string()], false, Vec::new())?;
-        db.add_authorized_client("CLIENT2", "11223344", vec![], true, Vec::new())?; // ADMIN
+        db.add_authorized_client(
+            "CLIENT1",
+            "aabbccdd",
+            ClientGrant {
+                allowed_accounts: vec!["ACC1".to_string()],
+                is_admin: false,
+                ..Default::default()
+            },
+        )?;
+        db.add_authorized_client(
+            "CLIENT2",
+            "11223344",
+            ClientGrant {
+                allowed_accounts: vec![],
+                is_admin: true,
+                ..Default::default()
+            },
+        )?; // ADMIN
 
         // Verify $CLIENTS exists and contains CLIENT1 and CLIENT2
         db.logto("SYSTEM")?;

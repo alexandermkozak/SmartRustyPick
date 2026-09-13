@@ -38,6 +38,7 @@ const REQUEST_FIELDS: &[&str] = &[
     "accounts_list",
     "is_admin",
     "capabilities",
+    "days",
     "durable",
     "field",
     "values",
@@ -614,6 +615,7 @@ fn generate_cert_record_is_documented() {
         key_path: String::new(),
         pfx_path: None,
         pfx_passphrase: None,
+        expires_at: None,
     };
     let value = generated.record();
     assert_documented_shape(
@@ -629,6 +631,7 @@ fn generate_cert_record_is_documented() {
             "key_path",
             "pfx_path",
             "pfx_passphrase",
+            "expires_at",
         ],
     );
 }

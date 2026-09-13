@@ -121,6 +121,9 @@ Currently supported settings:
   (default: 0, disabled).
 - `max_connections`: Maximum number of connections the server holds open at once; further connections are rejected
   until one closes (default: 1024).
+- `max_client_cert_days`: Longest client certificate lifetime this deployment will issue (default: 365). A
+  `GENERATE.CERT` asking for more is **refused, not shortened** — a caller that believes it holds a 30-day certificate
+  and actually holds a 365-day one is worse off than one that got an error.
 
 If SSL certificate paths are provided in `config.toml`, the database service will automatically start in the background
 when the CLI is launched. Missing certificates are generated on first start.

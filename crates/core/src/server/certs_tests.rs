@@ -144,3 +144,57 @@ fn test_the_passphrase_is_not_written_down_anywhere() {
     // Nor through a Debug print of the struct that holds it.
     assert_eq!(format!("{:?}", issued.pfx_passphrase), "Some([redacted])");
 }
+
+#[test]
+fn test_the_openssl_date_format_is_pinned() {
+    // The exact bytes openssl prints, including the two-space padding on a
+    // single-digit day. If a future openssl changed this, every expiry the
+    // system reports would go quietly absent, so the format is asserted here
+    // rather than trusted.
+    assert_eq!(
+        certs::parse_not_after_for_test("notAfter=Oct  6 20:16:55 2026 GMT"),
+        Some("2026-10-06T20:16:55Z".to_string())
+    );
+    assert_eq!(
+        certs::parse_not_after_for_test("notAfter=Sep 16 20:16:52 2026 GMT"),
+        Some("2026-09-16T20:16:52Z".to_string())
+    );
+    // Anything else is "unknown", never a guess.
+    assert_eq!(certs::parse_not_after_for_test("Oct  6 20:16:55 2026 GMT"), None);
+    assert_eq!(certs::parse_not_after_for_test("notAfter=nonsense"), None);
+    assert_eq!(certs::parse_not_after_for_test(""), None);
+}
+
+#[test]
+fn test_an_issued_certificate_reports_when_it_expires() {
+    if !openssl_present() {
+        return;
+    }
+    let guard = TempDir::new("certs_expiry");
+    let config = config_in(&guard);
+    certs::ensure_certificates(&config).unwrap();
+
+    let issued = certs::generate_client_cert(&config, "short-lived", 1, false).unwrap();
+    let expires = issued.expires_at.expect("an issued certificate knows its expiry");
+
+    // Read straight out of the certificate on disk, so this checks the value
+    // reported to the caller against the one a client will be judged by.
+    let from_disk = std::process::Command::new("openssl")
+        .args(["x509", "-enddate", "-noout", "-in", &issued.cert_path])
+        .output()
+        .unwrap();
+    let printed = String::from_utf8_lossy(&from_disk.stdout).trim().to_string();
+    assert_eq!(
+        certs::parse_not_after_for_test(&printed),
+        Some(expires.clone()),
+        "the reported expiry must be the certificate's own"
+    );
+
+    // A one-day certificate expires within about a day, which is the property
+    // the whole feature exists for.
+    let long = certs::generate_client_cert(&config, "long-lived", 365, false).unwrap();
+    assert!(
+        long.expires_at.unwrap() > expires,
+        "a longer lifetime must produce a later expiry"
+    );
+}

@@ -171,6 +171,10 @@ pub struct GeneratedCert {
     pub key_path: String,
     /// Present only when the PKCS#12 bundle could be produced.
     pub pfx_path: Option<String>,
+    /// When the certificate stops being valid, as an RFC 3339 UTC timestamp,
+    /// read from the certificate itself. `None` only if it could not be read;
+    /// an absent expiry says "unknown" rather than "none".
+    pub expires_at: Option<String>,
     /// The bundle's import passphrase, present exactly when `pfx_path` is.
     ///
     /// Generated per issuance, never written down, and delivered only through
@@ -197,6 +201,7 @@ impl GeneratedCert {
             "cert_path": self.cert_path,
             "key_path": self.key_path,
             "pfx_path": self.pfx_path,
+            "expires_at": self.expires_at,
             "pfx_passphrase": self.pfx_passphrase.as_ref().map(Secret::expose),
         })
     }
@@ -269,6 +274,53 @@ fn cert_output_dir(ca_path: &str) -> PathBuf {
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Reads the `notAfter` date out of a signed certificate, as an RFC 3339 UTC
+/// timestamp.
+///
+/// Read from the certificate rather than computed as `now + days`, because the
+/// certificate is what a client will actually be judged against. The two agree
+/// today; if `openssl` ever interpreted `-days` differently, a computed date
+/// would report an expiry the deployment does not have - and a wrong expiry is
+/// precisely the outage that reporting it at all is meant to prevent.
+///
+/// `None` when the date cannot be read. An absent expiry says "unknown", which
+/// is honest; a guessed one is not.
+fn not_after(cert_path: &str) -> Option<String> {
+    let output = std::process::Command::new("openssl")
+        .args(["x509", "-enddate", "-noout", "-in", cert_path])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    parse_not_after(line.trim())
+}
+
+/// The parser, reachable from the tests that pin openssl's output format.
+#[cfg(test)]
+pub fn parse_not_after_for_test(line: &str) -> Option<String> {
+    parse_not_after(line)
+}
+
+/// `notAfter=Oct  6 20:16:55 2026 GMT` to `2026-10-06T20:16:55Z`.
+///
+/// Split out from [`not_after`] so the format can be pinned by a test without
+/// generating a certificate. Note the day is **space padded** - openssl prints
+/// `Oct  6`, with two spaces - which is why this is a real format description
+/// and not a `split_whitespace`.
+fn parse_not_after(line: &str) -> Option<String> {
+    const OPENSSL_DATE: &[time::format_description::BorrowedFormatItem<'_>] = time::macros::format_description!(
+        "[month repr:short case_sensitive:false] [day padding:space] [hour]:[minute]:[second] [year] GMT"
+    );
+    let value = line.strip_prefix("notAfter=")?;
+    let parsed = time::PrimitiveDateTime::parse(value, OPENSSL_DATE).ok()?;
+    parsed
+        .assume_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
 }
 
 /// Issues a client certificate signed by the configured CA.
@@ -427,6 +479,7 @@ pub fn generate_client_cert(
         certificate_pem,
         private_key_pem,
         ca_pem,
+        expires_at: not_after(&crt_file),
         cert_path: crt_file,
         key_path: key_file,
         pfx_path,

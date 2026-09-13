@@ -342,3 +342,35 @@ fn test_effective_capabilities_are_sorted_and_deduplicated() {
         vec![Capability::AccountsManage, Capability::ServerObserve]
     );
 }
+
+#[test]
+fn test_the_days_until_expiry_are_counted_off_the_calendar() {
+    let at = |offset: time::Duration| ClientInfo {
+        name: "c".to_string(),
+        expires_at: Some(
+            (time::OffsetDateTime::now_utc() + offset)
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        ),
+        ..Default::default()
+    };
+
+    // The case that made this calendar arithmetic: a certificate issued moments
+    // ago for seven days has 6.99 days of duration left, and must not read as 6
+    // beside a date seven days out.
+    assert_eq!(at(time::Duration::days(7)).expires_in_days(), Some(7));
+    assert_eq!(at(time::Duration::days(1)).expires_in_days(), Some(1));
+    // Later today is today.
+    assert_eq!(at(time::Duration::minutes(1)).expires_in_days(), Some(0));
+    // And past is past, however recently.
+    assert_eq!(at(time::Duration::days(-1)).expires_in_days(), Some(-1));
+
+    // No expiry recorded means none reported; nothing is inferred.
+    assert_eq!(ClientInfo::default().expires_in_days(), None);
+    // Nor from something that is not a date.
+    let broken = ClientInfo {
+        expires_at: Some("soon-ish".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(broken.expires_in_days(), None);
+}

@@ -76,6 +76,14 @@ pub struct Config {
     /// Maximum number of connections the server holds open at once. Additional
     /// connections are rejected until one of the existing ones closes.
     pub max_connections: Option<usize>,
+    /// Longest client certificate lifetime, in days, this deployment will issue.
+    ///
+    /// A request above it is **refused**, not clamped: a caller that believes it
+    /// holds a 30-day certificate and actually holds a 365-day one is worse off
+    /// than one that got an error. Defaults to 365, which is what every
+    /// certificate lasted before the lifetime could be asked for at all, so the
+    /// default changes nothing.
+    pub max_client_cert_days: Option<u32>,
 }
 
 /// Written out rather than derived, so that `web_token` is redacted.
@@ -117,6 +125,11 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_TRANSFER_STALL_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 0; // disabled
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
+/// The lifetime a client certificate gets when nobody asks for one, and the
+/// ceiling when the deployment sets none. Both are 365 because that is what
+/// every certificate lasted before either could be chosen.
+pub const DEFAULT_CLIENT_CERT_DAYS: u32 = 365;
 
 /// Files kept in memory at once. Generous, because eviction is what forces two
 /// connections working on different files to interfere with each other, and a
@@ -177,6 +190,15 @@ impl Config {
     pub fn max_connections(&self) -> usize {
         self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS)
     }
+
+    /// The longest client certificate this deployment will issue. Never zero:
+    /// a ceiling of zero would mean no certificate could be issued at all,
+    /// which is a configuration mistake rather than a policy.
+    pub fn max_client_cert_days(&self) -> u32 {
+        self.max_client_cert_days
+            .filter(|days| *days > 0)
+            .unwrap_or(DEFAULT_CLIENT_CERT_DAYS)
+    }
 }
 
 /// The settings a fresh installation runs with.
@@ -196,6 +218,7 @@ impl Default for Config {
             ca_path: None,
             server_addr: Some("127.0.0.1".to_string()),
             log_detail: Some("normal".to_string()),
+            max_client_cert_days: None,
             max_log_records: Some(100),
             records_per_group: None,
             max_directory_record_bytes: None,

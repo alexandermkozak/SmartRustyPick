@@ -2,16 +2,13 @@ use smart_rusty_pick_core::config::Config;
 use smart_rusty_pick_core::db::archive::Source;
 use smart_rusty_pick_core::db::engine::archive::{FileAction, ImportPlan, ImportReport};
 use smart_rusty_pick_core::db::{
-    Capability, Database, DirectoryPolicy, DirectoryRecord, ExplodeSpec, Field, FileAttributes, QueueDelivery, Record,
-    SelectEntry, SelectList, ValuePosition, queue, report,
+    Capability, ClientGrant, Database, DirectoryPolicy, DirectoryRecord, ExplodeSpec, Field, FileAttributes,
+    QueueDelivery, Record, SelectEntry, SelectList, ValuePosition, queue, report,
 };
 use smart_rusty_pick_core::server;
 use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-
-/// Lifetime of a certificate issued by `GENERATE.CERT`, matching the server's.
-const CLIENT_CERT_DAYS: u32 = 365;
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -2450,7 +2447,15 @@ fn handle_authorize_conn(db: &mut Database, parts: &[&str]) {
     }
 
     let granted = describe_grants(is_admin, &accounts, &capabilities);
-    match db.add_authorized_client(name, thumbprint, accounts, is_admin, capabilities) {
+    // No expiry: AUTHORIZE.CONN names a thumbprint and never sees the
+    // certificate, so there is nothing to record and nothing is invented.
+    let grant = ClientGrant {
+        allowed_accounts: accounts,
+        is_admin,
+        capabilities,
+        expires_at: None,
+    };
+    match db.add_authorized_client(name, thumbprint, grant) {
         Ok(_) => println!("Authorized: {} as {} ({})", thumbprint, name, granted),
         Err(e) => println!("Error authorizing: {}", e),
     }
@@ -2549,8 +2554,11 @@ fn handle_list_conns(db: &mut Database) {
     let _ = db.refresh_clients_if_stale();
     let clients = db.authorized_clients();
 
-    println!("{:<20} {:<64} {:<30} Capabilities", "Name", "Thumbprint", "Accounts");
-    println!("{:-<20} {:-<64} {:-<30} {:-<40}", "", "", "", "");
+    println!(
+        "{:<20} {:<20} {:<24} {:<46} Expires",
+        "Name", "Thumbprint", "Accounts", "Capabilities"
+    );
+    println!("{:-<20} {:-<20} {:-<24} {:-<46} {:-<24}", "", "", "", "", "");
     for info in clients {
         let accounts = if info.is_admin {
             "(every account)".to_string()
@@ -2572,16 +2580,46 @@ fn handle_list_conns(db: &mut Database) {
         } else {
             capabilities
         };
+        // An expiry nobody can see is an outage waiting to happen, so the
+        // remaining days are spelled out rather than left as date arithmetic -
+        // and a certificate already past its date says so instead of showing a
+        // negative number.
+        let expires = match (&info.expires_at, info.expires_in_days()) {
+            (Some(at), Some(days)) if days < 0 => format!("{} (EXPIRED)", &at[..10.min(at.len())]),
+            (Some(at), Some(days)) => format!("{} ({} days)", &at[..10.min(at.len())], days),
+            (Some(at), None) => at.clone(),
+            // Authorized by thumbprint, so this database never saw the
+            // certificate and will not invent a date for it.
+            (None, _) => "unknown".to_string(),
+        };
+        // The thumbprint is truncated here because four columns of a 64-character
+        // hex string is an unreadable table; `READ $CLIENTS` has the whole one.
         println!(
-            "{:<20} {:<64} {:<30} {}",
-            info.name, info.thumbprint, accounts, capabilities
+            "{:<20} {:<20} {:<24} {:<46} {}",
+            info.name,
+            shorten(&info.thumbprint, 16),
+            accounts,
+            capabilities,
+            expires
         );
     }
 }
 
+/// `value` cut to `width` with an ellipsis, for a column that cannot take it all.
+fn shorten(value: &str, width: usize) -> String {
+    if value.len() <= width {
+        return value.to_string();
+    }
+    format!("{}…", &value[..width.saturating_sub(1)])
+}
+
 fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
     if parts.len() < 2 {
-        println!("Usage: GENERATE.CERT <common_name>");
+        println!("Usage: GENERATE.CERT <common_name> [DAYS <n>]");
+        println!(
+            "  Without DAYS the certificate lasts {} days, capped by max_client_cert_days.",
+            smart_rusty_pick_core::config::DEFAULT_CLIENT_CERT_DAYS
+        );
         return;
     }
 
@@ -2589,7 +2627,36 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
     // certificate made here and one made from the dashboard are the same
     // certificate, signed the same way and named the same way.
     let cn = parts[1];
-    let generated = match server::certs::generate_client_cert(config, cn, CLIENT_CERT_DAYS, true) {
+    let ceiling = config.max_client_cert_days();
+    let days = match parts.get(2).map(|word| word.to_uppercase()) {
+        None => smart_rusty_pick_core::config::DEFAULT_CLIENT_CERT_DAYS.min(ceiling),
+        Some(word) if word == "DAYS" => match parts.get(3).and_then(|n| n.parse::<u32>().ok()) {
+            // Refused rather than clamped, the same way the protocol refuses it:
+            // a caller that thinks it asked for 30 days and got 365 is worse off
+            // than one that got an error.
+            Some(0) => {
+                println!("Error: a lifetime of 0 days is not a certificate; ask for at least 1.");
+                return;
+            }
+            Some(days) if days > ceiling => {
+                println!(
+                    "Error: {} days exceeds this deployment's maximum of {}. Raise max_client_cert_days to allow it.",
+                    days, ceiling
+                );
+                return;
+            }
+            Some(days) => days,
+            None => {
+                println!("Usage: GENERATE.CERT <common_name> [DAYS <n>]   (n is a whole number of days)");
+                return;
+            }
+        },
+        Some(_) => {
+            println!("Usage: GENERATE.CERT <common_name> [DAYS <n>]");
+            return;
+        }
+    };
+    let generated = match server::certs::generate_client_cert(config, cn, days, true) {
         Ok(generated) => generated,
         Err(e) => {
             println!("Error generating certificate: {}", e);
@@ -2611,6 +2678,11 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
         _ => println!("PFX file: not generated"),
     }
     println!("SHA-256 Thumbprint: {}", generated.thumbprint);
+    match &generated.expires_at {
+        // The reissue date, printed beside the thing that has to be reissued.
+        Some(expires) => println!("Valid for {} days, until {}", days, expires),
+        None => println!("Valid for {} days", days),
+    }
 
     // Interactive authorization
     println!("\n--- Connection Authorization ---");
@@ -2655,7 +2727,14 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
     }
 
     let granted = describe_grants(is_admin, &accounts, &capabilities);
-    match db.add_authorized_client(&auth_name, &generated.thumbprint, accounts, is_admin, capabilities) {
+    let grant = ClientGrant {
+        allowed_accounts: accounts,
+        is_admin,
+        capabilities,
+        // Known here: this path issued the certificate.
+        expires_at: generated.expires_at.clone(),
+    };
+    match db.add_authorized_client(&auth_name, &generated.thumbprint, grant) {
         Ok(_) => println!(
             "Successfully authorized: {} as {} ({})",
             generated.thumbprint, auth_name, granted

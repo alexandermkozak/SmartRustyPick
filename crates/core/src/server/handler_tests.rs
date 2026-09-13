@@ -1,4 +1,4 @@
-use crate::db::Capability;
+use crate::db::{Capability, ClientGrant};
 use crate::db::{ClientInfo, Database, ValuePosition};
 use crate::server::handler::handle_request;
 use crate::server::models::{ErrorCode, Request};
@@ -607,8 +607,16 @@ fn test_management_commands_respect_the_clients_permissions() {
 fn test_list_conns_and_server_stats_describe_the_running_server() {
     let dir = TempDir::new("server_stats");
     let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
-    db.add_authorized_client("reporting-bot", "AB12CD", vec!["SALES".to_string()], false, Vec::new())
-        .unwrap();
+    db.add_authorized_client(
+        "reporting-bot",
+        "AB12CD",
+        ClientGrant {
+            allowed_accounts: vec!["SALES".to_string()],
+            is_admin: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     db.set_current_account("");
 
     let db_arc = Arc::new(RwLock::new(db));
@@ -3764,6 +3772,7 @@ fn test_a_provisioning_credential_cannot_read_what_it_creates() {
         allowed_accounts: Vec::new(),
         is_admin: false,
         capabilities: vec![Capability::AccountsManage],
+        ..Default::default()
     };
 
     // It can do the job it exists for.
@@ -3928,4 +3937,115 @@ fn test_capabilities_round_trip_through_the_clients_table() {
         listed["capabilities"],
         serde_json::json!(["accounts:manage", "server:observe"])
     );
+}
+
+/// A caller can ask for a shorter certificate, and is refused rather than
+/// silently given a longer one (#112).
+///
+/// The decision is tested directly rather than through `GENERATE.CERT`, because
+/// that path reads the process-wide `active_config()` - a `OnceLock` whose first
+/// writer wins - so a test going through it would depend on which test in the
+/// binary ran first. The end-to-end path is covered by the integration suite,
+/// against a real server with a real configuration.
+#[test]
+fn test_a_certificate_lifetime_is_bounded_and_refused_rather_than_clamped() {
+    use crate::server::handler::requested_cert_days;
+
+    let capped = |days: u32| crate::config::Config {
+        max_client_cert_days: Some(days),
+        ..isolated_config()
+    };
+
+    // Inside the ceiling, the request is honoured exactly.
+    assert_eq!(requested_cert_days(Some(7), &capped(30)).map_err(|_| ()), Ok(7));
+    assert_eq!(requested_cert_days(Some(30), &capped(30)).map_err(|_| ()), Ok(30));
+    assert_eq!(requested_cert_days(Some(1), &capped(30)).map_err(|_| ()), Ok(1));
+
+    // Above it, refused - not clamped. A caller that asked for a year and
+    // silently got 30 days would discover it when the certificate stopped
+    // working, which is the failure this refusal exists to prevent.
+    let refused = requested_cert_days(Some(365), &capped(30)).unwrap_err();
+    assert_eq!(refused.code, Some(ErrorCode::InvalidRequest));
+    let message = refused.message.unwrap();
+    assert!(message.contains("365"), "{message}");
+    assert!(message.contains("30"), "{message}");
+    assert!(
+        message.contains("max_client_cert_days"),
+        "the refusal should say how to allow it: {message}"
+    );
+
+    // Zero is refused for the same reason, rather than quietly becoming one.
+    let refused = requested_cert_days(Some(0), &capped(30)).unwrap_err();
+    assert_eq!(refused.code, Some(ErrorCode::InvalidRequest));
+
+    // Asking for nothing takes the default, itself capped: a deployment that
+    // caps at 30 never issues 365, even to a caller that named no lifetime.
+    assert_eq!(requested_cert_days(None, &capped(30)).map_err(|_| ()), Ok(30));
+    assert_eq!(
+        requested_cert_days(None, &isolated_config()).map_err(|_| ()),
+        Ok(crate::config::DEFAULT_CLIENT_CERT_DAYS)
+    );
+
+    // A ceiling of zero is a configuration mistake, not a policy of issuing
+    // nothing, so it falls back to the default rather than refusing everything.
+    assert_eq!(requested_cert_days(Some(90), &capped(0)).map_err(|_| ()), Ok(90));
+}
+
+/// The expiry survives into `$CLIENTS` and back out through `LIST.CONNS`, and a
+/// client authorized by thumbprint alone reports none rather than a guess.
+#[test]
+fn test_list_conns_reports_an_expiry_only_when_the_database_knows_one() {
+    let dir = TempDir::new("cert_expiry_listing");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    // Written the way `GENERATE.CERT` writes one.
+    db.add_authorized_client(
+        "issued-here",
+        "AA11",
+        ClientGrant {
+            allowed_accounts: vec!["SALES".to_string()],
+            expires_at: Some("2027-09-13T16:23:45Z".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // And the way `AUTHORIZE.CONN` writes one: a thumbprint, no certificate.
+    db.add_authorized_client(
+        "authorized-blind",
+        "BB22",
+        ClientGrant {
+            allowed_accounts: vec!["SALES".to_string()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let db_arc = Arc::new(RwLock::new(db));
+    let admin = ClientInfo {
+        name: "root".to_string(),
+        thumbprint: "root_tp".to_string(),
+        is_admin: true,
+        ..Default::default()
+    };
+    let resp = handle_request(
+        Request {
+            command: "LIST.CONNS".to_string(),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    let results = resp.results.unwrap();
+    let entry = |name: &str| results.iter().find(|(key, _)| key == name).unwrap().1.clone();
+
+    let known = entry("issued-here");
+    assert_eq!(known["expires_at"], serde_json::json!("2027-09-13T16:23:45Z"));
+    assert!(
+        known["expires_in_days"].as_i64().unwrap() > 0,
+        "a future expiry counts down, got {:?}",
+        known["expires_in_days"]
+    );
+
+    let unknown = entry("authorized-blind");
+    assert_eq!(unknown["expires_at"], serde_json::Value::Null);
+    assert_eq!(unknown["expires_in_days"], serde_json::Value::Null);
 }

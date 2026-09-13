@@ -13,6 +13,8 @@ export interface GeneratedCert {
      * exactly when `pfx_path` is.
      */
     pfx_passphrase: string | null
+    /** RFC 3339 UTC, read from the certificate itself. */
+    expires_at: string | null
 }
 
 /** The fields `GENERATE.CERT` needs. */
@@ -21,4 +23,6 @@ export interface CertificateRequest {
     accounts: string[]
     is_admin: boolean
     capabilities: string[]
+    /** Omitted to take the server's default; refused if above its ceiling. */
+    days?: number
 }

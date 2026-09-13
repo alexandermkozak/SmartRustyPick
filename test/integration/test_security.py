@@ -1,10 +1,12 @@
 """Verifies that the headless server enforces admin privileges and per-account access,
 and that it enforces its request-size, handshake, idle and connection-count limits."""
 
+import datetime
 import json
 import os
 import socket
 import ssl
+import subprocess
 import sys
 import time
 
@@ -27,6 +29,81 @@ def as_client(port, certificate, private_key, ca, request):
     """
     with harness.Client(port, certificate, private_key, ca) as client:
         return client.request(**request)
+
+
+def check_certificate_lifetimes(suite, admin):
+    """A caller can ask for a shorter certificate, within the deployment's cap.
+
+    There is no CRL and no OCSP, so removing a thumbprint is the only withdrawal
+    there is - and it only helps if somebody notices a leak. A short lifetime is
+    the withdrawal that happens whether or not anyone notices (issue #112). This
+    suite runs with max_client_cert_days = 30.
+    """
+    resp = admin.request(command="GENERATE.CERT", name="week-long", is_admin=True, days=7)
+    suite.check_eq("A certificate can be issued for fewer days", resp.get("status"), "OK")
+    issued = resp.get("record") or {}
+    expires = issued.get("expires_at") or ""
+    suite.check(
+        "and it reports when it expires, in UTC",
+        expires.endswith("Z") and len(expires) == 20,
+        f"expires_at={expires!r}",
+    )
+
+    # The reported date must be the certificate's own, not a guess.
+    on_disk = subprocess.run(
+        ["openssl", "x509", "-enddate", "-noout", "-in", issued.get("cert_path", "")],
+        capture_output=True,
+        text=True,
+    )
+    parsed = ""
+    if on_disk.returncode == 0:
+        raw = on_disk.stdout.strip().removeprefix("notAfter=")
+        parsed = datetime.datetime.strptime(raw, "%b %d %H:%M:%S %Y %Z").strftime("%Y-%m-%dT%H:%M:%SZ")
+    suite.check_eq("and the date is the certificate's own", parsed, expires)
+
+    # About seven days out, which is the property the whole feature is for.
+    not_after = datetime.datetime.strptime(expires, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc
+    )
+    days_out = (not_after - datetime.datetime.now(datetime.timezone.utc)).days
+    suite.check("and it really is a week, not a year", 6 <= days_out <= 7, f"{days_out} days")
+
+    # Above the deployment's ceiling: refused, never shortened.
+    resp = admin.request(command="GENERATE.CERT", name="too-long", is_admin=True, days=365)
+    suite.check_eq("A lifetime above the cap is refused", resp.get("code"), "INVALID_REQUEST")
+    suite.check(
+        "and the refusal says what the cap is",
+        "30" in (resp.get("message") or ""),
+        resp.get("message", ""),
+    )
+
+    resp = admin.request(command="GENERATE.CERT", name="zero-days", is_admin=True, days=0)
+    suite.check_eq("A lifetime of zero is refused", resp.get("code"), "INVALID_REQUEST")
+
+    # And nothing was issued for either refusal - a refusal that still wrote a
+    # key would leave a private key on disk for a client nobody authorized.
+    listing = dict(admin.request(command="LIST.CONNS").get("results") or [])
+    suite.check(
+        "A refused request authorizes nothing",
+        "too-long" not in listing and "zero-days" not in listing,
+        ", ".join(sorted(listing)),
+    )
+
+    # The expiry survives into $CLIENTS and is reported per client, with a day
+    # count - an expiry nobody can see is an outage waiting to happen.
+    entry = listing.get("week-long") or {}
+    suite.check_eq("LIST.CONNS reports the expiry", entry.get("expires_at"), expires)
+    # Seven, not six: the count is calendar days between the dates, so a
+    # certificate issued moments ago for seven days does not read as six.
+    suite.check_eq("and how many days are left", entry.get("expires_in_days"), 7)
+
+    # A client authorized by thumbprint alone has no certificate to read, so it
+    # reports no expiry rather than an invented one.
+    admin.request(command="AUTHORIZE.CONN", thumbprint="feed1234", name="blind-auth", is_admin=True)
+    listing = dict(admin.request(command="LIST.CONNS").get("results") or [])
+    blind = listing.get("blind-auth") or {}
+    suite.check_eq("An AUTHORIZE.CONN records no expiry", blind.get("expires_at"), None)
+    suite.check_eq("nor a day count", blind.get("expires_in_days"), None)
 
 
 def check_capabilities(suite, admin, certs, port, user_crt, user_key):
@@ -345,7 +422,8 @@ def main():
             # so seed the database first and only then hand the port to the headless server.
             harness.write_config(port, certs=None)
             seed_database(admin_tp, user_tp)
-            harness.write_config(port, certs)
+            # A ceiling below the default, so the refusal path is exercised.
+            harness.write_config(port, certs, extra="max_client_cert_days = 30\n")
 
             server = harness.start_server()
             admin = harness.wait_for_client(port, admin_crt, admin_key, certs.ca_crt, process=server)
@@ -404,6 +482,7 @@ def main():
 
                 check_no_secret_leakage(suite, admin, workspace.path)
                 check_capabilities(suite, admin, certs, port, user_crt, user_key)
+                check_certificate_lifetimes(suite, admin)
 
             check_tls_floor(suite, port, user_crt, user_key, certs.ca_crt)
             check_connection_limits(suite, certs, user_crt, user_key)

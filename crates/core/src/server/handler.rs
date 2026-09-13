@@ -2,8 +2,8 @@ use crate::db::archive;
 use crate::db::engine::archive::{ImportPlan, ImportReport};
 use crate::db::engine::dictionary::DEFAULT_FIELD_WIDTH;
 use crate::db::{
-    Capability, Change, ChangeOp, Condition, Database, DbError, ExplodeSpec, IndexStats, QueryNode, Record, SortSpec,
-    Table, TableHandle,
+    Capability, Change, ChangeOp, ClientGrant, Condition, Database, DbError, ExplodeSpec, IndexStats, QueryNode,
+    Record, SortSpec, Table, TableHandle,
 };
 use crate::server::models::{ChangeSpec, ErrorCode, Request, Response};
 use std::collections::HashMap;
@@ -28,11 +28,6 @@ pub fn read_lock(db: &SharedDb) -> RwLockReadGuard<'_, Database> {
 pub fn write_lock(db: &SharedDb) -> RwLockWriteGuard<'_, Database> {
     db.write().unwrap_or_else(|e| e.into_inner())
 }
-
-/// Lifetime of a certificate issued through `GENERATE.CERT`. A year matches
-/// what the CLI has always handed out; the dashboard's own certificate is far
-/// shorter lived and is issued separately.
-const CLIENT_CERT_DAYS: u32 = 365;
 
 /// An error reply: the code a client branches on, and the message a person
 /// reads. Both, always - a refusal that carries only prose is one no client can
@@ -390,6 +385,37 @@ fn is_record_command(command: &str) -> bool {
         // touches, which is the opposite of what per-file locking bought.
         "READ" | "WRITE" | "DELETE" | "QUERY" | "TRANSACT" | "ENQUEUE" | "DEQUEUE" | "ACK" | "NACK" | "PEEK"
     )
+}
+
+/// The lifetime a `GENERATE.CERT` should use, or the refusal explaining why not.
+///
+/// A request above `max_client_cert_days` is **refused rather than clamped**. A
+/// caller that believes it holds a 30-day certificate and actually holds a
+/// 365-day one is worse off than one that got an error - it has planned a
+/// reissue it does not need and, more to the point, a credential that outlives
+/// what it was scoped for. The same argument settles the floor: zero is refused
+/// rather than quietly becoming one.
+#[allow(clippy::result_large_err)]
+pub(crate) fn requested_cert_days(requested: Option<u32>, config: &crate::config::Config) -> Result<u32, Response> {
+    let ceiling = config.max_client_cert_days();
+    match requested {
+        // The default is capped too: a deployment that sets a ceiling below
+        // 365 means it, and a caller that named nothing should get the shortest
+        // thing this deployment is willing to issue rather than a refusal.
+        None => Ok(crate::config::DEFAULT_CLIENT_CERT_DAYS.min(ceiling)),
+        Some(0) => Err(error(
+            ErrorCode::InvalidRequest,
+            "A certificate lifetime of 0 days is not a certificate; ask for at least 1",
+        )),
+        Some(days) if days > ceiling => Err(error(
+            ErrorCode::InvalidRequest,
+            format!(
+                "A lifetime of {} days exceeds this deployment's maximum of {}; raise max_client_cert_days to allow it",
+                days, ceiling
+            ),
+        )),
+        Some(days) => Ok(days),
+    }
 }
 
 /// Commands that do not operate on a *current* account, so having none to
@@ -2472,7 +2498,16 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     "A client needs ADMIN, at least one account, or at least one capability",
                 );
             }
-            match db.add_authorized_client(&name, &thumbprint, accounts, is_admin, capabilities) {
+            // No `expires_at`: AUTHORIZE.CONN names a thumbprint and never sees
+            // the certificate behind it, so this database does not know when it
+            // stops being valid and says so rather than guessing.
+            let grant = ClientGrant {
+                allowed_accounts: accounts,
+                is_admin,
+                capabilities,
+                expires_at: None,
+            };
+            match db.add_authorized_client(&name, &thumbprint, grant) {
                 Ok(_) => Response {
                     status: "OK".to_string(),
                     ..Default::default()
@@ -2567,6 +2602,13 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                                 .iter()
                                 .map(|c| c.as_str())
                                 .collect::<Vec<_>>(),
+                            // Null when this database did not issue the
+                            // certificate and so does not know. The remaining
+                            // days come with the date because that is the form
+                            // the decision to reissue is actually made in, and
+                            // computing it per reader is a date library each.
+                            "expires_at": info.expires_at,
+                            "expires_in_days": info.expires_in_days(),
                         }),
                     )
                 })
@@ -2819,10 +2861,14 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 Ok(capabilities) => capabilities,
                 Err(response) => return response,
             };
+            let days = match requested_cert_days(req.days, &config) {
+                Ok(days) => days,
+                Err(response) => return response,
+            };
             // A generated certificate is useless until it is authorized, and a
             // caller that has to send a second command can leave orphaned keys
             // behind. Both happen here, or neither does.
-            match crate::server::certs::generate_client_cert(&config, &common_name, CLIENT_CERT_DAYS, true) {
+            match crate::server::certs::generate_client_cert(&config, &common_name, days, true) {
                 Ok(generated) => {
                     let accounts = req.accounts_list.unwrap_or_default();
                     let is_admin = req.is_admin.unwrap_or(false);
@@ -2832,9 +2878,14 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                             "A non-admin certificate needs at least one allowed account or capability",
                         );
                     }
-                    if let Err(e) =
-                        db.add_authorized_client(&common_name, &generated.thumbprint, accounts, is_admin, capabilities)
-                    {
+                    let grant = ClientGrant {
+                        allowed_accounts: accounts,
+                        is_admin,
+                        capabilities,
+                        // Known here, because this is the path that issued it.
+                        expires_at: generated.expires_at.clone(),
+                    };
+                    if let Err(e) = db.add_authorized_client(&common_name, &generated.thumbprint, grant) {
                         return db_error_in("Certificate generated but authorization failed", e);
                     }
                     Response {

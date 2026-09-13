@@ -19,6 +19,7 @@ const issued: GeneratedCert = {
     key_path: '.local/certs/reporting-bot.key',
     pfx_path: '.local/certs/reporting-bot.pfx',
     pfx_passphrase: 'a3f1c08e57d2b9416ef0',
+    expires_at: '2027-09-13T16:23:45Z',
 }
 
 const files = [

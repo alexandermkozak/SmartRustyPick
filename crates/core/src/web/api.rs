@@ -390,17 +390,20 @@ pub async fn route(client: &Arc<ProtocolClient>, request: &Request) -> Response 
                     "A non-admin certificate needs at least one allowed account or capability",
                 );
             }
-            run(
-                client,
-                json!({
-                    "command": "GENERATE.CERT",
-                    "name": common_name,
-                    "accounts_list": allowed,
-                    "is_admin": is_admin,
-                    "capabilities": capabilities,
-                }),
-            )
-            .await
+            // The bound is the server's to enforce, so an out-of-range value is
+            // passed on and refused there rather than being second-guessed here
+            // with a copy of the deployment's ceiling.
+            let mut request = json!({
+                "command": "GENERATE.CERT",
+                "name": common_name,
+                "accounts_list": allowed,
+                "is_admin": is_admin,
+                "capabilities": capabilities,
+            });
+            if let Some(days) = body.get("days").and_then(|value| value.as_u64()) {
+                request["days"] = json!(days);
+            }
+            run(client, request).await
         }
 
         // Accounts and their files: what exists, how big it is, and how it is

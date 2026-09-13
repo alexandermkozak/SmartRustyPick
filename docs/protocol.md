@@ -104,6 +104,7 @@ matched case-insensitively.
 | `accounts_list`   | array of strings | `AUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`, `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT`                                   | Allowed accounts for the client. Default `[]`.                                                                                                                                                                                                                                            |
 | `is_admin`        | bool             | `AUTHORIZE.CONN`, `GENERATE.CERT`                                                                                  | Grant the client admin rights. Default `false`.                                                                                                                                                                                                                                           |
 | `capabilities`    | array of strings | `AUTHORIZE.CONN`, `GENERATE.CERT`                                                                                  | Capabilities to grant, by name (`accounts:manage`, `clients:manage`, `server:observe`). Default `[]`. An unknown name is refused with `INVALID_DATA` rather than ignored. Ignored when `is_admin` is set, which already carries all of them.                                                 |
+| `days`            | integer          | `GENERATE.CERT`                                                                                                    | How many days the certificate is valid for. Default 365, capped by `max_client_cert_days`. A value above the cap, or `0`, is **refused** rather than clamped.                                                                                                                               |
 | `durable`         | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Per-file durable writes. Optional for `CREATE.FILE`, default `false` - except on a queue, which defaults to `true`. On `SET.FILE` an absent flag leaves the file's durability alone. See [Storage Engine](storage.md). |
 | `queue`           | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Make the file a [queue file](#queue-files): ordered records, claimed one at a time. Optional; on `SET.FILE` an absent flag leaves the file as it is, and `false` returns a queue to an ordinary file without touching its records. |
 | `autokey`         | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Make the file mint the key of a `WRITE` that names none - see [Server-minted keys](#server-minted-keys). Optional; on `SET.FILE` an absent flag leaves it as it is. Refused with `INVALID_REQUEST` alongside `queue` or `directory`: a queue already mints every key it stores, and a directory file's keys are the names of host files. |
@@ -1473,11 +1474,18 @@ server, written next to the CA (alongside a PKCS#12 bundle when `openssl` can pr
 which is the only time it is sent anywhere.
 
 - Required: `name`, which is both the certificate's common name and the authorization name. Optional: `accounts_list`,
-  `is_admin` (default `false`), `capabilities` (default `[]`). Requires `clients:manage` (or `ADMIN`).
+  `is_admin` (default `false`), `capabilities` (default `[]`), `days` (default 365). Requires `clients:manage` (or
+  `ADMIN`).
 - A non-admin certificate must be given at least one account, since a client with neither admin rights nor an allowed
   account could do nothing.
-- Certificates are valid for 365 days. Re-issuing under an existing name replaces that client's authorization, which
-  revokes the previous certificate.
+- `days` sets the lifetime. It defaults to 365 and is bounded by `max_client_cert_days` in `config.toml`, which also
+  defaults to 365. A request above the cap, or for `0` days, is **refused with `INVALID_REQUEST`** rather than quietly
+  clamped: a caller that believes it holds a 30-day certificate and actually holds a 365-day one is worse off than one
+  that got an error. There is no revocation list (see [Security](security.md)), so a short lifetime is the only
+  withdrawal that happens whether or not anyone notices a credential has leaked.
+- `expires_at` in the response is read from the issued certificate itself, as an RFC 3339 UTC timestamp — the date a
+  client will actually be judged against, not `now + days`.
+- Re-issuing under an existing name replaces that client's authorization, which revokes the previous certificate.
 - The PKCS#12 bundle is **passphrase-protected**. `pfx_passphrase` is generated per issuance, is never written to disk
   and is never recoverable afterwards — this response is the only place it exists. It is present exactly when
   `pfx_path` is, and both are `null` when `openssl` could not produce a bundle. Deliver it out of band from the bundle
@@ -1488,7 +1496,7 @@ which is the only time it is sent anywhere.
   with).
 
 ```json
-{"command": "GENERATE.CERT", "name": "reporting-bot", "accounts_list": ["SALES"]}
+{"command": "GENERATE.CERT", "name": "reporting-bot", "accounts_list": ["SALES"], "days": 30}
 ```
 
 ```json
@@ -1501,7 +1509,8 @@ which is the only time it is sent anywhere.
   "cert_path": ".local/certs/reporting-bot.crt",
   "key_path": ".local/certs/reporting-bot.key",
   "pfx_path": ".local/certs/reporting-bot.pfx",
-  "pfx_passphrase": "a3f1c08e57d2b9416ef0..."
+  "pfx_passphrase": "a3f1c08e57d2b9416ef0...",
+  "expires_at": "2027-09-13T16:23:45Z"
 }}
 ```
 
@@ -1511,6 +1520,10 @@ List every authorized client. `results` pairs the authorization name with its de
 not the list of open sessions, which `SERVER.STATS` carries.
 
 - Required: nothing. Requires `server:observe` (or `ADMIN`).
+- `expires_at` and `expires_in_days` are `null` for a client authorized with `AUTHORIZE.CONN`, which names a thumbprint
+  and never sees the certificate behind it — so the database does not know when it expires and says so rather than
+  guessing. They are populated for every certificate this database issued. `expires_in_days` is negative once the
+  certificate has expired.
 - Errors: `ADMIN_REQUIRED`.
 
 ```json
@@ -1520,7 +1533,8 @@ not the list of open sessions, which `SERVER.STATS` carries.
 ```json
 {"status": "OK", "count": 1,
  "results": [["reporting-bot", {"thumbprint": "9f86d081...", "accounts": ["SALES"], "is_admin": false,
-                                "capabilities": ["server:observe"]}]]}
+                                "capabilities": ["server:observe"],
+                                "expires_at": "2027-09-13T16:23:45Z", "expires_in_days": 364}]]}
 ```
 
 ### LIST.ACCOUNTS

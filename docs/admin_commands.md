@@ -145,8 +145,10 @@ Deauthorize a client certificate by its assigned name. This command is restricte
 List all authorized certificate names and their thumbprints. This command is restricted to the `SYSTEM` account.
 
 - **Usage**: `LIST.CONNS`
-- **Output**: name, thumbprint, allowed accounts and capabilities. `ADMIN` is expanded to the full capability set, so a
-  row says what a credential is *for* rather than leaving it to be inferred from a flag.
+- **Output**: name, thumbprint, allowed accounts, capabilities and expiry. `ADMIN` is expanded to the full capability
+  set, so a row says what a credential is *for* rather than leaving it to be inferred from a flag. The expiry reads
+  `unknown` for a client authorized with `AUTHORIZE.CONN`, which names a thumbprint and never sees the certificate
+  behind it — no date is invented for one.
 - **Note**: The same listing is available over the [remote protocol](protocol.md) to a client holding `server:observe`
   (or `ADMIN`), and in the [web dashboard](web_dashboard.md), which is how the dashboard manages authorizations.
 
@@ -155,8 +157,9 @@ List all authorized certificate names and their thumbprints. This command is res
 Generate and sign a new client certificate and private key using the system's CA, and automatically authorize it. This
 command is restricted to the `SYSTEM` account and runs interactively.
 
-- **Usage**: `GENERATE.CERT <common_name>`
+- **Usage**: `GENERATE.CERT <common_name> [DAYS <n>]`
 - **Example**: `GENERATE.CERT myclient`
+- **Example (short-lived)**: `GENERATE.CERT ci-runner DAYS 7`
 - **Note**: Admin clients can issue certificates the same way over the [remote protocol](protocol.md); the
   [web dashboard](web_dashboard.md) uses that to generate and download certificates from a browser.
 - **Output**: Creates `myclient.crt`, `myclient.key` and `myclient.pfx` in the current directory. The CSR is an input to
@@ -180,6 +183,13 @@ command is restricted to the `SYSTEM` account and runs interactively.
     unauthenticated.
   - If authorization is skipped (e.g., non-admin with neither an account nor a capability), you can still use
     `AUTHORIZE.CONN` manually later.
+  - **`DAYS` sets the lifetime**, defaulting to 365 and bounded by `max_client_cert_days` in `config.toml`. A request
+    above the ceiling, or for `0` days, is **refused rather than shortened** — a caller that believes it holds a
+    7-day certificate and actually holds a year-long one has a credential outliving what it was scoped for. There is
+    no CRL and no OCSP (see [Security](security.md)), so `DEAUTHORIZE.CONN` only helps if somebody notices a leak;
+    a short lifetime is the withdrawal that happens whether or not anyone does.
+  - The command prints the expiry beside the thumbprint, and `LIST.CONNS` carries it for every certificate this
+    database issued.
 
 #### START.SERVER
 
