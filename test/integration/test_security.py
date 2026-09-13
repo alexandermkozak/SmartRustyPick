@@ -1,6 +1,7 @@
 """Verifies that the headless server enforces admin privileges and per-account access,
 and that it enforces its request-size, handshake, idle and connection-count limits."""
 
+import json
 import os
 import socket
 import ssl
@@ -15,6 +16,57 @@ ACCOUNT = "TEST_ACC"
 # The protocol's error code for an admin-only command, asserted rather than the
 # message beside it: the wording may change, the code may not.
 ADMIN_REQUIRED = "ADMIN_REQUIRED"
+
+
+def check_no_secret_leakage(suite, admin, workspace_path):
+    """Issuing a certificate must not leave its key material anywhere (issue #55).
+
+    The rule is that key material, passphrases and tokens never reach `$LOGS`,
+    stdout, a protocol response or an HTTP body, with one deliberate exception:
+    the issuance path, which exists to deliver exactly that. So this issues a
+    certificate the documented way and then looks for its secrets everywhere
+    *except* the response that carried them.
+    """
+    resp = admin.request(command="GENERATE.CERT", name="leak-probe", accounts_list=[ACCOUNT])
+    if resp.get("status") != "OK":
+        suite.check("A certificate is issued for the leak probe", False, resp.get("message", ""))
+        return
+    issued = resp.get("record") or {}
+
+    # The body of the key, not its header - the PEM armour is a constant and
+    # would match text that carries no key at all.
+    key_body = "".join(issued.get("private_key_pem", "").splitlines()[1:-1])
+    passphrase = issued.get("pfx_passphrase") or ""
+    suite.check(
+        "The issuance response carries the key and passphrase, as it must",
+        len(key_body) > 100 and len(passphrase) >= 32,
+    )
+
+    # Everything the database has written. `$LOGS` and `$SAVEDLISTS` are in
+    # here, so this covers the acceptance criterion without depending on how
+    # either is queried.
+    found = []
+    for root, _dirs, files in os.walk(os.path.join(workspace_path, "db_storage")):
+        for name in files:
+            path = os.path.join(root, name)
+            with open(path, "rb") as handle:
+                blob = handle.read()
+            if key_body.encode() in blob or passphrase.encode() in blob:
+                found.append(os.path.relpath(path, workspace_path))
+    suite.check(
+        "No issued key or passphrase is written into the database",
+        not found,
+        ", ".join(found),
+    )
+
+    # And a second read of the same material through an ordinary command must
+    # not produce it: `LIST.CONNS` names clients, it does not hand back keys.
+    resp = admin.request(command="LIST.CONNS")
+    listing = json.dumps(resp)
+    suite.check(
+        "LIST.CONNS reports the client without its key material",
+        key_body not in listing and passphrase not in listing and "leak-probe" in listing,
+    )
 
 
 def tls_handshake(port, certificate, private_key, ca, maximum=None, minimum=None):
@@ -245,6 +297,8 @@ def main():
                 suite.check_eq(
                     "Non-admin may reach its own account", resp.get("code"), "RECORD_NOT_FOUND"
                 )
+
+                check_no_secret_leakage(suite, admin, workspace.path)
 
             check_tls_floor(suite, port, user_crt, user_key, certs.ca_crt)
             check_connection_limits(suite, certs, user_crt, user_key)

@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct Config {
     pub editor: Option<String>,
     pub server_port: Option<u16>,
@@ -76,6 +76,27 @@ pub struct Config {
     /// Maximum number of connections the server holds open at once. Additional
     /// connections are rejected until one of the existing ones closes.
     pub max_connections: Option<usize>,
+}
+
+/// Written out rather than derived, so that `web_token` is redacted.
+///
+/// Nothing prints a `Config` today. The point is that the next thing to do it -
+/// a startup trace, a `{:?}` in an error path - cannot put the dashboard
+/// credential into `$LOGS` or a terminal by accident. Every other field here is
+/// a path, a port or a limit, and is more useful visible than hidden.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("editor", &self.editor)
+            .field("server_port", &self.server_port)
+            .field("cert_path", &self.cert_path)
+            .field("key_path", &self.key_path)
+            .field("ca_path", &self.ca_path)
+            .field("server_addr", &self.server_addr)
+            .field("log_detail", &self.log_detail)
+            .field("web_token", &self.web_token.as_ref().map(|_| "[redacted]"))
+            .finish_non_exhaustive()
+    }
 }
 
 /// A single misbehaving (or compromised) authorised client should not be able to
@@ -285,5 +306,32 @@ mod tests {
 
         config.idle_timeout_ms = Some(500);
         assert_eq!(config.idle_timeout(), Some(std::time::Duration::from_millis(500)));
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::Config;
+
+    #[test]
+    fn test_a_printed_config_does_not_carry_the_dashboard_token() {
+        let config = Config {
+            web_token: Some("s3cret-token-value".to_string()),
+            cert_path: Some(".local/certs/server.crt".to_string()),
+            ..Config::default()
+        };
+        let printed = format!("{:?}", config);
+
+        assert!(!printed.contains("s3cret-token-value"), "{printed}");
+        assert!(printed.contains("[redacted]"), "{printed}");
+        // The rest stays visible: a redacted config nobody can read is a config
+        // nobody will print, and then the redaction has protected nothing.
+        assert!(printed.contains(".local/certs/server.crt"), "{printed}");
+    }
+
+    #[test]
+    fn test_an_absent_token_reads_as_absent_rather_than_as_redacted() {
+        let printed = format!("{:?}", Config::default());
+        assert!(printed.contains("web_token: None"), "{printed}");
     }
 }

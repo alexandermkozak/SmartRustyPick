@@ -136,6 +136,44 @@ audit trail readable in a stolen directory would undo much of what encrypting th
 This is the case that forces the ordering: the engine cannot list an account's files without reading `DIR`, so an
 encrypted database is unreadable until it is unlocked — consistent with decision 1's refusal to start without a key.
 
+### 4. What may never be logged
+
+The rule, so that the encryption work has something to check itself against — a key that leaks into a log line defeats
+all of it:
+
+> **Key material, passphrases and tokens never reach `$LOGS`, stdout, stderr, a protocol response, or an HTTP response
+> body.**
+
+There are exactly two deliberate exceptions, and both exist to *deliver* the thing they carry:
+
+1. **Certificate issuance.** `GENERATE.CERT` returns `private_key_pem` and `pfx_passphrase` to the caller that asked
+   for the certificate. That is the entire purpose of the command; there is no other way to get a key to a client.
+2. **The dashboard startup URL**, which prints the session token because it is how the operator reaches the dashboard
+   at all. Its lifecycle — a URL valid for the life of the process — is a known gap, tracked in #54.
+
+How the rule is held rather than remembered:
+
+- A `Secret` is the only type a passphrase, key or token is held in. It has no `Display`, no `Serialize` and no
+  `Clone`; its `Debug` prints `[redacted]` and it zeroizes on drop. `expose()` is the single way out, so every
+  legitimate disclosure is visible in review as the exception it is.
+- `GeneratedCert` deliberately derives neither `Debug` nor `Serialize`. It is the one struct holding a private key and
+  a passphrase at once, so a derive would carry both into any response or log line that ever touched it; `record()`
+  names each field it emits instead.
+- `Config` has a hand-written `Debug` that redacts `web_token`. Nothing prints a `Config` today — the point is that the
+  next thing to do it cannot leak the dashboard credential by accident.
+- A PKCS#12 passphrase reaches `openssl` through the child's environment, never `-passout pass:<value>`, which `ps`
+  shows to every user on the host.
+- The integration suite issues a certificate and then searches every byte the database wrote for its key and
+  passphrase. `$LOGS` and `$SAVEDLISTS` are inside that search, so the assertion does not depend on how either is
+  queried.
+
+**Certificate thumbprints are logged in full, on purpose.** A thumbprint is a public fingerprint — holding one grants
+nothing without the private key beside it — it is already stored in full in `$CLIENTS` for every authorized client, and
+the rejected-connection log line is how an operator discovers what to authorize next. Truncating it would cost a real
+workflow to hide an identifier that is not a secret. Peer addresses and denied-account names are logged for the same
+reason: they are the access-control record, and `$LOGS` is in scope for encryption at rest (decision 3) rather than
+being thinned out.
+
 ## What the operator is responsible for
 
 - **Key custody.** The KEK is yours to store, deliver and rotate. It must not live in the backup it protects, and a
