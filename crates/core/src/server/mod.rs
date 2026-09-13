@@ -1,4 +1,6 @@
 pub mod certs;
+#[cfg(test)]
+mod certs_tests;
 pub mod handler;
 #[cfg(test)]
 mod handler_tests;

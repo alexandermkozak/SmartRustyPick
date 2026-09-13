@@ -27,6 +27,7 @@
 //! chosen by [`FsyncPolicy`].
 
 use crate::db::models::Record;
+use crate::private_files;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -437,7 +438,7 @@ fn write_meta(dir: &Path, meta: SectionMeta, fsync: FsyncPolicy) -> io::Result<(
     );
     let tmp = dir.join("meta.tmp");
     {
-        let mut file = File::create(&tmp)?;
+        let mut file = private_files::create(&tmp)?;
         // The checksum goes first, on purpose. A file cut short at a line
         // boundary would otherwise lose the checksum along with the lines it
         // covers and read back as a perfectly plausible, older `meta`.
@@ -620,7 +621,7 @@ fn write_frames(path: &Path, entries: &mut [(&str, Cow<'_, Record>)], fsync: Fsy
 
     let tmp = path.with_extension("tmp");
     {
-        let file = File::create(&tmp)?;
+        let file = private_files::create(&tmp)?;
         let mut writer = BufWriter::new(&file);
         let mut crc: u32 = 0xFFFF_FFFF;
         let mut write = |writer: &mut BufWriter<&File>, bytes: &[u8]| -> io::Result<()> {

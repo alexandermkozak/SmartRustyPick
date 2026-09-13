@@ -15,8 +15,9 @@ use crate::db::error::{DbError, DbResult};
 use crate::db::hashfile;
 use crate::db::index::{self, FileIndex};
 use crate::db::models::*;
+use crate::private_files;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::Path;
 use std::time::SystemTime;
@@ -333,7 +334,7 @@ impl Database {
                 }
                 let mut table = Table::new();
                 table.data_meta = Self::init_data_section(&table_dir, self.records_per_group)?;
-                File::create(format!("{}/dict", table_dir))?;
+                private_files::create(format!("{}/dict", table_dir))?;
                 table
             }
             Err(e) => return Err(e.into()),

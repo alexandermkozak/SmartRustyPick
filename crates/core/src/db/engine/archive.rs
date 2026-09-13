@@ -82,6 +82,7 @@ use super::{Database, TableHandle, assert_no_table_guard_held};
 use crate::db::archive::{self, FileEntry, IndexEntry, Manifest, RecordKind, Sink, Source, Summary, Trailer};
 use crate::db::error::{DbError, DbResult};
 use crate::db::models::{FileAttributes, Record};
+use crate::private_files;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -311,7 +312,7 @@ impl Database {
         ));
 
         let outcome = (|| {
-            let file = File::create(&staging)?;
+            let file = private_files::create(&staging)?;
             let mut buffered = BufWriter::new(file);
             let trailer = self.export(source, &mut buffered)?;
             let file = buffered
@@ -730,7 +731,7 @@ impl Sink for Restore<'_> {
 
 /// Streams a record body into a staged path, reporting what actually arrived.
 fn stream_to(body: &mut dyn Read, staged: &Path) -> DbResult<u64> {
-    let mut file = BufWriter::new(File::create(staged)?);
+    let mut file = BufWriter::new(private_files::create(staged)?);
     let mut buffer = vec![0u8; 64 * 1024];
     let mut written = 0u64;
     loop {

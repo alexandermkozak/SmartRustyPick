@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::private_files;
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::fs::File;
 use std::io::{self, BufReader as SyncBufReader};
@@ -16,9 +17,14 @@ fn sibling(path: &str, extension: &str) -> String {
     sibling.to_string_lossy().into_owned()
 }
 
+/// Creates the directory a generated artefact lives in, owner-only.
+///
+/// `0700` rather than `0600`-files-in-a-public-directory because the entries are
+/// named after their common names: the listing alone is the set of clients this
+/// CA has ever issued for.
 fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
     match Path::new(path).parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+        Some(parent) if !parent.as_os_str().is_empty() => private_files::dir(parent),
         _ => Ok(()),
     }
 }
@@ -46,6 +52,10 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
     // 1. Generate CA key and certificate if needed
     if !Path::new(ca_key_path).exists() || !ca_exists {
         println!("Generating CA certificate...");
+        // openssl truncates an existing `-keyout` rather than replacing it, so the
+        // mode is decided here and there is no instant at which the CA key is
+        // readable by anyone else.
+        private_files::reserve(ca_key_path.as_str())?;
         let status = std::process::Command::new("openssl")
             .args([
                 "req",
@@ -69,6 +79,7 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
             ])
             .status()?;
         if !status.success() {
+            let _ = std::fs::remove_file(ca_key_path.as_str());
             return Err(std::io::Error::other("Failed to generate CA certificate"));
         }
     }
@@ -77,6 +88,7 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
     if !key_exists {
         println!("Generating server certificate...");
         let csr_path = &sibling(cert_path, "csr");
+        private_files::reserve(key_path.as_str())?;
         let status = std::process::Command::new("openssl")
             .args([
                 "req",
@@ -93,6 +105,7 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
             ])
             .status()?;
         if !status.success() {
+            let _ = std::fs::remove_file(key_path.as_str());
             return Err(std::io::Error::other("Failed to generate server CSR"));
         }
 
@@ -240,7 +253,7 @@ pub fn generate_client_cert(
     }
 
     let out_dir = cert_output_dir(&ca_file);
-    std::fs::create_dir_all(&out_dir)?;
+    private_files::dir(&out_dir)?;
     let out = |extension: &str| {
         out_dir
             .join(format!("{}.{}", common_name, extension))
@@ -256,11 +269,15 @@ pub fn generate_client_cert(
     let failed = |step: &str| io::Error::other(format!("{} failed", step));
     let ran = |result: io::Result<std::process::ExitStatus>| matches!(result, Ok(status) if status.success());
 
-    // The private key never leaves this directory except through the caller.
+    // The private key never leaves this directory except through the caller, and
+    // it is owner-only before openssl has written a byte into it - `genrsa -out`
+    // truncates the file this reserves instead of creating one at the umask.
+    private_files::reserve(&key_file)?;
     if !ran(std::process::Command::new("openssl")
         .args(["genrsa", "-out", &key_file, "2048"])
         .status())
     {
+        let _ = std::fs::remove_file(&key_file);
         return Err(failed("Generating the RSA key"));
     }
 
@@ -311,6 +328,7 @@ pub fn generate_client_cert(
     }
 
     let pfx_path = if write_pfx
+        && private_files::reserve(&pfx_file).is_ok()
         && ran(std::process::Command::new("openssl")
             .args([
                 "pkcs12",
@@ -330,6 +348,9 @@ pub fn generate_client_cert(
     {
         Some(pfx_file)
     } else {
+        // A reserved-but-unwritten bundle is an empty file claiming to be a
+        // credential; the caller is told there is none, so there must be none.
+        let _ = std::fs::remove_file(&pfx_file);
         None
     };
 

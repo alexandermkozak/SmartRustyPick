@@ -13,6 +13,7 @@ use crate::db::hashfile::{self, FsyncPolicy, SectionMeta};
 use crate::db::health::{HealthSummary, Verdict};
 use crate::db::index::{self, IndexReport, IndexStats, IndexValue};
 use crate::db::models::*;
+use crate::private_files;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -1408,7 +1409,7 @@ impl Database {
         {
             fs::create_dir_all(parent)?;
         }
-        let file = File::create(path)?;
+        let file = private_files::create(path)?;
         let mut writer = BufWriter::new(file);
 
         let mut keys: Vec<_> = map.keys().cloned().collect();
@@ -2127,7 +2128,7 @@ impl Database {
             fs::create_dir_all(&table_dir)?;
         }
         Self::init_data_section(&table_dir, self.records_per_group)?;
-        File::create(format!("{}/dict", table_dir))?;
+        private_files::create(format!("{}/dict", table_dir))?;
 
         let has_dir = {
             let mut listings = wlock(&self.available_tables);

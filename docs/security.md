@@ -50,8 +50,9 @@ implies otherwise is worse than none:
 | Protocol listener | TLS with **mutual** authentication: the client certificate is verified against `ca_path`, then its SHA-256 thumbprint must appear in `$CLIENTS`. An unknown thumbprint is logged and the connection is dropped with no response. | The TLS floor is rustls' default, so **TLS 1.2 is still accepted**; version and cipher suites are not pinned by this project. |
 | Records, dictionaries, saved lists, `$LOGS` | Nothing. | Written as **plaintext** frames (`[key_len][key][data_len][data]`, see [Storage Engine](storage.md)). The CRC32C trailer is integrity against a torn write, not authentication: it is keyless, so anyone who can edit a group file can recompute it. |
 | Web dashboard | Bound to `127.0.0.1:8080` by default. Its token is compared in constant time and stored in an `HttpOnly; SameSite=Strict` cookie. It is an ordinary protocol client with a certificate reissued every boot and valid for a day. | **Plain HTTP.** The cookie has no `Secure` attribute, the startup URL carries the token in a query string, and `POST /api/certificates` returns a freshly generated **private key** in the response body. Defensible on loopback; not once `web_addr` points anywhere else. |
-| CA, server and client keys | Nothing beyond the filesystem. | Unencrypted PEM (`openssl req -nodes`, `openssl genrsa`). PKCS#12 bundles are exported with an **empty password**. No explicit mode is set on any of them anywhere in the workspace, so the umask decides who can read them. |
+| CA, server and client keys | Filesystem permissions: `.local/certs/` is `0700` and every key, certificate and PKCS#12 bundle in it is `0600`, on Unix. The mode is set *before* `openssl` writes the key, so there is no instant at which a private key is readable by anyone else. | Unencrypted PEM (`openssl req -nodes`, `openssl genrsa`). PKCS#12 bundles are exported with an **empty password**, so the mode is the only thing protecting a bundle once it is copied off the host. |
 | Certificate lifetime | Client certificates last 365 days, the CA 3650. Deauthorization by name takes effect on the client's next request. | There is **no revocation path** — no CRL, no OCSP, no CA rotation. Removing a thumbprint from `$CLIENTS` is the only revocation, and it works only for this database. |
+| Files on disk | Every file this project writes — group files, `meta`, dictionaries, index state, queue books, the transaction intent log, directory-file records, archives and their staging siblings — is created `0600` on Unix, and a file written by an earlier build is tightened the next time it is rewritten. | **Directories** under `db_storage/` are left at the umask, so account and file names remain listable by anyone who can read the volume — which changes nothing, since those names are directory names either way (see below). **Windows sets no mode at all**: `PermissionsExt` is Unix-only, so there the files land at whatever the default ACL grants. |
 | `config.toml` | — | It is **committed to the repository** and has a `web_token` field. Treat it as a non-secret file; a token set there is a token in git history. |
 
 `$LOGS` is capped at `max_log_records` (default 100) and holds the message plus, in `detailed` mode, a UTC timestamp.
@@ -144,8 +145,10 @@ encrypted database is unreadable until it is unlocked — consistent with decisi
 - **The dashboard's exposure.** It is loopback and plain HTTP by design. Put it behind a TLS-terminating reverse proxy
   before binding it anywhere else, and expect the token cookie to need `Secure` once you do. The startup URL contains
   the token: treat it like a password, not like a bookmark.
-- **File modes.** Until the code sets them, `.local/certs/` and its keys land at whatever the umask allows. `0700` on
-  the directory and `0600` on the keys is the expectation.
+- **File modes on Windows.** On Unix the code sets them: `0700` on `.local/certs/`, `0600` on every key and on every
+  file under `db_storage/`. On Windows nothing is set, and the inherited ACL is yours to get right. One deliberate
+  exception on both: `EXTRACT` writes to a path you named, outside the database, so it follows your umask like any
+  other export rather than landing unreadable to everyone but the service user.
 - **`config.toml`.** It is committed. Keep secrets out of it and source them from the environment or a gitignored
   override.
 - **Certificate hygiene.** There is no revocation but the thumbprint list. Issue narrowly, keep `LIST.CONNS` short, and
@@ -156,6 +159,7 @@ encrypted database is unreadable until it is unlocked — consistent with decisi
 Recorded here so they are not mistaken for settled:
 
 - Pinning a TLS 1.3 floor and an explicit cipher suite list, rather than inheriting rustls' defaults.
+- Whether Windows gets real ACL tightening, or stays documented as an operator responsibility.
 - Whether the dashboard gets native TLS, refuses a non-loopback bind without it, or keeps key-bearing endpoints
   loopback-only regardless of bind address.
 - CA rotation and a real revocation path.

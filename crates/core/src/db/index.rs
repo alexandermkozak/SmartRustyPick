@@ -41,10 +41,11 @@
 use crate::db::hashfile::{self, FsyncPolicy, SectionMeta, SectionSource};
 use crate::db::health::{self, Health, Measure, Verdict};
 use crate::db::models::{Field, Record, Value, text_of};
+use crate::private_files;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -329,7 +330,7 @@ pub fn write_state(section_path: &str, state: &IndexState, fsync: FsyncPolicy) -
     }
     let tmp = dir.join("state.tmp");
     {
-        let mut file = File::create(&tmp)?;
+        let mut file = private_files::create(&tmp)?;
         writeln!(file, "checksum={:08x}", hashfile::crc32c(body.as_bytes()))?;
         file.write_all(body.as_bytes())?;
         file.flush()?;
