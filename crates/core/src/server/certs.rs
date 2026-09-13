@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::private_files;
+use crate::secret::Secret;
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::fs::File;
 use std::io::{self, BufReader as SyncBufReader};
@@ -153,7 +154,13 @@ pub fn ensure_certificates(config: &Config) -> std::io::Result<()> {
 /// The PEM bodies are carried alongside the paths so a caller that never
 /// touches the server's filesystem - the dashboard handing a certificate to a
 /// browser - can still deliver the material.
-#[derive(Debug, Clone, serde::Serialize)]
+///
+/// **Deliberately not `Serialize`, and deliberately not `Debug`.** This is the
+/// one struct in the project that holds a private key and a passphrase at the
+/// same time; a derive would put both into any response or log line that ever
+/// touched it. [`record`](GeneratedCert::record) is the single way out, and it
+/// names every field it emits, so the protocol shape is a written decision
+/// rather than a consequence of the field order here.
 pub struct GeneratedCert {
     pub common_name: String,
     pub thumbprint: String,
@@ -164,7 +171,49 @@ pub struct GeneratedCert {
     pub key_path: String,
     /// Present only when the PKCS#12 bundle could be produced.
     pub pfx_path: Option<String>,
+    /// The bundle's import passphrase, present exactly when `pfx_path` is.
+    ///
+    /// Generated per issuance, never written down, and delivered only through
+    /// [`record`](GeneratedCert::record) to the caller that asked for the
+    /// certificate. A bundle whose passphrase is stored beside it is decorative,
+    /// so the only copy is the one the caller is handed.
+    pub pfx_passphrase: Option<Secret>,
 }
+
+impl GeneratedCert {
+    /// The issuance response, field by field.
+    ///
+    /// The private key and the passphrase are in here on purpose: this is the
+    /// certificate-issuance path, which exists to deliver exactly that material
+    /// and is the one exception `docs/security.md` carves out of "no secret
+    /// reaches a response body".
+    pub fn record(&self) -> serde_json::Value {
+        serde_json::json!({
+            "common_name": self.common_name,
+            "thumbprint": self.thumbprint,
+            "certificate_pem": self.certificate_pem,
+            "private_key_pem": self.private_key_pem,
+            "ca_pem": self.ca_pem,
+            "cert_path": self.cert_path,
+            "key_path": self.key_path,
+            "pfx_path": self.pfx_path,
+            "pfx_passphrase": self.pfx_passphrase.as_ref().map(Secret::expose),
+        })
+    }
+}
+
+/// Names the environment variable openssl reads the export passphrase from.
+///
+/// `-passout pass:<value>` would put it on the command line, where `ps` shows it
+/// to every user on the host. A child's environment is readable through
+/// `/proc/<pid>/environ` by its owner alone, which is the same boundary the key
+/// file itself sits behind.
+const PFX_PASSPHRASE_VAR: &str = "SRP_PFX_PASSPHRASE";
+
+/// 18 bytes - 144 bits as 36 hex characters. Hex rather than anything prettier
+/// because the passphrase is read off a screen and typed into an import dialog,
+/// and a character set with no ambiguity is worth more there than brevity.
+const PFX_PASSPHRASE_BYTES: usize = 18;
 
 /// Rejects names that would turn into an `openssl` option or escape the
 /// certificate directory. The name reaches a command line and a file path, so
@@ -327,31 +376,44 @@ pub fn generate_client_cert(
         return Err(failed("Signing the certificate"));
     }
 
-    let pfx_path = if write_pfx
-        && private_files::reserve(&pfx_file).is_ok()
-        && ran(std::process::Command::new("openssl")
-            .args([
-                "pkcs12",
-                "-export",
-                "-out",
-                &pfx_file,
-                "-inkey",
-                &key_file,
-                "-in",
-                &crt_file,
-                "-certfile",
-                &ca_file,
-                "-passout",
-                "pass:",
-            ])
-            .status())
-    {
-        Some(pfx_file)
+    // The bundle and its passphrase are produced together or not at all: a
+    // `.pfx` whose passphrase nobody holds is not a credential, and a passphrase
+    // for a bundle that was never written is a puzzle for whoever reads the
+    // response.
+    let bundle = if write_pfx {
+        let passphrase = Secret::random_hex(PFX_PASSPHRASE_BYTES)?;
+        let exported = private_files::reserve(&pfx_file).is_ok()
+            && ran(std::process::Command::new("openssl")
+                .args([
+                    "pkcs12",
+                    "-export",
+                    "-out",
+                    &pfx_file,
+                    "-inkey",
+                    &key_file,
+                    "-in",
+                    &crt_file,
+                    "-certfile",
+                    &ca_file,
+                    "-passout",
+                    &format!("env:{}", PFX_PASSPHRASE_VAR),
+                ])
+                .env(PFX_PASSPHRASE_VAR, passphrase.expose())
+                .status());
+        if exported {
+            Some((pfx_file, passphrase))
+        } else {
+            // A reserved-but-unwritten bundle is an empty file claiming to be a
+            // credential; the caller is told there is none, so there must be none.
+            let _ = std::fs::remove_file(&pfx_file);
+            None
+        }
     } else {
-        // A reserved-but-unwritten bundle is an empty file claiming to be a
-        // credential; the caller is told there is none, so there must be none.
-        let _ = std::fs::remove_file(&pfx_file);
         None
+    };
+    let (pfx_path, pfx_passphrase) = match bundle {
+        Some((path, passphrase)) => (Some(path), Some(passphrase)),
+        None => (None, None),
     };
 
     let certificate_pem = std::fs::read_to_string(&crt_file)?;
@@ -368,6 +430,7 @@ pub fn generate_client_cert(
         cert_path: crt_file,
         key_path: key_file,
         pfx_path,
+        pfx_passphrase,
     })
 }
 

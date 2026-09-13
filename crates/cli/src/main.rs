@@ -2554,9 +2554,16 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
 
     println!("Certificate generated: {}", generated.cert_path);
     println!("Private key: {}", generated.key_path);
-    match &generated.pfx_path {
-        Some(path) => println!("PFX file: {}", path),
-        None => println!("PFX file: not generated"),
+    match (&generated.pfx_path, &generated.pfx_passphrase) {
+        (Some(path), Some(passphrase)) => {
+            println!("PFX file: {}", path);
+            // Shown here and nowhere else. It is not written beside the bundle,
+            // because a passphrase stored next to what it protects is
+            // decoration; whoever carries the `.pfx` to another machine has to
+            // carry this separately.
+            println!("PFX passphrase (shown once): {}", passphrase.expose());
+        }
+        _ => println!("PFX file: not generated"),
     }
     println!("SHA-256 Thumbprint: {}", generated.thumbprint);
 

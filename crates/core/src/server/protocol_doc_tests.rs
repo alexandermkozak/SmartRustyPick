@@ -612,8 +612,9 @@ fn generate_cert_record_is_documented() {
         cert_path: String::new(),
         key_path: String::new(),
         pfx_path: None,
+        pfx_passphrase: None,
     };
-    let value = serde_json::to_value(&generated).unwrap();
+    let value = generated.record();
     assert_documented_shape(
         "GENERATE.CERT",
         value_keys(&value),
@@ -626,6 +627,7 @@ fn generate_cert_record_is_documented() {
             "cert_path",
             "key_path",
             "pfx_path",
+            "pfx_passphrase",
         ],
     );
 }

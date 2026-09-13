@@ -154,10 +154,15 @@ command is restricted to the `SYSTEM` account and runs interactively.
   4. If not Admin, prompts for a comma-separated list of **Allowed Accounts**.
   5. Automatically performs the `AUTHORIZE.CONN` step.
 - **Note**:
-  - The `.pfx` file is generated with an empty password. It bundles the private key, the client certificate and the CA
-    that signed it. The CA belongs in there: a client that selects its certificate by building a chain - Windows'
-    Schannel, and so .NET's `SslStream` - will not offer a certificate it cannot chain to the CA the server asked for,
-    and the server then drops the connection as unauthenticated.
+  - The `.pfx` file is **passphrase-protected**. A passphrase is generated for each issuance, printed once by this
+    command (and shown once in the [web dashboard](web_dashboard.md)), and stored nowhere — not beside the bundle, not
+    in `$LOGS`, and not on any command line, since it reaches `openssl` through the child process's environment rather
+    than its arguments. Deliver it to whoever imports the bundle by some route other than the bundle itself. If it is
+    lost, re-issue the certificate; there is nothing to recover.
+  - The bundle carries the private key, the client certificate and the CA that signed it. The CA belongs in there: a
+    client that selects its certificate by building a chain - Windows' Schannel, and so .NET's `SslStream` - will not
+    offer a certificate it cannot chain to the CA the server asked for, and the server then drops the connection as
+    unauthenticated.
   - If authorization is skipped (e.g., non-admin with no accounts), you can still use `AUTHORIZE.CONN` manually later.
 
 #### START.SERVER

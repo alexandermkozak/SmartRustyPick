@@ -2712,7 +2712,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                     }
                     Response {
                         status: "OK".to_string(),
-                        record: Some(serde_json::to_value(&generated).unwrap_or(serde_json::Value::Null)),
+                        record: Some(generated.record()),
                         ..Default::default()
                     }
                 }

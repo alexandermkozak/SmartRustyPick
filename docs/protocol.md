@@ -1437,6 +1437,10 @@ which is the only time it is sent anywhere.
   account could do nothing.
 - Certificates are valid for 365 days. Re-issuing under an existing name replaces that client's authorization, which
   revokes the previous certificate.
+- The PKCS#12 bundle is **passphrase-protected**. `pfx_passphrase` is generated per issuance, is never written to disk
+  and is never recoverable afterwards — this response is the only place it exists. It is present exactly when
+  `pfx_path` is, and both are `null` when `openssl` could not produce a bundle. Deliver it out of band from the bundle
+  itself; a passphrase carried alongside what it protects is decoration.
 - Errors: `ADMIN_REQUIRED`, `MISSING_FIELD` (no `name`), `INVALID_REQUEST` (a non-admin
   certificate with no allowed account), `INVALID_DATA` (a common name that is not
   `[A-Za-z0-9._-]`), `UNAVAILABLE` (the server has no certificate configuration to sign
@@ -1455,7 +1459,8 @@ which is the only time it is sent anywhere.
   "ca_pem": "-----BEGIN CERTIFICATE-----\n...",
   "cert_path": ".local/certs/reporting-bot.crt",
   "key_path": ".local/certs/reporting-bot.key",
-  "pfx_path": ".local/certs/reporting-bot.pfx"
+  "pfx_path": ".local/certs/reporting-bot.pfx",
+  "pfx_passphrase": "a3f1c08e57d2b9416ef0..."
 }}
 ```
 

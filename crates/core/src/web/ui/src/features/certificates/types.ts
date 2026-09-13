@@ -8,6 +8,11 @@ export interface GeneratedCert {
     cert_path: string
     key_path: string
     pfx_path: string | null
+    /**
+     * The PKCS#12 import passphrase, returned once and stored nowhere. Present
+     * exactly when `pfx_path` is.
+     */
+    pfx_passphrase: string | null
 }
 
 /** The fields `GENERATE.CERT` needs. */
