@@ -68,6 +68,79 @@ fn test_handle_request_read_write() {
     assert_eq!(resp_denied.code, Some(ErrorCode::AccessDenied));
 }
 
+/// A write naming a field with no dictionary entry is refused, and nothing is
+/// stored (#127).
+///
+/// The behaviour this replaced discarded the unknown field and answered `OK`
+/// with a `version`: the record read back as a valid record, just a shorter
+/// one, so a client writing while a dictionary was still being set up lost
+/// content and was told it had not.
+#[test]
+fn a_write_naming_a_field_the_dictionary_does_not_know_is_refused() {
+    let dir = TempDir::new("handler_unknown_field");
+    let db = Database::new(dir.path(), Some(isolated_config())).unwrap();
+    db.create_test_account("SERVER_TEST").unwrap();
+    let db_arc = Arc::new(RwLock::new(db));
+    let client = ClientInfo {
+        name: "test_client".to_string(),
+        thumbprint: "test_tp".to_string(),
+        allowed_accounts: vec!["SERVER_TEST".to_string()],
+        is_admin: false,
+        ..Default::default()
+    };
+    let request = |command: &str| Request {
+        command: command.to_string(),
+        account: Some("SERVER_TEST".to_string()),
+        file: Some("USERS".to_string()),
+        // A key the seeded file does not already hold, so "nothing was stored"
+        // is the record still not being there.
+        key: Some("9001".to_string()),
+        ..Default::default()
+    };
+    // USERS is created with NAME and EMAIL; PHONE is the field nobody defined.
+    let payload = serde_json::json!({ "NAME": "Alice", "EMAIL": "alice@example.com", "PHONE": "555-0100" });
+
+    // Both spellings of the same payload - `structured_data`, and `data` as an
+    // object - refuse it, and name the field rather than leaving the caller to
+    // work out which of the three was wrong.
+    for (label, build) in [("structured_data", true), ("data as an object", false)] {
+        let mut write = request("WRITE");
+        if build {
+            write.structured_data = Some(payload.clone());
+        } else {
+            write.data = Some(payload.clone());
+        }
+        let response = handle_request(write, &db_arc, &client);
+        assert_eq!(response.code, Some(ErrorCode::InvalidData), "{label}");
+        assert!(
+            response.message.as_deref().is_some_and(|m| m.contains("'PHONE'")),
+            "{label}: unexpected message: {:?}",
+            response.message
+        );
+        assert!(response.version.is_none(), "{label}: a refused write mints no version");
+    }
+
+    // And nothing was written: a partial record is exactly what this refuses.
+    assert_eq!(
+        handle_request(request("READ"), &db_arc, &client).code,
+        Some(ErrorCode::RecordNotFound)
+    );
+
+    // Defining the field is all it takes.
+    let mut define = request("SET.DICT");
+    define.key = Some("PHONE".to_string());
+    define.structured_data = Some(serde_json::json!({ "field": 3 }));
+    assert_eq!(handle_request(define, &db_arc, &client).status, "OK");
+
+    let mut write = request("WRITE");
+    write.structured_data = Some(payload);
+    assert_eq!(handle_request(write, &db_arc, &client).status, "OK");
+    assert_eq!(
+        handle_request(request("READ"), &db_arc, &client).record.unwrap()["phone"],
+        serde_json::json!("555-0100")
+    );
+}
+
 #[test]
 fn test_create_and_delete_file_target_the_requested_account() {
     // A headless server is not logged into any account, so these commands must act on
@@ -2498,6 +2571,14 @@ fn test_a_queue_hands_each_record_to_one_consumer_over_the_protocol() {
     create.queue = Some(true);
     assert_eq!(handle_request(create, &db_arc, &admin).status, "OK");
 
+    // The payload below is enqueued by field name, so the queue needs the entry
+    // that name resolves through: an object naming a field this file's
+    // dictionary does not define is refused rather than stored short (#127).
+    let mut define = queue_request("SET.DICT", "JOBS");
+    define.key = Some("PAYLOAD".to_string());
+    define.structured_data = Some(serde_json::json!({ "field": 1 }));
+    assert_eq!(handle_request(define, &db_arc, &admin).status, "OK");
+
     let other = ClientInfo {
         name: "worker-2".to_string(),
         ..worker.clone()
@@ -2509,9 +2590,26 @@ fn test_a_queue_hands_each_record_to_one_consumer_over_the_protocol() {
     assert_eq!(resp.count, Some(0));
     assert!(resp.record.is_none());
 
+    // An object payload goes through the same codec a WRITE does, so a name
+    // this queue's dictionary does not define is refused rather than enqueued
+    // short (#127) - and nothing joins the queue.
+    let mut unknown = queue_request("ENQUEUE", "JOBS");
+    unknown.structured_data = Some(serde_json::json!({ "PAYLOAD": "first", "PRIORITY": "high" }));
+    let resp = handle_request(unknown, &db_arc, &worker);
+    assert_eq!(resp.code, Some(ErrorCode::InvalidData));
+    assert!(
+        resp.message.as_deref().is_some_and(|m| m.contains("'PRIORITY'")),
+        "unexpected message: {:?}",
+        resp.message
+    );
+    assert_eq!(
+        handle_request(queue_request("DEQUEUE", "JOBS"), &db_arc, &worker).status,
+        "EMPTY"
+    );
+
     for order in ["first", "second"] {
         let mut enqueue = queue_request("ENQUEUE", "JOBS");
-        enqueue.structured_data = Some(serde_json::json!({ "1": order }));
+        enqueue.structured_data = Some(serde_json::json!({ "PAYLOAD": order }));
         enqueue.data = Some(serde_json::Value::String(order.to_string()));
         let resp = handle_request(enqueue, &db_arc, &worker);
         assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
@@ -2996,6 +3094,42 @@ fn read_key(db: &Arc<RwLock<Database>>, client: &ClientInfo, file: &str, key: &s
         db,
         client,
     )
+}
+
+/// A change naming a field with no dictionary entry refuses the whole set
+/// (#127), which is the promise a transaction already makes about every other
+/// change it cannot read.
+#[test]
+fn a_transaction_change_naming_an_unknown_field_refuses_the_set() {
+    let (_dir, db_arc, client) = transact_fixture();
+
+    let response = transact(
+        &db_arc,
+        &client,
+        vec![
+            change("WRITE", "USERS", "9001", Some(serde_json::json!({ "NAME": "Alice" }))),
+            change(
+                "WRITE",
+                "USERS",
+                "9002",
+                Some(serde_json::json!({ "NAME": "Bob", "PHONE": "555-0100" })),
+            ),
+        ],
+    );
+    assert_eq!(response.code, Some(ErrorCode::InvalidData));
+    let message = response.message.unwrap_or_default();
+    assert!(message.contains("Change 2"), "unexpected message: {message}");
+    assert!(message.contains("'PHONE'"), "unexpected message: {message}");
+
+    // Neither change landed, including the one that was readable.
+    assert_eq!(
+        read_key(&db_arc, &client, "USERS", "9001").code,
+        Some(ErrorCode::RecordNotFound)
+    );
+    assert_eq!(
+        read_key(&db_arc, &client, "USERS", "9002").code,
+        Some(ErrorCode::RecordNotFound)
+    );
 }
 
 #[test]

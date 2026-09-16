@@ -51,7 +51,7 @@ pub use directory::DirectoryStats;
 pub use engine::directory::DirectoryRecord;
 pub use engine::queue::QueueDelivery;
 pub use engine::write::{Condition, Written};
-pub use engine::{Database, TableHandle, TableKey};
+pub use engine::{Database, RecordDecodeError, TableHandle, TableKey};
 pub use error::{DbError, DbResult};
 pub use health::{Health, HealthSummary, Measure, Verdict};
 pub use index::{FileIndex, IndexReport, IndexStats, IndexUsageStats, IndexValue};

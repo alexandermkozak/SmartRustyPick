@@ -90,7 +90,7 @@ matched case-insensitively.
 | `target_account`  | string           | `CREATE.ACCOUNT`, `CREATE.TEST.ACCOUNT`, `DELETE.ACCOUNT`                                                          | Name of the account to create or drop. (Distinct from `account`, which selects an existing context.)                                                                                                                                                                                      |
 | `file`            | string           | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`, `CREATE.FILE`, `SET.FILE`, `DELETE.FILE`, `FILE.STATS`, `LIST.DICT`, `SET.DICT`, `CREATE.INDEX`, `REBUILD.INDEX`, `DELETE.INDEX`, `INDEX.STATS`, `SET.INDEX.EXCLUDE`, `ENQUEUE`, `DEQUEUE`, `ACK`, `NACK`, `PEEK` | Table (file) name. Optional on `LIST.INDEXES`, which lists the whole account without it. |                                                                                                                                                                                                                                                                        |
 | `key`             | string           | `READ`, `WRITE`, `DELETE`, `SET.DICT`, `ACK`, `NACK`, `PEEK`                                                                              | Record key; for `SET.DICT`, the name of the dictionary entry; for `ACK` and `NACK`, the claimed record. Optional on `PEEK`, which reads the head of the queue without it. Never sent on `ENQUEUE`, whose key the engine mints. Optional on `WRITE` to an [autokey file](#server-minted-keys), which mints one and returns it in `key`; an empty string is a *missing* key, not a request to mint one. |
-| `data`            | string \| object | `WRITE`, `ENQUEUE`                                                                                                            | Record contents. A string is parsed as a display-format record (`^` field mark, `]` value mark, `\` sub-value mark). An object maps field names — original dictionary names or their camelCase form — to values, applying the dictionary's input conversions (ICONV).                     |
+| `data`            | string \| object | `WRITE`, `ENQUEUE`                                                                                                            | Record contents. A string is parsed as a display-format record (`^` field mark, `]` value mark, `\` sub-value mark). An object maps field names — original dictionary names or their camelCase form — to values, applying the dictionary's input conversions (ICONV). A name the file's dictionary has no entry for is refused with `INVALID_DATA` rather than dropped; see [Field names a dictionary does not define](#field-names-a-dictionary-does-not-define). |
 | `structured_data` | object           | `WRITE`, `SET.DICT`, `ENQUEUE`                                                                                                | `WRITE` and `ENQUEUE`: same object form as `data`, checked first when present — use either this or `data`, not both. `SET.DICT`: the dictionary attributes of one entry.                                                                                                                                 |
 | `is_dict`         | bool             | `READ`, `WRITE`, `DELETE`, `QUERY`, `SELECT`                                                                       | Operate on the file's dictionary section instead of its data section. Default `false`.                                                                                                                                                                                                    |
 | `query_string`    | string           | `QUERY`, `SELECT`                                                                                                  | Pick-style query, e.g. `WITH NAME = "John" BY NAME`. Alternative to `query_node`. A bare command with neither selects every record; a `query_string` that is not a query is refused with `INVALID_QUERY` rather than read as one.                                                          |
@@ -193,6 +193,42 @@ The mark bytes `0xFC`, `0xFD` and `0xFE` are the record's *structure* (see
 [Data Structures](data_structures.md)), not content: a value containing one is read back as
 two values. Content that may hold arbitrary bytes — an image, a PDF, a compiled module —
 belongs in a blob referenced by the record rather than inlined into one.
+
+#### Field names a dictionary does not define
+
+A write that sends an object — `structured_data`, or `data` as an object — names its
+fields, and every name is resolved through the file's dictionary. A name with no entry
+there is refused with `INVALID_DATA`, naming the fields at fault, and **nothing is
+written**:
+
+```json
+{"command": "WRITE", "account": "SALES", "file": "USERS", "key": "1",
+ "structured_data": {"NAME": "Alice", "EMAIL": "alice@example.com", "PHONE": "555-0100"}}
+```
+
+```json
+{"status": "ERROR", "code": "INVALID_DATA",
+ "message": "Invalid structured data: 'PHONE' has no dictionary entry in this file, so there is nowhere to store it. Add it with SET.DICT, or leave it out of the write"}
+```
+
+All the unresolved names are listed, not just the first, so a client writing against a
+dictionary that is still being set up learns about them in one round trip. Define the
+field with [`SET.DICT`](#setdict) and the same write succeeds.
+
+The alternative — store what resolved, answer `OK` — is a wrong answer sent as a right
+one. The record reads back as a valid record, just a shorter one; nothing in the reply
+says which half arrived; and because the value is discarded rather than parked, adding the
+entry afterwards does not bring it back. Whatever depended on the missing content notices
+long after the write has left any log that would explain it. This is the same rule the
+protocol applies to an unknown `capabilities` name on `AUTHORIZE.CONN` and `GENERATE.CERT`,
+and to a `WITH` clause against a [directory file](#directory-files), which has no
+dictionary to read it against.
+
+This applies wherever a record arrives as an object: [`WRITE`](#write),
+[`ENQUEUE`](#enqueue) and every write of a [`TRANSACT`](#transact) set — where, like any
+other unreadable change, it refuses the whole set. `data` as a display **string** names no
+fields and is unaffected: it addresses attributes by position, so it can write an
+attribute the dictionary does not describe, exactly as it always could.
 
 ### Exploded results
 
@@ -390,11 +426,14 @@ correctly.
   an [autokey file](#server-minted-keys), which mints one and returns it. Optional:
   `account`, `is_dict`, `if_absent`, `if_match`.
 - `data` as a string is a raw display-format record; `data` as an object, or
-  `structured_data`, is field-name → value with ICONV applied.
+  `structured_data`, is field-name → value with ICONV applied. A name the file's dictionary
+  has no entry for refuses the whole write with `INVALID_DATA` and stores nothing — see
+  [Field names a dictionary does not define](#field-names-a-dictionary-does-not-define).
 - `version` comes back on every write: it is what the record now has, so a client can make
   its *next* write conditional without reading in between.
 - Errors: `MISSING_FIELD` (no `file` or data; no `key` on a file that does not mint them),
-  `INVALID_DATA` (data that is not a record, or an empty `if_match`), `INVALID_REQUEST`
+  `INVALID_DATA` (data that is not a record, a field name the dictionary does not define, or
+  an empty `if_match`), `INVALID_REQUEST`
   (`if_absent` and `if_match` together, a condition on a directory file, or a keyless write
   to a file that does not mint keys), `PRECONDITION_FAILED`, `ACCOUNT_NOT_SPECIFIED`,
   `ACCESS_DENIED`, `FILE_NOT_FOUND`.
@@ -586,7 +625,8 @@ does not implement.
 
 - Response: `count`, the number of changes applied.
 - Errors: `MISSING_FIELD` (no `changes`, or a change with no `file` or `key`),
-  `INVALID_DATA` (an `op` that is neither, or data that is not a record),
+  `INVALID_DATA` (an `op` that is neither, data that is not a record, or a field name the
+  file's dictionary does not define),
   `INVALID_REQUEST` (the same file and key changed twice in one set - nothing says which
   change would win), `TRANSACTION_SCOPE` (see below), `ACCOUNT_NOT_SPECIFIED`,
   `ACCESS_DENIED`, `FILE_NOT_FOUND`.
@@ -794,7 +834,8 @@ rather than parses.
 Append a record to a queue. The engine mints its key.
 
 - Required: `file`, and one of `data` or `structured_data` — the same two forms `WRITE`
-  takes, mapped through the queue's own dictionary.
+  takes, mapped through the queue's own dictionary, and refused the same way when an object
+  names a field that dictionary does not define.
 - Response: `claim`, carrying the key the record was stored under.
 - Errors: `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`, `MISSING_FIELD` (no `file`, or no data),
   `INVALID_DATA`, `FILE_NOT_FOUND`, `INVALID_REQUEST` (the file is not a queue).

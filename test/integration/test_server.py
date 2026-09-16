@@ -305,6 +305,73 @@ def main():
                     resp.get("code"),
                     "INVALID_DATA",
                 )
+
+                # A field name the dictionary does not define is refused rather
+                # than dropped (#127). It used to be discarded and the write
+                # answered OK, so a client was told a record was stored when
+                # part of what it sent had gone for good.
+                resp = conn.request(
+                    command="WRITE",
+                    file=FILE,
+                    key="PARTIAL",
+                    account=ACCOUNT,
+                    structured_data={"name": "Alice", "phone": "555-0100"},
+                )
+                suite.check_eq(
+                    "A write naming an undefined field is refused",
+                    resp.get("code"),
+                    "INVALID_DATA",
+                )
+                suite.check(
+                    "...and the message names the field",
+                    "'phone'" in resp.get("message", ""),
+                    resp.get("message", ""),
+                )
+
+                resp = conn.request(command="READ", file=FILE, key="PARTIAL", account=ACCOUNT)
+                suite.check_eq(
+                    "...and nothing was stored", resp.get("code"), "RECORD_NOT_FOUND"
+                )
+
+                # `data` as an object is the same codec, and so is the same
+                # refusal; a display string names no fields and is unaffected.
+                resp = conn.request(
+                    command="WRITE",
+                    file=FILE,
+                    key="PARTIAL",
+                    account=ACCOUNT,
+                    data={"name": "Alice", "phone": "555-0100"},
+                )
+                suite.check_eq(
+                    "data as an object is refused the same way",
+                    resp.get("code"),
+                    "INVALID_DATA",
+                )
+
+                resp = conn.request(
+                    command="SET.DICT",
+                    file=FILE,
+                    key="PHONE",
+                    account=ACCOUNT,
+                    structured_data={"field": 9},
+                )
+                suite.check_eq("The field can be defined", resp["status"], "OK")
+
+                resp = conn.request(
+                    command="WRITE",
+                    file=FILE,
+                    key="PARTIAL",
+                    account=ACCOUNT,
+                    structured_data={"name": "Alice", "phone": "555-0100"},
+                )
+                suite.check_eq("...and then the same write is stored", resp["status"], "OK")
+
+                resp = conn.request(command="READ", file=FILE, key="PARTIAL", account=ACCOUNT)
+                suite.check_eq(
+                    "...with the value the first write would have lost",
+                    (resp.get("record") or {}).get("phone"),
+                    "555-0100",
+                )
         except Exception as exc:  # noqa: BLE001 - report instead of aborting the whole run
             suite.error("Server protocol suite", exc)
         finally:
