@@ -47,6 +47,18 @@ fn db_error(e: DbError) -> Response {
     error(ErrorCode::from(&e), e.to_string())
 }
 
+/// A payload that is not a record of the file it was sent to.
+///
+/// Every variant is `INVALID_DATA` and nothing is written, including the one
+/// this codebase used to let through: a field name the dictionary has no entry
+/// for. Storing the rest and answering `OK` told the client its record was
+/// saved when part of what it sent had been dropped on the floor - and adding
+/// the entry later did not bring the value back. See
+/// [`crate::db::RecordDecodeError`].
+fn decode_error(e: crate::db::RecordDecodeError) -> Response {
+    error(ErrorCode::InvalidData, e.to_string())
+}
+
 /// The same, where the error's own words do not say what was being attempted:
 /// "No space left on device" is not much use without "Save error" in front of
 /// it. The code is unchanged - the context is for the reader.
@@ -589,11 +601,11 @@ fn queued_record(db: &Database, acc: &str, req: Request) -> Result<(String, Reco
     let record = match (req.structured_data, req.data) {
         (Some(structured), _) => db
             .deserialize_record_in(&handle.read(), &structured)
-            .ok_or_else(|| error(ErrorCode::InvalidData, "Invalid structured data"))?,
+            .map_err(decode_error)?,
         (None, Some(serde_json::Value::String(text))) => Record::from_display_string(&text),
         (None, Some(object @ serde_json::Value::Object(_))) => db
             .deserialize_record_in(&handle.read(), &object)
-            .ok_or_else(|| error(ErrorCode::InvalidData, "Invalid structured data in data field"))?,
+            .map_err(decode_error)?,
         (None, Some(_)) => {
             return Err(error(
                 ErrorCode::InvalidData,
@@ -1430,13 +1442,13 @@ fn record_from(
     if let Some(structured) = structured_data {
         return db
             .deserialize_record_in(&handle.read(), &structured)
-            .ok_or_else(|| error(ErrorCode::InvalidData, "Invalid structured data"));
+            .map_err(decode_error);
     }
     match data {
         Some(serde_json::Value::String(text)) => Ok(Record::from_display_string(&text)),
-        Some(object @ serde_json::Value::Object(_)) => db
-            .deserialize_record_in(&handle.read(), &object)
-            .ok_or_else(|| error(ErrorCode::InvalidData, "Invalid structured data in data field")),
+        Some(object @ serde_json::Value::Object(_)) => {
+            db.deserialize_record_in(&handle.read(), &object).map_err(decode_error)
+        }
         Some(_) => Err(error(
             ErrorCode::InvalidData,
             "Invalid data type in data field: expected string or object",

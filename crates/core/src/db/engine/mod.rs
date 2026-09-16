@@ -333,6 +333,61 @@ struct RecordSchemaField {
     conversion: Option<String>,
 }
 
+/// Why an object payload is not a record of this file.
+///
+/// Every one of these is a refusal rather than a partial write. A record that
+/// went to disk missing what the caller sent reads back as a valid record, just
+/// a shorter one, and nothing in the reply says which half arrived - so the
+/// caller finds out at whatever depended on the missing content, long after the
+/// write is out of any log that would explain it. See
+/// [`Database::deserialize_record_in`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordDecodeError {
+    /// The payload is not a JSON object, so it has no field names at all.
+    NotAnObject,
+    /// Names the file's dictionary has no entry for, in the order the payload
+    /// gave them. There is no attribute to store these under and no later
+    /// `SET.DICT` recovers them, so the write is refused while the caller can
+    /// still do something about it.
+    UnknownFields(Vec<String>),
+    /// A `{"$base64": "..."}` envelope whose payload does not decode, named by
+    /// the field that carried it.
+    UndecodableValue(String),
+}
+
+impl std::fmt::Display for RecordDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAnObject => write!(f, "Invalid structured data: expected an object of field names"),
+            Self::UnknownFields(fields) => {
+                let named = fields
+                    .iter()
+                    .map(|field| format!("'{}'", field))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let (has, them) = if fields.len() == 1 {
+                    ("has", "it")
+                } else {
+                    ("have", "them")
+                };
+                write!(
+                    f,
+                    "Invalid structured data: {} {} no dictionary entry in this file, so there is nowhere \
+                     to store {}. Add {} with SET.DICT, or leave {} out of the write",
+                    named, has, them, them, them
+                )
+            }
+            Self::UndecodableValue(field) => write!(
+                f,
+                "Invalid structured data: the value of '{}' is a {} envelope whose payload is not base64",
+                field, BINARY_JSON_KEY
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecordDecodeError {}
+
 impl Table {
     /// The controlling field this entry names in attribute 5, and the tier it
     /// pairs at, or `None` when it names none.
@@ -2664,19 +2719,28 @@ impl Database {
         Some(values)
     }
 
-    pub fn deserialize_record(&self, table_name: &str, data: &serde_json::Value) -> Option<Record> {
+    pub fn deserialize_record(&self, table_name: &str, data: &serde_json::Value) -> Result<Record, RecordDecodeError> {
         self.deserialize_record_for_account(&self.current_account(), table_name, data)
     }
 
+    /// The record an object payload describes, against a file named rather than
+    /// resolved. A file that does not exist has no dictionary and so knows none
+    /// of the names, which is [`RecordDecodeError::UnknownFields`] over every
+    /// key - the caller that can say *which* file is missing checks for it
+    /// before coming here.
     pub fn deserialize_record_for_account(
         &self,
         account: &str,
         table_name: &str,
         data: &serde_json::Value,
-    ) -> Option<Record> {
-        let handle = self.get_table_read_only_for_account(account, table_name)?;
-        let table = handle.read();
-        self.deserialize_record_in(&table, data)
+    ) -> Result<Record, RecordDecodeError> {
+        match self.get_table_read_only_for_account(account, table_name) {
+            Some(handle) => {
+                let table = handle.read();
+                self.deserialize_record_in(&table, data)
+            }
+            None => Self::unknown_fields(data),
+        }
     }
 
     /// Same, from a file the caller has already resolved.
@@ -2685,8 +2749,19 @@ impl Database {
     /// connections are writing at once, looking it up again is not free: every
     /// resolution takes that contended lock once more, on top of the `stat`
     /// calls of the freshness check.
-    pub fn deserialize_record_in(&self, table: &Table, data: &serde_json::Value) -> Option<Record> {
-        let obj = data.as_object()?;
+    ///
+    /// A name the dictionary has no entry for refuses the whole payload rather
+    /// than dropping that one field: there is no attribute to put it under, the
+    /// value is gone the moment the write is answered `OK`, and adding the
+    /// entry afterwards does not bring it back. That is the same rule the
+    /// protocol already applies to an unknown `capabilities` name and to a
+    /// `WITH` clause against a file with no dictionary - a write that quietly
+    /// stored part of a record is a wrong answer sent as a right one. See
+    /// [`RecordDecodeError`].
+    pub fn deserialize_record_in(&self, table: &Table, data: &serde_json::Value) -> Result<Record, RecordDecodeError> {
+        let Some(obj) = data.as_object() else {
+            return Err(RecordDecodeError::NotAnObject);
+        };
         let mut record = Record::new();
 
         // Inverse mapping of camelCase or original dictionary keys to attribute indices and conversion codes
@@ -2711,16 +2786,44 @@ impl Database {
             }
         }
 
+        // Resolved in full before a single value is decoded, and every unknown
+        // name collected rather than the first: a caller writing against a
+        // dictionary that is still being set up wants one round trip naming all
+        // three fields, not three round trips naming one each.
+        let mut resolved = Vec::with_capacity(obj.len());
+        let mut unknown = Vec::new();
         for (key, val) in obj {
-            if let Some(&idx) = attr_map.get(key) {
-                while record.fields.len() <= idx {
-                    record.fields.push(Field::default());
-                }
-                record.fields[idx].values = Self::deserialize_field(val, conv_map.get(key).map(String::as_str))?;
+            match attr_map.get(key) {
+                Some(&idx) => resolved.push((key, val, idx)),
+                None => unknown.push(key.clone()),
             }
         }
+        if !unknown.is_empty() {
+            return Err(RecordDecodeError::UnknownFields(unknown));
+        }
 
-        Some(record)
+        for (key, val, idx) in resolved {
+            while record.fields.len() <= idx {
+                record.fields.push(Field::default());
+            }
+            record.fields[idx].values = Self::deserialize_field(val, conv_map.get(key).map(String::as_str))
+                .ok_or_else(|| RecordDecodeError::UndecodableValue(key.clone()))?;
+        }
+
+        Ok(record)
+    }
+
+    /// The refusal for a payload whose field names could not be resolved at
+    /// all, because there was no dictionary to resolve them against.
+    fn unknown_fields(data: &serde_json::Value) -> Result<Record, RecordDecodeError> {
+        match data.as_object() {
+            // An object naming no fields describes an empty record, and an
+            // empty record is the same empty record whatever the dictionary
+            // says.
+            Some(obj) if obj.is_empty() => Ok(Record::new()),
+            Some(obj) => Err(RecordDecodeError::UnknownFields(obj.keys().cloned().collect())),
+            None => Err(RecordDecodeError::NotAnObject),
+        }
     }
 
     fn to_camel_case(&self, s: &str) -> String {

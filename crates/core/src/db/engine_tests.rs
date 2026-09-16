@@ -1,4 +1,5 @@
 use crate::db::DbError;
+use crate::db::RecordDecodeError;
 use crate::db::engine::Database;
 use crate::db::models::*;
 use crate::test_support::{TempDir, isolated_config};
@@ -534,15 +535,79 @@ fn a_binary_envelope_that_does_not_decode_is_refused() {
         serde_json::json!({ "name": { "$base64": "Zg=" } }),
         serde_json::json!({ "name": { "$base64": 7 } }),
     ] {
-        assert!(
-            db.deserialize_record("USERS", &bad).is_none(),
+        assert_eq!(
+            db.deserialize_record("USERS", &bad),
+            Err(RecordDecodeError::UndecodableValue("name".to_string())),
             "{bad} should have been refused"
         );
     }
 
     // An ordinary object that is not an envelope keeps the behaviour it had.
     let other = serde_json::json!({ "name": { "something": "else" } });
-    assert!(db.deserialize_record("USERS", &other).is_some());
+    assert!(db.deserialize_record("USERS", &other).is_ok());
+}
+
+/// A field name the dictionary has no entry for refuses the whole payload
+/// (#127).
+///
+/// The alternative this replaced dropped that one field and let the write be
+/// answered `OK`: the client was told its record was stored, part of what it
+/// sent was not, and no later `SET.DICT` brought the value back.
+#[test]
+fn a_field_the_dictionary_does_not_define_refuses_the_payload() {
+    let (_dir, db) = json_shape_db("json_unknown_field");
+
+    let payload = serde_json::json!({ "NAME": "Alice", "PHONE": "555-0100" });
+    assert_eq!(
+        db.deserialize_record("USERS", &payload),
+        Err(RecordDecodeError::UnknownFields(vec!["PHONE".to_string()]))
+    );
+
+    // Every unknown name, not just the first: a caller writing against a
+    // dictionary still being set up wants one round trip, not one per field.
+    let several = serde_json::json!({ "NAME": "Alice", "PHONE": "555-0100", "FAX": "555-0101" });
+    assert_eq!(
+        db.deserialize_record("USERS", &several),
+        Err(RecordDecodeError::UnknownFields(vec![
+            "FAX".to_string(),
+            "PHONE".to_string()
+        ])),
+        "the payload's own keys, and all of them"
+    );
+
+    // The message names them, because "invalid structured data" on its own
+    // leaves the caller to guess which of thirty fields it got wrong.
+    let message = db.deserialize_record("USERS", &payload).unwrap_err().to_string();
+    assert!(message.contains("'PHONE'"), "unexpected message: {message}");
+    assert!(message.contains("SET.DICT"), "unexpected message: {message}");
+
+    // Both spellings of a name the dictionary does define still work.
+    assert!(
+        db.deserialize_record("USERS", &serde_json::json!({ "NAME": "Alice" }))
+            .is_ok()
+    );
+    assert!(
+        db.deserialize_record("USERS", &serde_json::json!({ "priceDate": "1" }))
+            .is_err(),
+        "camelCase of a name that is not defined is still not defined"
+    );
+    assert!(
+        db.deserialize_record("USERS", &serde_json::json!({ "price": "1.50" }))
+            .is_ok()
+    );
+
+    // An object naming no fields is an empty record, not a refusal.
+    assert_eq!(
+        db.deserialize_record("USERS", &serde_json::json!({})),
+        Ok(Record::new())
+    );
+
+    // And a payload that is not an object at all is told apart from one whose
+    // names did not resolve.
+    assert_eq!(
+        db.deserialize_record("USERS", &serde_json::json!("Alice^alice@example.com")),
+        Err(RecordDecodeError::NotAnObject)
+    );
 }
 
 #[test]

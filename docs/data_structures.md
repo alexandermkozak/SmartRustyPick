@@ -166,6 +166,10 @@ SmartRustyPick supports automatic data conversion between internal storage forma
 Conversions apply to each value and sub-value of a field, not to the field as a whole, so an `MD2` column holding
 `120000]250` reads as `1200.00]2.50`.
 
+The dictionary is also what a structured write resolves a field *name* through, so a name with no entry here has
+nowhere to go: the write is refused rather than stored without it. See
+[Field names a dictionary does not define](protocol.md#field-names-a-dictionary-does-not-define).
+
 #### Database Layout
 
 The database is stored in the `db_storage` directory, organized by account:
