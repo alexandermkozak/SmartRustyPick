@@ -503,6 +503,19 @@ fn requested_capabilities(names: Option<&[String]>) -> Result<Vec<Capability>, R
 pub fn handle_request(req: Request, db: &SharedDb, client_info: &crate::db::ClientInfo) -> Response {
     let command = req.command.to_uppercase();
 
+    // A producer with an enqueue grant reaches exactly two commands on exactly
+    // the files it names, and is answered here - before the account check
+    // below, which would refuse it, and without ever being treated as a client
+    // that may reach the account. Everything else it sends falls through to
+    // that check and is refused there like any stranger's request.
+    if let Some(account) = enqueue_grant_target(&command, &req, client_info) {
+        let db = read_lock(db);
+        return match command.as_str() {
+            "ENQUEUE" => enqueue_record(&db, &account, req),
+            _ => file_statistics(&db, &account, req.file.as_deref()),
+        };
+    }
+
     // Fast path: record work needs nothing exclusive, because the file it names
     // carries its own lock. Anything else - an unresolvable account, a denied
     // request that wants to be logged - falls through to the slow path, which is
@@ -517,6 +530,60 @@ pub fn handle_request(req: Request, db: &SharedDb, client_info: &crate::db::Clie
 
     let mut db = write_lock(db);
     handle_request_locked(req, &mut db, client_info)
+}
+
+/// The account an [enqueue grant](crate::db::EnqueueGrant) lets this request
+/// into, or `None` when it is not a request one covers.
+///
+/// Only `ENQUEUE` and `FILE.STATS`, only with the account named explicitly -
+/// a producer has no account of its own to default to - and only when the
+/// client could not reach the account anyway. A client that can reach it takes
+/// the ordinary path, so holding both grants never narrows what it may do.
+fn enqueue_grant_target(command: &str, req: &Request, client_info: &crate::db::ClientInfo) -> Option<String> {
+    if !matches!(command, "ENQUEUE" | "FILE.STATS") {
+        return None;
+    }
+    let account = req.account.as_deref()?;
+    let file = req.file.as_deref()?;
+    (!client_info.may_reach(account) && client_info.may_enqueue(account, file)).then(|| account.to_string())
+}
+
+/// `FILE.STATS` for one file, shared by the ordinary path and the
+/// enqueue-grant one so the two cannot answer differently.
+fn file_statistics(db: &Database, acc: &str, file: Option<&str>) -> Response {
+    let Some(name) = file else {
+        return error(ErrorCode::MissingField, "File not specified");
+    };
+    match db.file_statistics(acc, name) {
+        Ok(stats) => Response {
+            status: "OK".to_string(),
+            record: Some(serde_json::to_value(stats).unwrap_or(serde_json::Value::Null)),
+            ..Default::default()
+        },
+        Err(e) => db_error(e),
+    }
+}
+
+/// The enqueue grants an `AUTHORIZE.CONN` or `GENERATE.CERT` names, or the
+/// refusal to send. One that does not read as `<ACCOUNT>/<FILE>` is refused
+/// rather than dropped, for the reason an unknown capability is: a typo must
+/// not read as a grant that quietly does nothing.
+#[allow(clippy::result_large_err)]
+fn requested_enqueue_files(requested: Option<&[String]>) -> Result<Vec<crate::db::EnqueueGrant>, Response> {
+    let mut grants = Vec::new();
+    for text in requested.unwrap_or_default() {
+        match crate::db::EnqueueGrant::parse(text) {
+            Some(grant) if !grants.contains(&grant) => grants.push(grant),
+            Some(_) => {}
+            None => {
+                return Err(error(
+                    ErrorCode::InvalidData,
+                    format!("'{}' is not an enqueue grant; write it as <ACCOUNT>/<FILE>", text),
+                ));
+            }
+        }
+    }
+    Ok(grants)
 }
 
 /// Runs one of the [record commands](is_record_command) against an account the
@@ -2581,12 +2648,16 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 Ok(capabilities) => capabilities,
                 Err(response) => return response,
             };
+            let enqueue_files = match requested_enqueue_files(req.enqueue_files.as_deref()) {
+                Ok(grants) => grants,
+                Err(response) => return response,
+            };
             let accounts = req.accounts_list.unwrap_or_default();
             let is_admin = req.is_admin.unwrap_or(false);
-            if !is_admin && accounts.is_empty() && capabilities.is_empty() {
+            if !is_admin && accounts.is_empty() && capabilities.is_empty() && enqueue_files.is_empty() {
                 return error(
                     ErrorCode::InvalidRequest,
-                    "A client needs ADMIN, at least one account, or at least one capability",
+                    "A client needs ADMIN, at least one account, capability or enqueue grant",
                 );
             }
             // No `expires_at`: AUTHORIZE.CONN names a thumbprint and never sees
@@ -2597,6 +2668,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 is_admin,
                 capabilities,
                 expires_at: None,
+                enqueue_files,
             };
             match db.add_authorized_client(&name, &thumbprint, grant) {
                 Ok(_) => Response {
@@ -2700,6 +2772,13 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                             // computing it per reader is a date library each.
                             "expires_at": info.expires_at,
                             "expires_in_days": info.expires_in_days(),
+                            // Empty for ADMIN, which needs none: it reaches
+                            // every account already.
+                            "enqueue_files": info
+                                .enqueue_files
+                                .iter()
+                                .map(|grant| grant.as_string())
+                                .collect::<Vec<_>>(),
                         }),
                     )
                 })
@@ -2783,20 +2862,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
             if target_account.is_none() {
                 return error(ErrorCode::AccountNotSpecified, "Account not specified");
             }
-            let name = match req.file {
-                Some(n) => n,
-                None => {
-                    return error(ErrorCode::MissingField, "File not specified");
-                }
-            };
-            match db.file_statistics(acc, &name) {
-                Ok(stats) => Response {
-                    status: "OK".to_string(),
-                    record: Some(serde_json::to_value(stats).unwrap_or(serde_json::Value::Null)),
-                    ..Default::default()
-                },
-                Err(e) => db_error(e),
-            }
+            file_statistics(db, acc, req.file.as_deref())
         }
         "LIST.DICT" => {
             if target_account.is_none() {
@@ -2952,6 +3018,10 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 Ok(capabilities) => capabilities,
                 Err(response) => return response,
             };
+            let enqueue_files = match requested_enqueue_files(req.enqueue_files.as_deref()) {
+                Ok(grants) => grants,
+                Err(response) => return response,
+            };
             let days = match requested_cert_days(req.days, &config) {
                 Ok(days) => days,
                 Err(response) => return response,
@@ -2963,10 +3033,10 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                 Ok(generated) => {
                     let accounts = req.accounts_list.unwrap_or_default();
                     let is_admin = req.is_admin.unwrap_or(false);
-                    if !is_admin && accounts.is_empty() && capabilities.is_empty() {
+                    if !is_admin && accounts.is_empty() && capabilities.is_empty() && enqueue_files.is_empty() {
                         return error(
                             ErrorCode::InvalidRequest,
-                            "A non-admin certificate needs at least one allowed account or capability",
+                            "A non-admin certificate needs at least one allowed account, capability or enqueue grant",
                         );
                     }
                     let grant = ClientGrant {
@@ -2975,6 +3045,7 @@ pub fn handle_request_locked(req: Request, db: &mut Database, client_info: &crat
                         capabilities,
                         // Known here, because this is the path that issued it.
                         expires_at: generated.expires_at.clone(),
+                        enqueue_files,
                     };
                     if let Err(e) = db.add_authorized_client(&common_name, &generated.thumbprint, grant) {
                         return db_error_in("Certificate generated but authorization failed", e);

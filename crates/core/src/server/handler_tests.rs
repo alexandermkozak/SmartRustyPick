@@ -1,6 +1,6 @@
 use crate::db::{Capability, ClientGrant};
 use crate::db::{ClientInfo, Database, ValuePosition};
-use crate::server::handler::handle_request;
+use crate::server::handler::{handle_request, read_lock};
 use crate::server::models::{ErrorCode, Request};
 use crate::test_support::{TempDir, isolated_config};
 use std::path::Path;
@@ -4272,4 +4272,173 @@ fn test_a_delay_is_refused_when_it_contradicts_itself_or_is_too_long() {
         handle_request(queue_request("DEQUEUE", "JOBS"), &db_arc, &worker).status,
         "EMPTY"
     );
+}
+
+/// A producer: no account, one enqueue grant on `QUEUE_TEST/JOBS`.
+fn producer() -> ClientInfo {
+    ClientInfo {
+        name: "scheduler".to_string(),
+        thumbprint: "scheduler_tp".to_string(),
+        enqueue_files: vec![crate::db::EnqueueGrant::parse("QUEUE_TEST/JOBS").unwrap()],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_an_enqueue_grant_appends_to_its_queue_and_reads_nothing_back() {
+    let (_dir, db_arc, admin, worker) = queue_fixture("handler_enqueue_grant");
+    for file in ["JOBS", "OTHER"] {
+        let mut create = queue_request("CREATE.FILE", file);
+        create.queue = Some(true);
+        assert_eq!(handle_request(create, &db_arc, &admin).status, "OK");
+    }
+    let producer = producer();
+
+    let mut enqueue = queue_request("ENQUEUE", "JOBS");
+    enqueue.data = Some(serde_json::Value::String("from the scheduler".to_string()));
+    let resp = handle_request(enqueue, &db_arc, &producer);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let key = resp.claim.unwrap()["key"].as_str().unwrap().to_string();
+
+    // It can see whether its work is being drained...
+    let stats = handle_request(queue_request("FILE.STATS", "JOBS"), &db_arc, &producer);
+    assert_eq!(stats.status, "OK", "unexpected message: {:?}", stats.message);
+    assert_eq!(stats.record.unwrap()["queue"]["depth"], serde_json::json!(1));
+
+    // ...and the consumer that may reach the account gets the record.
+    let claimed = handle_request(queue_request("DEQUEUE", "JOBS"), &db_arc, &worker);
+    assert_eq!(claimed.claim.as_ref().unwrap()["key"].as_str(), Some(key.as_str()));
+}
+
+#[test]
+fn test_an_enqueue_grant_is_refused_everything_else() {
+    let (_dir, db_arc, admin, _worker) = queue_fixture("handler_enqueue_grant_refused");
+    for file in ["JOBS", "OTHER"] {
+        let mut create = queue_request("CREATE.FILE", file);
+        create.queue = Some(true);
+        assert_eq!(handle_request(create, &db_arc, &admin).status, "OK");
+    }
+    let mut seed = queue_request("ENQUEUE", "JOBS");
+    seed.data = Some(serde_json::Value::String("somebody's work".to_string()));
+    let key = handle_request(seed, &db_arc, &admin).claim.unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let producer = producer();
+
+    // Every command that would hand a record back, on the file it may enqueue to.
+    for command in ["DEQUEUE", "PEEK", "READ", "QUERY", "LIST.DICT"] {
+        let mut req = queue_request(command, "JOBS");
+        req.key = Some(key.clone());
+        let resp = handle_request(req, &db_arc, &producer);
+        assert_ne!(resp.status, "OK", "{} must be refused to an enqueue grant", command);
+        assert!(
+            resp.record.is_none() && resp.results.is_none(),
+            "{} leaked data",
+            command
+        );
+    }
+    // Writing and settling are not appending.
+    for command in ["WRITE", "DELETE", "ACK", "NACK"] {
+        let mut req = queue_request(command, "JOBS");
+        req.key = Some(key.clone());
+        req.data = Some(serde_json::Value::String("x".to_string()));
+        assert_ne!(
+            handle_request(req, &db_arc, &producer).status,
+            "OK",
+            "{} must be refused",
+            command
+        );
+    }
+    // Another queue in the same account is a different grant.
+    let mut other = queue_request("ENQUEUE", "OTHER");
+    other.data = Some(serde_json::Value::String("x".to_string()));
+    assert_eq!(
+        handle_request(other, &db_arc, &producer).code,
+        Some(ErrorCode::AccessDenied)
+    );
+    assert_eq!(
+        handle_request(queue_request("FILE.STATS", "OTHER"), &db_arc, &producer).status,
+        "ERROR"
+    );
+    // A producer has no account of its own, so it must name one.
+    let mut unnamed = queue_request("ENQUEUE", "JOBS");
+    unnamed.account = None;
+    unnamed.data = Some(serde_json::Value::String("x".to_string()));
+    assert_ne!(handle_request(unnamed, &db_arc, &producer).status, "OK");
+
+    // And what it was refused left the queue as it was.
+    let stats = handle_request(queue_request("FILE.STATS", "JOBS"), &db_arc, &admin);
+    assert_eq!(stats.record.unwrap()["queue"]["depth"], serde_json::json!(1));
+}
+
+#[test]
+fn test_authorize_conn_grants_enqueue_files_and_refuses_a_malformed_one() {
+    let (_dir, db_arc, admin, _worker) = queue_fixture("handler_enqueue_grant_authorize");
+    let mut authorize = Request {
+        command: "AUTHORIZE.CONN".to_string(),
+        thumbprint: Some("abcdef".to_string()),
+        name: Some("dispatch".to_string()),
+        enqueue_files: Some(vec!["queue_test/JOBS".to_string(), "QUEUE_TEST/EVENTS".to_string()]),
+        ..Default::default()
+    };
+    let resp = handle_request(authorize, &db_arc, &admin);
+    assert_eq!(
+        resp.status, "OK",
+        "an enqueue grant alone is a client: {:?}",
+        resp.message
+    );
+
+    let client = read_lock(&db_arc).client_for_thumbprint("abcdef").unwrap();
+    assert!(
+        client.allowed_accounts.is_empty(),
+        "an enqueue grant is not an account grant"
+    );
+    assert!(!client.may_reach("QUEUE_TEST"));
+    assert!(client.may_enqueue("QUEUE_TEST", "JOBS"), "the account is uppercased");
+    assert!(client.may_enqueue("QUEUE_TEST", "EVENTS"));
+    assert!(!client.may_enqueue("QUEUE_TEST", "jobs"), "file names match exactly");
+
+    // It survives a reload of the registry from `$CLIENTS`.
+    read_lock(&db_arc).load_clients_from_table().unwrap();
+    let reloaded = read_lock(&db_arc).client_for_thumbprint("abcdef").unwrap();
+    assert_eq!(reloaded.enqueue_files, client.enqueue_files);
+
+    // LIST.CONNS shows it as what it is.
+    let listing = handle_request(
+        Request {
+            command: "LIST.CONNS".to_string(),
+            ..Default::default()
+        },
+        &db_arc,
+        &admin,
+    );
+    let row = listing
+        .results
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == "dispatch")
+        .unwrap()
+        .1;
+    assert_eq!(
+        row["enqueue_files"],
+        serde_json::json!(["QUEUE_TEST/JOBS", "QUEUE_TEST/EVENTS"])
+    );
+
+    for malformed in ["JOBS", "QUEUE_TEST/", "/JOBS", "A/B/C"] {
+        authorize = Request {
+            command: "AUTHORIZE.CONN".to_string(),
+            thumbprint: Some("012345".to_string()),
+            name: Some("typo".to_string()),
+            enqueue_files: Some(vec![malformed.to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            handle_request(authorize, &db_arc, &admin).code,
+            Some(ErrorCode::InvalidData),
+            "'{}' must be refused, not stored as a grant to nothing",
+            malformed
+        );
+    }
+    assert!(read_lock(&db_arc).client_for_thumbprint("012345").is_none());
 }

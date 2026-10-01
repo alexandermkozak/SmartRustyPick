@@ -15,6 +15,7 @@ pub const SYS_CLIENTS_ACCOUNTS_IDX: usize = 1;
 pub const SYS_CLIENTS_ADMIN_IDX: usize = 2;
 pub const SYS_CLIENTS_CAPABILITIES_IDX: usize = 3;
 pub const SYS_CLIENTS_EXPIRES_IDX: usize = 4;
+pub const SYS_CLIENTS_ENQUEUE_IDX: usize = 5;
 pub const SYS_LOGS_MESSAGE_IDX: usize = 0;
 pub const SYS_LOGS_DETAIL_IDX: usize = 1;
 // DIR entries describe the files of an account: field 1 is the entry type,
@@ -1232,6 +1233,58 @@ pub struct ClientGrant {
     /// takes a thumbprint and never sees a certificate, so an authorization made
     /// that way has no expiry to record - and reports none, rather than a guess.
     pub expires_at: Option<String>,
+    /// Queue files this client may `ENQUEUE` to in an account it may not
+    /// otherwise reach. See [`EnqueueGrant`].
+    pub enqueue_files: Vec<EnqueueGrant>,
+}
+
+/// Permission to append to one queue file, and to do nothing else in its
+/// account.
+///
+/// An account grant is all or nothing: a client that may reach an account may
+/// read, write and delete every record in it. That is the wrong shape for a
+/// *producer* - a scheduler, a webhook receiver, a service that hands work to
+/// somebody else's workers - which needs to add records to a queue and has no
+/// business reading anything back. An enqueue grant is that shape: `ENQUEUE`
+/// on the file it names, `FILE.STATS` on the same file so the producer can see
+/// whether its work is being drained, and nothing else in the account. Not
+/// `PEEK`, not `DEQUEUE`, not `READ`: each of those hands back a record.
+///
+/// Written `<ACCOUNT>/<FILE>` on the wire and in `$CLIENTS`, and
+/// `enqueue:<ACCOUNT>/<FILE>` in a grant list, one token per file, so it reads
+/// in a listing as what it is and splits on commas like every other grant.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EnqueueGrant {
+    pub account: String,
+    pub file: String,
+}
+
+impl EnqueueGrant {
+    /// The prefix a grant list uses to tell an enqueue grant from an account
+    /// name or a capability.
+    pub const PREFIX: &'static str = "enqueue:";
+
+    /// Parses `<ACCOUNT>/<FILE>`. The account is uppercased, as account names
+    /// are everywhere a grant is read; the file is taken as written, because
+    /// file names are matched exactly. `None` for anything that is not exactly
+    /// two non-empty parts - a grant that cannot be read must end up granting
+    /// nothing, never something nearby.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (account, file) = text.trim().split_once('/')?;
+        let (account, file) = (account.trim(), file.trim());
+        if account.is_empty() || file.is_empty() || file.contains('/') {
+            return None;
+        }
+        Some(EnqueueGrant {
+            account: account.to_uppercase(),
+            file: file.to_string(),
+        })
+    }
+
+    /// `<ACCOUNT>/<FILE>`, which is also what [`parse`](Self::parse) reads.
+    pub fn as_string(&self) -> String {
+        format!("{}/{}", self.account, self.file)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1250,6 +1303,8 @@ pub struct ClientInfo {
     /// When this client's certificate expires, RFC 3339 UTC, when the database
     /// knows - which is when it issued it. See [`ClientGrant::expires_at`].
     pub expires_at: Option<String>,
+    /// Queue files this client may append to without reaching their account.
+    pub enqueue_files: Vec<EnqueueGrant>,
 }
 
 impl ClientInfo {
@@ -1266,6 +1321,17 @@ impl ClientInfo {
     /// stops them growing back together.
     pub fn may_reach(&self, account: &str) -> bool {
         self.is_admin || self.allowed_accounts.iter().any(|a| a == account)
+    }
+
+    /// Whether this client holds an [`EnqueueGrant`] on `file` in `account`.
+    ///
+    /// Deliberately not folded into [`may_reach`](ClientInfo::may_reach): a
+    /// client that may enqueue to one file in an account may not reach the
+    /// account, and every check that asks `may_reach` must keep refusing it.
+    pub fn may_enqueue(&self, account: &str, file: &str) -> bool {
+        self.enqueue_files
+            .iter()
+            .any(|grant| grant.account == account && grant.file == file)
     }
 
     /// How many days until this client's certificate expires, negative if it

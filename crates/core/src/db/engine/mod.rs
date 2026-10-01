@@ -882,6 +882,20 @@ impl Database {
                     .and_then(|v| v.first_text())
                     .map(|text| text.trim().to_string())
                     .filter(|text| !text.is_empty());
+                // Field 5 is absent on every entry written before enqueue
+                // grants existed, which reads as none. A value that does not
+                // parse is dropped, for the reason an unknown capability is.
+                let mut enqueue_files = Vec::new();
+                if let Some(field) = record.fields.get(SYS_CLIENTS_ENQUEUE_IDX) {
+                    for value in &field.values {
+                        if let Some(text) = value.first_text()
+                            && let Some(grant) = EnqueueGrant::parse(text.as_ref())
+                            && !enqueue_files.contains(&grant)
+                        {
+                            enqueue_files.push(grant);
+                        }
+                    }
+                }
                 clients.push(ClientInfo {
                     name: name.clone(),
                     thumbprint: tp_lower,
@@ -889,6 +903,7 @@ impl Database {
                     is_admin,
                     capabilities,
                     expires_at,
+                    enqueue_files,
                 });
             }
         }
@@ -2893,6 +2908,7 @@ impl Database {
                 is_admin,
                 capabilities,
                 expires_at,
+                enqueue_files,
             } = &grant;
             let thumbprint_lower = thumbprint.to_lowercase();
 
@@ -2901,7 +2917,7 @@ impl Database {
                 let handle = db.get_table_mut("$CLIENTS")?;
                 let mut table = handle.write();
                 let mut record = Record::new();
-                while record.fields.len() <= SYS_CLIENTS_EXPIRES_IDX {
+                while record.fields.len() <= SYS_CLIENTS_ENQUEUE_IDX {
                     record.fields.push(Field::default());
                 }
                 // Field 0: Thumbprint
@@ -2934,6 +2950,16 @@ impl Database {
                     record.fields[SYS_CLIENTS_EXPIRES_IDX]
                         .values
                         .push(Value::text(expires_at));
+                }
+
+                // Field 5: enqueue grants, `<ACCOUNT>/<FILE>` one per value.
+                // Not written for ADMIN, which reaches every account anyway.
+                if !*is_admin {
+                    for grant in enqueue_files {
+                        record.fields[SYS_CLIENTS_ENQUEUE_IDX]
+                            .values
+                            .push(Value::text(grant.as_string()));
+                    }
                 }
 
                 table.insert_record(name, record);

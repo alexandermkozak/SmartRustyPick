@@ -2,8 +2,8 @@ use smart_rusty_pick_core::config::Config;
 use smart_rusty_pick_core::db::archive::Source;
 use smart_rusty_pick_core::db::engine::archive::{FileAction, ImportPlan, ImportReport};
 use smart_rusty_pick_core::db::{
-    Capability, ClientGrant, Database, DirectoryPolicy, DirectoryRecord, ExplodeSpec, Field, FileAttributes,
-    QueueDelivery, Record, SelectEntry, SelectList, ValuePosition, queue, report,
+    Capability, ClientGrant, Database, DirectoryPolicy, DirectoryRecord, EnqueueGrant, ExplodeSpec, Field,
+    FileAttributes, QueueDelivery, Record, SelectEntry, SelectList, ValuePosition, queue, report,
 };
 use smart_rusty_pick_core::server;
 use std::io::{self, Write};
@@ -2520,51 +2520,92 @@ fn handle_list_files(db: &mut Database) {
 /// mean exactly what they meant. A token is a capability if it names one, and
 /// an account otherwise; capability names carry a colon, which an account name
 /// conventionally does not.
-fn parse_grants(argument: &str) -> (bool, Vec<String>, Vec<Capability>) {
-    let mut is_admin = false;
-    let mut accounts = Vec::new();
-    let mut capabilities = Vec::new();
+///
+/// `enqueue:<ACCOUNT>/<FILE>` is the fourth kind: permission to append to one
+/// queue file and nothing else in its account (see `EnqueueGrant`). A token
+/// with that prefix that does not parse is an error, not an account name - an
+/// account called `ENQUEUE:APP` is not what anybody typing it meant.
+fn parse_grants(argument: &str) -> Result<Grants, String> {
+    let mut grants = Grants::default();
     for token in argument.split(',').map(str::trim).filter(|t| !t.is_empty()) {
         if token.eq_ignore_ascii_case("ADMIN") {
-            is_admin = true;
+            grants.is_admin = true;
         } else if let Some(capability) = Capability::parse(token) {
-            if !capabilities.contains(&capability) {
-                capabilities.push(capability);
+            if !grants.capabilities.contains(&capability) {
+                grants.capabilities.push(capability);
+            }
+        } else if token.len() >= EnqueueGrant::PREFIX.len()
+            && token[..EnqueueGrant::PREFIX.len()].eq_ignore_ascii_case(EnqueueGrant::PREFIX)
+        {
+            match EnqueueGrant::parse(&token[EnqueueGrant::PREFIX.len()..]) {
+                Some(grant) if !grants.enqueue_files.contains(&grant) => grants.enqueue_files.push(grant),
+                Some(_) => {}
+                None => {
+                    return Err(format!(
+                        "'{}' is not an enqueue grant; write it as enqueue:<ACCOUNT>/<FILE>",
+                        token
+                    ));
+                }
             }
         } else {
             // Accounts have always been uppercased here; capabilities are not,
             // because their wire names are lowercase.
-            accounts.push(token.to_uppercase());
+            grants.accounts.push(token.to_uppercase());
         }
     }
-    (is_admin, accounts, capabilities)
+    Ok(grants)
+}
+
+/// What a grant list asks for, sorted into its kinds.
+#[derive(Default)]
+struct Grants {
+    is_admin: bool,
+    accounts: Vec<String>,
+    capabilities: Vec<Capability>,
+    enqueue_files: Vec<EnqueueGrant>,
+}
+
+impl Grants {
+    /// A non-admin client with nothing granted can do nothing at all, which is
+    /// a mistake rather than an authorization.
+    fn is_empty(&self) -> bool {
+        !self.is_admin && self.accounts.is_empty() && self.capabilities.is_empty() && self.enqueue_files.is_empty()
+    }
 }
 
 fn handle_authorize_conn(db: &mut Database, parts: &[&str]) {
     if parts.len() < 4 {
-        println!("Usage: AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts | capabilities>");
+        println!("Usage: AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts | capabilities | enqueue grants>");
         println!("  A comma separated list, mixing account names with capabilities:");
         println!("    {}", Capability::ALL.map(|c| c.as_str()).join(", "));
+        println!("  and enqueue:<ACCOUNT>/<FILE>, which may append to that one queue file and nothing else.");
         println!("  ADMIN is every capability and every account, as it always was.");
         return;
     }
     let thumbprint = parts[1];
     let name = parts[2];
-    let (is_admin, accounts, capabilities) = parse_grants(parts[3]);
+    let grants = match parse_grants(parts[3]) {
+        Ok(grants) => grants,
+        Err(message) => {
+            println!("Error: {}", message);
+            return;
+        }
+    };
 
-    if !is_admin && accounts.is_empty() && capabilities.is_empty() {
-        println!("Error: Must provide ADMIN, at least one account, or at least one capability.");
+    if grants.is_empty() {
+        println!("Error: Must provide ADMIN, at least one account, capability or enqueue grant.");
         return;
     }
 
-    let granted = describe_grants(is_admin, &accounts, &capabilities);
+    let granted = describe_grants(&grants);
     // No expiry: AUTHORIZE.CONN names a thumbprint and never sees the
     // certificate, so there is nothing to record and nothing is invented.
     let grant = ClientGrant {
-        allowed_accounts: accounts,
-        is_admin,
-        capabilities,
+        allowed_accounts: grants.accounts,
+        is_admin: grants.is_admin,
+        capabilities: grants.capabilities,
         expires_at: None,
+        enqueue_files: grants.enqueue_files,
     };
     match db.add_authorized_client(name, thumbprint, grant) {
         Ok(_) => println!("Authorized: {} as {} ({})", thumbprint, name, granted),
@@ -2575,18 +2616,34 @@ fn handle_authorize_conn(db: &mut Database, parts: &[&str]) {
 /// What was granted, for the line printed back. An authorization that reports
 /// only success leaves the operator to re-read the listing to find out whether
 /// a mistyped account became an account or was refused.
-fn describe_grants(is_admin: bool, accounts: &[String], capabilities: &[Capability]) -> String {
-    if is_admin {
+fn describe_grants(grants: &Grants) -> String {
+    if grants.is_admin {
         return "ADMIN".to_string();
     }
     let mut parts = Vec::new();
-    if !accounts.is_empty() {
-        parts.push(format!("accounts: {}", accounts.join(", ")));
+    if !grants.accounts.is_empty() {
+        parts.push(format!("accounts: {}", grants.accounts.join(", ")));
     }
-    if !capabilities.is_empty() {
+    if !grants.capabilities.is_empty() {
         parts.push(format!(
             "capabilities: {}",
-            capabilities.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ")
+            grants
+                .capabilities
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !grants.enqueue_files.is_empty() {
+        parts.push(format!(
+            "enqueue only: {}",
+            grants
+                .enqueue_files
+                .iter()
+                .map(EnqueueGrant::as_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     parts.join("; ")
@@ -2671,12 +2728,27 @@ fn handle_list_conns(db: &mut Database) {
     );
     println!("{:-<20} {:-<20} {:-<24} {:-<46} {:-<24}", "", "", "", "", "");
     for info in clients {
+        // Enqueue grants are listed with the accounts, in the form a grant list
+        // takes them, because they are the narrowest thing a client can hold
+        // on an account and reading them as full access would be the mistake.
         let accounts = if info.is_admin {
             "(every account)".to_string()
-        } else if info.allowed_accounts.is_empty() {
-            "-".to_string()
         } else {
-            info.allowed_accounts.join(",")
+            let reach: Vec<String> = info
+                .allowed_accounts
+                .iter()
+                .cloned()
+                .chain(
+                    info.enqueue_files
+                        .iter()
+                        .map(|grant| format!("{}{}", EnqueueGrant::PREFIX, grant.as_string())),
+                )
+                .collect();
+            if reach.is_empty() {
+                "-".to_string()
+            } else {
+                reach.join(",")
+            }
         };
         // Expanded for ADMIN, so the row says what the credential can do rather
         // than leaving it to be inferred from a flag in another column.
@@ -2816,34 +2888,48 @@ fn handle_generate_cert(db: &mut Database, parts: &[&str], config: &Config) {
     // One prompt for both, parsed the same way `AUTHORIZE.CONN` parses its
     // grant list, so the interactive path and the command cannot disagree about
     // what a token means.
-    let (accounts, capabilities) = if is_admin {
-        (Vec::new(), Vec::new())
+    let grants = if is_admin {
+        Grants {
+            is_admin: true,
+            ..Default::default()
+        }
     } else {
         println!(
             "Capabilities available: {}",
             Capability::ALL.map(|c| c.as_str()).join(", ")
         );
-        print!("Enter comma-separated accounts and/or capabilities: ");
+        println!("Enqueue grants are written enqueue:<ACCOUNT>/<FILE>.");
+        print!("Enter comma-separated accounts, capabilities and/or enqueue grants: ");
         io::stdout().flush().unwrap();
         let mut grants_input = String::new();
         io::stdin().read_line(&mut grants_input).unwrap();
-        let (_, accounts, capabilities) = parse_grants(grants_input.trim());
-        (accounts, capabilities)
+        match parse_grants(grants_input.trim()) {
+            Ok(grants) => Grants {
+                is_admin: false,
+                ..grants
+            },
+            Err(message) => {
+                println!("Error: {}", message);
+                println!("Authorization skipped. Use AUTHORIZE.CONN to authorize manually.");
+                return;
+            }
+        }
     };
 
-    if !is_admin && accounts.is_empty() && capabilities.is_empty() {
-        println!("Error: A non-admin connection needs at least one allowed account or capability.");
+    if grants.is_empty() {
+        println!("Error: A non-admin connection needs at least one allowed account, capability or enqueue grant.");
         println!("Authorization skipped. Use AUTHORIZE.CONN to authorize manually.");
         return;
     }
 
-    let granted = describe_grants(is_admin, &accounts, &capabilities);
+    let granted = describe_grants(&grants);
     let grant = ClientGrant {
-        allowed_accounts: accounts,
-        is_admin,
-        capabilities,
+        allowed_accounts: grants.accounts,
+        is_admin: grants.is_admin,
+        capabilities: grants.capabilities,
         // Known here: this path issued the certificate.
         expires_at: generated.expires_at.clone(),
+        enqueue_files: grants.enqueue_files,
     };
     match db.add_authorized_client(&auth_name, &generated.thumbprint, grant) {
         Ok(_) => println!(

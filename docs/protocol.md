@@ -51,6 +51,17 @@ message names the capability that would have been enough.
 **`ADMIN` means every capability and every account**, exactly as it always did, so an authorization
 written before capabilities existed behaves identically and nothing has to be migrated.
 
+**Enqueue grants: a producer that cannot read.** An account grant is all or nothing, which is
+the wrong shape for a client whose whole job is to hand work to somebody else's consumers - a
+scheduler, a webhook receiver. An enqueue grant, `<ACCOUNT>/<FILE>` in `enqueue_files`, lets
+a client `ENQUEUE` to that one queue file and run `FILE.STATS` on it, so it can see whether
+its work is being drained - and nothing else in the account. Not `DEQUEUE`, `PEEK`, `READ` or
+`QUERY`, each of which hands a record back; not `WRITE`, `DELETE`, `ACK` or `NACK`; not
+another file. Such a client must name the account in every request, since it has none of its
+own to default to, and everything it is not granted is refused with `ACCESS_DENIED` exactly
+as a stranger's request would be.
+
+
 **Creating an account does not grant access to it.** A client holding `accounts:manage` can create
 an account and cannot read it; granting access is a separate `ADD.CLIENT.ACCOUNT` under
 `clients:manage`. That separation is the point — it is what lets a provisioning credential exist
@@ -103,6 +114,7 @@ matched case-insensitively.
 | `name`            | string           | `AUTHORIZE.CONN`, `DEAUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`, `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT`               | Human-readable client name; the identifier for later management. For `GENERATE.CERT` it is also the certificate's common name, so it is limited to letters, digits, `.`, `-` and `_`.                                                                                                     |
 | `accounts_list`   | array of strings | `AUTHORIZE.CONN`, `ADD.CLIENT.ACCOUNT`, `REMOVE.CLIENT.ACCOUNT`, `GENERATE.CERT`                                   | Allowed accounts for the client. Default `[]`.                                                                                                                                                                                                                                            |
 | `is_admin`        | bool             | `AUTHORIZE.CONN`, `GENERATE.CERT`                                                                                  | Grant the client admin rights. Default `false`.                                                                                                                                                                                                                                           |
+| `enqueue_files`   | array of strings | `AUTHORIZE.CONN`, `GENERATE.CERT`                                                                                  | Queue files the client may append to without reaching their account, as `<ACCOUNT>/<FILE>`. Default `[]`. One that does not read that way is refused with `INVALID_DATA`. Ignored when `is_admin` is set. See [Authorization](#authorization). |
 | `capabilities`    | array of strings | `AUTHORIZE.CONN`, `GENERATE.CERT`                                                                                  | Capabilities to grant, by name (`accounts:manage`, `clients:manage`, `server:observe`). Default `[]`. An unknown name is refused with `INVALID_DATA` rather than ignored. Ignored when `is_admin` is set, which already carries all of them.                                                 |
 | `days`            | integer          | `GENERATE.CERT`                                                                                                    | How many days the certificate is valid for. Default 365, capped by `max_client_cert_days`. A value above the cap, or `0`, is **refused** rather than clamped.                                                                                                                               |
 | `durable`         | bool             | `CREATE.FILE`, `SET.FILE`                                                                                          | Per-file durable writes. Optional for `CREATE.FILE`, default `false` - except on a queue, which defaults to `true`. On `SET.FILE` an absent flag leaves the file's durability alone. See [Storage Engine](storage.md). |
@@ -1536,12 +1548,23 @@ Drop a table from `account`.
 Authorize a client certificate.
 
 - Required: `thumbprint`, `name`. Optional: `accounts_list` (default `[]`), `is_admin`
-  (default `false`), `capabilities` (default `[]`). Requires `clients:manage` (or `ADMIN`).
-- Errors: `ADMIN_REQUIRED`, `MISSING_FIELD` (no `thumbprint` or `name`).
+  (default `false`), `capabilities` (default `[]`), `enqueue_files` (default `[]`). Requires
+  `clients:manage` (or `ADMIN`).
+- A client needs at least one of `is_admin`, an account, a capability or an enqueue grant.
+  Authorizing a name that already exists replaces its grants, which is how an enqueue grant's
+  list of files is changed.
+- Errors: `ADMIN_REQUIRED`, `MISSING_FIELD` (no `thumbprint` or `name`), `INVALID_DATA` (an
+  unknown capability, or an enqueue grant not written `<ACCOUNT>/<FILE>`), `INVALID_REQUEST`
+  (nothing granted).
 
 ```json
 {"command": "AUTHORIZE.CONN", "thumbprint": "9f86d081...", "name": "reporting-bot",
  "accounts_list": ["SALES"], "is_admin": false, "capabilities": ["server:observe"]}
+```
+
+```json
+{"command": "AUTHORIZE.CONN", "thumbprint": "4b227777...", "name": "scheduler",
+ "enqueue_files": ["APP/JOBS", "APP/EVENTS"]}
 ```
 
 ```json
@@ -1588,10 +1611,10 @@ server, written next to the CA (alongside a PKCS#12 bundle when `openssl` can pr
 which is the only time it is sent anywhere.
 
 - Required: `name`, which is both the certificate's common name and the authorization name. Optional: `accounts_list`,
-  `is_admin` (default `false`), `capabilities` (default `[]`), `days` (default 365). Requires `clients:manage` (or
-  `ADMIN`).
-- A non-admin certificate must be given at least one account, since a client with neither admin rights nor an allowed
-  account could do nothing.
+  `is_admin` (default `false`), `capabilities` (default `[]`), `enqueue_files` (default `[]`), `days` (default 365).
+  Requires `clients:manage` (or `ADMIN`).
+- A non-admin certificate must be given at least one account, capability or enqueue grant, since a client with none
+  of them could do nothing.
 - `days` sets the lifetime. It defaults to 365 and is bounded by `max_client_cert_days` in `config.toml`, which also
   defaults to 365. A request above the cap, or for `0` days, is **refused with `INVALID_REQUEST`** rather than quietly
   clamped: a caller that believes it holds a 30-day certificate and actually holds a 365-day one is worse off than one
@@ -1638,6 +1661,8 @@ not the list of open sessions, which `SERVER.STATS` carries.
   and never sees the certificate behind it — so the database does not know when it expires and says so rather than
   guessing. They are populated for every certificate this database issued. `expires_in_days` is negative once the
   certificate has expired.
+- `enqueue_files` lists the client's [enqueue grants](#authorization) as `<ACCOUNT>/<FILE>`, and is empty for `ADMIN`,
+  which needs none.
 - Errors: `ADMIN_REQUIRED`.
 
 ```json
@@ -1648,7 +1673,8 @@ not the list of open sessions, which `SERVER.STATS` carries.
 {"status": "OK", "count": 1,
  "results": [["reporting-bot", {"thumbprint": "9f86d081...", "accounts": ["SALES"], "is_admin": false,
                                 "capabilities": ["server:observe"],
-                                "expires_at": "2027-09-13T16:23:45Z", "expires_in_days": 364}]]}
+                                "expires_at": "2027-09-13T16:23:45Z", "expires_in_days": 364,
+                                "enqueue_files": []}]]}
 ```
 
 ### LIST.ACCOUNTS
