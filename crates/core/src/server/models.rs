@@ -64,6 +64,14 @@ pub struct Request {
     /// `CREATE.FILE` and `SET.FILE`: deliveries a record of this queue gets
     /// before it is moved to the dead-letter file.
     pub max_deliveries: Option<u32>,
+    /// `ENQUEUE` and `NACK`: hold the record back for this many seconds before
+    /// anybody may claim it. Cannot be combined with `due`.
+    pub delay_seconds: Option<u64>,
+    /// `ENQUEUE` and `NACK`: hold the record back until this moment, in
+    /// milliseconds since the epoch - the unit a sequence key and every other
+    /// queue time on the wire already use. A moment already past is due now.
+    /// Cannot be combined with `delay_seconds`.
+    pub due: Option<u64>,
     /// `CREATE.FILE`: create the file as a directory file, whose records are
     /// the files of a real directory on the host. Not settable on an existing
     /// file: a file's type is fixed when it is created, because changing it

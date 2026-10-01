@@ -1272,10 +1272,12 @@ fn print_help(current_account: &str) {
     println!("           [TIMEOUT <s>] [RETRIES <n>]");
     println!("                                        - Change an existing file's attributes, keeping its records.");
     println!("                                          Turning durability on flushes what the file had buffered.");
-    println!("  ENQUEUE <queue> <data>                - Append a record; the engine mints its sequence key.");
+    println!("  ENQUEUE <queue> [AFTER <s> | AT <ms>] <data> - Append a record; the engine mints its sequence key.");
+    println!("                                          AFTER/AT hold it back until it is due.");
     println!("  DEQUEUE <queue> [<seconds>]           - Claim the oldest unclaimed record for <seconds>.");
     println!("  ACK <queue> <key>                     - The work succeeded: remove the record for good.");
-    println!("  NACK <queue> <key>                    - The work failed: give it back now rather than on timeout.");
+    println!("  NACK <queue> <key> [AFTER <s> | AT <ms>] - The work failed: give it back now rather than on timeout,");
+    println!("                                          or hold it back until it is due.");
     println!("  PEEK <queue> [<key>]                  - Read the head of the queue, or one record, claiming nothing.");
     println!("  STORE <file> <key> <path>             - Copy a host file in as one record of a directory file.");
     println!("  EXTRACT <file> <key> <path>           - Copy one record back out to a host file, byte for byte.");
@@ -1835,15 +1837,62 @@ fn handle_set_file(db: &mut Database, parts: &[&str]) {
 /// acknowledged by a remote consumer that never had it.
 const CLI_OWNER: &str = "CLI";
 
+/// Reads an optional `AFTER <seconds>` or `AT <epoch-ms>` starting at
+/// `parts[at]`, returning the due time and how many words it used.
+///
+/// `Err` carries the message to print. The bounds are the server's, so a
+/// command typed here and the same request sent over the wire are refused for
+/// the same reasons.
+fn parse_due(parts: &[&str], at: usize) -> Result<(Option<u64>, usize), String> {
+    let ceiling = queue::MAX_DELAY_SECONDS;
+    let now = queue::now_millis();
+    let keyword = parts.get(at).map(|word| word.to_ascii_uppercase());
+    match keyword.as_deref() {
+        Some("AFTER") => match parts.get(at + 1).and_then(|text| text.parse::<u64>().ok()) {
+            Some(0) => Ok((None, 2)),
+            Some(seconds) if seconds <= ceiling => Ok((Some(now + seconds * 1000), 2)),
+            _ => Err(format!("AFTER takes a whole number of seconds up to {}", ceiling)),
+        },
+        Some("AT") => match parts.get(at + 1).and_then(|text| text.parse::<u64>().ok()) {
+            Some(due) if due <= now + ceiling * 1000 => Ok((Some(due), 2)),
+            _ => Err(format!(
+                "AT takes a time in milliseconds since the epoch, at most {} days from now",
+                ceiling / 86_400
+            )),
+        },
+        _ => Ok((None, 0)),
+    }
+}
+
 fn handle_enqueue(db: &Database, parts: &[&str]) {
+    let usage = "Usage: ENQUEUE <queue> [AFTER <seconds> | AT <epoch-ms>] <data>";
     if parts.len() < 3 {
-        println!("Usage: ENQUEUE <queue> <data>");
+        println!("{}", usage);
+        return;
+    }
+    let (due, used) = match parse_due(parts, 2) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            println!("{}", message);
+            return;
+        }
+    };
+    if parts.len() < 3 + used {
+        println!("{}", usage);
         return;
     }
     let account = db.current_account();
-    let record = Record::from_display_string(&parts[2..].join(" "));
-    match db.enqueue(&account, parts[1], record) {
-        Ok(key) => println!("[{}] enqueued as {}", parts[1], key),
+    let record = Record::from_display_string(&parts[2 + used..].join(" "));
+    match db.enqueue_due(&account, parts[1], record, due) {
+        Ok(key) => match due {
+            Some(due) => println!(
+                "[{}] enqueued as {}, due in {}s",
+                parts[1],
+                key,
+                due.saturating_sub(queue::now_millis()) / 1000
+            ),
+            None => println!("[{}] enqueued as {}", parts[1], key),
+        },
         Err(e) => println!("Error: {}", e),
     }
 }
@@ -1889,18 +1938,38 @@ fn handle_peek(db: &Database, parts: &[&str]) {
 }
 
 fn handle_ack(db: &Database, parts: &[&str], nack: bool) {
-    let command = if nack { "NACK" } else { "ACK" };
     if parts.len() < 3 {
-        println!("Usage: {} <queue> <key>", command);
+        if nack {
+            println!("Usage: NACK <queue> <key> [AFTER <seconds> | AT <epoch-ms>]");
+        } else {
+            println!("Usage: ACK <queue> <key>");
+        }
         return;
     }
+    let due = if nack {
+        match parse_due(parts, 3) {
+            Ok((due, _)) => due,
+            Err(message) => {
+                println!("{}", message);
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let account = db.current_account();
     let settled = if nack {
-        db.nack(&account, parts[1], parts[2], CLI_OWNER)
+        db.nack_until(&account, parts[1], parts[2], CLI_OWNER, due)
     } else {
         db.ack(&account, parts[1], parts[2], CLI_OWNER)
     };
     match settled {
+        Ok(()) if nack && due.is_some() => println!(
+            "[{}] {} returned to the queue, due in {}s",
+            parts[1],
+            parts[2],
+            due.unwrap_or_default().saturating_sub(queue::now_millis()) / 1000
+        ),
         Ok(()) if nack => println!("[{}] {} returned to the queue", parts[1], parts[2]),
         Ok(()) => println!("[{}] {} acknowledged and removed", parts[1], parts[2]),
         Err(e) => println!("Error: {}", e),
@@ -1919,6 +1988,15 @@ fn print_delivery(file: &str, delivery: &QueueDelivery, what: &str) {
             )
         })
         .unwrap_or_default();
+    let due = delivery
+        .due_millis
+        .map(|due| {
+            format!(
+                ", held until due in {}s",
+                due.saturating_sub(queue::now_millis()) / 1000
+            )
+        })
+        .unwrap_or_default();
     let held = delivery
         .expires_millis
         .map(|expires| {
@@ -1929,8 +2007,8 @@ fn print_delivery(file: &str, delivery: &QueueDelivery, what: &str) {
         })
         .unwrap_or_default();
     println!(
-        "[{}] {} {} (delivery {}{}{})",
-        file, what, delivery.key, delivery.deliveries, age, held
+        "[{}] {} {} (delivery {}{}{}{})",
+        file, what, delivery.key, delivery.deliveries, age, held, due
     );
     for (index, field) in delivery.record.fields.iter().enumerate() {
         println!("  {:>3}: {}", index + 1, field_display(field));
@@ -2197,11 +2275,20 @@ fn handle_file_stats(db: &Database, parts: &[&str]) {
             Some(seconds) => format!("{}s", seconds),
             None => "-".to_string(),
         };
+        let held = match queue.next_due_millis {
+            Some(due) if queue.held > 0 => format!(
+                ", {} held (next due in {}s)",
+                queue.held,
+                due.saturating_sub(smart_rusty_pick_core::db::queue::now_millis()) / 1000
+            ),
+            _ => String::new(),
+        };
         println!(
-            "  queue{}: {} waiting, {} in flight, oldest {}, {} dead-lettered",
+            "  queue{}: {} waiting, {} in flight{}, oldest {}, {} dead-lettered",
             if queue.dead_letter { " (dead letters)" } else { "" },
             queue.depth,
             queue.in_flight,
+            held,
             age,
             queue.dead_letters,
         );

@@ -756,13 +756,19 @@ Beside the records, a queue file carries one small `queue` file:
 ```text
 <account>/JOBS/data.hf/        the records
 <account>/JOBS/dict            the dictionary
-<account>/JOBS/queue           the next sequence number and the delivery counts
+<account>/JOBS/queue           the next sequence number, the delivery counts and the due times
 ```
 
-It holds two things: the next sequence number, and the delivery count of each record that has been delivered at least
-once. Written checksum-first through a temporary file and a rename, like an index's `state`, and written *after* the
+It holds three things: the next sequence number, the delivery count of each record that has been delivered at least
+once, and the due time of each record that was [held back](protocol.md#delayed-records) and has not yet left the
+queue. Written checksum-first through a temporary file and a rename, like an index's `state`, and written *after* the
 records for the same reason — it names records, so it must never get ahead of them. A count naming a record the data
 section has not got is dropped on the next load; a record with no count merely starts its retries again.
+
+**Due times are persisted; claims are not.** A due time belongs to the record: a backoff somebody asked for, or work
+that is not to start until tomorrow, and a restart that forgot it would hand the record out early. A record is attached
+held if it has one, and the first sweep after load lets in whatever came due while the server was down. A due time is
+kept after the record comes due, until it leaves the queue, because its age is measured from it.
 
 **Claims are not persisted at all.** A claim belongs to a connection, and a server that has restarted has none, so
 every claim is released on load and its record becomes available again with its delivery count intact. This is why the

@@ -27,6 +27,7 @@ fn persisted(next: u64, deliveries: &[(&str, u32)]) -> PersistedQueue {
     PersistedQueue {
         next_sequence: next,
         deliveries: deliveries.iter().map(|(key, n)| (key.to_string(), *n)).collect(),
+        due: Vec::new(),
     }
 }
 
@@ -324,4 +325,75 @@ fn a_dead_letter_file_is_named_from_its_queue_and_recognises_itself() {
     // The name is derivable in both directions, which is how `FILE.STATS`
     // counts a queue's dead letters without being told where they are.
     assert!(queue::is_dead_letter_name(&queue::dead_letter_name("JOBS")));
+}
+
+#[test]
+fn due_times_round_trip_through_the_state_file_in_a_stable_order() {
+    let guard = TempDir::new("queue_format_due");
+    let dir = guard.path();
+    let state = PersistedQueue {
+        next_sequence: 42,
+        deliveries: vec![("00000000000000000002".to_string(), 1)],
+        // Deliberately out of order: the file is sorted, so the same state
+        // always writes the same bytes.
+        due: vec![
+            ("00000000000000000003".to_string(), 9_000),
+            ("00000000000000000001".to_string(), 5_000),
+        ],
+    };
+    queue::write_state(dir, &state, FsyncPolicy::Never).unwrap();
+    let first = fs::read_to_string(queue::state_path(dir)).unwrap();
+    let read = queue::read_state(dir).expect("a state file just written reads back");
+    assert_eq!(read.next_sequence, 42);
+    let mut due = read.due.clone();
+    due.sort();
+    assert_eq!(
+        due,
+        vec![
+            ("00000000000000000001".to_string(), 5_000),
+            ("00000000000000000003".to_string(), 9_000),
+        ]
+    );
+    queue::write_state(dir, &read, FsyncPolicy::Never).unwrap();
+    assert_eq!(fs::read_to_string(queue::state_path(dir)).unwrap(), first);
+}
+
+#[test]
+fn a_held_record_is_attached_held_and_let_in_when_due() {
+    let keys = ["00000000000000000001", "00000000000000000002"];
+    let persisted = PersistedQueue {
+        next_sequence: 3,
+        deliveries: Vec::new(),
+        due: vec![("00000000000000000001".to_string(), 10_000)],
+    };
+    let mut state = QueueState::attach(&records(&keys), persisted);
+    assert_eq!(state.held(), 1);
+    assert_eq!(state.depth(), 1, "only the record with no due time is claimable");
+    assert_eq!(
+        state.tracked(),
+        2,
+        "held records are tracked, so no reconcile is triggered"
+    );
+    assert_eq!(state.next_due(), Some(10_000));
+
+    assert!(!state.has_due_record(9_999));
+    assert_eq!(state.release_due(9_999), 0);
+    assert!(state.has_due_record(10_000));
+    assert_eq!(state.release_due(10_000), 1);
+    assert_eq!(state.held(), 0);
+    // Once due it takes its place by arrival, ahead of the record behind it.
+    assert_eq!(state.head().map(String::as_str), Some("00000000000000000001"));
+}
+
+#[test]
+fn reconciling_keeps_a_held_record_held() {
+    let keys = ["00000000000000000001", "00000000000000000002"];
+    let mut state = QueueState::attach(&records(&keys), persisted(3, &[]));
+    state.enqueue_held("00000000000000000002", u64::MAX);
+    let mut more = records(&keys);
+    more.insert("HANDWRITTEN".to_string(), Record::from_display_string("x"));
+    state.reconcile(&more);
+    assert_eq!(state.held(), 1, "a reconcile must not let a held record in early");
+    assert_eq!(state.depth(), 2);
+    assert_eq!(state.tracked(), 3);
 }

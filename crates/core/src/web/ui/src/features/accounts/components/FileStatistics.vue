@@ -179,6 +179,7 @@ const queueRows = computed<Array<[string, string]>>(() => {
   return [
     ['Waiting', count(queue.depth)],
     ['In flight', count(queue.in_flight)],
+    ['Held until due', count(queue.held ?? 0)],
     [
       'Oldest unacknowledged',
       queue.oldest_unacknowledged_seconds === null

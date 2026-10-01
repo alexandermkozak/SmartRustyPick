@@ -48,6 +48,9 @@ pub struct QueueDelivery {
     pub expires_millis: Option<u64>,
     /// Who is holding it. `None` for a `PEEK`.
     pub owner: Option<String>,
+    /// When a record being held back becomes claimable, in milliseconds since
+    /// the epoch. `None` for a record that is claimable now, or claimed.
+    pub due_millis: Option<u64>,
 }
 
 /// What [`Database::queue_file`] has to do before the order can be used.
@@ -189,6 +192,13 @@ impl Database {
 
     /// Appends a record to a queue and returns the key the engine minted for it.
     pub fn enqueue(&self, account: &str, name: &str, record: Record) -> DbResult<String> {
+        self.enqueue_due(account, name, record, None)
+    }
+
+    /// [`enqueue`](Self::enqueue), holding the record back until `due_millis`
+    /// when one is given. See [the queue module](crate::db::queue) on where a
+    /// held record's key and age come from.
+    pub fn enqueue_due(&self, account: &str, name: &str, record: Record, due_millis: Option<u64>) -> DbResult<String> {
         let (handle, _) = self.queue_file(account, name)?;
         let key = {
             let mut table = handle.write();
@@ -199,11 +209,11 @@ impl Database {
                 .mint(queue::now_millis());
             let key = queue::format_key(sequence);
             table.insert_record(&key, record);
-            table
-                .queue
-                .as_mut()
-                .expect("queue_file attaches the queue state")
-                .enqueue(&key);
+            let state = table.queue.as_mut().expect("queue_file attaches the queue state");
+            match due_millis {
+                Some(millis) => state.enqueue_held(&key, millis),
+                None => state.enqueue(&key),
+            }
             key
         };
         self.note_write_for(account, name)?;
@@ -241,6 +251,7 @@ impl Database {
                     enqueued_millis: queue::key_enqueued_millis(&key),
                     expires_millis: expires,
                     owner: Some(owner.to_string()),
+                    due_millis: None,
                     deliveries,
                     key,
                 }
@@ -279,6 +290,20 @@ impl Database {
     /// lapse. A record that has used up its deliveries is dead lettered here
     /// rather than made available again.
     pub fn nack(&self, account: &str, name: &str, key: &str, owner: &str) -> DbResult<()> {
+        self.nack_until(account, name, key, owner, None)
+    }
+
+    /// [`nack`](Self::nack), holding the record back until `due_millis` when
+    /// one is given: the backoff a consumer asks for when retrying at once
+    /// would only fail again.
+    pub fn nack_until(
+        &self,
+        account: &str,
+        name: &str,
+        key: &str,
+        owner: &str,
+        due_millis: Option<u64>,
+    ) -> DbResult<()> {
         let (handle, policy) = self.queue_file(account, name)?;
         let policy = Self::effective_policy(name, policy);
         let dead = {
@@ -287,7 +312,7 @@ impl Database {
             Self::claim_check(&table, key, owner, present, name)?;
             let table = &mut *table;
             let state = table.queue.as_mut().expect("queue_file attaches the queue state");
-            if state.release(key, policy) {
+            if state.release_until(key, policy, due_millis) {
                 let deliveries = state.deliveries(key);
                 state.forget(key);
                 let record = table.records.remove(key).unwrap_or_default();
@@ -326,13 +351,13 @@ impl Database {
         {
             let table = handle.read();
             let state = table.queue.as_ref().expect("queue_file attaches the queue state");
-            if !state.has_lapsed_claim(now) {
+            if !state.has_lapsed_claim(now) && !state.has_due_record(now) {
                 return Ok(Self::delivery_in(&table, key));
             }
         }
 
-        // Something has lapsed, so this peek has to put it back before it can
-        // answer. Another peek may have swept it between the two locks, which
+        // Something has lapsed or come due, so this peek has to put it in the
+        // order before it can answer. Another peek may have swept it between the two locks, which
         // costs this one an exclusive lock it turned out not to need - the
         // alternative is holding a lock across the check, which is the thing
         // being avoided.
@@ -364,6 +389,7 @@ impl Database {
             enqueued_millis: queue::key_enqueued_millis(&wanted),
             expires_millis: claim.map(|claim| claim.expires_millis),
             owner: claim.map(|claim| claim.owner.clone()),
+            due_millis: state.held_until(&wanted),
             record,
             key: wanted,
         })
@@ -387,6 +413,8 @@ impl Database {
             let stats = QueueStats {
                 depth: state.depth() as u64,
                 in_flight: state.in_flight() as u64,
+                held: state.held() as u64,
+                next_due_millis: state.next_due(),
                 oldest_unacknowledged_seconds: state.oldest_unacknowledged_seconds(now),
                 dead_letters: 0,
                 next_sequence: state.next_sequence(),

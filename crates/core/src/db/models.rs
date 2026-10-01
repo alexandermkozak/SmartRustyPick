@@ -1340,6 +1340,15 @@ pub struct QueueStats {
     pub depth: u64,
     /// Records claimed and not yet acknowledged.
     pub in_flight: u64,
+    /// Records held back by a due time that has not come yet: not claimable,
+    /// and counted in neither `depth` nor `in_flight`. Defaulted so a payload
+    /// from a server that predates held records still reads.
+    #[serde(default)]
+    pub held: u64,
+    /// When the earliest held record comes due, in milliseconds since the
+    /// epoch. `None` when nothing is held.
+    #[serde(default)]
+    pub next_due_millis: Option<u64>,
     /// Age of the oldest record still in the queue, claimed or not, taken from
     /// the millisecond its sequence key carries. `None` for an empty queue, or
     /// one holding only records whose keys the engine did not mint.

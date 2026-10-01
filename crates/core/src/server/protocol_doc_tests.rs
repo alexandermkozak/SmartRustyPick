@@ -46,6 +46,8 @@ const REQUEST_FIELDS: &[&str] = &[
     "queue",
     "visibility_timeout",
     "max_deliveries",
+    "delay_seconds",
+    "due",
     "directory",
     "path",
     "length",
@@ -450,6 +452,8 @@ fn file_stats_derived_objects_are_documented() {
         &[
             "depth",
             "in_flight",
+            "held",
+            "next_due_millis",
             "oldest_unacknowledged_seconds",
             "dead_letters",
             "next_sequence",
