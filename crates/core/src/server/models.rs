@@ -37,6 +37,10 @@ pub struct Request {
     /// existed sends - so those callers keep granting exactly what they did.
     /// Ignored when `is_admin` is set, since `ADMIN` already carries all of them.
     pub capabilities: Option<Vec<String>>,
+    /// `AUTHORIZE.CONN` and `GENERATE.CERT`: queue files the client may append
+    /// to without reaching their account, as `<ACCOUNT>/<FILE>`. Absent means
+    /// none. Ignored when `is_admin` is set, since `ADMIN` reaches everything.
+    pub enqueue_files: Option<Vec<String>>,
     /// `CREATE.FILE`: create the file with per-file durable writes enabled.
     /// `SET.FILE`: turn per-file durable writes on or off for a file that
     /// already exists. Required there, since an absent flag must not be read as

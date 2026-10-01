@@ -38,6 +38,7 @@ const REQUEST_FIELDS: &[&str] = &[
     "accounts_list",
     "is_admin",
     "capabilities",
+    "enqueue_files",
     "days",
     "durable",
     "field",

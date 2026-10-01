@@ -98,11 +98,12 @@ Restore an archive — to the same server or a different one.
 Authorize a client certificate SHA-256 thumbprint with a name and access restrictions. This command is restricted to the
 `SYSTEM` account.
 
-- **Usage**: `AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts | capabilities>`
+- **Usage**: `AUTHORIZE.CONN <thumbprint> <name> <ADMIN | accounts | capabilities | enqueue grants>`
 - **Example (Admin)**: `AUTHORIZE.CONN ef9d7b4d5... my-laptop ADMIN`
 - **Example (Restricted)**: `AUTHORIZE.CONN ef9d7b4d5... my-laptop MYAPP,TESTDB`
 - **Example (Provisioning)**: `AUTHORIZE.CONN ef9d7b4d5... deploy-bot accounts:manage`
 - **Example (Mixed)**: `AUTHORIZE.CONN ef9d7b4d5... ops MYAPP,server:observe`
+- **Example (Producer)**: `AUTHORIZE.CONN ef9d7b4d5... scheduler enqueue:MYAPP/JOBS,enqueue:MYAPP/EVENTS`
 - **Note**:
   - The third argument is one comma-separated list. A token is a **capability** if it names one, and an **account**
     otherwise; `ADMIN` is recognised on its own.
@@ -114,10 +115,16 @@ Authorize a client certificate SHA-256 thumbprint with a name and access restric
     every account in the database. Granting access afterwards is `ADD.CLIENT.ACCOUNT`, under `clients:manage`.
   - `ADMIN` connections have no account restrictions and hold every capability, exactly as before. An authorization
     written before capabilities existed behaves identically; nothing has to be migrated.
-  - A client must be given at least one of the three: `ADMIN`, an account, or a capability.
+  - **An enqueue grant is the narrowest access there is.** `enqueue:<ACCOUNT>/<FILE>` lets the client `ENQUEUE` to that
+    one queue file and see its `FILE.STATS`, and nothing else in the account - no `DEQUEUE`, `PEEK` or `READ`, since
+    each hands a record back. It is for a producer that feeds somebody else's consumers and has no business reading
+    what they work on. One token per file; a token with the prefix that is not `<ACCOUNT>/<FILE>` is refused. See
+    [Authorization](protocol.md#authorization).
+  - A client must be given at least one of: `ADMIN`, an account, a capability, or an enqueue grant.
   - If a restricted client has only ONE allowed account, the server defaults to that account if none is specified in the
     request.
-  - The authorization is stored in the `$CLIENTS` file within the `SYSTEM` account, capabilities in attribute 4.
+  - The authorization is stored in the `$CLIENTS` file within the `SYSTEM` account, capabilities in attribute 4 and
+    enqueue grants in attribute 6, one `<ACCOUNT>/<FILE>` per value.
 
 #### ADD.CLIENT.ACCOUNT
 

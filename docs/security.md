@@ -163,6 +163,14 @@ exactly as it did and nothing has to be migrated. `EXPORT.*` and `IMPORT*` stay 
 capability: an export reads every record of whatever it names, so a capability granting it would grant reading every
 account — the conflation this decision exists to undo.
 
+**A third shape: append, and nothing else.** Between "every record in the account" and "nothing in it" there is one
+grant: an enqueue grant on a named queue file, which allows `ENQUEUE` there and `FILE.STATS` on it and refuses every
+other command in the account. It exists for a producer - a scheduler, a webhook receiver, a control plane handing work
+to an application's own consumers - whose compromise should cost an attacker the ability to add work, not the ability
+to read the data the work is about. It is checked as its own narrow path before the account check, and deliberately not
+folded into the allowed-account list, so nothing that asks "may this client reach the account?" can ever answer yes for
+it.
+
 A secondary benefit worth stating, because it is what an operator actually sees: `LIST.CONNS` can now distinguish a
 credential that exists to run backups from one that exists to provision accounts. Both used to read `ADMIN`.
 
