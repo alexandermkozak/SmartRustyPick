@@ -394,9 +394,14 @@ moment in milliseconds since the epoch; either may be up to thirty days ahead. T
 Claim the oldest unclaimed record, printing its key, its delivery count and its contents. An optional number of
 seconds overrides the queue's own visibility timeout for this one claim.
 
-- **Usage**: `DEQUEUE <queue> [<visibility seconds>]`
+`WAIT` waits up to that many seconds (at most 60) for a record when there is none, rather than answering empty at
+once. Over the [remote protocol](protocol.md#waiting-for-a-record) the wait is woken by the next `ENQUEUE`; here, in
+the CLI, it checks again every tenth of a second.
+
+- **Usage**: `DEQUEUE <queue> [<visibility seconds>] [WAIT <seconds>]`
 - **Example**: `DEQUEUE JOBS`
 - **Example**: `DEQUEUE JOBS 300`
+- **Example**: `DEQUEUE JOBS WAIT 20`
 
 #### ACK
 

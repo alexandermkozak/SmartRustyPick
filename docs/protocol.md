@@ -113,6 +113,7 @@ matched case-insensitively.
 | `visibility_timeout` | number        | `CREATE.FILE`, `SET.FILE`, `DEQUEUE`                                                                               | Seconds a claim is held before it lapses. On the file commands it sets the queue's own timeout (default 60, maximum 86400); on `DEQUEUE` it overrides that timeout for the one claim being taken. Out of range is refused with `INVALID_DATA`. |
 | `max_deliveries`  | number           | `CREATE.FILE`, `SET.FILE`                                                                                          | Deliveries a record of this queue gets before it moves to the dead-letter file. Default 5, maximum 1000. Out of range is refused with `INVALID_DATA`. |
 | `delay_seconds`   | number           | `ENQUEUE`, `NACK`                                                                                                  | Hold the record back this many seconds before anybody may claim it. `0` is no delay. Maximum 2592000 (30 days); beyond that is refused with `INVALID_DATA`. Cannot be sent with `due` (`INVALID_REQUEST`). See [Delayed records](#delayed-records). |
+| `wait_seconds`    | number           | `DEQUEUE`                                                                                                          | When the queue is empty, wait up to this many seconds for a record before answering `EMPTY`. `0` is no wait. Maximum 60; beyond that is refused with `INVALID_DATA`. See [Waiting for a record](#waiting-for-a-record). |
 | `due`             | number           | `ENQUEUE`, `NACK`                                                                                                  | Hold the record back until this moment, in milliseconds since the epoch. A moment already past is due now. More than 30 days ahead is refused with `INVALID_DATA`. Cannot be sent with `delay_seconds`. |
 | `length`          | number           | `PUT.BYTES`, `IMPORT.BYTES`                                                                                        | Bytes of body that follow this request line on the connection. Required: a body is announced rather than delimited, because a record may contain any byte including a newline. Checked against `max_directory_record_bytes` (`PUT.BYTES`) or `max_archive_bytes` (`IMPORT.BYTES`) *before* a byte of body is read. |
 | `directory`       | bool             | `CREATE.FILE`                                                                                                      | Make the file a [directory file](#directory-files): its records are the files of a real directory on the host. A file's type is fixed when it is created, so `SET.FILE` refuses to change it with `INVALID_REQUEST`. |
@@ -890,13 +891,40 @@ Append a record to a queue. The engine mints its key.
 
 Claim the oldest unclaimed record.
 
-- Required: `file`. Optional: `visibility_timeout`, which applies to this claim only.
+- Required: `file`. Optional: `visibility_timeout`, which applies to this claim only, and
+  `wait_seconds`, to [wait for a record](#waiting-for-a-record) when there is none.
 - Response: `record` (the payload, shaped as `READ` shapes one) and `claim`. When there is
   nothing to claim, `status: "EMPTY"` with `count: 0` and no record — an empty queue is the
   ordinary state of one that is keeping up, not an error.
 - Errors: `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`, `MISSING_FIELD` (no `file`),
-  `INVALID_DATA` (`visibility_timeout` out of range), `FILE_NOT_FOUND`, `INVALID_REQUEST`
-  (the file is not a queue).
+  `INVALID_DATA` (`visibility_timeout` or `wait_seconds` out of range), `FILE_NOT_FOUND`,
+  `INVALID_REQUEST` (the file is not a queue).
+
+#### Waiting for a record
+
+A consumer polling an empty queue either asks often and wastes requests, or asks rarely and
+is late. `wait_seconds` lets it ask once: when there is nothing to claim, the server holds
+the request open and answers as soon as a record can be claimed, or with `EMPTY` when the
+wait runs out.
+
+- **The connection is busy while it waits.** Requests on one connection are answered in
+  order, so a consumer that also wants to do other work while waiting uses a second
+  connection.
+- **Woken by arrivals.** An `ENQUEUE`, or a `NACK` returning a record for immediate
+  redelivery, wakes every waiter at once. A record that becomes claimable without either — a
+  [held record](#delayed-records) coming due, or a claim lapsing — is found within a second,
+  because a waiter tries again at least that often.
+- **Every attempt is an ordinary `DEQUEUE`.** Authorization is re-read, lapsed claims are
+  swept and held records let in, exactly as for a request that did not wait — so a waiting
+  request can be answered with nothing a plain one could not, and a client deauthorized
+  mid-wait is told so.
+- **Sixty seconds at most.** Long enough that an idle consumer makes one request a minute;
+  short enough that the connection still looks alive to anything between it and the server.
+  A consumer that wants to wait longer asks again.
+
+```json
+{"command": "DEQUEUE", "account": "SALES", "file": "JOBS", "wait_seconds": 20}
+```
 
 ```json
 {"command": "DEQUEUE", "account": "SALES", "file": "JOBS", "visibility_timeout": 300}

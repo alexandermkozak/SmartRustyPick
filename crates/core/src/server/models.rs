@@ -72,6 +72,10 @@ pub struct Request {
     /// queue time on the wire already use. A moment already past is due now.
     /// Cannot be combined with `delay_seconds`.
     pub due: Option<u64>,
+    /// `DEQUEUE`: when the queue is empty, wait up to this many seconds for a
+    /// record rather than answering `EMPTY` at once. `0` or absent is no wait.
+    /// At most 60.
+    pub wait_seconds: Option<u64>,
     /// `CREATE.FILE`: create the file as a directory file, whose records are
     /// the files of a real directory on the host. Not settable on an existing
     /// file: a file's type is fixed when it is created, because changing it

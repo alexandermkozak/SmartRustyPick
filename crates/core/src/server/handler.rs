@@ -580,6 +580,23 @@ fn claim_json(file: &str, delivery: &crate::db::QueueDelivery) -> serde_json::Va
     claim
 }
 
+/// How long a `DEQUEUE` may wait for a record, or the refusal to send. `None`
+/// is no wait, which is what `0` means as well as what absent does.
+#[allow(clippy::result_large_err)]
+pub(crate) fn requested_wait(req: &Request) -> Result<Option<std::time::Duration>, Response> {
+    match req.wait_seconds {
+        None | Some(0) => Ok(None),
+        Some(seconds) if seconds > crate::db::queue::MAX_WAIT_SECONDS => Err(error(
+            ErrorCode::InvalidData,
+            format!(
+                "wait_seconds can be at most {}; wait again if nothing came",
+                crate::db::queue::MAX_WAIT_SECONDS
+            ),
+        )),
+        Some(seconds) => Ok(Some(std::time::Duration::from_secs(seconds))),
+    }
+}
+
 /// When a record an `ENQUEUE` or `NACK` carries may first be claimed, or the
 /// refusal to send.
 ///
@@ -703,6 +720,12 @@ fn dequeue_record(db: &Database, acc: &str, req: &Request, owner: &str) -> Respo
         Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
         None => None,
     };
+    // Checked here although the waiting is done by the connection loop, so a
+    // bad value is refused on the first attempt - and so the rule lives beside
+    // the other bounds a DEQUEUE is held to rather than in the transport.
+    if let Err(resp) = requested_wait(req) {
+        return resp;
+    }
     match db.dequeue(acc, file, owner, visibility) {
         Ok(Some(delivery)) => Response {
             status: "OK".to_string(),

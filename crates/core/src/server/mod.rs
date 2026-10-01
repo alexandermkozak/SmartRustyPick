@@ -11,6 +11,8 @@ pub mod stats;
 pub mod transfer;
 #[cfg(test)]
 mod transfer_tests;
+#[cfg(test)]
+mod wait_tests;
 
 use crate::config::Config;
 pub use certs::{ensure_certificates, load_certs, load_key};
@@ -357,13 +359,13 @@ pub async fn start_server(config: Arc<Config>, db: SharedDb, override_addr: Opti
                         // client info is re-fetched inside the same task, both to
                         // support dynamic permission updates and to keep the lock off
                         // this thread entirely.
-                        let db_for_task = db.clone();
-                        let tp = thumbprint.clone();
-                        let handled = tokio::task::spawn_blocking(move || {
-                            let info = read_lock(&db_for_task).client_for_thumbprint(&tp);
-                            info.map(|info| handle_request(req, &db_for_task, &info))
-                        })
-                        .await;
+                        //
+                        // A DEQUEUE that may wait is the one request answered
+                        // by several attempts: see `dequeue_waiting`.
+                        let handled = match (command.as_str(), handler::requested_wait(&req)) {
+                            ("DEQUEUE", Ok(Some(wait))) => dequeue_waiting(&line, wait, &db, &thumbprint).await,
+                            _ => dispatch(req, &db, &thumbprint).await,
+                        };
 
                         match handled {
                             Ok(Some(resp)) => {
@@ -446,4 +448,62 @@ fn spawn_flusher(db: SharedDb) {
             .await;
         }
     });
+}
+
+/// Runs one request on a blocking thread, re-reading the client's
+/// authorization inside the same task. `None` when the client has been
+/// deauthorized since the connection opened.
+async fn dispatch(req: Request, db: &SharedDb, thumbprint: &str) -> Result<Option<Response>, tokio::task::JoinError> {
+    let db = db.clone();
+    let tp = thumbprint.to_string();
+    tokio::task::spawn_blocking(move || {
+        let info = read_lock(&db).client_for_thumbprint(&tp);
+        info.map(|info| handle_request(req, &db, &info))
+    })
+    .await
+}
+
+/// A `DEQUEUE` that waits up to `wait` for a record when the queue is empty.
+///
+/// The waiting is done here, between attempts, rather than in the handler:
+/// an attempt holds the database's shared lock, and a consumer that slept
+/// inside one would hold it for the length of its nap. Each attempt is an
+/// ordinary `DEQUEUE` - authorization re-read, claims swept, held records let
+/// in - so a waiting request can never be answered by anything a plain one
+/// could not.
+///
+/// Between attempts it sleeps until the [arrivals signal](crate::db::queue::arrivals)
+/// is raised or [`WAIT_RECHECK`](crate::db::queue::WAIT_RECHECK) passes. The
+/// waiter registers for the signal *before* each attempt, so a record enqueued
+/// between an attempt finding nothing and the sleep beginning still wakes it.
+///
+/// The request is re-read from its line for each attempt rather than cloned:
+/// it is the same bytes, it was already parsed once, and the wire types stay
+/// free of a `Clone` only this needs.
+async fn dequeue_waiting(
+    line: &str,
+    wait: std::time::Duration,
+    db: &SharedDb,
+    thumbprint: &str,
+) -> Result<Option<Response>, tokio::task::JoinError> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let woken = crate::db::queue::arrivals().notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+
+        let req: Request = serde_json::from_str(line).expect("this line was parsed once already");
+        let answer = dispatch(req, db, thumbprint).await?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match &answer {
+            Some(resp) if resp.status == "EMPTY" && !remaining.is_zero() => {
+                let nap = remaining.min(crate::db::queue::WAIT_RECHECK);
+                tokio::select! {
+                    _ = &mut woken => {}
+                    _ = tokio::time::sleep(nap) => {}
+                }
+            }
+            _ => return Ok(answer),
+        }
+    }
 }
