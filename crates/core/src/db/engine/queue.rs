@@ -217,6 +217,9 @@ impl Database {
             key
         };
         self.note_write_for(account, name)?;
+        if due_millis.is_none() {
+            queue::arrivals().notify_waiters();
+        }
         Ok(key)
     }
 
@@ -328,6 +331,11 @@ impl Database {
         };
         self.bury(account, name, dead)?;
         self.note_write_for(account, name)?;
+        // A record handed straight back is claimable now; a backed-off one is
+        // found by a waiter's recheck once it is due, like any held record.
+        if due_millis.is_none() {
+            queue::arrivals().notify_waiters();
+        }
         Ok(())
     }
 

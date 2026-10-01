@@ -48,6 +48,7 @@ const REQUEST_FIELDS: &[&str] = &[
     "max_deliveries",
     "delay_seconds",
     "due",
+    "wait_seconds",
     "directory",
     "path",
     "length",

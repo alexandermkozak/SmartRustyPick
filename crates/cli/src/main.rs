@@ -1274,7 +1274,8 @@ fn print_help(current_account: &str) {
     println!("                                          Turning durability on flushes what the file had buffered.");
     println!("  ENQUEUE <queue> [AFTER <s> | AT <ms>] <data> - Append a record; the engine mints its sequence key.");
     println!("                                          AFTER/AT hold it back until it is due.");
-    println!("  DEQUEUE <queue> [<seconds>]           - Claim the oldest unclaimed record for <seconds>.");
+    println!("  DEQUEUE <queue> [<seconds>] [WAIT <s>] - Claim the oldest unclaimed record for <seconds>,");
+    println!("                                          waiting up to <s> for one when the queue is empty.");
     println!("  ACK <queue> <key>                     - The work succeeded: remove the record for good.");
     println!("  NACK <queue> <key> [AFTER <s> | AT <ms>] - The work failed: give it back now rather than on timeout,");
     println!("                                          or hold it back until it is due.");
@@ -1899,9 +1900,23 @@ fn handle_enqueue(db: &Database, parts: &[&str]) {
 
 fn handle_dequeue(db: &Database, parts: &[&str]) {
     if parts.len() < 2 {
-        println!("Usage: DEQUEUE <queue> [<visibility seconds>]");
+        println!("Usage: DEQUEUE <queue> [<visibility seconds>] [WAIT <seconds>]");
         return;
     }
+    // `WAIT <seconds>` comes last, after the optional visibility, and is taken
+    // off before the visibility is read so the two cannot be mistaken.
+    let (parts, wait) = match parts.iter().position(|word| word.eq_ignore_ascii_case("WAIT")) {
+        None => (parts, None),
+        Some(at) => match parts.get(at + 1).and_then(|text| text.parse::<u64>().ok()) {
+            Some(seconds) if seconds <= queue::MAX_WAIT_SECONDS && at + 2 == parts.len() => {
+                (&parts[..at], Some(Duration::from_secs(seconds)))
+            }
+            _ => {
+                println!("WAIT takes a whole number of seconds up to {}", queue::MAX_WAIT_SECONDS);
+                return;
+            }
+        },
+    };
     let visibility = match parts.get(2) {
         None => None,
         Some(text) => match text.parse::<u64>() {
@@ -1916,7 +1931,16 @@ fn handle_dequeue(db: &Database, parts: &[&str]) {
         },
     };
     let account = db.current_account();
-    match db.dequeue(&account, parts[1], CLI_OWNER, visibility) {
+    // The CLI holds the database directly, with no connection loop to wait in
+    // and nobody else's ENQUEUE to be woken by, so it simply asks again.
+    let deadline = std::time::Instant::now() + wait.unwrap_or_default();
+    let claimed = loop {
+        match db.dequeue(&account, parts[1], CLI_OWNER, visibility) {
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            other => break other,
+        }
+    };
+    match claimed {
         Ok(Some(delivery)) => print_delivery(parts[1], &delivery, "claimed"),
         Ok(None) => println!("[{}] empty", parts[1]),
         Err(e) => println!("Error: {}", e),

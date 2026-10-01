@@ -53,6 +53,23 @@
 //! that forgot it would hand out at once the retry somebody asked to be backed
 //! off.
 //!
+//! # Waiting for a record
+//!
+//! A consumer that finds a queue empty can ask the server to wait for one
+//! (`DEQUEUE … WAIT`). The wait is not done here: the engine is synchronous and
+//! a claim is taken under the database's shared lock, so a consumer that slept
+//! inside it would hold that lock for the length of its nap. The connection
+//! loop does the waiting instead, between attempts, and [`arrivals`] is what
+//! wakes it - a signal raised by every command that can make a record
+//! claimable at once. It names no queue: a waiter that is woken for somebody
+//! else's queue tries its own, finds it empty, and waits again, which costs one
+//! claim attempt and buys not having a registry of waiters to keep consistent.
+//!
+//! Two things make a record claimable without any command raising the signal:
+//! a held record coming due, and a claim lapsing. Both are noticed only by the
+//! next sweep, and a sweep is what an attempt is. So a waiter also tries again
+//! at least every [`WAIT_RECHECK`], which bounds how late it can be for either.
+//!
 //! # Dead letters
 //!
 //! A record delivered [`QueuePolicy::max_deliveries`] times without being
@@ -87,6 +104,27 @@ pub const MAX_VISIBILITY_SECONDS: u64 = 86_400;
 
 /// Most times a record may be delivered before it is dead lettered.
 pub const MAX_DELIVERY_LIMIT: u32 = 1_000;
+
+/// Longest a `DEQUEUE` may wait for a record, in seconds.
+///
+/// Long enough that an idle consumer makes one request a minute rather than
+/// sixty; short enough that a connection waiting on an empty queue is still
+/// recognisably alive to everything between it and the server.
+pub const MAX_WAIT_SECONDS: u64 = 60;
+
+/// How often a waiting `DEQUEUE` tries again without being woken - see
+/// [Waiting for a record](self#waiting-for-a-record).
+pub const WAIT_RECHECK: Duration = Duration::from_secs(1);
+
+/// The signal raised whenever a record may have become claimable.
+///
+/// One per process rather than one per database or per queue - see
+/// [Waiting for a record](self#waiting-for-a-record) for why a wake-up that
+/// was not for you is cheaper than knowing who to wake.
+pub fn arrivals() -> &'static tokio::sync::Notify {
+    static ARRIVALS: std::sync::LazyLock<tokio::sync::Notify> = std::sync::LazyLock::new(tokio::sync::Notify::new);
+    &ARRIVALS
+}
 
 /// Longest a record may be held back before it is due, in seconds: thirty days.
 ///
