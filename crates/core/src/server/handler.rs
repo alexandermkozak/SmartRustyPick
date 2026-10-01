@@ -574,7 +574,45 @@ fn claim_json(file: &str, delivery: &crate::db::QueueDelivery) -> serde_json::Va
     if let Some(owner) = &delivery.owner {
         object.insert("owner".to_string(), owner.as_str().into());
     }
+    if let Some(due) = delivery.due_millis {
+        object.insert("due".to_string(), due.into());
+    }
     claim
+}
+
+/// When a record an `ENQUEUE` or `NACK` carries may first be claimed, or the
+/// refusal to send.
+///
+/// `delay_seconds` and `due` say the same thing two ways, so naming both is
+/// refused rather than settled - the same rule `if_absent` and `if_match`
+/// follow, and for the same reason: whichever one was dropped would be a check
+/// the caller believes ran. A delay of zero is no delay, which is exactly what
+/// it says. Anything past [`MAX_DELAY_SECONDS`](crate::db::queue::MAX_DELAY_SECONDS)
+/// from now is refused, whichever way it was spelled.
+#[allow(clippy::result_large_err)]
+fn requested_due(req: &Request, now_millis: u64) -> Result<Option<u64>, Response> {
+    let ceiling = crate::db::queue::MAX_DELAY_SECONDS;
+    let too_far = || {
+        error(
+            ErrorCode::InvalidData,
+            format!(
+                "A record can be held back for at most {} seconds ({} days); a queue is for work that is going to be done",
+                ceiling,
+                ceiling / 86_400
+            ),
+        )
+    };
+    match (req.delay_seconds, req.due) {
+        (Some(_), Some(_)) => Err(error(
+            ErrorCode::InvalidRequest,
+            "delay_seconds and due both say when the record may be claimed; name one",
+        )),
+        (Some(0), None) | (None, None) => Ok(None),
+        (Some(seconds), None) if seconds > ceiling => Err(too_far()),
+        (Some(seconds), None) => Ok(Some(now_millis.saturating_add(seconds * 1000))),
+        (None, Some(due)) if due > now_millis.saturating_add(ceiling * 1000) => Err(too_far()),
+        (None, Some(due)) => Ok(Some(due)),
+    }
 }
 
 /// The response a queue command that found nothing sends.
@@ -618,11 +656,15 @@ fn queued_record(db: &Database, acc: &str, req: Request) -> Result<(String, Reco
 }
 
 fn enqueue_record(db: &Database, acc: &str, req: Request) -> Response {
+    let due = match requested_due(&req, crate::db::queue::now_millis()) {
+        Ok(due) => due,
+        Err(resp) => return resp,
+    };
     let (file, record) = match queued_record(db, acc, req) {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    match db.enqueue(acc, &file, record) {
+    match db.enqueue_due(acc, &file, record, due) {
         Ok(key) => {
             let delivery = crate::db::QueueDelivery {
                 enqueued_millis: crate::db::queue::key_enqueued_millis(&key),
@@ -631,6 +673,7 @@ fn enqueue_record(db: &Database, acc: &str, req: Request) -> Response {
                 deliveries: 0,
                 expires_millis: None,
                 owner: None,
+                due_millis: due,
             };
             Response {
                 status: "OK".to_string(),
@@ -681,9 +724,22 @@ fn settle_claim(db: &Database, acc: &str, req: &Request, owner: &str, how: Settl
         Some(key) => key,
         None => return error(ErrorCode::MissingField, "Key not specified"),
     };
+    let due = match requested_due(req, crate::db::queue::now_millis()) {
+        Ok(due) => due,
+        Err(resp) => return resp,
+    };
     let settled = match how {
+        // An acknowledged record leaves the queue, so there is nothing left to
+        // hold back - and a caller that sent a delay with an ACK has mistaken
+        // which of the two it meant, which is worth telling it.
+        Settle::Ack if due.is_some() || req.delay_seconds == Some(0) => {
+            return error(
+                ErrorCode::InvalidRequest,
+                "ACK consumes the record, so it has nothing to delay; a delay belongs on NACK",
+            );
+        }
         Settle::Ack => db.ack(acc, file, key, owner),
-        Settle::Nack => db.nack(acc, file, key, owner),
+        Settle::Nack => db.nack_until(acc, file, key, owner, due),
     };
     match settled {
         Ok(()) => Response {

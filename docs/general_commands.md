@@ -369,16 +369,25 @@ than a lost record. A record that has used up its `RETRIES` moves to `<name>.DEA
 its key and its failure count. That file is the end of the line: `NACK` a record while draining it and the record stays
 there, counted, rather than moving on to a `<name>.DEAD.DEAD`.
 
+A record can also be **held**: enqueued, or returned by `NACK`, with a time before which nobody may claim it. It waits
+in the file, is counted as held rather than waiting, and joins the order by its arrival once it is due.
+
 Everything else still works on the file: `LIST`, `SELECT`, `READ` and the dictionary commands treat a queue as the
-ordinary file it also is. `FILE.STATS` adds the queue's depth, in-flight count, oldest unacknowledged age and
-dead-letter count. See [Storage Engine](storage.md#queue-files) for what is on disk and what survives a crash.
+ordinary file it also is. `FILE.STATS` adds the queue's depth, in-flight count, held count, oldest unacknowledged age
+and dead-letter count. See [Storage Engine](storage.md#queue-files) for what is on disk and what survives a crash.
 
 #### ENQUEUE
 
 Append a record to a queue. The key is minted by the engine and printed back.
 
-- **Usage**: `ENQUEUE <queue> <data>`
+`AFTER` or `AT` holds the record back: nobody can claim it until it is due. `AFTER` takes seconds from now, `AT` a
+moment in milliseconds since the epoch; either may be up to thirty days ahead. The record is in the file the whole time -
+`PEEK` by key shows it and when it is due - and it is let into the queue by the first `DEQUEUE` after that. See
+[Delayed records](protocol.md#delayed-records).
+
+- **Usage**: `ENQUEUE <queue> [AFTER <seconds> | AT <epoch-ms>] <data>`
 - **Example**: `ENQUEUE JOBS invoice^4471`
+- **Example**: `ENQUEUE JOBS AFTER 3600 reminder^4471`
 
 #### DEQUEUE
 
@@ -402,8 +411,12 @@ may acknowledge it, and only while the claim stands.
 The work failed: give the record back now rather than waiting for the claim to lapse. The delivery already counted
 stands, so returning a record for the last time it is allowed dead-letters it.
 
-- **Usage**: `NACK <queue> <key>`
+`AFTER` or `AT` backs the record off instead of returning it for immediate redelivery - the thing to do when whatever
+failed will not have recovered in the next millisecond. A record on its last delivery is dead-lettered regardless.
+
+- **Usage**: `NACK <queue> <key> [AFTER <seconds> | AT <epoch-ms>]`
 - **Example**: `NACK JOBS 01764950412345000001`
+- **Example**: `NACK JOBS 01764950412345000001 AFTER 30`
 
 #### PEEK
 

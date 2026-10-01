@@ -4183,3 +4183,93 @@ fn test_list_conns_reports_an_expiry_only_when_the_database_knows_one() {
     assert_eq!(unknown["expires_at"], serde_json::Value::Null);
     assert_eq!(unknown["expires_in_days"], serde_json::Value::Null);
 }
+
+#[test]
+fn test_a_delay_holds_a_record_back_over_the_protocol() {
+    let (_dir, db_arc, admin, worker) = queue_fixture("handler_queue_delay");
+    let mut create = queue_request("CREATE.FILE", "JOBS");
+    create.queue = Some(true);
+    assert_eq!(handle_request(create, &db_arc, &admin).status, "OK");
+
+    let mut later = queue_request("ENQUEUE", "JOBS");
+    later.data = Some(serde_json::Value::String("later".to_string()));
+    later.delay_seconds = Some(60);
+    let resp = handle_request(later, &db_arc, &worker);
+    assert_eq!(resp.status, "OK", "unexpected message: {:?}", resp.message);
+    let claim = resp.claim.unwrap();
+    let due = claim["due"].as_u64().expect("an enqueue that was held says until when");
+    let enqueued = claim["enqueued"].as_u64().unwrap();
+    assert!(due >= enqueued + 59_000 && due <= enqueued + 61_000);
+    assert_eq!(
+        handle_request(queue_request("DEQUEUE", "JOBS"), &db_arc, &worker).status,
+        "EMPTY",
+        "held, so nothing is claimable"
+    );
+
+    // A due time in the past is due now.
+    let mut now = queue_request("ENQUEUE", "JOBS");
+    now.data = Some(serde_json::Value::String("now".to_string()));
+    now.due = Some(1);
+    assert_eq!(handle_request(now, &db_arc, &worker).status, "OK");
+    let claimed = handle_request(queue_request("DEQUEUE", "JOBS"), &db_arc, &worker);
+    assert_eq!(claimed.status, "OK");
+    let key = claimed.claim.as_ref().unwrap()["key"].as_str().unwrap().to_string();
+
+    // A NACK can back off too, and an ACK cannot be delayed.
+    let mut ack = queue_request("ACK", "JOBS");
+    ack.key = Some(key.clone());
+    ack.delay_seconds = Some(5);
+    assert_eq!(
+        handle_request(ack, &db_arc, &worker).code,
+        Some(ErrorCode::InvalidRequest)
+    );
+    let mut nack = queue_request("NACK", "JOBS");
+    nack.key = Some(key);
+    nack.delay_seconds = Some(60);
+    assert_eq!(handle_request(nack, &db_arc, &worker).status, "OK");
+    assert_eq!(
+        handle_request(queue_request("DEQUEUE", "JOBS"), &db_arc, &worker).status,
+        "EMPTY",
+        "backed off, not handed straight back"
+    );
+}
+
+#[test]
+fn test_a_delay_is_refused_when_it_contradicts_itself_or_is_too_long() {
+    let (_dir, db_arc, admin, worker) = queue_fixture("handler_queue_delay_refused");
+    let mut create = queue_request("CREATE.FILE", "JOBS");
+    create.queue = Some(true);
+    assert_eq!(handle_request(create, &db_arc, &admin).status, "OK");
+
+    let mut both = queue_request("ENQUEUE", "JOBS");
+    both.data = Some(serde_json::Value::String("x".to_string()));
+    both.delay_seconds = Some(5);
+    both.due = Some(crate::db::queue::now_millis() + 5_000);
+    assert_eq!(
+        handle_request(both, &db_arc, &worker).code,
+        Some(ErrorCode::InvalidRequest)
+    );
+
+    let mut too_long = queue_request("ENQUEUE", "JOBS");
+    too_long.data = Some(serde_json::Value::String("x".to_string()));
+    too_long.delay_seconds = Some(crate::db::queue::MAX_DELAY_SECONDS + 1);
+    assert_eq!(
+        handle_request(too_long, &db_arc, &worker).code,
+        Some(ErrorCode::InvalidData)
+    );
+
+    // A millisecond timestamp sent as seconds is the mistake the ceiling catches.
+    let mut mistaken = queue_request("ENQUEUE", "JOBS");
+    mistaken.data = Some(serde_json::Value::String("x".to_string()));
+    mistaken.due = Some(crate::db::queue::now_millis() * 1000);
+    assert_eq!(
+        handle_request(mistaken, &db_arc, &worker).code,
+        Some(ErrorCode::InvalidData)
+    );
+
+    // Nothing refused joined the queue.
+    assert_eq!(
+        handle_request(queue_request("DEQUEUE", "JOBS"), &db_arc, &worker).status,
+        "EMPTY"
+    );
+}

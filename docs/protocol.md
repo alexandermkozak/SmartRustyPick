@@ -112,6 +112,8 @@ matched case-insensitively.
 | `if_match`        | string           | `WRITE`, `DELETE`                                                                                                  | Apply the write or delete only if the record under the key still has this `version`, as `READ` reported it. Anything else - changed, or no longer there - is refused with `PRECONDITION_FAILED` and nothing is written. Naming it alongside `if_absent` is refused with `INVALID_REQUEST`. See [Conditional writes](#conditional-writes). |
 | `visibility_timeout` | number        | `CREATE.FILE`, `SET.FILE`, `DEQUEUE`                                                                               | Seconds a claim is held before it lapses. On the file commands it sets the queue's own timeout (default 60, maximum 86400); on `DEQUEUE` it overrides that timeout for the one claim being taken. Out of range is refused with `INVALID_DATA`. |
 | `max_deliveries`  | number           | `CREATE.FILE`, `SET.FILE`                                                                                          | Deliveries a record of this queue gets before it moves to the dead-letter file. Default 5, maximum 1000. Out of range is refused with `INVALID_DATA`. |
+| `delay_seconds`   | number           | `ENQUEUE`, `NACK`                                                                                                  | Hold the record back this many seconds before anybody may claim it. `0` is no delay. Maximum 2592000 (30 days); beyond that is refused with `INVALID_DATA`. Cannot be sent with `due` (`INVALID_REQUEST`). See [Delayed records](#delayed-records). |
+| `due`             | number           | `ENQUEUE`, `NACK`                                                                                                  | Hold the record back until this moment, in milliseconds since the epoch. A moment already past is due now. More than 30 days ahead is refused with `INVALID_DATA`. Cannot be sent with `delay_seconds`. |
 | `length`          | number           | `PUT.BYTES`, `IMPORT.BYTES`                                                                                        | Bytes of body that follow this request line on the connection. Required: a body is announced rather than delimited, because a record may contain any byte including a newline. Checked against `max_directory_record_bytes` (`PUT.BYTES`) or `max_archive_bytes` (`IMPORT.BYTES`) *before* a byte of body is read. |
 | `directory`       | bool             | `CREATE.FILE`                                                                                                      | Make the file a [directory file](#directory-files): its records are the files of a real directory on the host. A file's type is fixed when it is created, so `SET.FILE` refuses to change it with `INVALID_REQUEST`. |
 | `path`            | string           | `CREATE.FILE`, `EXPORT.FILE`, `EXPORT.ACCOUNT`, `EXPORT.ALL`, `IMPORT`                                             | On `CREATE.FILE`, the host directory a directory file's records are the files of; absent means the default place inside the file's own directory, and it implies `directory: true` (given for an ordinary file it is refused with `INVALID_REQUEST`). On the archive commands, the path **on the server host** the archive is written to or read from. Required there - to move an archive over the connection instead, use `EXPORT.BYTES` / `IMPORT.BYTES`. |
@@ -810,8 +812,29 @@ has none, so a record that was claimed and not acknowledged is available again a
 server is back, with its delivery count intact. Records that were acknowledged do not come
 back. See [Storage Engine](storage.md#queue-files).
 
-`FILE.STATS` reports a queue's depth, in-flight count, oldest unacknowledged age and
-dead-letter count — see [FILE.STATS](#filestats).
+`FILE.STATS` reports a queue's depth, in-flight count, held count, oldest unacknowledged age
+and dead-letter count — see [FILE.STATS](#filestats).
+
+### Delayed records
+
+`ENQUEUE` and `NACK` can say when a record may first be claimed: `delay_seconds` from now, or
+`due` as a moment in milliseconds since the epoch. Until then the record is **held** — it is in
+the file, `READ` and `PEEK` by key find it, `FILE.STATS` counts it as `held` — but `DEQUEUE`
+steps over it as if it were not there. The first `DEQUEUE`, `PEEK` or `FILE.STATS` after it is
+due lets it in; nothing runs on a timer.
+
+- **For backoff**, `NACK` with a delay returns a failed record without handing it straight back
+  to whichever consumer asks next. The delivery limit is checked first: a record with no
+  deliveries left is dead-lettered now, delay or not.
+- **For work that is not due yet**, `ENQUEUE` with a delay: "send the reminder in an hour".
+- **Its key is still its arrival.** Once due, a held record takes its place by the millisecond
+  it arrived, ahead of anything enqueued after it. Its *age* in `oldest_unacknowledged_seconds`
+  is measured from when it came due, because a record nobody was allowed to claim was not
+  waiting.
+- **Due times survive a restart**, unlike claims: a backoff somebody asked for is not undone by
+  the server going down.
+- **Thirty days at most.** A queue is for work that is going to be done; a record due in a year
+  is a schedule kept in the wrong place.
 
 ### The claim object
 
@@ -825,6 +848,7 @@ dead-letter count — see [FILE.STATS](#filestats).
 | `"enqueued"`  | all three                    | When it was enqueued, in milliseconds since the epoch, read from its key.         |
 | `"expires"`   | `DEQUEUE`                    | When this claim lapses, in milliseconds since the epoch.                          |
 | `"owner"`     | `DEQUEUE`, and `PEEK` at a claimed record | The authorised name holding it.                                      |
+| `"due"`       | `ENQUEUE` with a delay, and `PEEK` at a held record | When the record becomes claimable, in milliseconds since the epoch. Absent once it is. |
 
 Times are milliseconds since the epoch rather than a formatted date, so a client subtracts
 rather than parses.
@@ -836,9 +860,11 @@ Append a record to a queue. The engine mints its key.
 - Required: `file`, and one of `data` or `structured_data` — the same two forms `WRITE`
   takes, mapped through the queue's own dictionary, and refused the same way when an object
   names a field that dictionary does not define.
-- Response: `claim`, carrying the key the record was stored under.
+- Optional: `delay_seconds` or `due`, to [hold the record back](#delayed-records).
+- Response: `claim`, carrying the key the record was stored under, and `due` when it is held.
 - Errors: `ACCOUNT_NOT_SPECIFIED`, `ACCESS_DENIED`, `MISSING_FIELD` (no `file`, or no data),
-  `INVALID_DATA`, `FILE_NOT_FOUND`, `INVALID_REQUEST` (the file is not a queue).
+  `INVALID_DATA` (including a delay beyond 30 days), `FILE_NOT_FOUND`, `INVALID_REQUEST` (the
+  file is not a queue, or both `delay_seconds` and `due` were sent).
 
 ```json
 {"command": "ENQUEUE", "account": "SALES", "file": "JOBS",
@@ -848,6 +874,16 @@ Append a record to a queue. The engine mints its key.
 ```json
 {"status": "OK", "claim": {"queue": "JOBS", "key": "01764950412345000001",
                            "deliveries": 0, "enqueued": 1764950412345}}
+```
+
+```json
+{"command": "ENQUEUE", "account": "SALES", "file": "JOBS", "delay_seconds": 3600,
+ "structured_data": {"kind": "reminder", "orderId": "4471"}}
+```
+
+```json
+{"status": "OK", "claim": {"queue": "JOBS", "key": "01764950412345000002",
+                           "deliveries": 0, "enqueued": 1764950412345, "due": 1764954012345}}
 ```
 
 ### DEQUEUE
@@ -901,12 +937,21 @@ The work succeeded: consume the claimed record, which leaves the queue for good.
 The work failed: give the record back now rather than waiting for the claim to lapse.
 
 - Required: `file`, `key`. Same ownership rules as `ACK`.
+- Optional: `delay_seconds` or `due`, to back the record off rather than return it for
+  immediate redelivery — see [Delayed records](#delayed-records). `ACK` takes neither: it
+  consumes the record, so there is nothing to delay, and sending one is refused with
+  `INVALID_REQUEST`.
 - The delivery already counted at `DEQUEUE` stands, so a record returned for the last time it
-  is allowed moves to the dead-letter file instead of back onto the queue.
-- Errors: as `ACK`.
+  is allowed moves to the dead-letter file instead of back onto the queue, delay or not.
+- Errors: as `ACK`, plus `INVALID_DATA` for a delay beyond 30 days.
 
 ```json
 {"command": "NACK", "account": "SALES", "file": "JOBS", "key": "01764950412345000001"}
+```
+
+```json
+{"command": "NACK", "account": "SALES", "file": "JOBS", "key": "01764950412345000001",
+ "delay_seconds": 30}
 ```
 
 ```json
@@ -1773,14 +1818,17 @@ the four numbers an administrator needs about one, plus the policy behind them:
 
 ```json
 {"queue": {
-  "depth": 128, "in_flight": 3, "oldest_unacknowledged_seconds": 41,
+  "depth": 128, "in_flight": 3, "held": 5, "next_due_millis": 1764950442345,
+  "oldest_unacknowledged_seconds": 41,
   "dead_letters": 2, "next_sequence": 1764950412345000131,
   "visibility_timeout_seconds": 300, "max_deliveries": 3, "dead_letter": false
 }}
 ```
 
-`depth` is the records available to be claimed and `in_flight` the ones claimed and not yet
-acknowledged; together they are the file's record count.
+`depth` is the records available to be claimed, `in_flight` the ones claimed and not yet
+acknowledged, and `held` the ones [held back](#delayed-records) until a due time that has not
+come; together they are the file's record count. `next_due_millis` is when the earliest held
+record comes due, and `null` when none is held.
 `oldest_unacknowledged_seconds` is the age of the oldest record still in the queue, claimed
 or not, read from the millisecond its sequence key carries — `null` for an empty queue. It is
 the number that separates a stalled queue from a busy one: the same `depth` with nothing in

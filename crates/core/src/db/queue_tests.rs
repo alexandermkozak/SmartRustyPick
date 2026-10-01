@@ -566,3 +566,151 @@ fn peeking_still_puts_back_a_claim_that_has_lapsed() {
     // And the record really is available again, not merely reported as such.
     assert_eq!(db.dequeue("QH", "JOBS", "bob", None).unwrap().unwrap().key, key);
 }
+
+#[test]
+fn a_record_enqueued_with_a_due_time_is_not_claimed_until_it_is_due() {
+    let guard = TempDir::new("queue_due_enqueue");
+    let base = guard.path();
+    let db = open_account(base, "QD");
+    queue_file(&db, "QD", "JOBS", 30, 3);
+
+    let later = queue::now_millis() + 60_000;
+    let held = db
+        .enqueue_due("QD", "JOBS", Record::from_display_string("later"), Some(later))
+        .unwrap();
+    let now = enqueue(&db, "QD", "JOBS", "now");
+
+    let first = db.dequeue("QD", "JOBS", "worker", None).unwrap().unwrap();
+    assert_eq!(first.key, now, "the held record is skipped, not waited for");
+    assert!(db.dequeue("QD", "JOBS", "worker", None).unwrap().is_none());
+
+    // Still readable by key, and says when it becomes claimable.
+    let peeked = db.peek("QD", "JOBS", Some(&held)).unwrap().unwrap();
+    assert_eq!(peeked.due_millis, Some(later));
+    assert_eq!(body(&peeked.record), "later");
+
+    let stats = db.queue_statistics("QD", "JOBS").unwrap();
+    assert_eq!(stats.held, 1);
+    assert_eq!(stats.depth, 0);
+    assert_eq!(stats.in_flight, 1);
+    assert_eq!(stats.next_due_millis, Some(later));
+}
+
+#[test]
+fn a_due_time_already_past_is_claimable_at_once() {
+    let guard = TempDir::new("queue_due_past");
+    let base = guard.path();
+    let db = open_account(base, "QP");
+    queue_file(&db, "QP", "JOBS", 30, 3);
+
+    let key = db
+        .enqueue_due("QP", "JOBS", Record::from_display_string("due"), Some(1))
+        .unwrap();
+    let delivery = db.dequeue("QP", "JOBS", "worker", None).unwrap().unwrap();
+    assert_eq!(delivery.key, key);
+    assert_eq!(delivery.due_millis, None, "a claimed record is not held");
+}
+
+#[test]
+fn a_held_record_is_let_in_by_the_first_claim_after_it_is_due() {
+    let guard = TempDir::new("queue_due_release");
+    let base = guard.path();
+    let db = open_account(base, "QR");
+    queue_file(&db, "QR", "JOBS", 30, 3);
+
+    let key = db
+        .enqueue_due(
+            "QR",
+            "JOBS",
+            Record::from_display_string("soon"),
+            Some(queue::now_millis() + 150),
+        )
+        .unwrap();
+    assert!(db.dequeue("QR", "JOBS", "worker", None).unwrap().is_none());
+    std::thread::sleep(Duration::from_millis(200));
+    let delivery = db.dequeue("QR", "JOBS", "worker", None).unwrap().unwrap();
+    assert_eq!(delivery.key, key);
+    assert_eq!(delivery.deliveries, 1, "being held is not a delivery");
+}
+
+#[test]
+fn a_nack_with_a_due_time_backs_the_record_off_and_keeps_its_count() {
+    let guard = TempDir::new("queue_due_nack");
+    let base = guard.path();
+    let db = open_account(base, "QN");
+    queue_file(&db, "QN", "JOBS", 30, 3);
+
+    let key = enqueue(&db, "QN", "JOBS", "flaky");
+    db.dequeue("QN", "JOBS", "worker", None).unwrap().unwrap();
+    db.nack_until("QN", "JOBS", &key, "worker", Some(queue::now_millis() + 150))
+        .unwrap();
+    assert!(
+        db.dequeue("QN", "JOBS", "worker", None).unwrap().is_none(),
+        "backed off, so not handed straight back"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let again = db.dequeue("QN", "JOBS", "worker", None).unwrap().unwrap();
+    assert_eq!(again.key, key);
+    assert_eq!(again.deliveries, 2);
+}
+
+#[test]
+fn a_nack_with_a_due_time_on_the_last_delivery_still_dead_letters() {
+    let guard = TempDir::new("queue_due_nack_dead");
+    let base = guard.path();
+    let db = open_account(base, "QX");
+    queue_file(&db, "QX", "JOBS", 30, 1);
+
+    let key = enqueue(&db, "QX", "JOBS", "doomed");
+    db.dequeue("QX", "JOBS", "worker", None).unwrap().unwrap();
+    db.nack_until("QX", "JOBS", &key, "worker", Some(queue::now_millis() + 60_000))
+        .unwrap();
+    let stats = db.queue_statistics("QX", "JOBS").unwrap();
+    assert_eq!(stats.held, 0, "a record with no deliveries left is buried, not held");
+    assert_eq!(stats.dead_letters, 1);
+}
+
+#[test]
+fn a_held_record_stays_held_across_a_restart() {
+    let guard = TempDir::new("queue_due_restart");
+    let base = guard.path();
+    let later = queue::now_millis() + 60_000;
+    let key = {
+        let db = open_account(base, "QS");
+        queue_file(&db, "QS", "JOBS", 30, 3);
+        let key = db
+            .enqueue_due("QS", "JOBS", Record::from_display_string("later"), Some(later))
+            .unwrap();
+        db.save().unwrap();
+        key
+    };
+    let db = Database::new(base, Some(isolated_config())).unwrap();
+    db.logto("QS").unwrap();
+    assert!(
+        db.dequeue("QS", "JOBS", "worker", None).unwrap().is_none(),
+        "a restart that forgot the due time would hand the record out early"
+    );
+    let peeked = db.peek("QS", "JOBS", Some(&key)).unwrap().unwrap();
+    assert_eq!(peeked.due_millis, Some(later));
+}
+
+#[test]
+fn a_held_record_is_aged_from_when_it_came_due() {
+    let guard = TempDir::new("queue_due_age");
+    let base = guard.path();
+    let db = open_account(base, "QA");
+    queue_file(&db, "QA", "JOBS", 30, 3);
+
+    db.enqueue_due(
+        "QA",
+        "JOBS",
+        Record::from_display_string("later"),
+        Some(queue::now_millis() + 60_000),
+    )
+    .unwrap();
+    let stats = db.queue_statistics("QA", "JOBS").unwrap();
+    assert_eq!(
+        stats.oldest_unacknowledged_seconds, None,
+        "a record nobody may claim yet is not waiting"
+    );
+}

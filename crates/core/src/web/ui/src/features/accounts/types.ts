@@ -176,6 +176,10 @@ export interface FileStats {
 export interface QueueStats {
     depth: number
     in_flight: number
+    /** Held back by a due time that has not come yet. Absent from older servers. */
+    held?: number
+    /** When the earliest held record comes due, in ms since the epoch. */
+    next_due_millis?: number | null
     /** Age of the oldest record still in the queue, claimed or not. Null for an
      *  empty one. */
     oldest_unacknowledged_seconds: number | null

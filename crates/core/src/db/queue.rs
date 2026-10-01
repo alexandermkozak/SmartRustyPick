@@ -30,6 +30,29 @@
 //! delivered at least once. In a queue that is being drained normally both are
 //! tiny, and the file is rewritten as a unit on every flush.
 //!
+//! # Delayed records
+//!
+//! A record can be enqueued, or handed back by `NACK`, with a time before
+//! which nobody may claim it. It waits in the file like any other record -
+//! `LIST` and `PEEK` by key still find it - but it is held out of the order
+//! until it is due, and the sweep that runs before every claim is what lets it
+//! in. There is no timer thread, for the reason there is none for lapsed
+//! claims: the only observer of a record becoming due is the next consumer.
+//!
+//! Its key is still minted from the millisecond it *arrived*. Minting it from
+//! the millisecond it is due would push the file's counter into the future,
+//! and every record enqueued after it - due at once - would then sort behind a
+//! record nobody may have yet. So once due, a delayed record takes its place by
+//! arrival, ahead of anything that arrived after it, which is the order it
+//! would have had if it had never been held back. Its *age* is another matter:
+//! a record that was not claimable for an hour has not been waiting for an
+//! hour, so the due time is remembered and the age is measured from it.
+//!
+//! Unlike a claim, a due time is persisted. A claim belongs to a connection
+//! that a restart has ended; a due time belongs to the record, and a restart
+//! that forgot it would hand out at once the retry somebody asked to be backed
+//! off.
+//!
 //! # Dead letters
 //!
 //! A record delivered [`QueuePolicy::max_deliveries`] times without being
@@ -64,6 +87,15 @@ pub const MAX_VISIBILITY_SECONDS: u64 = 86_400;
 
 /// Most times a record may be delivered before it is dead lettered.
 pub const MAX_DELIVERY_LIMIT: u32 = 1_000;
+
+/// Longest a record may be held back before it is due, in seconds: thirty days.
+///
+/// A queue is for work that is going to be done, and a record due in a year is
+/// a schedule stored in the wrong place - one that a queue's counters, its
+/// oldest-age alarm and its dead-letter file all describe badly. A bound also
+/// keeps a mistyped millisecond timestamp, read as seconds, from parking a
+/// record past the lifetime of the machine.
+pub const MAX_DELAY_SECONDS: u64 = 30 * 86_400;
 
 /// The name of the file `queue`'s dead letters go to.
 pub fn dead_letter_name(queue: &str) -> String {
@@ -206,6 +238,13 @@ pub struct QueueState {
     /// file it is written to - the size of the trouble rather than the size of
     /// the queue.
     deliveries: HashMap<String, u32>,
+    /// When each record that was held back became, or becomes, claimable, in
+    /// milliseconds since the epoch. Kept after the record is due, until it
+    /// leaves the queue, because it is what the record's age is measured from.
+    due: HashMap<String, u64>,
+    /// The records not yet due, in the order they will be: earliest first. A
+    /// subset of `due`, and disjoint from both `available` and `claims`.
+    held: BTreeSet<(u64, String)>,
     /// Set when anything above changed and the `queue` file no longer says so.
     dirty: bool,
 }
@@ -220,11 +259,27 @@ impl QueueState {
     /// `queue` file that was lost or is behind cannot mint a key that collides
     /// with a record that is still there.
     pub fn attach<R>(records: &HashMap<String, R>, persisted: PersistedQueue) -> Self {
-        let mut available = BTreeSet::new();
         let mut sequence = Sequence::restored(persisted.next_sequence);
+        let due: HashMap<String, u64> = persisted
+            .due
+            .into_iter()
+            .filter(|(key, _)| records.contains_key(key))
+            .collect();
+        let mut available = BTreeSet::new();
+        let mut held = BTreeSet::new();
         for key in records.keys() {
             sequence.raise_past(key);
-            available.insert(key.clone());
+            // Everything is attached as held if it has a due time: the first
+            // sweep lets in whatever has come due while the file was closed, so
+            // there is one place that decides what "due" means rather than two.
+            match due.get(key) {
+                Some(millis) => {
+                    held.insert((*millis, key.clone()));
+                }
+                None => {
+                    available.insert(key.clone());
+                }
+            }
         }
         let deliveries: HashMap<String, u32> = persisted
             .deliveries
@@ -236,6 +291,8 @@ impl QueueState {
             available,
             claims: HashMap::new(),
             deliveries,
+            due,
+            held,
             dirty: false,
         }
     }
@@ -264,8 +321,21 @@ impl QueueState {
     /// Puts a newly written record at the back of the queue.
     pub fn enqueue(&mut self, key: &str) {
         self.claims.remove(key);
+        self.unhold(key);
         self.available.insert(key.to_string());
         self.dirty = true;
+    }
+
+    /// Puts a newly written record in the queue, not to be claimed before
+    /// `due_millis`.
+    ///
+    /// A due time that has already passed is not refused: it is a record that
+    /// is due now, and the next sweep lets it in. It still keeps the due time,
+    /// so its age is measured from it like any other held record's.
+    pub fn enqueue_held(&mut self, key: &str, due_millis: u64) {
+        self.claims.remove(key);
+        self.available.remove(key);
+        self.hold(key, due_millis);
     }
 
     /// Forgets a record entirely: acknowledged, deleted, or moved to the
@@ -274,7 +344,71 @@ impl QueueState {
         self.available.remove(key);
         self.claims.remove(key);
         self.deliveries.remove(key);
+        self.unhold(key);
+        self.due.remove(key);
         self.dirty = true;
+    }
+
+    /// Holds `key` out of the order until `due_millis`.
+    fn hold(&mut self, key: &str, due_millis: u64) {
+        self.unhold(key);
+        self.due.insert(key.to_string(), due_millis);
+        self.held.insert((due_millis, key.to_string()));
+        self.dirty = true;
+    }
+
+    /// Takes `key` out of the held set, leaving its due time recorded.
+    fn unhold(&mut self, key: &str) {
+        if let Some(millis) = self.due.get(key)
+            && self.held.remove(&(*millis, key.to_string()))
+        {
+            self.dirty = true;
+        }
+    }
+
+    /// Lets every held record that is due by `now_millis` into the order, and
+    /// returns how many there were.
+    ///
+    /// Earliest first and one at a time off the front of an ordered set, so
+    /// the cost is the number of records coming due rather than the number
+    /// held.
+    pub fn release_due(&mut self, now_millis: u64) -> usize {
+        let mut released = 0;
+        while let Some((millis, _)) = self.held.first()
+            && *millis <= now_millis
+        {
+            let (_, key) = self.held.pop_first().expect("first() was Some");
+            self.available.insert(key);
+            released += 1;
+        }
+        if released > 0 {
+            self.dirty = true;
+        }
+        released
+    }
+
+    /// Whether a held record has come due and is waiting to be let in.
+    ///
+    /// The held-record half of [`has_lapsed_claim`](Self::has_lapsed_claim):
+    /// the question a read-only command asks before deciding it needs the
+    /// exclusive lock.
+    pub fn has_due_record(&self, now_millis: u64) -> bool {
+        self.held.first().is_some_and(|(millis, _)| *millis <= now_millis)
+    }
+
+    /// When the earliest held record comes due, if any is held. For a consumer
+    /// that found the queue empty and wants to know how long it is worth
+    /// waiting.
+    pub fn next_due(&self) -> Option<u64> {
+        self.held.first().map(|(millis, _)| *millis)
+    }
+
+    /// When `key` becomes claimable, if it is being held back.
+    pub fn held_until(&self, key: &str) -> Option<u64> {
+        self.due
+            .get(key)
+            .filter(|millis| self.held.contains(&(**millis, key.to_string())))
+            .copied()
     }
 
     /// Returns every claim that has lapsed to the queue, and names the records
@@ -285,6 +419,11 @@ impl QueueState {
     /// the only observer of an expired claim is the next consumer, and it does
     /// the sweeping on its way past.
     pub fn expire(&mut self, now_millis: u64, policy: QueuePolicy) -> Expired {
+        // Held records first: one that came due and a claim that lapsed in the
+        // same instant are both available to the claim this sweep precedes, and
+        // letting the held one in second would change nothing but the order in
+        // which this function happens to mention them.
+        self.release_due(now_millis);
         let lapsed: Vec<String> = self
             .claims
             .iter()
@@ -383,14 +522,30 @@ impl QueueState {
     /// lapse. `true` when the record has used up its deliveries and is to be
     /// dead lettered instead of made available.
     pub fn release(&mut self, key: &str, policy: QueuePolicy) -> bool {
+        self.release_until(key, policy, None)
+    }
+
+    /// [`release`](Self::release), holding the record back until `due_millis`
+    /// when one is given - the backoff a consumer asks for when it knows the
+    /// thing that failed will not have recovered in the next millisecond.
+    ///
+    /// The delivery limit is checked first and the delay does not change it: a
+    /// record that has used up its deliveries is dead lettered now, since
+    /// waiting to bury it would only be a record occupying the queue that
+    /// nobody is ever going to be handed.
+    pub fn release_until(&mut self, key: &str, policy: QueuePolicy, due_millis: Option<u64>) -> bool {
         self.claims.remove(key);
         self.dirty = true;
         if self.deliveries.get(key).copied().unwrap_or(0) >= policy.max_deliveries {
-            true
-        } else {
-            self.available.insert(key.to_string());
-            false
+            return true;
         }
+        match due_millis {
+            Some(millis) => self.hold(key, millis),
+            None => {
+                self.available.insert(key.to_string());
+            }
+        }
+        false
     }
 
     /// Brings the order back in line with the records after something other
@@ -404,10 +559,13 @@ impl QueueState {
     /// there are. A record nobody has claimed becomes available in key order
     /// like any other; one that has vanished is forgotten.
     pub fn reconcile<R>(&mut self, records: &HashMap<String, R>) {
+        self.held.retain(|(_, key)| records.contains_key(key));
+        self.due.retain(|key, _| records.contains_key(key));
+        let held: std::collections::HashSet<&String> = self.held.iter().map(|(_, key)| key).collect();
         self.available
-            .retain(|key| records.contains_key(key) && !self.claims.contains_key(key));
+            .retain(|key| records.contains_key(key) && !self.claims.contains_key(key) && !held.contains(key));
         for key in records.keys() {
-            if !self.claims.contains_key(key) {
+            if !self.claims.contains_key(key) && !held.contains(key) {
                 self.available.insert(key.clone());
             }
             self.sequence.raise_past(key);
@@ -420,7 +578,7 @@ impl QueueState {
     /// Records this queue is tracking, claimed or not. Compared against the
     /// record count to decide whether a [`reconcile`](Self::reconcile) is due.
     pub fn tracked(&self) -> usize {
-        self.available.len() + self.claims.len()
+        self.available.len() + self.claims.len() + self.held.len()
     }
 
     /// Records available to be claimed.
@@ -431,6 +589,11 @@ impl QueueState {
     /// Records claimed and not yet acknowledged.
     pub fn in_flight(&self) -> usize {
         self.claims.len()
+    }
+
+    /// Records held back and not yet due.
+    pub fn held(&self) -> usize {
+        self.held.len()
     }
 
     /// How long ago the oldest record still in the queue - available or claimed
@@ -451,14 +614,36 @@ impl QueueState {
         // perfectly good record that carries no arrival time, and one that
         // sorts ahead of the minted keys must be stepped over rather than
         // ending the search.
-        let oldest_waiting = self.available.iter().find_map(|key| key_enqueued_millis(key));
+        //
+        // A record that was held back is measured from when it came due, not
+        // from its key (see the module documentation), so it is stepped over
+        // here and counted below instead. Stepping over is bounded by the
+        // number of such records, which is the number anybody delayed.
+        let oldest_waiting = self
+            .available
+            .iter()
+            .filter(|key| !self.due.contains_key(*key))
+            .find_map(|key| key_enqueued_millis(key));
+        // Records that were held and are now in the order or claimed: aged from
+        // their due time. The ones still held are not waiting at all yet.
+        let oldest_released = self
+            .due
+            .iter()
+            .filter(|(key, _)| self.available.contains(*key) || self.claims.contains_key(*key))
+            .map(|(_, millis)| *millis)
+            .min();
         // The claims are the in-flight set, which is the number of consumers
         // rather than the depth, so this one is cheap as it stands.
-        let oldest_claimed = self.claims.keys().filter_map(|key| key_enqueued_millis(key)).min();
-        let oldest = match (oldest_waiting, oldest_claimed) {
-            (Some(waiting), Some(claimed)) => waiting.min(claimed),
-            (waiting, claimed) => waiting.or(claimed)?,
-        };
+        let oldest_claimed = self
+            .claims
+            .keys()
+            .filter(|key| !self.due.contains_key(*key))
+            .filter_map(|key| key_enqueued_millis(key))
+            .min();
+        let oldest = [oldest_waiting, oldest_released, oldest_claimed]
+            .into_iter()
+            .flatten()
+            .min()?;
         Some(now_millis.saturating_sub(oldest) / 1000)
     }
 
@@ -471,6 +656,7 @@ impl QueueState {
                 .iter()
                 .map(|(key, count)| (key.clone(), *count))
                 .collect(),
+            due: self.due.iter().map(|(key, millis)| (key.clone(), *millis)).collect(),
         }
     }
 }
@@ -480,6 +666,9 @@ impl QueueState {
 pub struct PersistedQueue {
     pub next_sequence: u64,
     pub deliveries: Vec<(String, u32)>,
+    /// Each held record's due time, in milliseconds since the epoch - see the
+    /// module documentation on why this, unlike a claim, is written down.
+    pub due: Vec<(String, u64)>,
 }
 
 /// The `queue` file inside a file's directory.
@@ -505,6 +694,11 @@ pub fn read_state(file_dir: &str) -> Option<PersistedQueue> {
             && let Ok(count) = count.trim().parse::<u32>()
         {
             state.deliveries.push((key.to_string(), count));
+        } else if let Some(entry) = line.strip_prefix("due=")
+            && let Some((key, millis)) = entry.rsplit_once(':')
+            && let Ok(millis) = millis.trim().parse::<u64>()
+        {
+            state.due.push((key.to_string(), millis));
         }
     }
     Some(state)
@@ -524,6 +718,11 @@ pub fn write_state(file_dir: &str, state: &PersistedQueue, fsync: FsyncPolicy) -
     deliveries.sort();
     for (key, count) in deliveries {
         body.push_str(&format!("deliveries={}:{}\n", key, count));
+    }
+    let mut due: Vec<&(String, u64)> = state.due.iter().collect();
+    due.sort();
+    for (key, millis) in due {
+        body.push_str(&format!("due={}:{}\n", key, millis));
     }
     crate::db::statefile::write(&state_path(file_dir), &body, fsync)
 }
